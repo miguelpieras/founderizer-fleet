@@ -19,3 +19,4 @@
 # the public halves here. Until then `releases.read_keys` answers an empty set, every manifest is refused with
 # "this checkout carries no release key", and no fleet can be updated from the channel. That is the safe state,
 # not a gap: a fleet that cannot check a release takes none.
+Rx2H3IQWLleJlIx+4x2ckg0JN4d+CGjfF0Zkeon6vmg=

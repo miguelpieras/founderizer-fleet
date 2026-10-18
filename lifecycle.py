@@ -34,7 +34,8 @@ BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,100}")
 FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "agent_key", "broker_callers",
             "runtime_switch", "login_create", "login_capture", "api_request",
             "app_server_tasks",     # helper abilities that the hub may use; app_server_tasks: app_server_task below
-            "manager_switch"]       # the manager's helper closes its previous runtime's session after a switch
+            "manager_switch",       # the manager's helper closes its previous runtime's session after a switch
+            "mcp_program"]          # it resolves a command MCP server's program for POST /ui/mcp/check
 SWITCH_RUNTIMES = ("codex", "claude")       # the runtimes that an owner can switch between (owner feature runtime_switch)
 MODELS_EVERY = 6 * 3600         # seconds between readings of the runtime's model options
 MODEL_NAME = re.compile(r"[A-Za-z0-9._:/\[\]-]{1,120}")

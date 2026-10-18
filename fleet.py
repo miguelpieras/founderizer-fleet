@@ -62,7 +62,7 @@ import uuid
 
 from threads import MARKER, THREAD_ID, CodexFiles, Tailer, Translator, complete_rows, manager_transcript, text_of
 from usage import Collector, local_model
-from lifecycle import (GITHUB_TOKEN, REPO_ACCESS, REPO_NAME, TOOL_CATALOG, Lifecycle, Updating,
+from lifecycle import (GITHUB_TOKEN, MCP_PROGRAM, REPO_ACCESS, REPO_NAME, TOOL_CATALOG, Lifecycle, Updating,
                        app_server_task, exe, follow_config_ref, mcp_variable, tool_catalog, tool_needs)
 from desktop import Publisher
 
@@ -2168,10 +2168,28 @@ class Helper:
             threading.Thread(target=self.runtime_login, args=(extra,), daemon=True, name="runtime-login").start()
         elif kind == "trigger_check":
             self.trigger_check(extra)
+        elif kind == "mcp_program":
+            self.mcp_program(extra)
         if kind not in ("say", "task", "chat"):
             code, data = http("POST", f"/helper/ack/{self.agent}", {"ids": [ev["id"]]})
             if code != 200:
                 raise Refused("the hub did not acknowledge helper work")
+
+    def mcp_program(self, extra):
+        """The owner asked, in the app, whether this machine has the program of a command MCP server (owner feature
+        mcp_program, the hub's POST /ui/mcp/check). The helper resolves the name exactly as the start of a task
+        session resolves it — this machine's PATH, then ~/.local/bin — and never runs the program. The owner waits
+        for this answer, so it goes back at once and in this loop."""
+        probe, command = extra.get("probe"), extra.get("command")
+        if not (isinstance(probe, str) and isinstance(command, str) and MCP_PROGRAM.fullmatch(command)):
+            raise Refused("invalid MCP program check")
+        found = exe(command)
+        self.say(f"MCP server program {command}: " + (f"this machine has it at {found}" if found else
+                                                      "not on this machine's PATH or in ~/.local/bin"))
+        code, _ = http("POST", f"/helper/mcp/program/{self.agent}",
+                       {"probe": probe, "found": bool(found), "path": found}, timeout=10)
+        if code != 200:
+            raise Refused(f"the hub did not take the answer about {command} ({code})")
 
     def runtime_login(self, extra):
         """The owner asked, in the app, for this machine's runtime to be signed in (machine_signin). The provider's

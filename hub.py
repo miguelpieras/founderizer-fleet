@@ -472,7 +472,7 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "screen_model", "agent_auth", "vault_access", "runtime_switch",
                "account_email", "secrets", "login_create", "login_capture", "api_request",
                "owner_knowledge", "secret_grants", "integrations", "chat_apps", "people", "conversations",
-               "agent_messages", "google", "mcp", "mcp_check", "servers", "responsibilities",
+               "agent_messages", "google", "mcp", "mcp_check", "mcp_program", "servers", "responsibilities",
                "server_prepare",
                "mobile", "attachments", "resource_grants", "machine_signin",
                "releases", "entitlement", "agent_signin", "github_app", "need_options", "restore"]
@@ -792,7 +792,7 @@ def filed_under(agent, kind, task):
 
 def emit(agent, kind, text, task=None, extra=None):
     """Queue a message for one agent's helper. Kinds: task, say, chat, stop, control, signin, handover, create,
-    capture, request, notify."""
+    capture, request, notify, mcp_program."""
     return ins(EVENT, (agent, kind, filed_under(agent, kind, task), str(text), now(), json.dumps(extra or {})))
 
 
@@ -12929,9 +12929,14 @@ MCP_STALE = "This Connect expired, or another one took its place. Start Connect 
 MCP_NO_OAUTH = "This MCP server does not use the hub's Connect: its auth is not oauth."
 MCP_UNCONNECTED = "The owner has not connected this MCP server yet."
 MCP_ENDED = "The access of this MCP server ended. Connect it again."
+MCP_PROBE_WAIT = 15             # seconds the hub waits for a machine's answer about a command server's program
+MCP_PROBE_STEP = 0.25           # seconds between two looks for that answer
+MCP_PROBE_MAX = 8               # machines that one check asks; the rest are named as not asked
+MCP_PROBE_FEATURE = "mcp_program"       # the helper step that answers it: an older helper reports it not
 # Only in the hub's memory: each server's access token (with the SHA-256 of the refresh token that it came from), the
-# problem of each server whose refresh the server refused, and the pending Connect. A restart ends them all.
-MCP = {"tokens": {}, "problems": {}, "pending": None}
+# problem of each server whose refresh the server refused, the pending Connect, and the program checks of
+# POST /ui/mcp/check that wait for a machine's answer. A restart ends them all.
+MCP = {"tokens": {}, "problems": {}, "pending": None, "probes": {}}
 MCP_LOCK = threading.Lock()
 
 
@@ -13075,26 +13080,123 @@ def mcp_key_names():
             if isinstance(entry, dict) and entry.get("kind") == "api_key" and entry.get("env")}
 
 
-def check_mcp_server(name, entry):
+def mcp_probe_candidates(name, agent=None):
+    """Whose machine would run a command server's program: the agent that the owner named, else every worker and
+    lead that has this server in team.json now. The manager gets no MCP server, so it is never one of them. The
+    owner usually checks a server before it saves it, when no agent has it yet: then the app names the agent."""
+    if agent:
+        return [agent]
+    return sorted(n for n, a in agents().items() if a.get("role") in ("worker", "lead")
+                  and name in (a.get("tools") or []))
+
+
+def mcp_probe_waiting(token):
+    """True while one program check still waits for its answer. The hub hands a helper no older one: a check that
+    gave up leaves nothing for a machine to run minutes later."""
+    with MCP_LOCK:
+        probe = MCP["probes"].get(token) if isinstance(token, str) else None
+    return bool(probe) and probe["answer"] is None
+
+
+def mcp_probe_answer(agent, token, found, path):
+    """One machine's answer (POST /helper/mcp/program/<agent>). False when the hub does not wait for it any more: a
+    check that gave up, an answer that came twice, or another agent's token."""
+    with MCP_LOCK:
+        probe = MCP["probes"].get(token) if isinstance(token, str) else None
+        if not probe or probe["agent"] != agent or probe["answer"] is not None:
+            return False
+        probe["answer"] = {"found": found, "path": path}
+        return True
+
+
+def mcp_probe(names, command):
+    """Ask each of these agents' machines whether it has this program, and wait once for all the answers. Nobody
+    runs the program: the helper resolves the name as a task session does (PATH, then ~/.local/bin) and sends back
+    what it found. A machine that has not checked in, and one whose Fleet is older than this check, are not asked at
+    all, so the hub waits only for a machine that can answer. One row for each agent, in the order given."""
+    t0, rows, waiting = now(), [], {}
+
+    def label(agent):
+        machine = (agents().get(agent) or {}).get("machine")
+        return f"{agent} ({machine})" if machine else str(agent)
+
+    def row(agent, state, says, path=None):
+        made = {"agent": agent, "machine": (agents().get(agent) or {}).get("machine"), "state": state,
+                "path": path, "says": f"{label(agent)}: {says}"}
+        rows.append(made)
+        return made
+
+    for agent in names[:MCP_PROBE_MAX]:
+        if not helper_online(agent, t0):
+            row(agent, "not_asked", "not asked, this machine has not checked in.")
+        elif MCP_PROBE_FEATURE not in helper_features(agent):
+            row(agent, "not_asked", "not asked, this machine's Fleet is older than this check.")
+        else:
+            token = secrets.token_urlsafe(16)
+            with MCP_LOCK:
+                MCP["probes"][token] = {"agent": agent, "command": command, "asked": t0, "answer": None}
+            emit(agent, "mcp_program", f"Does this machine have the program {command}?",
+                 extra={"probe": token, "command": command})
+            waiting[token] = row(agent, "asked", "asked.")
+    for agent in names[MCP_PROBE_MAX:]:
+        row(agent, "not_asked", f"not asked, one check asks at most {MCP_PROBE_MAX} machines.")
+    asked = list(waiting)
+    deadline = t0 + MCP_PROBE_WAIT
+    while waiting and now() < deadline:
+        time.sleep(MCP_PROBE_STEP)
+        for token in list(waiting):
+            with MCP_LOCK:
+                got = (MCP["probes"].get(token) or {}).get("answer")
+            if not got:
+                continue
+            made = waiting.pop(token)
+            made.update(state="found" if got["found"] else "missing", path=got["path"],
+                        says=f"{label(made['agent'])}: " + (f"{command} is at {got['path']}." if got["found"]
+                             else f"no {command} on its PATH or in ~/.local/bin."))
+    for made in waiting.values():
+        made.update(state="no_answer",
+                    says=f"{label(made['agent'])}: no answer in {MCP_PROBE_WAIT} seconds.")
+    with MCP_LOCK:
+        for token in asked:
+            MCP["probes"].pop(token, None)
+    return rows
+
+
+def check_mcp_server(name, entry, agent=None):
     """Does one MCP server answer? What POST /ui/mcp/check says about the server the owner is about to save, with no
     change to anything.
 
     A url server is asked for real: one `initialize` of mcp.check, with this server's saved access token when it is
     connected. A server that answers 401 or 403 is there and wants credentials, which the hub never types for it, so
     that is an answer too and `needs` says which one is missing; a server saved as auth "none" that asks for
-    credentials is not. A command server runs on the agent's machine, so the hub runs nothing at all: `checked` is
-    false, and the session's start text is what says that the program is missing. For both kinds the hub names the
-    API keys that the server needs and the fleet does not hold, because that is the other typo that shows only in a
-    session. ValueError (the shape) is the caller's 400."""
+    credentials is not. A command server is a program of the agent's own machine, so the hub asks that machine to
+    resolve the name, as a task session does, and nobody runs it: `machines` says what each one answered, and a
+    machine that was not asked is named with the reason. For both kinds the hub names the API keys that the server
+    needs and the fleet does not hold, because that is the other typo that shows only in a session. ValueError (the
+    shape) is the caller's 400. agent: whose machine to ask about a command server, for a server that no agent has
+    yet; it changes nothing for a url server."""
     made = mcp_server(name, entry)                  # ValueError with the reason
     needs = [v for v in tool_needs(made) if v != mcp_variable(name)]
     result = {"name": name, "kind": "url" if "url" in made else "command", "checked": False, "answers": None,
               "needs": None, "says": "", "server": None, "version": None, "tools": [], "note": None,
-              "keys": {"needs": needs, "missing": sorted(set(needs) - mcp_key_names())}}
+              "machines": [], "keys": {"needs": needs, "missing": sorted(set(needs) - mcp_key_names())}}
     if result["kind"] == "command":
-        result.update(needs="machine", says=(
-            f"{made['command']} is a program of the agent's own machine, so the hub cannot run it: it checked the "
-            f"server's shape only. The machine says in the session's start text when the program is not installed."))
+        where = mcp_probe(mcp_probe_candidates(name, agent), made["command"])
+        answered = [w for w in where if w["state"] in ("found", "missing")]
+        open_ones = [w for w in where if w["state"] not in ("found", "missing")]
+        result["machines"] = where
+        said = " ".join(w["says"] for w in where)
+        if not answered:
+            result.update(needs="machine", says=(
+                f"{made['command']} is a program of the agent's own machine, so the hub never runs it, and no "
+                f"machine answered this check. " + (said or f"No agent has {name} yet, so there was no machine to "
+                f"ask: give the server to an agent, or name one.") +
+                " The session's start text says it when the program is not installed."))
+            return result
+        missing = any(w["state"] == "missing" for w in answered)
+        result.update(checked=True, answers=not missing, needs="machine" if missing or open_ones else None,
+                      says=f"{made['command']} is a program of the agent's own machine: each machine resolved the "
+                           f"name itself and nobody ran it. {said}")
         return result
     access, url = None, made["url"]
     if made["auth"] == "oauth":
@@ -15895,15 +15997,22 @@ class Handler(BaseHTTPRequestHandler):
 
         The server is asked in `read`, before the hub takes its lock: a server that does not answer must not hold
         the whole hub while it times out. A server that does not answer is a 200 with `answers` false, because its
-        answer is the result of this call.
+        answer is the result of this call. A command server is asked of the machines that would run its program,
+        which waits in the same place and for the same reason.
         """
         got = {}
 
         def read(data):
-            self.only(data, ("name", "server"))
+            self.only(data, ("name", "server", "agent"))
             name = data.get("name")
             if not isinstance(name, str) or not MCP_NAME.fullmatch(name):
                 raise ValueError("name must be 1 to 31 characters a-z 0-9 - that start with a letter")
+            who = data.get("agent")
+            if who is not None:
+                if not isinstance(who, str) or who not in agents():
+                    raise ValueError("agent must be the name of an agent of team.json")
+                if agents()[who].get("role") not in ("worker", "lead"):
+                    raise ValueError("agent must be a worker or a lead: an MCP server reaches task sessions only")
             entry = data.get("server")
             if entry is None:
                 entry = (TEAM.get("mcp") or {}).get(name)
@@ -15911,8 +16020,8 @@ class Handler(BaseHTTPRequestHandler):
                     raise Refusal(404, f"no MCP server {name}")
             if secret_hit(json.dumps(entry)):       # before the server is asked, not after it was told
                 raise Refusal(422, "a registered login cannot be sent as text")
-            got["result"] = check_mcp_server(name, entry)        # ValueError with the reason: the 400 of this call
-            return {"name": name, "server": entry}
+            got["result"] = check_mcp_server(name, entry, who)   # ValueError with the reason: the 400 of this call
+            return {"name": name, "server": entry, "agent": who}
 
         return self.ui_command("mcp/check", read, lambda body: got["result"])
 
@@ -17760,6 +17869,8 @@ class Handler(BaseHTTPRequestHandler):
                     if r["kind"] == "check" and not q1("SELECT id FROM machine_checks WHERE id=? AND state='requested'",
                                                          (extra.get("check"),)):
                         continue
+                    if r["kind"] == "mcp_program" and not mcp_probe_waiting(extra.get("probe")):
+                        continue        # owner feature mcp_program: the owner's check gave up, so this asks nobody
                     if r["kind"] in ("signin", "handover", "create", "capture", "request") and not q1("SELECT id FROM jobs WHERE id=? AND finished IS NULL", (extra.get("job"),)):
                         continue
                     keep.append(r)
@@ -18033,6 +18144,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.helper_session(parts[2])
         if parts[:2] == ["helper", "integrations"] and len(parts) == 3:
             return self.helper_integrations(parts[2])
+        if parts[:3] == ["helper", "mcp", "program"] and len(parts) == 4:
+            return self.helper_mcp_program(parts[3])
         if parts[:2] == ["helper", "vault"] and len(parts) == 3:
             return self.helper_vault(parts[2])
         if parts[:2] == ["helper", "vault"] and len(parts) == 4 and parts[3] == "fingerprints":
@@ -18354,6 +18467,22 @@ class Handler(BaseHTTPRequestHandler):
                        f"{max(0, int(ends - now()) // 60)} minutes")
         return self.json(200, {"repos": repos, "tools": tools, "tokens": tokens, "errors": errors,
                                "mcp": servers, "mcp_problems": problems}, {"Cache-Control": "no-store"})
+
+    def helper_mcp_program(self, agent):
+        """POST /helper/mcp/program/<agent>: this machine's answer to one program check of POST /ui/mcp/check
+        (owner feature mcp_program). The helper resolved the name as a task session does and ran nothing. `taken`
+        is false when the hub does not wait for this answer any more, which is no error of the helper's."""
+        if agent not in agents():
+            return self.json(404, {"error": "unknown agent"})
+        if not self.allowed(agent):
+            return
+        f = self.form()
+        found, path = f.get("found"), f.get("path")
+        if not isinstance(found, bool):
+            return self.json(400, {"error": "found must be true or false"})
+        if path is not None and not (isinstance(path, str) and 0 < len(path) <= 500):
+            return self.json(400, {"error": "path must be the resolved program, or null"})
+        return self.json(200, {"taken": mcp_probe_answer(agent, f.get("probe"), found, path if found else None)})
 
     def ui_agent_key(self, agent):
         """The owner registers, replaces or removes an agent's key (owner API 1.12), also for an agent that team.json
