@@ -1,0 +1,526 @@
+#!/usr/bin/env python3
+"""Self-test for the pilot hub: starts a temporary hub and exercises it the way agents and helpers would.
+
+    python3 selftest.py        # prints failures and a summary
+    python3 selftest.py -v     # prints every check
+
+Needs nothing but Python. The sealed-handover checks are skipped when `age` is not installed.
+Takes about a minute because it waits for the hub's timers. It tests hub.py only: fleet.py needs
+tmux and real sessions, which is what the pilot itself is for.
+"""
+import hashlib, json, os, shutil, socket, subprocess, sys, tempfile, threading, time
+import urllib.error, urllib.parse, urllib.request
+
+VERBOSE = "-v" in sys.argv
+KIT = os.path.dirname(os.path.abspath(__file__))
+TMP = tempfile.mkdtemp(prefix="fleet-selftest-")
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+# The three agents these checks need. A hub that has them in its own team.json is checked with its own; a hub whose
+# team.json has not got them yet — a fresh install has one manager (hub.sh, HUB-INSTALL.md) — is checked with these,
+# so selftest.py checks the code of any hub and not only this pilot's team.
+REFERENCE = {
+    "manager": {"role": "manager", "machine": "hub", "runtime": "claude", "can": ["shell", "web"],
+                "start": "claude --permission-mode bypassPermissions --tools default {settings} {prompt}"},
+    "vps": {"role": "worker", "machine": "vps", "runtime": "codex", "can": ["shell", "web"],
+            "start": "codex --no-daemon --sandbox danger-full-access --ask-for-approval never {prompt}"},
+    "studio": {"role": "worker", "machine": "mac-studio", "runtime": "claude",
+               "can": ["shell", "web", "browser", "screen"],
+               "screen_command": "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+               "start": "claude --permission-mode acceptEdits {chrome} {settings} {prompt}"},
+}
+
+
+def start_hub(name, addresses, *flags, agents=None):
+    port = free_port()
+    team = json.load(open(os.path.join(KIT, "team.json"), encoding="utf-8"))
+    if not REFERENCE.keys() <= team.get("agents", {}).keys():
+        team["agents"] = json.loads(json.dumps(REFERENCE))
+    team["addresses"] = addresses
+    if agents:          # agents of the check's own, so that it does not depend on the agents this team.json has
+        team["agents"].update(json.loads(json.dumps(agents)))
+    for conf in team["agents"].values():    # the file-mode login flow is checked here; test_vault.py checks broker mode
+        conf.pop("vault", None)
+        conf.pop("vault_recipient", None)
+        # and the grants that add a tool, so that the tool sets below are the hub's own and not this team's:
+        # test_create_login.py, test_call_api.py and test_google_api.py check the tools a grant adds.
+        conf.pop("vault_create", None)
+        conf.pop("google", None)
+    path = os.path.join(TMP, f"{name}.json")
+    json.dump(team, open(path, "w"))
+    proc = subprocess.Popen([sys.executable, os.path.join(KIT, "hub.py"), "--host", "127.0.0.1", "--port", str(port),
+                             "--db", os.path.join(TMP, f"{name}.db"), "--team", path, *flags],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    base = f"http://127.0.0.1:{port}"
+    for _ in range(80):
+        try:
+            urllib.request.build_opener(urllib.request.ProxyHandler({})).open(base + "/health", timeout=1).read()
+            return proc, base
+        except (urllib.error.URLError, OSError):
+            time.sleep(0.1)
+    print("the hub did not start")
+    sys.exit(1)
+
+
+# The tools of each role, by name, in RULES.md's own groups: the ones every agent has, then the manager's fifteen with
+# its two duty writes, or the eight of a worker's task. A count says only that something moved; a set says which tool
+# moved, and RULES.md names every one of these. The tools a grant adds are not here: start_hub drops the grants.
+EVERY_AGENT = ["read_messages", "search_knowledge", "see_responsibilities", "open_case", "record_step", "close_case",
+               "attach_watch", "see_triggers", "save_trigger", "change_trigger", "message_owner", "message_agent"]
+MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "answer", "check_result",
+                               "decide_permission", "set_reminder", "see_team", "see_capacity", "see_goals",
+                               "update_goal", "record_spend", "raise_needs_you", "tell_owner", "grant_access",
+                               "set_duty", "change_duty"]
+WORKER_TOOLS = EVERY_AGENT + ["list_my_tasks", "report_progress", "read_attachment", "ask_my_requester",
+                              "deliver_result", "sign_in", "hand_over", "resolve_outcome"]
+
+
+def tool_set(got, want):
+    """Empty when the names are the same set, else which names are missing and which are extra."""
+    missing, extra = sorted(set(want) - set(got)), sorted(set(got) - set(want))
+    return "" if not missing and not extra else f"missing {missing}, extra {extra}"
+
+
+HUB_PROC, HUB = start_hub("main", {"vps": "", "mac-studio": "", "owner": ""},
+                          "--silence", "6", "--question-wait", "60", "--manager-silence", "12", "--stop-after", "3",
+                          "--tick", "1", "--hook-wait", "4", "--ask-max", "3", "--job-wait", "3")
+fails, count = [], [0]
+
+
+def check(name, cond, detail=""):
+    count[0] += 1
+    if VERBOSE or not cond:
+        print(("PASS " if cond else "FAIL ") + name + (f"  [{detail}]" if detail and not cond else ""))
+    if not cond:
+        fails.append(name)
+
+
+def raw(method, path, body=None, headers=None, form=None, base=None):
+    if path.startswith("/hook/") and body is not None and base is None:
+        task = path.rsplit("/",1)[1]
+        rows = json.loads(raw("GET", "/records")[2])
+        t = next((t for t in rows["tasks"] if "T-"+str(t["id"]) == task), None)
+        if t:
+            body = dict(body, generation=rows["db"], attempt=t["attempt"])
+    h = dict(headers or {})
+    data = None
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode(); h["Content-Type"] = "application/x-www-form-urlencoded"
+    elif body is not None:
+        data = json.dumps(body).encode(); h["Content-Type"] = "application/json"
+    req = urllib.request.Request((base or HUB) + path, data=data, method=method, headers=h)
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k): return None
+    op = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
+    try:
+        with op.open(req, timeout=60) as r:
+            return r.status, dict(r.headers), r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), e.read().decode()
+
+rid = [0]
+def rpc(agent, method, params=None, notify=False, base=None):
+    msg = {"jsonrpc": "2.0", "method": method}
+    if params is not None: msg["params"] = params
+    if not notify:
+        rid[0] += 1; msg["id"] = rid[0]
+    path = f"/mcp/{agent}"
+    if agent in ("vps", "studio") and method == "tools/call" and (params or {}).get("arguments",{}).get("task_id") and base is None:
+        records = json.loads(raw("GET", "/records")[2])
+        task = params["arguments"]["task_id"]
+        t = next((t for t in records["tasks"] if "T-"+str(t["id"]) == task), None)
+        path += f"/{records['db']}/{task}/{t['attempt'] if t else 1}"
+    code, headers, text = raw("POST", path, msg, {"Accept": "application/json, text/event-stream"}, base=base)
+    try:
+        return code, headers, (json.loads(text) if text else None)
+    except ValueError:
+        return code, headers, None
+
+def tool(agent, name, **args):
+    code, headers, resp = rpc(agent, "tools/call", {"name": name, "arguments": args})
+    res = resp["result"]
+    return res["content"][0]["text"], res["isError"]
+
+def events(agent, after=0, wait=0, alive=None):
+    path = f"/events/{agent}?after={after}&wait={wait}" + (f"&alive={urllib.parse.quote(alive)}" if alive is not None else "")
+    return json.loads(raw("GET", path)[2])["events"]
+
+def later(fn, delay):
+    threading.Thread(target=lambda: (time.sleep(delay), fn()), daemon=True).start()
+
+def board():
+    return raw("GET", "/board")[2]
+
+# 1 handshake and roles
+code, headers, resp = rpc("manager", "initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "sim-cli", "version": "9.9"}})
+check("initialize answers with the requested version", code == 200 and resp["result"]["protocolVersion"] == "2025-06-18")
+check("initialize gives a session id header", any(k.lower() == "mcp-session-id" for k in headers))
+code, headers, resp = rpc("manager", "initialize", {"protocolVersion": "2099-01-01", "capabilities": {}, "clientInfo": {"name": "sim-cli", "version": "9.9"}})
+check("unknown protocol version falls back to a known one", resp["result"]["protocolVersion"] == "2025-06-18")
+code, _, resp = rpc("manager", "notifications/initialized", notify=True)
+check("a notification gets 202 and no body", code == 202 and resp is None)
+check("GET on the MCP endpoint is 405", raw("GET", "/mcp/manager")[0] == 405)
+check("unknown agent is 404", rpc("nobody", "ping")[0] == 404)
+mt = [t["name"] for t in rpc("manager", "tools/list")[2]["result"]["tools"]]
+wt = [t["name"] for t in rpc("studio", "tools/list")[2]["result"]["tools"]]
+mdiff, wdiff = tool_set(mt, MANAGER_TOOLS), tool_set(wt, WORKER_TOOLS)
+check("the manager's tools are the ones RULES.md names", not mdiff, mdiff)
+check("a worker's tools are the ones RULES.md names", not wdiff, wdiff)
+text, err = tool("studio", "raise_needs_you", title="x", why="y")
+check("a worker cannot reach the owner", err and "no tool" in text, text)
+check("ping", rpc("studio", "ping")[2]["result"] == {})
+check("unknown method is an error", "error" in rpc("studio", "nope/nope")[2])
+code, _, resp = raw("POST", "/mcp/studio", [{"jsonrpc": "2.0", "id": 91, "method": "ping"}, {"jsonrpc": "2.0", "method": "notifications/x"}], {"Accept": "application/json"})
+check("a batch is answered as a list", code == 200 and isinstance(json.loads(resp), list) and len(json.loads(resp)) == 1)
+b = board()
+check("the board names the client that connected as the manager, and none for studio yet",
+      "sim-cli 9.9" in b and "nothing yet" in b)
+
+# 2 tasks and routing
+text, err = tool("manager", "create_task", owner="vps", title="shot", done_when="file exists", needs="browser")
+check("hub refuses a browser task for a machine without one", err and "studio" in text, text)
+text, err = tool("manager", "create_task", owner="studio", title="Take a screenshot of example.com", done_when="outputs/example.png is pushed", needs="browser", details="Save it to outputs/example.png")
+check("create_task", not err and "T-1" in text, text)
+data = json.loads(raw("GET", "/events/studio?after=0&wait=0")[2])
+ev = data["events"]
+check("the worker's helper gets a task event with needs=browser", ev and ev[-1]["kind"] == "task" and ev[-1]["task"] == "T-1" and ev[-1]["extra"]["needs"] == "browser", str(ev))
+check("the hub names its database, so a helper can tell a new one", bool(data.get("db")))
+fresh = json.loads(raw("GET", "/events/studio?after=0&wait=0&fresh=1")[2])
+check("a helper new to this hub is handed the task still waiting to start", [e["task"] for e in fresh["events"]] == ["T-1"] and fresh["last"] >= ev[-1]["id"], str(fresh))
+text, err = tool("vps", "list_my_tasks", task_id="T-1")
+check("another worker cannot open the task", err, text)
+text, err = tool("studio", "list_my_tasks", task_id="T-1")
+check("list_my_tasks shows the task and marks it working", not err and "[submitted]" not in text and "Done when" in text, text)
+fresh = json.loads(raw("GET", "/events/studio?after=0&wait=0&fresh=1")[2])
+check("a helper new to this hub is not handed a task that already started", fresh["events"] == [], str(fresh))
+text, err = tool("studio", "report_progress", task_id="T-1", note="Opened the page")
+check("report_progress", not err)
+
+# Delivery is durable until the agent reads, even after a helper changes its cursor.
+pending = lambda: json.loads(raw("GET", "/events/studio?delivery=1&after=999999&wait=0")[2])["events"]
+check("a sent task stays pending without a read receipt", any(e["task"] == "T-1" for e in pending()))
+text, err = tool("studio", "read_messages", task_id="T-1")
+check("agent read returns the message and removes it from delivery", not err and "Message M-" in text and not pending())
+records = json.loads(raw("GET", "/records")[2])
+msg = {"jsonrpc":"2.0","id":900,"method":"tools/call","params":{"name":"report_progress","arguments":{"task_id":"T-1","note":"stale"}}}
+resp = json.loads(raw("POST", f"/mcp/studio/{records['db']}/T-1/0", msg)[2])["result"]
+check("an old attempt cannot report progress", resp["isError"] and "STOP" in resp["content"][0]["text"])
+msg["params"]["name"] = "deliver_result"
+msg["params"]["arguments"] = {"task_id":"T-1","what_was_done":"old","where_output_is":"old","how_checked":"old"}
+resp = json.loads(raw("POST", f"/mcp/studio/{records['db']}/T-1/0", msg)[2])["result"]
+check("an old attempt cannot deliver a result", resp["isError"] and "STOP" in resp["content"][0]["text"])
+# 3 question answered while the call waits
+later(lambda: tool("manager", "answer", question_id="Q-1", text="teal"), 1.0)
+t0 = time.time(); text, err = tool("studio", "ask_my_requester", task_id="T-1", question="Which\x03 colour;\x1b?", wait_seconds=10)
+check("an answer inside the wait comes back in the call", "teal" in text and time.time() - t0 < 3, text)
+mev = events("manager")
+check("the manager was told about the question", any("Q-1" in e["text"] for e in mev), str(mev)[:300])
+check("the inbox retains question text without typing it into a terminal", any("\x03" in e["text"] for e in mev))
+# 4 question answered late
+t0 = time.time(); text, err = tool("studio", "ask_my_requester", task_id="T-1", question="Which size?", wait_seconds=900)
+check("no answer in time: the call says the task is paused", "paused" in text, text)
+check("a question never waits longer than the caller's own limit", time.time() - t0 < 6, f"{time.time() - t0:.1f}s")
+check("task shows input-required", "[input-required]" in tool("manager", "see_team")[0])
+before = events("studio")[-1]["id"]
+text, err = tool("manager", "answer", question_id="Q-2", text="large")
+ev = events("studio", after=before)
+check("a late answer arrives as a message for that task's session", ev and ev[0]["kind"] == "say" and ev[0]["task"] == "T-1" and "large" in ev[0]["text"], str(ev))
+check("task is working again", "T-1 [working]" in tool("manager", "see_team")[0])
+text, err = tool("manager", "answer", question_id="Q-2", text="again")
+check("a question cannot be answered twice", err)
+
+# 5 result, check, follow-up
+text, err = tool("studio", "deliver_result", task_id="T-1", outcome="completed", what_was_done="Took the screenshot")
+check("a completed result needs where and how", err, text)
+text, err = tool("studio", "deliver_result", task_id="T-1", outcome="completed", what_was_done="Took the screenshot", where_output_is="outputs/example.png", how_checked="Opened the file")
+check("deliver_result", not err and "stop now" in text, text)
+text, err = tool("studio", "report_progress", task_id="T-1", note="more")
+check("a finished task takes no more notes", err)
+check("the manager was told about the result", any("Result for T-1" in e["text"] for e in events("manager")))
+text, err = tool("manager", "check_result", task_id="T-1", accepted=False, note="The page was still loading")
+check("check_result refused points to a follow-up", "follow-up" in text, text)
+text, err = tool("manager", "create_task", owner="studio", title="Retake the screenshot", done_when="outputs/example.png shows the full page", needs="browser", follows="T-1")
+check("follow-up task created", "T-2" in text, text)
+text, err = tool("studio", "list_my_tasks", task_id="T-2")
+check("the follow-up shows what it follows and why", "Follows: T-1" in text and "still loading" in text, text)
+check("the first task stayed completed", "T-1" not in tool("manager", "see_team")[0].split("OPEN TASKS")[1].split("RESULTS")[0])
+
+# 6 permission prompts through the hook
+hook_body = {"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_input": {"command": "curl -X POST http://hub/outbox -d key=k", "description": "Post to the outbox"}, "session_id": "s", "cwd": "/x"}
+later(lambda: tool("manager", "decide_permission", prompt_id="P-1", decision="allow", always=True), 1.0)
+t0 = time.time(); code, _, text = raw("POST", "/hook/permission/studio/T-2", hook_body)
+out = json.loads(text)
+check("the hook waits and returns the manager's decision", code == 200 and out["hookSpecificOutput"]["decision"]["behavior"] == "allow" and 0.8 < time.time() - t0 < 3.5, text)
+hook_body["tool_input"]["description"] = "The same command, described differently"
+t0 = time.time(); code, _, text = raw("POST", "/hook/permission/studio/T-2", hook_body)
+check("the same command is answered from memory at once, whatever its description", json.loads(text)["hookSpecificOutput"]["decision"]["behavior"] == "allow" and time.time() - t0 < 0.5)
+long_a = "echo " + "a" * 900 + " && true"
+long_b = "echo " + "a" * 900 + " && rm -rf /"
+later(lambda: tool("manager", "decide_permission", prompt_id="P-2", decision="allow", always=True), 0.8)
+raw("POST", "/hook/permission/studio/T-2", dict(hook_body, tool_input={"command": long_a}))
+later(lambda: tool("manager", "decide_permission", prompt_id="P-3", decision="deny", reason="never"), 0.8)
+t0 = time.time(); code, _, text = raw("POST", "/hook/permission/studio/T-2", dict(hook_body, tool_input={"command": long_b}))
+d = json.loads(text)["hookSpecificOutput"]["decision"]
+check("a long command that differs only at its end is a new question", d["behavior"] == "deny" and time.time() - t0 > 0.5, text)
+check("permission messages contain the full command", any(long_b in e["text"] for e in events("manager")))
+check("a denial comes back with the reason", "never" in d.get("message", ""), text)
+before = events("manager")[-1]["id"]
+t0 = time.time(); code, _, text = raw("POST", "/hook/permission/studio/T-2", dict(hook_body, tool_input={"command": "sudo reboot"}))
+d = json.loads(text)["hookSpecificOutput"]["decision"]
+check("no decision in time: the answer is no, with the way forward", d["behavior"] == "deny" and "ask your requester" in d["message"] and 3.5 < time.time() - t0 < 7, text)
+text, err = tool("manager", "decide_permission", prompt_id="P-4", decision="allow")
+check("a decision that comes too late is refused, not lost", err and "expired" in text, text)
+check("the requester is told the prompt expired", any("P-4" in e["text"] and "expired" in e["text"] for e in events("manager", after=before)))
+check("the task is working again after the prompt", "T-2 [working]" in tool("manager", "see_team")[0])
+before = events("manager")[-1]["id"]
+def answer_later():
+    time.sleep(0.5)
+    raw("POST", "/helper/dialog/studio/T-2", {})        # the helper sees that same question on the worker's screen
+    time.sleep(0.5)
+    pending = [e for e in events("manager", after=before) if "Permission prompt" in e["text"]][-1]["text"]
+    tool("manager", "decide_permission", prompt_id=pending.split("Permission prompt ")[1].split()[0], decision="deny")
+threading.Thread(target=answer_later, daemon=True).start()
+raw("POST", "/hook/permission/studio/T-2", dict(hook_body, tool_input={"command": "make install"}))
+check("a prompt the hub is carrying is not reported as a question nobody can answer",
+      not any("own screen" in e["text"] for e in events("manager", after=before)), str(events("manager", after=before))[:300])
+raw("POST", "/helper/dialog/studio/T-2", {})
+check("a question on a worker's screen with no prompt behind it is reported to the requester",
+      any("own screen" in e["text"] for e in events("manager", after=before)))
+tool("studio", "report_progress", task_id="T-2", note="someone answered it at the machine")
+check("...and the mark clears when the session moves again", "its screen" not in tool("manager", "see_team")[0])
+code, _, text = raw("POST", "/hook/activity/studio/T-2", {"tool_name": "Read"})
+check("activity hook", code == 200)
+
+# 7 needs you
+text, err = tool("manager", "raise_needs_you", title="Pick the codename", why="Naming is the owner's choice", what_to_do="Type a name")
+check("raise_needs_you", "N-1" in text)
+check("the owner gets a notification event", any(e["kind"] == "notify" and "N-1" in e["text"] for e in events("owner")))
+before = events("manager")[-1]["id"]
+code, headers, _ = raw("POST", "/needs/1", form={"answer": "Tide"})
+check("answering on the board redirects back", code == 303)
+ev = events("manager", after=before)
+check("the owner's answer reaches the manager", ev and "Tide" in ev[0]["text"], str(ev))
+code, _, _ = raw("POST", "/say", form={"text": "Status please"})
+check("owner message reaches the manager", any("[owner] Status please" in e["text"] for e in events("manager", after=before)))
+
+# 8 outbox, practice site, fingerprints, seatbelt
+check("outbox starts empty", json.loads(raw("GET", "/outbox?key=launch")[2])["count"] == 0)
+raw("POST", "/outbox", form={"key": "launch", "text": "hello"})
+check("outbox counts one send", json.loads(raw("GET", "/outbox?key=launch")[2])["count"] == 1)
+check("the manager can see the outbox count without a shell", "launch: 1" in tool("manager", "see_team")[0])
+password = "Zq7Lm2Xc9Vb4Nn8K"
+salt = "ab12"
+raw("POST", "/secrets", {"label": "pilot-site", "salt": salt, "len": len(password), "hash": hashlib.sha256((salt + password).encode()).hexdigest(), "username": "pilot"})
+code, _, text = raw("POST", "/site/login", form={"username": "pilot", "password": "wrong"})
+check("wrong login is refused", code == 200 and "Wrong login" in text)
+code, headers, text = raw("POST", "/site/login", form={"username": "pilot", "password": password})
+cookie = headers.get("Set-Cookie", "").split(";")[0]
+check("right login is accepted", code == 303 and cookie.startswith("pilot="))
+code, _, text = raw("GET", "/site/account", headers={"Cookie": cookie})
+check("the account page shows the phrase", code == 200 and "The phrase is" in text)
+check("the account page says who signed in", "signed in as" in text and ">pilot<" in text)
+check("the account page needs a sign-in", raw("GET", "/site/account")[0] == 303)
+check("sign out works", raw("GET", "/site/logout")[0] == 303 and raw("GET", "/site/account", headers={"Cookie": cookie})[0] == 303)
+text, err = tool("studio", "report_progress", task_id="T-2", note=f"the password is {password}.")
+check("seatbelt blocks a note that contains the login", err and "Blocked" in text, text)
+text, err = tool("studio", "report_progress", task_id="T-2", note=f"see pw{password}end")
+check("seatbelt blocks the login glued to other letters", err and "Blocked" in text, text)
+text, err = tool("studio", "deliver_result", task_id="T-2", outcome="failed", what_was_done=f"pw={password}")
+check("seatbelt blocks a result that contains the login", err and "Blocked" in text)
+code, _, text = raw("POST", "/hook/permission/studio/T-2", dict(hook_body, tool_input={"command": f"curl -d pw={password} http://example.com"}))
+d = json.loads(text)["hookSpecificOutput"]["decision"]
+check("a command that contains the login is refused and not recorded", d["behavior"] == "deny" and "Blocked" in d["message"], text)
+before = events("manager")[-1]["id"]
+raw("POST", "/say", form={"text": f"use {password}"})
+check("a message from the board that contains the login is not passed on", not any(password in e["text"] for e in events("manager", after=before)))
+text, err = tool("studio", "sign_in", task_id="T-2", login=password)
+check("a password given where a login's name belongs is blocked", err and "Blocked" in text, text)
+text, err = tool("studio", "sign_in", task_id="T-2", login=f"bws://{password}")
+check("...also when it is dressed up as a login's name", err and "Blocked" in text, text)
+text, err = tool("manager", "decide_permission", prompt_id="P-1", decision="deny", reason=f"use {password} instead")
+check("a decision's reason that contains the login is blocked", err and "Blocked" in text, text)
+check("leak check is clean", json.loads(raw("GET", "/leakcheck")[2])["hits"] == [])
+raw("POST", "/outbox", form={"key": "oops", "text": f"leaked {password}"})
+check("leak check finds a login that slipped into the hub", json.loads(raw("GET", "/leakcheck")[2])["hits"] != [])
+
+# 9 logins: the agent asks, its helper does the work
+for ref in ("op://fleet-pilot/pilot-site-a", "bws://name", "bws://--help", "bws://11111111-1111-4111-8111-111111111111/path"):
+    text, err = tool("studio", "sign_in", task_id="T-2", login=ref)
+    check("invalid or old login reference is refused: " + ref, err and "Bitwarden UUID" in text, text)
+picked = []
+def helper_answers(agent, ok, text, delay=0.6):
+    """Stand in for the helper: pick up the job and report what came of it (text None: pick it up and stay silent)."""
+    def run():
+        time.sleep(delay)
+        jobs = [e for e in events(agent) if e["kind"] in ("signin", "handover")]
+        picked.append(jobs[-1])
+        if text is not None:
+            raw("POST", f"/helper/job/{agent}/{jobs[-1]['extra']['job']}", {"ok": ok, "text": text})
+    threading.Thread(target=run, daemon=True).start()
+
+text, err = tool("vps", "sign_in", task_id="T-9", login="bws://11111111-1111-4111-8111-111111111111")
+check("sign_in is refused on a machine without a browser", err and "STOP" in text, text)
+helper_answers("studio", True, 'Signed in on http://hub with the login "pilot-site-a".')
+text, err = tool("studio", "sign_in", task_id="T-2", login="bws://11111111-1111-4111-8111-111111111111")
+check("sign_in returns the helper's word", not err and "Signed in" in text, text)
+job = picked[-1]
+check("the helper is handed the login's name, and a task", job["extra"]["login"] == "bws://11111111-1111-4111-8111-111111111111" and job["task"] == "T-2", str(job))
+helper_answers("studio", False, "the vault refused: this machine's token cannot open that login, or the name is wrong")
+text, err = tool("studio", "sign_in", task_id="T-2", login="bws://22222222-2222-4222-8222-222222222222")
+check("a refusal from the vault comes back as an error", err and "vault refused" in text, text)
+helper_answers("studio", True, None)
+t0 = time.time(); text, err = tool("studio", "sign_in", task_id="T-2", login="bws://11111111-1111-4111-8111-111111111111")
+check("no helper: sign_in gives up and says so", err and "did not answer" in text and time.time() - t0 < 6, text)
+late = picked[-1]["extra"]["job"]
+check("a helper report that comes too late is refused", raw("POST", f"/helper/job/studio/{late}", {"ok": True, "text": "late"})[0] == 409)
+check("a sign-in whose asker has stopped waiting is not handed to a helper later", not any(e["kind"] in ("signin", "handover") for e in events("studio")))
+helper_answers("studio", True, f"oops {password}")
+text, err = tool("studio", "sign_in", task_id="T-2", login="bws://11111111-1111-4111-8111-111111111111")
+check("a helper report that contains the login is blocked", err and "blocked" in text and password not in text, text)
+text, err = tool("studio", "hand_over", task_id="T-2", login="bws://11111111-1111-4111-8111-111111111111", to="nobody")
+check("hand_over needs a real agent", err and "not another agent" in text, text)
+text, err = tool("studio", "hand_over", task_id="T-2", login="bws://11111111-1111-4111-8111-111111111111", to="vps")
+check("hand_over needs the receiver's key", err and "no key" in text, text)
+KEYFILE = os.path.join(TMP, 'studio.key')
+if shutil.which('age') and shutil.which('age-keygen'):
+    subprocess.run(["age-keygen", "-o", KEYFILE], capture_output=True)
+    pub = subprocess.run(["age-keygen", "-y", KEYFILE], capture_output=True, text=True).stdout.strip()
+    check("register key", raw("POST", "/keys/studio", {"pubkey": pub})[0] == 200)
+    check("bad key refused", raw("POST", "/keys/studio", {"pubkey": "hello"})[0] == 400)
+    text, err = tool("manager", "create_task", owner="vps", title="Hand over a login", done_when="studio has it")
+    tid = text.split()[1]
+    tool("vps", "list_my_tasks", task_id=tid)
+    sealed = subprocess.run(["age", "-a", "-r", pub], input=json.dumps({"username": "pilot", "password": password, "url": HUB + "/site/login"}), capture_output=True, text=True).stdout
+    def vps_helper():
+        time.sleep(0.6)
+        job = [e for e in events("vps") if e["kind"] == "handover"][-1]
+        code, _, text = raw("POST", "/sealed", {"sender": "vps", "recipient": job["extra"]["to"], "task": job["task"], "label": "pilot-site", "ciphertext": sealed})
+        raw("POST", f"/helper/job/vps/{job['extra']['job']}", {"ok": True, "text": f"{json.loads(text)['ref']} is the name of the locked copy. Only studio can open it."})
+    threading.Thread(target=vps_helper, daemon=True).start()
+    text, err = tool("vps", "hand_over", task_id=tid, login="bws://22222222-2222-4222-8222-222222222222", to="studio")
+    check("hand_over returns the name of the locked copy", not err and "sealed:1" in text, text)
+    check("another machine cannot fetch it", raw("GET", "/sealed/1?agent=vps")[0] == 403)
+    code, _, text = raw("GET", "/sealed/1?agent=studio")
+    plain = subprocess.run(["age", "-d", "-i", KEYFILE], input=json.loads(text)["ciphertext"], capture_output=True, text=True).stdout
+    check("the receiver can open it", json.loads(plain)["password"] == password)
+    check("the hub's copy does not contain the password", password not in text)
+    tool("vps", "deliver_result", task_id=tid, outcome="completed", what_was_done="Handed over", where_output_is="sealed:1", how_checked="The tool said so")
+else:
+    print('note: age is not installed, sealed-handover checks skipped')
+raw("GET", "/site/price", headers={"User-Agent": "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 Chrome/141.0 Safari/537.36"})
+raw("GET", "/api/price", headers={"User-Agent": "curl/8.7.1"})
+b = board()
+check("board renders", "Retake the screenshot" in b and "read by Chrome" in b and "read by curl" in b and "Pick the codename" in b)
+check("board does not show the password", password not in b)
+check("text board", "OPEN TASKS" in raw("GET", "/board.txt")[2])
+
+# 10 timers (this hub runs with short timers)
+text, err = tool("manager", "set_reminder", minutes=0.03, note="look at T-2")
+before = events("manager")[-1]["id"]
+time.sleep(4)
+check("reminder fires", any("Reminder" in e["text"] and "look at T-2" in e["text"] for e in events("manager", after=before)))
+tool("studio", "report_progress", task_id="T-2", note="working on it")
+before_s = events("studio")[-1]["id"]; before_m = events("manager")[-1]["id"]
+time.sleep(8)
+check("silence: the owner of the task is nudged first", any("No activity on T-2" in e["text"] for e in events("studio", after=before_s)))
+time.sleep(7)
+check("silence: then the requester is told", any("T-2" in e["text"] and "silent" in e["text"] for e in events("manager", after=before_m)))
+check("board marks the stall", "STALLED" in board())
+time.sleep(4)
+check("manager silence: the hub tells the owner itself", any("Fleet hub" in e["text"] for e in events("owner")), str(events("owner")))
+check("board shows the banner", "telling you itself" in board())
+tool("manager", "read_messages")
+time.sleep(3)
+check("banner clears once the manager acts", "telling you itself" not in board())
+text, err = tool("manager", "cancel_task", task_id="T-2", reason="not needed")
+check("cancel_task", not err)
+check("a canceled task is no longer marked as stalled", "STALLED" not in board())
+check("worker session is told to stop", any("canceled" in e["text"] for e in events("studio", after=before_s)))
+time.sleep(5)
+check("stop event closes finished sessions", any(e["kind"] == "stop" and e["task"] in ("T-1", "T-2") for e in events("studio")))
+text, err = tool("manager", "create_task", owner="vps", title="Never mind", done_when="x")
+tid = text.split()[1]
+before = events("vps")[-1]["id"] - 1 if events("vps") else 0
+tool("manager", "cancel_task", task_id=tid, reason="changed my mind")
+data = json.loads(raw("GET", f"/events/vps?after={before}&wait=0")[2])
+check("a task canceled before its session started is not started later",
+      not any(e["kind"] == "task" and e["task"] == tid for e in data["events"]) and data["last"] > before, str(data)[:300])
+before_o = (events("owner") or [{"id": 0}])[-1]["id"]
+raw("POST", "/helper/dialog/manager/manager", {})
+time.sleep(3)
+check("a manager stuck at a question on its own screen: the hub tells the owner itself",
+      any("own screen" in e["text"] for e in events("owner", after=before_o)) and "own screen" in board())
+HUB_PROC.terminate()
+
+# 11 who is calling: a second hub that knows its machines by address. One address for each machine, as owner API 1.12
+# asks of every fixture, and every call below comes from 127.0.0.1: so the manager, alone on the hub machine's own
+# address, is the one name this hub accepts. "stray" is an agent whose machine is in no address at all, which
+# validate_team refuses but a team.json the hub was started with can hold.
+STRAY = {"stray": {"role": "worker", "machine": "nowhere", "runtime": "claude", "can": ["shell"]}}
+proc2, hub2 = start_hub("strict", {"hub": "127.0.0.1", "vps": "127.0.0.2", "mac-studio": "127.0.0.77",
+                                   "owner": "127.0.0.78"}, "--tick", "1", agents=STRAY)
+wrong_machine = []
+
+
+def refused(code):
+    """A call the machine rule must refuse. The board's row below counts exactly these, so they are counted here and
+    not written down as a number that goes stale."""
+    wrong_machine.append(code)
+    return code == 403
+
+
+check("a name is accepted from its own machine", rpc("manager", "tools/list", base=hub2)[0] == 200)
+check("a name whose machine has no address is refused, not taken from anybody",      # all: every call is counted
+      all([refused(rpc("stray", "ping", base=hub2)[0]), refused(rpc("stray", "tools/list", base=hub2)[0]),
+           refused(raw("GET", "/events/stray?after=0&wait=0", base=hub2)[0])]))
+# PRODUCT.md 4.8: this hub is the case, so it is also the proof. It started on the file, it answered /health above,
+# and it says the rule it breaks. The rule itself is not asserted here: which one comes first depends on the
+# team.json this checkout has (test_servers.py TeamAtStartup pins the line on a fixture of its own).
+check("a hub started with a team.json that validate_team refuses starts and says so on its board",
+      "team.json does not validate" in raw("GET", "/board", base=hub2)[2])
+check("another worker's name is refused from a machine that is not its own", refused(rpc("vps", "ping", base=hub2)[0]))
+check("team tools under another machine's name are refused", refused(rpc("studio", "tools/list", base=hub2)[0]))
+check("another machine's messages cannot be read", refused(raw("GET", "/events/studio?after=0&wait=0", base=hub2)[0]))
+check("only the owner's machine can message the manager", refused(raw("POST", "/say", form={"text": "I am the owner"}, base=hub2)[0]))
+check("only the owner's machine can read the owner's notifications", refused(raw("GET", "/events/owner?after=0&wait=0", base=hub2)[0]))
+check("only the owner's machine can say which logins to watch for", refused(raw("POST", "/secrets", {"label": "x", "salt": "s", "hash": "0" * 64}, base=hub2)[0]))
+check("a key cannot be registered under another machine's name", refused(raw("POST", "/keys/studio", {"pubkey": "age1" + "q" * 58}, base=hub2)[0]))
+check("a permission prompt cannot be raised under another machine's name", refused(raw("POST", "/hook/permission/studio/T-1", {"tool_name": "Bash", "tool_input": {"command": "ls"}}, base=hub2)[0]))
+check("a handover cannot be sent under another machine's name", refused(raw("POST", "/sealed", {"sender": "studio", "recipient": "vps", "ciphertext": "-----BEGIN AGE ENCRYPTED FILE-----"}, base=hub2)[0]))
+b2 = raw("GET", "/board", base=hub2)[2]
+check("the board counts the calls the machine rule refused, and nothing else",
+      f"from the wrong machine</td><td>{len(wrong_machine)}<" in b2, b2[-900:])
+import http.client
+conn = http.client.HTTPConnection("127.0.0.1", int(hub2.rsplit(":", 1)[1]), timeout=10)
+ping = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"})
+conn.request("POST", "/mcp/studio", body=ping, headers={"Content-Type": "application/json"})
+first = conn.getresponse(); first.read()
+conn.request("POST", "/mcp/manager", body=ping, headers={"Content-Type": "application/json"})
+second = conn.getresponse(); answer = second.read()
+# the body too: a connection that kept half a request would answer the next one from the wrong bytes
+check("a refusal leaves a kept-alive connection usable",
+      first.status == 403 and second.status == 200 and json.loads(answer).get("result") == {},
+      f"{first.status} {second.status} {answer[:120]}")
+proc2.terminate()
+
+# 12 two agents on one address: the address alone names nobody, so a session sends its own credential (owner API 1.12)
+proc3, hub3 = start_hub("shared", {"hub": "127.0.0.1", "vps": "127.0.0.1", "mac-studio": "127.0.0.77",
+                                   "owner": "127.0.0.78"}, "--tick", "1")
+code, _, resp = rpc("manager", "tools/list", base=hub3)
+check("on a shared address a name alone is refused, with the reason",
+      code == 403 and (resp or {}).get("auth") == "credential_required", f"{code} {resp}")
+check("the other agent of that address is refused as well", rpc("vps", "ping", base=hub3)[0] == 403)
+b3 = raw("GET", "/board", base=hub3)[2]
+check("a refusal on a credential is not counted as a wrong machine",
+      "from the wrong machine</td><td>0<" in b3 and "credential did not match</td><td>2<" in b3, b3[-900:])
+proc3.terminate()
+
+shutil.rmtree(TMP, ignore_errors=True)
+print(f"{count[0] - len(fails)} of {count[0]} checks passed." + ("" if not fails else f" FAILED: {fails}"))
+sys.exit(1 if fails else 0)

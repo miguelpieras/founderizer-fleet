@@ -1,0 +1,21 @@
+# The Founderizer release public keys (PRODUCT.md 4.2 and 4.3).
+#
+# One base64 line for each 32-byte Ed25519 public key, and lines that start with # are for the reader. The private
+# halves live only on the website host that issues releases, and never on a hub: a fleet can check a release and
+# can never make one.
+#
+# **This file holds a set, and every key in it is trusted.** That is what makes a key replaceable: the release
+# that brings the next key is signed with the key it replaces, every release after it is signed with the new one,
+# and a fleet that skipped the release in between still carries a key that checks both. PRODUCT.md 4.3, "How a
+# signing key is replaced", says how a key is brought in, how long both stay here and when the old line goes.
+# At most four lines; a line that is not a 32-byte key makes the whole file carry nothing, because a key file that
+# is half read is a mistake and a fleet that cannot say which keys it trusts takes no release.
+#
+# The first release must publish **two** keys: the one that signs it and a spare whose private half is kept off
+# the website host. Without that spare, a lost private key ends the update path of every fleet in the field, and
+# the only way out is a console on each customer's machine.
+#
+# This file carries no key yet, because P7 (the shop and the channel) makes the key pairs on that host and commits
+# the public halves here. Until then `releases.read_keys` answers an empty set, every manifest is refused with
+# "this checkout carries no release key", and no fleet can be updated from the channel. That is the safe state,
+# not a gap: a fleet that cannot check a release takes none.

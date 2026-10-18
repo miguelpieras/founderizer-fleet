@@ -1,0 +1,50 @@
+# wa-link
+
+wa-link holds one WhatsApp linked-device session for the Fleet bridge (`channels.py`). It uses [whatsmeow](https://github.com/tulir/whatsmeow) and keeps the session in one SQLite file. The protocol is in `CHAT-APPS.md` section 15.12.
+
+## Build and test
+
+Go 1.26 or later (`brew install go`). The builds use no C compiler.
+
+```sh
+cd wa-link
+go vet ./... && go test -race ./...
+GOOS=linux  GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -o bin/wa-link-linux-amd64 .
+GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -o bin/wa-link-darwin-arm64 .
+```
+
+## Run
+
+```sh
+wa-link --db ~/.fleet/chat-apps/whatsapp-main.db
+```
+
+The bridge starts wa-link and writes JSON lines to its standard input. wa-link writes events to standard output and logs to standard error. The logs never hold message text. The database file and its `-wal` and `-shm` files have mode 600. The folder must exist.
+
+## Protocol details
+
+These details add to section 15.12.
+
+- **Start.** With no device in the database, the first event is `state` `logged_out`. With a device, it is `state` `connecting`, then `linked` when WhatsApp accepts the session. whatsmeow reconnects by itself after a lost connection.
+- **pair.** The first `qr` code has `timeout` 60, the next ones 20. After the last code, the event is `state` `logged_out` with the error "the QR code was not scanned in time". A `pair` on a linked database gives `state` `linked` and starts nothing.
+- **ack.** A `message` event waits for its `ack`. whatsmeow sends the delivery acknowledgement to WhatsApp only after that (`SynchronousAck`). Without an ack in 10 seconds, wa-link confirms the message all the same and logs a warning. When wa-link stops before the ack (the input ends, a signal, the output fails), it does not confirm the message, and WhatsApp delivers it again after the next start. The decrypted-event buffer in the database lets wa-link read it again.
+- **sent.** An `error` that starts with `unknown: ` means that the message can have arrived (a timeout, a lost connection, a stop). The bridge then reports `unknown`. Every other error means that WhatsApp did not take the message: the bridge reports `failed`.
+- **send, read, typing.** wa-link accepts only the JID of a person (`<number>@s.whatsapp.net` or `<id>@lid`, with no device part). Message IDs have 1 to 128 letters and digits. A text has 1 to 65,536 bytes.
+- **First message (CHAT-APPS.md 16.4).** A `send` can go to a person who never wrote to this number, in either JID form. For a phone-number JID, wa-link gets the person's hidden ID first: from the LID store, else from WhatsApp (whatsmeow's `GetUserInfo`, a usync query that saves the ID). whatsmeow then sends to the hidden ID with the phone number as `peer_recipient_pn`, as for every phone-number send. A number that is not on WhatsApp, or a lookup that fails, gives the error `not sent: …`, and no message went out. A hidden-ID JID goes as it is; when this number's LID store does not know the person's phone number (each account has its own database), the message has no `peer_recipient_pn`. Use the phone-number form for a first message when you know it.
+- **reply_to.** wa-link keeps the last 1,000 inbound direct messages in memory. When `reply_to` is one of them, from the chat with `to`, the message quotes it. Otherwise, and after a restart, it is a plain message.
+- **typing.** `on: true` sets the presence to available and the chat state to composing. `on: false` sets the chat state to paused and the presence to unavailable.
+- **logout.** When WhatsApp does not answer, wa-link deletes the local session all the same and gives `state` `logged_out` with an error. The phone then still lists the device until the owner removes it there.
+- **message.** `kind` is `text` (plain and extended text), `image`, `audio`, `file` (documents) or `other` (video, sticker, location, contact, poll, event). Captions go in `text`. `sender` and `sender_alt` have no device part.
+- **Ignored.** Status updates and broadcast lists (`@broadcast`), channels, Meta AI bots, edits, reactions, revokes and other protocol messages, history sync, and undecryptable messages give no event. Receipts give events only for `delivered` and `read` in direct chats.
+
+## Install on the hub machine
+
+The hub machine is the Linux machine of the fleet, `fleet-hub` below. Build on the Mac, then copy:
+
+```sh
+ssh fleet-hub 'uname -m && mkdir -p ~/.fleet/bin ~/.fleet/chat-apps && chmod 700 ~/.fleet/chat-apps'
+scp bin/wa-link-linux-amd64 fleet-hub:.fleet/bin/wa-link
+ssh fleet-hub 'chmod 755 ~/.fleet/bin/wa-link && ~/.fleet/bin/wa-link --db /dev/null/x </dev/null; echo "exit $?"'
+```
+
+`uname -m` must print `x86_64`. The last command must fail to open the database (exit 1); this shows that the binary runs. The bridge then starts wa-link with `--db ~/.fleet/chat-apps/<account>.db`.

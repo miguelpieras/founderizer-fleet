@@ -1,0 +1,17 @@
+# The Founderizer entitlement public keys (PRODUCT.md 4.2).
+#
+# One base64 line for each 32-byte Ed25519 public key, exactly as `release-key.pub`: a set, every key in it
+# trusted, at most four lines, and lines that start with # are for the reader. 4.3, "How a signing key is
+# replaced", is the rotation of this file too.
+#
+# **This is not the release key.** The website signs a release with one key and an entitlement with the other, it
+# makes them separately (`npm run keygen -- entitlement`, `npm run keygen -- release`) and it publishes both at
+# `GET /.well-known/founderizer-keys`. A hub that checked an entitlement with its release key would mark every
+# real entitlement unverified, so the two files land together and `hub.entitlement_keys` reads this one.
+#
+# The entitlement is carried, never enforced: nothing in a fleet refuses work when it expires or when it is not
+# verified, because only our side refuses (4.2). So this file deciding nothing today is not a reason to let the
+# wrong key check it.
+#
+# It carries no key yet, because P7 (the shop and the channel) makes the key pairs on the website host and commits
+# the public halves here.

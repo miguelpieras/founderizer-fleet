@@ -1,0 +1,373 @@
+# Install a Founderizer hub
+
+`hub.sh` turns a bare server into a working Founderizer hub: the one the Mac app and the
+iPhone app connect to, and the one every worker and joined server then fetches its
+code from. It is the counterpart of `join.sh`, which adds a *server* to a hub that
+already runs (WORKER-INSTALL.md, UI-API.md "Servers"). One line. The hub answers in under
+ten minutes; the security updates at the end can take some minutes more, and by then the
+hub is already yours.
+
+A customer never types any of this in a console: the Mac app installs over SSH from
+their own Mac, or they paste `INSTALL-PROMPT.md` into the agent they already run and it
+takes the steps below for them. This file is the description of the installer itself.
+
+It needs root on a fresh Ubuntu 22.04 or 24.04, or Debian 12 server. It does not
+create a model provider account, does not sign in to one, does not write, copy or
+refresh a provider credential, does not make a vault entry, and opens no public
+port. Every step checks first, so the line is safe to run again after a failure and
+a second run on a working hub changes nothing.
+
+**The owner signs in to Claude themselves, from the app.** That is not a convenience,
+it is the condition on which an operator may host the unmodified Claude Code at all:
+each end user signs in through Anthropic's own flow, and the operator never collects,
+stores or intermediates the credential. So the installer installs the runtime and
+signs in to nothing, and `"vault": "none"` in the first `team.json` says that the
+manager holds no credential of Founderizer's. See "The sign-in, and renewing it" below.
+
+## Before you run it
+
+1. **A server.** Ubuntu 22.04 or 24.04, or Debian 12, with systemd, and root. A €5
+   VPS is enough to start. Nothing else may be using port 8765.
+2. **A Tailscale auth key** for the fleet's own tailnet, from its Tailscale admin
+   console. One use is enough; a pre-authorized key saves a sign-in. The key goes to
+   the installer on **standard input**, so run the line in a terminal on the server,
+   not through a pipe. It never becomes a command argument or part of a URL.
+3. **A copy of this repository on the server**, with its history. The hub's own
+   repository is made from that copy, so a folder of loose files is not enough:
+
+   ```sh
+   rsync -a --exclude .claude ~/fleet-pilot/ root@<server>:/root/fleet-kit/
+   ```
+
+   A `git clone`, a `git bundle` or `--source` (below) does the same. Uncommitted
+   changes in the copy are not installed: the installer takes its commit.
+4. **The owner's Mac on the same tailnet**, with the Mac app, because the owner
+   proves that Mac's address while the install runs.
+
+## The install
+
+One line on the server, as root:
+
+```sh
+sh /root/fleet-kit/hub.sh
+```
+
+With `--source` it clones the repository into `/root/fleet-kit` first, which replaces
+step 3 above when the server can reach that address:
+
+```sh
+sh hub.sh --source https://github.com/miguelpieras/founderizer-fleet.git
+```
+
+The installer asks for the Tailscale auth key and does not show what you type. To give it
+without a prompt, pipe it in — that still keeps the key out of the command line and out of
+the process list:
+
+```sh
+printf '%s\n' 'tskey-auth-...' | sh /root/fleet-kit/hub.sh
+```
+
+`--check` prints the plan and changes nothing. Run it first on an unfamiliar server:
+
+```sh
+sh /root/fleet-kit/hub.sh --check
+```
+
+Other options: `--port N` (default 8765), `--timezone Z` (default the server's own),
+`--runtime claude|codex` for the manager, `--hostname NAME` for the Tailscale name
+(default `fleet-hub`), `--claim-wait SECONDS` (default 1800) and `--reclaim`.
+
+### What the fifteen steps do
+
+1. **This server and this copy of Founderizer.** Root, the system, systemd, and that the
+   copy is a Founderizer checkout with a commit.
+2. **Base packages:** `git tmux python3 curl ca-certificates ufw unattended-upgrades`.
+3. **The user `fleet`:** created, password locked, out of `sudo`, `admin` and `wheel`,
+   home mode 700, and lingering on, so its services run after logout and after a
+   restart. It runs the hub and the git daemon, and no agent's session: each agent has
+   its own user (step 9). Nothing of Founderizer runs as root.
+4. **The private network.** Tailscale from its own installer when the server has none
+   (`curl -fsSL https://tailscale.com/install.sh | sh`, the vendor's own script, which is what
+   `join.sh` uses for a server too),
+   then `tailscale up --auth-key=file:<a root-only file> --hostname=fleet-hub
+   --accept-dns=false`. This hub's address is what `tailscale ip -4` then gives.
+5. **The firewall** (`ufw`): incoming traffic to SSH and to `tailscale0` only, outgoing
+   allowed. It comes before the claim, because the owner's Mac must reach port 8765
+   while the install still runs. A firewall that is already active keeps its own rules.
+6. **The Founderizer repository on this hub.** `~fleet/fleet-pilot.git` is the bare
+   repository and the origin of the whole fleet: `fleet-git` serves it read-only over
+   `git://`, and every worker and joined server fetches its code from it.
+   `~fleet/fleet-pilot` is the hub's own checkout and it stands on `config`, the
+   configuration ref — the branch the hub writes and nothing else writes (PILOT.md,
+   "The configuration ref"). Both refs start at the commit of the copy you ran, so the
+   code the hub serves is the code it runs.
+7. **The first `team.json`, and the owner's own Mac.** One manager agent on the hub
+   machine, this machine's address, `"vault": "none"`, and no credential of any kind.
+   Then the claim, below. The file is committed on `config` and pushed to the hub's own
+   repository, so the record starts at the first minute.
+8. **The root helper that makes an agent's OS user**, below:
+   `/usr/local/sbin/fleet-agent-user` and `/etc/sudoers.d/fleet-agents`.
+9. **One OS user for each agent of this machine**, below.
+10. **The services** `fleet-hub` and `fleet-git`, as systemd user services of `fleet`,
+    enabled and started. No agent's service is here any more: each one belongs to its
+    own user, in the next step.
+11. **Each agent of this machine, under its own OS user**, below: its checkout cloned
+    over `git://` on the configuration ref, its runtime in its own `~/.local/bin`, and
+    its service in its own systemd manager. The manager runs from the first minute with
+    its runtime signed out, and reports that to the app, which is what lets you sign in
+    from there.
+12. **The checks** the owner can act on, below.
+13. **This fleet's own id**, below: sixteen hex characters in the hub's key store, made
+    once and never again.
+14. **Security updates:** unattended security updates on, and the pending ones once.
+    It never restarts the server; it says when a restart is needed.
+15. **`verify`**, below: the last step says whether this machine is healthy, and the
+    line ends in failure when a check failed.
+
+### One OS user for each agent
+
+`join.sh` and `hub.sh` make one OS user for each agent the fleet's `team.json` gives
+this machine: `fleet-<agent>`, with a locked password, out of `sudo`, `admin` and
+`wheel`, lingering on, and the home `/home/fleet-<agent>` of mode 700 that belongs to
+it alone. On a new hub that is the manager, and `verify` names the agents of a machine,
+so a second run of the line makes the user of an agent that was added since.
+
+It is the step that gives each agent's own files somewhere no other agent's user can
+read: a runtime credential, a vault token, a session record. The one command behind
+both installers is
+
+```sh
+python3 hubsetup.py agent-users --team <team.json> --machine <name> [--check]
+```
+
+and it is safe to run again: a user that is already as Founderizer needs it is left exactly as
+it is, and a home that somebody opened to other users is closed again.
+
+**And the agent's session runs there.** Its checkout, its runtime, the credential the
+vendor's client writes, its vault token and its systemd user service are all in that
+home at mode 700, so one agent cannot read another agent's credential. On the hub the
+manager moved with the rest: one rule for every Linux agent is smaller than two. The
+installer's own step for it is step 11, and three things follow from it:
+
+- **The runtime is installed once for each agent**, in that user's own `~/.local/bin`,
+  because the credential lives beside it and a home of mode 700 cannot be shared. A
+  machine with several agents carries one copy of the runtime for each.
+- **An agent's checkout is a clone over `git://`**, like every worker's, into
+  `/home/fleet-<agent>/fleet-<agent>` on the configuration ref. So no agent pushes to
+  the hub's bare repository through the filesystem any more — the manager could while it
+  shared the hub's own user, and it is now in the same position as every other agent of
+  a fleet these installers make: fetch only until the owner installs a push key
+  ("Not part of this installer"). The hub itself still commits the owner's own files.
+- **`verify` reads each agent as its own user** (PRODUCT.md 4.1 keeps its check ids; a
+  reading it cannot take warns), which is why the root helper of step 8 exists.
+
+A Mac keeps one user for its agents: a Mac agent's service is a LaunchAgent of a desktop
+session, so a second user would have to be logged in at the screen.
+
+### The root helper that makes an agent's OS user
+
+An agent the owner adds later from the app is installed by the server service, which runs
+as that machine's service user without root, so it cannot make a user by itself. Both
+installers therefore put two files in place, with `visudo -c` on the second before it is
+moved in:
+
+- `/usr/local/sbin/fleet-agent-user` — one root command that takes one argument,
+  `fleet-<agent>`, checks it against the agent names the hub allows, and makes that user.
+- `/etc/sudoers.d/fleet-agents` — it gives the service user two rights and nothing else:
+  that one command as root, and any command as a member of the group `fleet-agents`,
+  which holds the agent users and nobody else.
+
+The service user needs the second right to install an agent under its own user, and
+`verify` needs it to read one. That user is not an agent and runs no AI session, so it is
+not a way from one agent to another.
+
+### The claim: the owner's own Mac
+
+In Founderizer the owner is a private-network address and no token (`hub.py`,
+`allowed("owner")`). A hub with the wrong `addresses.owner` would serve the owner's
+pages to the wrong machine, and one with none would serve them to nobody and could not
+start at all. So the installer proves the address before it finishes, with the same
+one-time code `join.sh` uses, the other way round.
+
+The installer prints a line like this and waits up to 30 minutes:
+
+```
+FLEET_CLAIM=XXXX-XXXX-XXXX sh -c "$(curl -fsS http://100.80.1.2:8765/claim)"
+```
+
+Paste it in Terminal **on the Mac that will own this fleet**. It sends the code back on
+standard input, and the address of that call becomes `addresses.owner`. Then it waits
+for the hub itself on the same port, and prints the address to paste into the app.
+
+The code is made on the server, kept there only as its SHA-256, and never written to a
+log, a file or a URL. It works once. Five wrong codes from one address and that address
+waits. The hub's own address cannot claim it. If nothing claims it in time, nothing is
+written and the line can be run again for a new code.
+
+Because the claim listens on the hub's own address and port, it also proves the fleet's
+Tailscale access rules for port 8765 before the hub exists. A claim that never arrives
+is nearly always those rules.
+
+### The checks at the end
+
+- **`python3 selftest.py`** in the hub's checkout. On a clean hub every check passes:
+  `127 of 127 checks passed` and no `FAILED:` line (the total grows when a lane adds a
+  check; what counts is that nothing failed). Since 18 October 2026 the suite carries no
+  standing failures, so **any** failure is real: send the line to the operator.
+- **`GET /health`** from the server, which the installer makes: it names the agents the
+  hub runs.
+- **`GET /ui/state`** from the owner's Mac, which the claim line makes on that Mac. 200
+  there is the real proof: that route answers the owner's address and no other.
+- **The address line**, printed last. Paste it into the Mac app, Settings.
+
+### This fleet's own id
+
+`python3 hubsetup.py fleet-id` keeps sixteen random hex characters in the hub's key
+store, under `fleet_id` — the same key and the same store the hub's own `fleet_id()`
+reads and the app reads over `GET /ui/releases`. It identifies this fleet to us and says
+nothing about its owner: no address, no name, no account (PRODUCT.md 4.2).
+
+It is made **once and never again**, because a second id would orphan the fleet's
+subscription, and a second run of the installer finds the one that is there. The step
+comes after the end checks, because the hub writes its records when it starts.
+
+**The installer claims no entitlement with it.** A claim key works once, so the claim has
+exactly one caller and that is the app (PRODUCT.md 4.5): it reads the id from the hub,
+calls the website, and posts the token back to `POST /ui/releases/entitlement`. Had both
+claimed, the second would be refused and the customer would need a new key. So the
+install ends at `verify`, and nothing of a subscription is in it.
+
+### The last step: `verify`
+
+`python3 fleet.py verify` (PRODUCT.md 4.1) runs as `fleet` from the hub's own checkout,
+and the installer prints every line it answers:
+
+```
+  ok    services: fleet-hub, fleet-git, fleet-manager are active and enabled
+  ok    hub_answers: the hub answers http://100.80.1.2:8765/health for manager
+  ok    owner_claimed: the owner of this hub is the Mac at 100.80.1.3
+  ...
+  fail  runtime_signed_in: manager is not signed in to claude  (fix: sign this machine in from the app: Machines, then Sign in)
+NOT READY: runtime_signed_in
+```
+
+An install that half worked therefore says which check failed and what fixes it, instead
+of looking finished, and the line itself ends in failure, so the agent or the app that
+ran it knows. A `warn` is not a failure. Until the owner signs the machine in,
+`runtime_signed_in` fails on purpose: that is the one step only they can take.
+
+The same command is the right first question at any later moment, and the app shows the
+same array as the owner's checklist.
+
+## The sign-in, and renewing it
+
+One thing is left after the install, and it is done in the app: **sign in to your own
+Claude account.** Machines → this machine → **Sign in**.
+
+What happens, in order (UI-API.md, "Sign a machine in"):
+
+1. The app asks the hub, which starts Claude Code's own sign-in in a window of its own
+   on that machine.
+2. Claude prints its sign-in link; the hub passes that link to the app.
+3. You open it **in your own browser**, on your own Mac, and authenticate with
+   Anthropic.
+4. Anthropic gives you a code. You paste it into the app.
+5. The hub hands it to that machine, which types it into the waiting sign-in. Claude's
+   own client writes the credential there, on the machine it belongs to.
+
+Nothing of that is stored by Founderizer. The link, the code and anything derived from them
+live in the hub's memory only, for one reader, and are gone when they are used. No
+long-lived token ever passes through Founderizer: `claude setup-token` and anything like it
+is out of the question, because holding such a token is exactly what the operator may
+not do.
+
+**When the login expires you use the same button.** Expiry is recurring and only you
+can answer it; nobody can renew it for you, and no part of Founderizer stores, copies or
+refreshes it.
+
+Codex works the same way, with its own device sign-in: the app shows you a link and a
+code, you open the link and type that code into OpenAI's page, and nothing comes back
+through the app. **Grok has no sign-in path at all**, in the app or anywhere else in
+Founderizer: xAI's terms do not let a third party run it this way, and Founderizer refuses it in
+code rather than leaving it to a rule nobody reads.
+
+Then add your agents in the app (Agents → Add agent). Each one is signed in the same
+way, on the machine it runs on.
+
+## Run it again, update, remove
+
+The line is safe to run again. Each step checks first: a package that is installed is
+left, the service user and the agents' own users are left as they are, a Tailscale
+connection that is up is left, the repositories are left as they are, a `team.json` that
+already names an owner makes no new code and is not touched, and the services are
+written again and restarted. Nothing is destroyed. A second run also makes the user,
+the checkout and the service of an agent that was added since.
+
+- **The owner's Mac changed address.** Run the line with `--reclaim`: it makes a new
+  code, waits for the new Mac, and changes only `addresses.owner`.
+- **New code for the fleet.** This is a deployment, not an install: fetch, merge `main`
+  into `config`, check `import hub`, push `config`, restart `fleet-hub` (COORDINATION.md,
+  "The configuration ref"). The hub serves the new code to every machine from its own
+  bare repository.
+- **Remove the services** and keep everything else:
+
+  ```sh
+  runuser -u fleet -- systemctl --user disable --now fleet-hub fleet-git
+  rm -f ~fleet/.config/systemd/user/fleet-hub.service ~fleet/.config/systemd/user/fleet-git.service
+  runuser -u fleet -- systemctl --user daemon-reload
+  ```
+
+  Each agent's service belongs to that agent's own user, so it is stopped there, once for
+  each agent of this machine:
+
+  ```sh
+  runuser -u fleet-manager -- systemctl --user disable --now fleet-manager
+  rm -f ~fleet-manager/.config/systemd/user/fleet-manager.service
+  runuser -u fleet-manager -- systemctl --user daemon-reload
+  ```
+
+  This keeps the repository, the records (`~fleet/.fleet/pilot.db`), the outputs, each
+  agent's own checkout and its runtime sign-in.
+
+## Not part of this installer
+
+- **Worker push keys.** A worker that pushes its task output needs the hub's separate
+  push listener (`fleet-git-push`, port 9419) and a key of its own; its files and steps
+  are in the devops repository, `hosts/terminal-relay-worker-2/fleet-git-push/`
+  (PILOT.md, "Worker pushes"). Until then a worker fetches but cannot push, and it
+  reports its output in its result instead.
+- **A vault broker**, which an agent needs before it can use a saved login
+  (WORKER-INSTALL.md, "Vault broker"). The hub itself needs none: the manager holds no
+  credential.
+- **The apps.** The Mac app and the iPhone app are installed on the owner's own
+  machines, not here.
+- **Backups.** The records are `~fleet/.fleet/pilot.db` and the repository is
+  `~fleet/fleet-pilot.git`; the owner decides how they are kept.
+
+## The test
+
+`python3 -m unittest test_hub_install.py test_join_install.py` proves both installers
+— with `test_agent_users.py` for the per-agent user, the root helper and the agent-add
+path — without touching a machine: the first `team.json` is one the hub can run and holds no
+credential, the claim takes one code once and refuses the rest, the hub's own repository
+is made for real in a temporary folder with both refs at the right commit, `hub.sh
+--check` names its fifteen steps in order and changes nothing, this fleet's id is made
+once and never twice and the installers claim no entitlement, the per-agent user is
+made for the agents of the right machine and for no other and a second run changes
+nothing, both installers end in `verify` and end in failure when a check failed,
+`INSTALL-PROMPT.md` carries its refusals in writing and names no command the installers
+do not take, and `create_login`, `save_key` and `sign_in` refuse a model provider's own
+site.
+
+What a test cannot reach, a container can. On 17 October 2026 this was run on a real
+Ubuntu 24.04 with systemd: `hub.sh --check` named all its steps; `hubsetup.py
+agent-users` made the users of two agents for real, with locked passwords, no sudo,
+lingering, and homes of mode 700 that one agent could not read from the other's user; a
+second run changed nothing, and a home that had been opened to other users was closed
+again; and `verify`, run through `runuser` as the service user, printed its lines and
+made the installer's own line end in failure. The move of each agent's session into its
+own user was proved the same way, by the lane that made it (PRODUCT.md, "What the move to
+per-agent users decided"). What stays unproved until a real server runs it: `apt-get`,
+`tailscale up`, `ufw`, the systemd user services and the claim, because a container has
+no tailnet and makes no `/run/user/<uid>` — which step 11 waits for, so the whole line
+has still never run to its end on a machine.

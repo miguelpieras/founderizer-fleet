@@ -1,0 +1,743 @@
+#!/usr/bin/env python3
+"""The release channel: how a Founderizer fleet takes a new revision, and how it keeps the old one when the new one
+is bad. PRODUCT.md 4.2 and 4.3, package P6.
+
+The fleet already moves between revisions: its configuration lives on the branch `config`, the hub commits the
+owner's own changes there, and code arrives by a merge (COORDINATION.md "The configuration ref"). This module adds
+the three things that a customer's machine needs and the owner's own fleet never had: where the code comes from
+(the git remote `upstream`), which revision is released (a signed manifest), and the safety that a bad release
+costs nothing.
+
+    manifest = check(raw, key)                      a manifest we may act on, or Untrusted
+    Update(kit, manifest, origin=url).apply()       the update, with its own roll-back
+
+**The signature is the whole trust.** A manifest that no public key in the repository verifies is not read, not
+recorded and not applied. The private keys live only on the website (PRODUCT.md 4.2), so a hub can check a release
+and can never make one. The key file holds a set, so a key can be replaced without stranding a fleet that skipped
+the release which brought the new one (4.3, "How a signing key is replaced").
+
+**Nothing happens in the hub's own checkout until every check passed.** The merge, the released code's schema
+against a copy of this fleet's own database, `selftest.py` and `fleet.py verify` all run in a temporary clone,
+exactly as `hub.commit_kit_file` commits the owner's files. So the pinned revision is not a revision the fleet
+goes back to: it is the revision the fleet never left. A broken release costs the time it took to find out, and
+nothing else.
+
+The schema check is there because the other two cannot see it: both start hubs on *fresh* databases, so a
+migration step that only the customer's own rows refuse passes them and meets real data for the first time at the
+restart, after the ref has moved. `Update.schema_check` says the rest.
+
+**The `hold` flag is the stop button.** The manifest can say that no fleet should take this release, whatever a
+fleet's own settings say. It is signed with everything else, so it cannot be stripped on the way.
+
+**The entitlement is carried, never enforced.** The hub sends it as a bearer to the channel and keeps what comes
+back. Nothing here refuses work when it expires; only our side refuses (PRODUCT.md 4.2).
+
+No dependency: a hub is a bare Ubuntu server with python3, git and curl (hub.sh PACKAGES), so the Ed25519
+verification below is the reference implementation of RFC 8032 and nothing else.
+"""
+import base64
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+
+# The configuration ref and the baseline of selftest.py belong to other packages; this module reads them and
+# changes neither, so the three can never disagree about what "up to date" or "a pass" means.
+from lifecycle import CONFIG_BRANCH
+from verify import SELFTEST_BASELINE
+
+# Where a release comes from, and where the manifest is asked for. Both are defaults: the hub overrides them from
+# its own configuration (hub.releases region), because P7 settles the host of the channel and the address of the
+# published repository.
+DEFAULT_CHANNEL = "https://founderizer.com"
+DEFAULT_UPSTREAM = "https://github.com/miguelpieras/founderizer-fleet.git"
+REMOTE = "upstream"                 # PRODUCT.md 4.3: "every hub carries [it] as the git remote `upstream`"
+KEY_FILE = "release-key.pub"        # the release public keys, shipped in the repository beside this file
+ENTITLEMENT_KEY_FILE = "entitlement-key.pub"    # the entitlement public keys: another key, and its own file (4.2)
+
+CHANNEL_TIMEOUT = 10        # seconds for GET /releases/latest: a channel that does not answer changes nothing
+SELFTEST_WAIT = 300         # seconds for selftest.py, as verify.py gives it
+VERIFY_WAIT = 420           # seconds for fleet.py verify, which runs selftest.py again inside itself
+SCHEMA_WAIT = 120           # seconds for the released code's schema against a copy of this fleet's database
+GIT_WAIT = 300              # seconds for one git step; a fetch of the whole repository is the slow one
+
+REVISION = re.compile(r"[0-9a-f]{40}")                          # a full commit id, never a short one
+VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._+-]{0,40}")      # the name the owner reads, "2026.10.2"
+NOTES = re.compile(r"https://[A-Za-z0-9._~:/?#@!$&'()*+,;=%-]{1,400}")
+TOKEN = re.compile(r"[A-Za-z0-9_-]{1,2000}\.[A-Za-z0-9_-]{1,200}")      # the entitlement, as 4.2 is carried
+
+
+class Untrusted(Exception):
+    """A manifest, a signature or an entitlement that this fleet will not act on. Its text is one line for the
+    owner, and it never carries what it refused."""
+
+
+# ---------------------------------------------------------------- Ed25519 (RFC 8032, the reference implementation)
+#
+# Kept as close to the RFC's own appendix as the house style allows, so that it can be read against it. The hub
+# only ever verifies; sign() is here because our own publishing step and the tests need the other half, and because
+# a signature scheme with no reachable signer cannot be tested at all. No private key is ever kept on a hub.
+
+_P = 2 ** 255 - 19
+_Q = 2 ** 252 + 27742317777372353535851937790883648493
+
+
+def _inv(x):
+    return pow(x, _P - 2, _P)
+
+
+_D = -121665 * _inv(121666) % _P
+_SQRT_M1 = pow(2, (_P - 1) // 4, _P)
+
+
+def _recover_x(y, sign):
+    if y >= _P:
+        return None
+    x2 = (y * y - 1) * _inv(_D * y * y + 1) % _P
+    if x2 == 0:
+        return None if sign else 0
+    x = pow(x2, (_P + 3) // 8, _P)
+    if (x * x - x2) % _P != 0:
+        x = x * _SQRT_M1 % _P
+    if (x * x - x2) % _P != 0:
+        return None
+    if (x & 1) != sign:
+        x = _P - x
+    return x
+
+
+def _add(point, other):
+    """Two points in extended coordinates (X, Y, Z, T)."""
+    a = (point[1] - point[0]) * (other[1] - other[0]) % _P
+    b = (point[1] + point[0]) * (other[1] + other[0]) % _P
+    c = 2 * point[3] * other[3] * _D % _P
+    d = 2 * point[2] * other[2] % _P
+    e, f, g, h = b - a, d - c, d + c, b + a
+    return (e * f % _P, g * h % _P, f * g % _P, e * h % _P)
+
+
+def _mul(scalar, point):
+    found = (0, 1, 1, 0)
+    while scalar > 0:
+        if scalar & 1:
+            found = _add(found, point)
+        point = _add(point, point)
+        scalar >>= 1
+    return found
+
+
+_IDENTITY = (0, 1, 1, 0)
+
+
+def _same(point, other):
+    return ((point[0] * other[2] - other[0] * point[2]) % _P == 0
+            and (point[1] * other[2] - other[1] * point[2]) % _P == 0)
+
+
+def _usable_key(point):
+    """A public key of the prime-order subgroup, and not the identity or the one point of order two.
+
+    RFC 8032 does not ask for this, and many implementations leave it out, which is how a signature of a
+    small-order key verifies against messages nobody signed. Our key is our own and is none of them, so this costs
+    one scalar multiplication on a poll and closes the one shape in which a wrong key could verify at all."""
+    return point[0] % _P != 0 and _same(_mul(_Q, point), _IDENTITY)
+
+
+_GY = 4 * _inv(5) % _P
+_GX = _recover_x(_GY, 0)
+_G = (_GX, _GY, 1, _GX * _GY % _P)
+
+
+def _compress(point):
+    zinv = _inv(point[2])
+    x, y = point[0] * zinv % _P, point[1] * zinv % _P
+    return int.to_bytes(y | ((x & 1) << 255), 32, "little")
+
+
+def _decompress(blob):
+    if len(blob) != 32:
+        return None
+    y = int.from_bytes(blob, "little")
+    sign, y = y >> 255, y & ((1 << 255) - 1)
+    x = _recover_x(y, sign)
+    return None if x is None else (x, y, 1, x * y % _P)
+
+
+def _modq(blob):
+    return int.from_bytes(hashlib.sha512(blob).digest(), "little") % _Q
+
+
+def _expand(secret):
+    digest = hashlib.sha512(secret).digest()
+    scalar = int.from_bytes(digest[:32], "little")
+    return (scalar & ((1 << 254) - 8)) | (1 << 254), digest[32:]
+
+
+def public_key(secret):
+    """The 32-byte public key of a 32-byte Ed25519 seed."""
+    if not isinstance(secret, bytes) or len(secret) != 32:
+        raise ValueError("an Ed25519 seed is 32 bytes")
+    return _compress(_mul(_expand(secret)[0], _G))
+
+
+def sign(secret, message):
+    """The 64-byte detached signature of `message`. Never called on a hub: the key lives only on the website."""
+    if not isinstance(secret, bytes) or len(secret) != 32:
+        raise ValueError("an Ed25519 seed is 32 bytes")
+    scalar, prefix = _expand(secret)
+    pub = _compress(_mul(scalar, _G))
+    r = _modq(prefix + message)
+    rs = _compress(_mul(r, _G))
+    return rs + int.to_bytes((r + _modq(rs + pub + message) * scalar) % _Q, 32, "little")
+
+
+def verify_signature(public, message, signature):
+    """True when `signature` is this public key's signature of `message`. Every wrong shape is False, never a
+    crash: a manifest from the outside must not be able to raise out of a check."""
+    if not (isinstance(public, bytes) and len(public) == 32
+            and isinstance(signature, bytes) and len(signature) == 64 and isinstance(message, bytes)):
+        return False
+    try:
+        point = _decompress(public)
+        given = _decompress(signature[:32])
+        scalar = int.from_bytes(signature[32:], "little")
+        if point is None or given is None or scalar >= _Q or not _usable_key(point):
+            return False
+        h = _modq(signature[:32] + public + message)
+        return _same(_mul(scalar, _G), _add(given, _mul(h, point)))
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
+# ---------------------------------------------------------------- the public keys, shipped in the repository
+
+MAX_KEYS = 4            # how many keys one file may hold: two while a key is being replaced, and room for a mistake
+
+
+def read_keys(kit, name=KEY_FILE):
+    """The public keys of this checkout, a tuple in the file's own order, and empty when it carries none yet.
+
+    The file holds one base64 line for each 32-byte Ed25519 public key; lines that start with # are for the reader.
+    **It is a set, and every key in it is trusted.** That is the whole of a rotation: the release that brings the
+    next key is signed with the key it replaces, every release after it is signed with the new one, and a fleet
+    that skipped the release in between still carries a key that checks both (PRODUCT.md 4.3, "How a signing key
+    is replaced"). One line is the ordinary state and asks nothing of a reader.
+
+    A line that is not a 32-byte key, or more lines than MAX_KEYS, makes the whole file carry nothing: a key file
+    that is half read is a mistake, and a fleet that cannot say which keys it trusts takes no release. No key means
+    that every manifest is refused, which is the right answer until P7 publishes the first ones."""
+    path = os.path.join(kit, name)
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+    except OSError:
+        return ()
+    if not lines or len(lines) > MAX_KEYS:
+        return ()
+    keys = []
+    for line in lines:
+        try:
+            key = base64.b64decode(line, validate=True)
+        except (ValueError, TypeError):
+            return ()
+        if len(key) != 32:
+            return ()
+        keys.append(key)
+    return tuple(keys)
+
+
+def trusted(keys):
+    """The keys a check may use, from the tuple `read_keys` gives, from one key, or from None. One key is still one
+    key: nothing that holds a key has to know that the file became a set."""
+    held = (keys,) if isinstance(keys, (bytes, bytearray)) else tuple(keys or ())
+    return tuple(bytes(key) for key in held if isinstance(key, (bytes, bytearray)) and len(key) == 32)
+
+
+def signed_by_any(keys, message, signature):
+    """True when one of these keys signed `message`. Every key the checkout carries is trusted, so the fleet that
+    is a release behind and the fleet that is up to date check the same release, each with a key it has."""
+    return any(verify_signature(key, message, signature) for key in trusted(keys))
+
+
+# ---------------------------------------------------------------- the manifest
+
+# What the signature covers, which PRODUCT.md 4.3 leaves open. One line for each field, in this order, so that a
+# signer in any language produces the same bytes and no field can be dropped on the way: `hold` is in here, so the
+# stop button cannot be stripped. A later version numbers itself in the first line and is not taken by this one.
+SIGNED_PREFIX = b"founderizer-release-1"
+
+
+def signed_text(manifest):
+    """The exact bytes that a release signature covers."""
+    return b"\n".join([SIGNED_PREFIX,
+                       manifest["revision"].encode(),
+                       manifest["version"].encode(),
+                       (manifest["notes"] or "").encode(),
+                       (manifest["minimum"] or "").encode(),
+                       b"true" if manifest["hold"] else b"false"]) + b"\n"
+
+
+def read_manifest(raw):
+    """The manifest of PRODUCT.md 4.3, checked field by field before anything is done with it. `hold` is optional
+    and false when it is absent, so a channel that never holds a release writes nothing extra.
+
+    It raises Untrusted on anything it does not recognise. This runs before the signature check, so it must not
+    trust a single character of what it reads."""
+    if not isinstance(raw, dict):
+        raise Untrusted("the release channel did not answer with a manifest")
+    revision, version = raw.get("revision"), raw.get("version")
+    notes, minimum, hold = raw.get("notes"), raw.get("minimum"), raw.get("hold", False)
+    if not (isinstance(revision, str) and REVISION.fullmatch(revision)):
+        raise Untrusted("the manifest names no revision")
+    if not (isinstance(version, str) and VERSION.fullmatch(version)):
+        raise Untrusted("the manifest has no version name")
+    if notes is not None and not (isinstance(notes, str) and (notes == "" or NOTES.fullmatch(notes))):
+        raise Untrusted("the manifest's notes are not an https address")
+    if minimum is not None and minimum != "" and not (isinstance(minimum, str) and REVISION.fullmatch(minimum)):
+        raise Untrusted("the manifest's minimum is not a commit")
+    if not isinstance(hold, bool):
+        raise Untrusted("the manifest's hold is not true or false")
+    signature = raw.get("signature")
+    if not (isinstance(signature, str) and 0 < len(signature) <= 200):
+        raise Untrusted("the manifest carries no signature")
+    return {"revision": revision, "version": version, "notes": notes or None, "minimum": minimum or None,
+            "hold": hold, "signature": signature}
+
+
+def check(raw, keys):
+    """The manifest this fleet may act on, or Untrusted. Nothing else in this module reads an unchecked manifest.
+
+    `keys` is what `read_keys` gave this fleet, and any one of them may have signed the release."""
+    manifest = read_manifest(raw)
+    keys = trusted(keys)
+    if not keys:
+        raise Untrusted(f"this checkout carries no release key ({KEY_FILE}), so no release can be checked")
+    try:
+        signature = base64.b64decode(manifest["signature"] + "=" * (-len(manifest["signature"]) % 4), validate=False)
+    except (ValueError, TypeError):
+        raise Untrusted("the manifest's signature is not base64") from None
+    if not signed_by_any(keys, signed_text(manifest), signature):
+        raise Untrusted("the manifest's signature is not a signature of it by a release key this checkout carries")
+    return manifest
+
+
+# ---------------------------------------------------------------- the entitlement (PRODUCT.md 4.2)
+
+def new_fleet_id():
+    """Sixteen random hex characters: it identifies a fleet to us and says nothing about its owner (4.2)."""
+    return os.urandom(8).hex()
+
+
+def read_entitlement(token, keys=None):
+    """The claims of an entitlement token, as given. `verified` says whether one of our own keys signed it.
+
+    The keys are the **entitlement** keys, `ENTITLEMENT_KEY_FILE`, and not the release keys: the website signs a
+    release with one and an entitlement with the other, and publishes both (PRODUCT.md 4.2). A hub that checked an
+    entitlement with its release key would mark every real entitlement unverified.
+
+    The hub carries this token and never acts on it: an expired entitlement changes nothing here, because only our
+    side refuses (4.2). So an unverifiable token is still kept and still shown; it is marked, not refused."""
+    if not (isinstance(token, str) and TOKEN.fullmatch(token)):
+        raise Untrusted("an entitlement is <claims>.<signature>, both base64url")
+    body, _, signature = token.partition(".")
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)).decode("utf-8"))
+        raw_signature = base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4))
+    except (ValueError, TypeError, UnicodeDecodeError):
+        raise Untrusted("the entitlement's claims are not base64url JSON") from None
+    if not isinstance(claims, dict):
+        raise Untrusted("the entitlement's claims are not an object")
+    fleet, plan, until = claims.get("fleet"), claims.get("plan"), claims.get("until")
+    machines, agents = claims.get("machines"), claims.get("agents")
+    if not (isinstance(fleet, str) and re.fullmatch(r"[0-9a-f]{16}", fleet)):
+        raise Untrusted("the entitlement names no fleet")
+    if not (isinstance(plan, str) and VERSION.fullmatch(plan)):
+        raise Untrusted("the entitlement names no plan")
+    if isinstance(until, bool) or not isinstance(until, (int, float)) or not 0 < until < 2 ** 40:
+        raise Untrusted("the entitlement has no until date")
+    for name, number in (("machines", machines), ("agents", agents)):
+        if number is not None and (isinstance(number, bool) or not isinstance(number, int) or not 0 <= number <= 10000):
+            raise Untrusted(f"the entitlement's {name} is not a count")
+    return {"fleet": fleet, "plan": plan, "until": float(until), "machines": machines, "agents": agents,
+            "verified": signed_by_any(keys, body.encode(), raw_signature)}
+
+
+def sign_entitlement(secret, claims):
+    """The other half of read_entitlement, for our own side and for the tests. Never called on a hub."""
+    body = base64.urlsafe_b64encode(json.dumps(claims, sort_keys=True, separators=(",", ":")).encode()).rstrip(b"=")
+    return (body + b"." + base64.urlsafe_b64encode(sign(secret, body)).rstrip(b"=")).decode()
+
+
+# ---------------------------------------------------------------- GET /releases/latest
+
+def _fetch(url, token=None, timeout=CHANNEL_TIMEOUT):
+    """(status, body, headers). status 0 and the reason in the body when the channel did not answer. The
+    entitlement goes as a bearer and nothing else of this fleet goes with it."""
+    headers = {"Accept": "application/json", "User-Agent": "founderizer-hub"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(urllib.request.Request(url, headers=headers), timeout=timeout) as answer:
+            return answer.status, answer.read(65536).decode("utf-8", "replace"), dict(answer.headers)
+    except urllib.error.HTTPError as answer:
+        with answer:
+            return answer.code, answer.read(65536).decode("utf-8", "replace"), dict(answer.headers)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return 0, str(getattr(e, "reason", e))[:300], {}
+
+
+def latest(channel, keys, token=None, *, fetch=_fetch, timeout=CHANNEL_TIMEOUT):
+    """Poll the release channel once.
+
+    Returns {"status", "manifest", "says", "entitlement"}: the manifest when one verified, else None with the one
+    line that says why. `entitlement` is a fresh token the channel sent along, kept whatever the manifest did
+    (4.5: "Near expiry the hub asks for a fresh one with the old one"). It never raises."""
+    url = (channel or DEFAULT_CHANNEL).rstrip("/") + "/releases/latest"
+    status, body, _headers = fetch(url, token, timeout)
+    if status == 0:
+        return {"status": 0, "manifest": None, "entitlement": None, "says": "the release channel did not answer: " + body}
+    if status in (401, 403):
+        return {"status": status, "manifest": None, "entitlement": None,
+                "says": "the release channel refused this fleet's entitlement"}
+    if status != 200:
+        return {"status": status, "manifest": None, "entitlement": None,
+                "says": f"the release channel answered {status}"}
+    try:
+        raw = json.loads(body)
+    except ValueError:
+        return {"status": status, "manifest": None, "entitlement": None,
+                "says": "the release channel did not answer with JSON"}
+    fresh = raw.get("entitlement") if isinstance(raw, dict) else None
+    fresh = fresh if isinstance(fresh, str) and TOKEN.fullmatch(fresh) else None
+    try:
+        return {"status": status, "manifest": check(raw, keys), "entitlement": fresh, "says": None}
+    except Untrusted as e:
+        return {"status": status, "manifest": None, "entitlement": fresh, "says": str(e)}
+
+
+# ---------------------------------------------------------------- the update
+
+def _run(argv, timeout=GIT_WAIT, cwd=None):
+    """One command. It never raises: a step that cannot run is a step that failed, with its reason."""
+    try:
+        done = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL)
+        return done.returncode, done.stdout.strip(), done.stderr.strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return 1, "", str(e)[:300]
+
+
+def _line(text):
+    return " ".join(str(text or "").split())[:400]
+
+
+def selftest_summary(out):
+    """(passed, of, everything it failed, the failures that are not in the baseline) from selftest.py's own last
+    line, or None when it printed no summary. The baseline is COORDINATION.md rule 5, read from verify.py so that
+    the release check and `fleet.py verify` cannot drift apart about what a pass is."""
+    for line in reversed([one for one in (out or "").split("\n") if one.strip()]):
+        found = re.search(r"(\d+) of (\d+) checks passed\.(?:\s*FAILED:\s*(\[.*\]))?\s*$", line)
+        if not found:
+            continue
+        failed = re.findall(r"'([^']*)'", found.group(3) or "")
+        return (int(found.group(1)), int(found.group(2)), failed,
+                [n for n in failed if n not in SELFTEST_BASELINE])
+    return None
+
+
+def schema_summary(out):
+    """(how many steps the database refused, the lines that say which) from `hub.py --check-schema`'s own last
+    line, or None when it printed none. The released code writes that line; `hub.check_schema` is the other half
+    of this contract and says so."""
+    lines = [one.strip() for one in (out or "").split("\n") if one.strip()]
+    for line in reversed(lines):
+        found = re.search(r"schema check: (\d+) steps? refused\.$", line)
+        if found:
+            return int(found.group(1)), [one[len("refused: "):] for one in lines if one.startswith("refused: ")]
+    return None
+
+
+# The owner's own files, which a release never moves: the paths `hub.CONFIG_FILES` lets the hub write. The
+# published repository carries a `team.json` and profiles of its own, and a customer's fleet carries theirs, so
+# without this a release would replace the fleet it was meant to update. The merge takes the code; these paths come
+# back exactly as the pinned revision has them.
+OWNER_PATHS = ("team.json", "profiles", "knowledge/owner")
+
+# What an update run says about itself. The app shows the state and the line; nothing else reads them.
+KEPT, ROLLED_BACK, DONE, FAILED = "kept", "rolled_back", "done", "failed"
+STATES = (KEPT, ROLLED_BACK, DONE, FAILED)
+STEPS = ("hold", "branch", "clean", "pinned", "fetch", "have", "already", "minimum", "clone", "merge", "keep",
+         "schema", "selftest", "verify", "push", "follow")
+
+
+class Update:
+    """One update run of one fleet.
+
+    The hub's own checkout is read until the last step: the merge and all three checks happen in a temporary
+    clone of it, and the merge reaches the configuration ref only when the schema check, `selftest.py` and
+    `fleet.py verify` have all passed in that clone. So `pinned` is the revision the fleet keeps, not a revision
+    it returns to, and a failure leaves the checkout, the ref and every machine exactly as they were.
+
+    `origin` is the address the configuration ref is pushed to, as the hub pushes the owner's own commits. With no
+    origin the run stops before the push and says so, which is what a test of the merge and the checks wants.
+
+    `database` is a copy of this fleet's own database, which the released code's schema is run against inside the
+    clone before anything moves (the `schema` check). Without one that check is skipped, which is what a test of
+    the merge wants and what a hub with no records to risk would get anyway."""
+
+    def __init__(self, kit, manifest, *, origin=None, upstream=None, branch=CONFIG_BRANCH, remote=REMOTE,
+                 run=_run, python=None, database=None, selftest_wait=SELFTEST_WAIT, verify_wait=VERIFY_WAIT,
+                 schema_wait=SCHEMA_WAIT):
+        self.kit, self.manifest, self.origin, self.upstream = kit, manifest, origin, upstream
+        self.branch, self.remote, self.run, self.database = branch, remote, run, database
+        self.python = python or sys.executable
+        self.selftest_wait, self.verify_wait, self.schema_wait = selftest_wait, verify_wait, schema_wait
+        # pinned: the revision this fleet runs and keeps. reached: the revision that got onto the configuration
+        # ref, which only a run that published one has.
+        self.pinned, self.reached, self.clone = None, None, None
+
+    # ---- the readings
+
+    def git(self, *args, cwd=None, timeout=GIT_WAIT):
+        return self.run(["git", "-C", cwd or self.kit, *args], timeout=timeout)
+
+    def answer(self, state, step, says):
+        return {"state": state, "step": step, "says": _line(says), "pinned": self.pinned, "reached": self.reached,
+                "revision": self.manifest["revision"], "version": self.manifest["version"]}
+
+    # ---- the run
+
+    def apply(self):
+        """Do the update. One of KEPT (nothing was touched), ROLLED_BACK (the merge or a check failed and the fleet
+        keeps the pinned revision), DONE, or FAILED (the ref moved and this hub did not follow it: the one state a
+        person must look at)."""
+        ready = self.before()
+        if ready:
+            return ready
+        folder = tempfile.mkdtemp(prefix="founderizer-release-")
+        self.clone = os.path.join(folder, "kit")
+        try:
+            return self.in_clone()
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def before(self):
+        """Everything that is read before a single object is written: the answer when the run stops here."""
+        manifest = self.manifest
+        if manifest["hold"]:
+            return self.answer(KEPT, "hold", f"release {manifest['version']} is held: no fleet takes it")
+        code, branch, _ = self.git("symbolic-ref", "--short", "--quiet", "HEAD", timeout=60)
+        if code != 0 or branch != self.branch:
+            return self.answer(KEPT, "branch", f"this checkout is on {branch or 'no branch'}, not the configuration "
+                                               f"ref {self.branch}, so a release cannot be merged into it")
+        if self.git("status", "--porcelain", "--untracked-files=no", timeout=60)[1]:
+            return self.answer(KEPT, "clean", "this checkout has its own changes; nothing is merged over them")
+        code, head, _ = self.git("rev-parse", "HEAD", timeout=60)
+        if code != 0 or not REVISION.fullmatch(head):
+            return self.answer(KEPT, "pinned", "this checkout has no revision to pin")
+        self.pinned = head
+        answer = self.fetch()
+        if answer:
+            return answer
+        if self.git("cat-file", "-e", manifest["revision"] + "^{commit}", timeout=60)[0] != 0:
+            return self.answer(KEPT, "have", f"the released revision {manifest['revision'][:12]} is not in "
+                                             f"{self.remote} after the fetch")
+        if self.git("merge-base", "--is-ancestor", manifest["revision"], head, timeout=60)[0] == 0:
+            return self.answer(KEPT, "already", f"this fleet already runs release {manifest['version']}")
+        least = manifest["minimum"]
+        if least and self.git("merge-base", "--is-ancestor", least, head, timeout=60)[0] != 0:
+            return self.answer(KEPT, "minimum", f"release {manifest['version']} needs a fleet at {least[:12]} or "
+                                                f"later; this one is at {head[:12]}")
+        return None
+
+    def fetch(self):
+        """`git fetch upstream`, with the remote added when the repository does not carry it yet."""
+        code, url, _ = self.git("remote", "get-url", self.remote, timeout=60)
+        if code != 0:
+            if not self.upstream:
+                return self.answer(KEPT, "fetch", f"this checkout has no remote {self.remote} and no address was "
+                                                  f"configured for it")
+            if self.git("remote", "add", self.remote, self.upstream, timeout=60)[0] != 0:
+                return self.answer(KEPT, "fetch", f"the remote {self.remote} could not be added")
+        elif self.upstream and url != self.upstream:
+            if self.git("remote", "set-url", self.remote, self.upstream, timeout=60)[0] != 0:
+                return self.answer(KEPT, "fetch", f"the remote {self.remote} could not be pointed at the published "
+                                                  f"repository")
+        code, _, err = self.git("fetch", "-q", "--no-write-fetch-head", self.remote)
+        if code != 0:
+            return self.answer(KEPT, "fetch", f"the fetch of {self.remote} failed: {err[-200:]}")
+        return None
+
+    def in_clone(self):
+        """The merge and the three checks, in a clone, then the push and this checkout's own fast-forward."""
+        code, _, err = self.run(["git", "clone", "-q", "--shared", self.kit, self.clone])
+        if code != 0 or self.git("checkout", "-q", self.pinned, cwd=self.clone, timeout=60)[0] != 0:
+            return self.answer(ROLLED_BACK, "clone", f"the update could not be prepared: {err[-200:]}")
+        answer = self.merge()
+        if answer:
+            return answer
+        code, merged, _ = self.git("rev-parse", "HEAD", cwd=self.clone, timeout=60)
+        if code != 0 or not REVISION.fullmatch(merged):
+            return self.answer(ROLLED_BACK, "merge", "the merge left no commit")
+        answer = self.checks()
+        if answer:
+            return answer
+        return self.publish(merged)
+
+    def clone_git(self, *args, timeout=60):
+        return self.git(*args, cwd=self.clone, timeout=timeout)
+
+    def merge(self):
+        """The release's code into this fleet's configuration ref, in the clone, with the owner's own files kept.
+
+        The owner's files are configuration, not code. The published repository carries a `team.json`, profiles and
+        owner knowledge of its own, and the fleet being updated carries the owner's: taking ours would replace the
+        team, the agents and their instructions with a stranger's. And because the owner changes exactly those
+        files, a release that touched one of them would otherwise conflict with every fleet there is.
+
+        So the merge is made without a commit, every path of OWNER_PATHS comes back as the pinned revision has it,
+        and a conflict that is still there afterwards is a real one: that release does not fit this fleet."""
+        version, author = self.manifest["version"], ["-c", "user.name=Founderizer",
+                                                     "-c", "user.email=releases@founderizer.invalid"]
+        _code, out, err = self.run(["git", "-C", self.clone, *author, "merge", "--no-commit", "--no-ff",
+                                    self.manifest["revision"]])
+        if self.clone_git("rev-parse", "--verify", "--quiet", "MERGE_HEAD")[0] != 0:
+            return self.answer(ROLLED_BACK, "merge", f"release {version} could not be merged into this fleet: "
+                                                     f"{_line(err or out)}. The fleet stays at {self.pinned[:12]}.")
+        answer = self.keep_configuration()
+        if answer:
+            return answer
+        left = self.clone_git("diff", "--name-only", "--diff-filter=U")[1]
+        if left:
+            self.clone_git("merge", "--abort")
+            return self.answer(ROLLED_BACK, "merge", f"release {version} does not merge into this fleet's own "
+                                                     f"changes: {_line(left)}. The fleet stays at "
+                                                     f"{self.pinned[:12]}.")
+        code, out, err = self.run(["git", "-C", self.clone, *author, "commit", "-q", "--allow-empty", "-m",
+                                   f"Take release {version} ({self.manifest['revision'][:12]})"], timeout=60)
+        if code != 0:
+            return self.answer(ROLLED_BACK, "merge", f"the merge of release {version} could not be committed: "
+                                                     f"{_line(err or out)}")
+        if self.clone_git("diff", "--quiet", self.pinned, "HEAD", "--", *OWNER_PATHS)[0] != 0:
+            return self.answer(ROLLED_BACK, "keep", f"release {version} changes this fleet's own configuration "
+                                                    f"({', '.join(OWNER_PATHS)}), which a release never does. The "
+                                                    f"fleet stays at {self.pinned[:12]}.")
+        return None
+
+    def keep_configuration(self):
+        """Inside the unfinished merge: every path of OWNER_PATHS exactly as the pinned revision has it. A file the
+        release brought that this fleet does not have goes out with the rest."""
+        for path in OWNER_PATHS:
+            self.clone_git("checkout", "-q", self.pinned, "--", path)       # none at pinned: nothing to restore
+        ours = set(self.clone_git("ls-tree", "-r", "--name-only", self.pinned, "--", *OWNER_PATHS)[1].split("\n"))
+        listed = self.clone_git("ls-files", "--", *OWNER_PATHS)[1]
+        extra = sorted({one for one in listed.split("\n") if one and one not in ours})
+        if extra and self.clone_git("rm", "-f", "-q", "--", *extra)[0] != 0:
+            return self.answer(ROLLED_BACK, "keep", f"release {self.manifest['version']} brings files this fleet "
+                                                    f"does not have ({', '.join(extra[:4])}) and they could not "
+                                                    f"be left out")
+        return None
+
+    def schema_check(self):
+        """The released code's own schema against a copy of this fleet's database, in the clone.
+
+        `selftest.py` starts real hubs, and every one of them on a *fresh* database. So the one thing it cannot
+        see is the customer's own rows: a unique index over a table that already holds a duplicate, or a NOT NULL
+        column with no default on a table that has rows. Those passed every check there is and then met real data
+        for the first time at the restart — which `hub.finish_release` does after the push, when the ref has moved
+        and every machine has followed it. This is that meeting, brought forward to where a failure still costs
+        nothing: the fleet is kept, exactly as a failed selftest keeps it.
+
+        The copy is a copy of a copy: the hub already hands over a throwaway, and this makes its own inside the
+        folder `apply()` deletes, so the released code can only ever open a file this run wrote. That costs the
+        database's size in the tempdir for the length of the run, which is the right price for the invariant."""
+        if not self.database:
+            return None
+        version, pinned = self.manifest["version"], self.pinned[:12]
+        copy = os.path.join(os.path.dirname(self.clone), "database.sqlite3")
+        try:
+            shutil.copyfile(self.database, copy)
+        except OSError as e:
+            return self.answer(ROLLED_BACK, "schema", f"this fleet's database could not be copied for the schema "
+                                                      f"check of release {version}: {e}. The fleet stays at {pinned}.")
+        code, out, err = self.run([self.python, os.path.join(self.clone, "hub.py"), "--check-schema", copy],
+                                  timeout=self.schema_wait, cwd=self.clone)
+        summary = schema_summary(out)
+        if summary is None:
+            return self.answer(ROLLED_BACK, "schema", f"release {version} could not read this fleet's database: "
+                                                      f"{_line(err or out) or 'no output'}. The fleet stays at "
+                                                      f"{pinned}.")
+        refused, says = summary
+        if refused:
+            return self.answer(ROLLED_BACK, "schema", f"release {version} needs {refused} schema step(s) that this "
+                                                      f"fleet's own records refuse ({_line('; '.join(says[:2]))}). "
+                                                      f"The fleet stays at {pinned}.")
+        if code != 0:
+            return self.answer(ROLLED_BACK, "schema", f"the schema check of release {version} ended with {code} "
+                                                      f"and named nothing. The fleet stays at {pinned}.")
+        return None
+
+    def checks(self):
+        """The schema against a copy of this fleet's records, then `selftest.py` and `fleet.py verify`, all three
+        in the clone, so they read the released code and not this hub's. Any one failing keeps the fleet where it
+        is. The schema goes first because it takes a second and the other two take minutes."""
+        answer = self.schema_check()
+        if answer:
+            return answer
+        version, pinned = self.manifest["version"], self.pinned[:12]
+        code, out, err = self.run([self.python, os.path.join(self.clone, "selftest.py")],
+                                  timeout=self.selftest_wait, cwd=self.clone)
+        summary = selftest_summary(out)
+        if summary is None:
+            return self.answer(ROLLED_BACK, "selftest", f"selftest.py did not answer for release {version}: "
+                                                        f"{_line(err or out) or 'no output'}. The fleet stays at "
+                                                        f"{pinned}.")
+        passed, total, failed, new = summary
+        if new:
+            return self.answer(ROLLED_BACK, "selftest", f"release {version} fails {len(new)} check(s) that the "
+                                                        f"baseline does not have ({', '.join(new[:4])}); "
+                                                        f"{passed} of {total} passed. The fleet stays at {pinned}.")
+        if code != 0 and not failed:
+            return self.answer(ROLLED_BACK, "selftest", f"selftest.py ended with {code} for release {version} and "
+                                                        f"named no failure; {passed} of {total} passed. The fleet "
+                                                        f"stays at {pinned}.")
+        code, out, err = self.run([self.python, os.path.join(self.clone, "fleet.py"), "verify", "--json"],
+                                  timeout=self.verify_wait, cwd=self.clone)
+        try:
+            results = json.loads(out)
+            bad = [one["check"] for one in results if one.get("state") == "fail"]
+        except (ValueError, TypeError, KeyError):
+            return self.answer(ROLLED_BACK, "verify", f"fleet.py verify did not answer for release {version}: "
+                                                      f"{_line(err or out) or 'no output'}. The fleet stays at "
+                                                      f"{pinned}.")
+        if bad:
+            return self.answer(ROLLED_BACK, "verify", f"release {version} is not healthy: verify failed "
+                                                      f"{', '.join(bad)}. The fleet stays at {pinned}.")
+        return None
+
+    def publish(self, merged):
+        """The push to the configuration ref, and this checkout's fast-forward onto it. Nothing before this point
+        left the clone."""
+        version = self.manifest["version"]
+        if not self.origin:
+            return self.answer(ROLLED_BACK, "push", f"release {version} passed every check, and this fleet has no "
+                                                    f"address for its configuration ref, so nothing was pushed")
+        code, _, err = self.run(["git", "-C", self.clone, "push", "-q", self.origin, f"HEAD:{self.branch}"])
+        if code != 0:
+            return self.answer(ROLLED_BACK, "push", f"release {version} passed every check and the push to "
+                                                    f"{self.branch} was refused: {_line(err)}. The fleet stays at "
+                                                    f"{self.pinned[:12]}.")
+        self.reached = merged           # it is on the ref now, so every machine of this fleet follows it
+        if self.git("fetch", "-q", "origin")[0] != 0 or self.git("merge", "-q", "--ff-only", merged)[0] != 0:
+            return self.answer(FAILED, "follow", f"release {version} is on {self.branch} as {merged[:12]}, and this "
+                                                 f"hub's own checkout did not move onto it. Bring it up to date by "
+                                                 f"hand: git -C {self.kit} merge --ff-only {merged[:12]}")
+        return self.answer(DONE, "follow", f"release {version} is on {self.branch} as {merged[:12]}; this fleet "
+                                           f"moved from {self.pinned[:12]}")

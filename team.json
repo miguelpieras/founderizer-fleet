@@ -1,0 +1,34 @@
+{
+  "note": "The placeholder team.json of the published repository. The hub installer replaces this whole file with the fleet's own: this machine's address, the owner's Mac proved by a one-time code, and one manager agent. The hub address 0.0.0.0 is no machine, so no install can adopt this file by accident, and there is no owner address, so no hub can start on it.",
+  "hub": {
+    "machine": "hub",
+    "port": 8765
+  },
+  "goals": {
+    "sweep_minutes": 15,
+    "review_hour": 9,
+    "timezone": "UTC"
+  },
+  "addresses": {
+    "hub": "0.0.0.0"
+  },
+  "access": {
+    "hub": {
+      "ssh_user": "fleet",
+      "ssh_port": 22
+    }
+  },
+  "agents": {
+    "manager": {
+      "role": "manager",
+      "machine": "hub",
+      "runtime": "claude",
+      "can": [
+        "shell",
+        "web"
+      ],
+      "vault": "none",
+      "start": "claude --permission-mode bypassPermissions --tools default {settings} {prompt}"
+    }
+  }
+}
