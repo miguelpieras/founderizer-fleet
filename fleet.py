@@ -2207,13 +2207,13 @@ class Helper:
 
         self.say(f"sign-in L-{lid}: {runtime}")
         try:
-            exe = lifecycle.exe(runtime, os.path.expanduser("~")) if runtime in LOGIN_URLS else None
-            if not exe:
+            program = exe(runtime, os.path.expanduser("~")) if runtime in LOGIN_URLS else None
+            if not program:
                 return report("failed", detail=f"{runtime} is not installed on this machine.")
             if not getattr(self, "lifecycle", None):
                 return report("failed", detail="This machine's helper is still starting. Try again in a minute.")
             try:
-                command = runtime_login_command(runtime, exe)
+                command = runtime_login_command(runtime, program)
             except Refused as e:
                 return report("failed", detail=str(e))
             tmux("kill-session", "-t", session)          # a sign-in that was given up leaves no window behind

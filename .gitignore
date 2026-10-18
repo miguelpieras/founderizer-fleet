@@ -1,0 +1,4 @@
+pilot.db
+pilot.db-journal
+*.log
+__pycache__/
