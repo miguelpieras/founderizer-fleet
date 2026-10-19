@@ -477,10 +477,13 @@ def schema_summary(out):
 
 
 # The owner's own files, which a release never moves: the paths `hub.CONFIG_FILES` lets the hub write. The
-# published repository carries a `team.json` and profiles of its own, and a customer's fleet carries theirs, so
-# without this a release would replace the fleet it was meant to update. The merge takes the code; these paths come
-# back exactly as the pinned revision has them.
-OWNER_PATHS = ("team.json", "profiles", "knowledge/owner")
+# published repository carries a `team.json`, profiles and a `knowledge/services.md` of its own, and a customer's
+# fleet carries theirs, so without this a release would replace the fleet it was meant to update. The merge takes the
+# code; these paths come back exactly as the pinned revision has them. All of `knowledge/` is here, and not only
+# `knowledge/owner/`: an agent writes the knowledge files its profile lists (hub.write_knowledge), so a release that
+# replaced them would revert what the fleet learned. An install still seeds them, the way it seeds the manager's
+# profile; only an update leaves them alone.
+OWNER_PATHS = ("team.json", "profiles", "knowledge")
 
 
 def _owner_file(path):

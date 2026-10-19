@@ -834,7 +834,8 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
             raise Refused("a Claude chat resumes only a session id")
         settings = {"permissions": {"allow": ["mcp__fleet__read_messages", "mcp__fleet__tell_owner",
                                               "mcp__fleet__message_owner", "mcp__fleet__message_agent",
-                                              "mcp__fleet__see_responsibilities"], "deny": DENY}}
+                                              "mcp__fleet__see_responsibilities",
+                                              "mcp__fleet__recall"], "deny": DENY}}
         args = ["claude"] + (["--resume", resume] if resume else ["--session-id", marker] if marker else []) + \
             ["--permission-mode", "dontAsk", "--tools", "", "--strict-mcp-config",
              "--mcp-config", mcp_config_file(agent, "owner-chat", url, token) if token else

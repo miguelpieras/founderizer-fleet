@@ -66,16 +66,17 @@ def start_hub(name, addresses, *flags, agents=None):
 
 
 # The tools of each role, by name, in RULES.md's own groups: the ones every agent has, then the manager's fifteen with
-# its two duty writes, or the eight of a worker's task. A count says only that something moved; a set says which tool
+# its two duty writes, or the nine of a worker's task. A count says only that something moved; a set says which tool
 # moved, and RULES.md names every one of these. The tools a grant adds are not here: start_hub drops the grants.
-EVERY_AGENT = ["read_messages", "search_knowledge", "see_responsibilities", "open_case", "record_step", "close_case",
-               "attach_watch", "see_triggers", "save_trigger", "change_trigger", "message_owner", "message_agent"]
+EVERY_AGENT = ["read_messages", "search_knowledge", "write_knowledge", "see_responsibilities", "open_case",
+               "record_step", "close_case", "attach_watch", "see_notes", "write_notes", "remember", "recall",
+               "forget", "see_triggers", "save_trigger", "change_trigger", "message_owner", "message_agent"]
 MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "answer", "check_result",
                                "decide_permission", "set_reminder", "see_team", "see_capacity", "see_goals",
                                "update_goal", "record_spend", "raise_needs_you", "tell_owner", "grant_access",
                                "set_duty", "change_duty"]
 WORKER_TOOLS = EVERY_AGENT + ["list_my_tasks", "report_progress", "read_attachment", "ask_my_requester",
-                              "deliver_result", "sign_in", "hand_over", "resolve_outcome"]
+                              "deliver_result", "sign_in", "hand_over", "resolve_outcome", "see_earlier_work"]
 
 
 def tool_set(got, want):
