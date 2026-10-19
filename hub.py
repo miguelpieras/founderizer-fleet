@@ -4859,13 +4859,13 @@ def release_goal_holds(goal_id, by):
     return resumed, still
 
 
-def budget_pause(g, bump=True):
+def budget_pause(g):
     """An active goal whose money budget is used up takes no new task. Money is recorded before it is spent, so its
     running tasks continue. Tokens never pause a goal or hold a task (owner API 1.10)."""
     if g["state"] != "active" or (budget_use(g) or 0) < 1:
         return False
-    q("UPDATE goals SET state='paused', paused_by='budget', revision=revision+?, updated=?, idle_since=NULL WHERE id=?",
-      (1 if bump else 0, now(), g["id"]))
+    q("UPDATE goals SET state='paused', paused_by='budget', revision=revision+1, updated=?, idle_since=NULL WHERE id=?",
+      (now(), g["id"]))
     goal_history(g["id"], "hub", "budget", f"The money budget is used up ({budget_text(g)}). No new task starts.")
     emit(manager_name(), "say", f"[goal {gref(g['id'])}] {g['title']} has used up its money budget ({budget_text(g)}). "
          f"No new task starts for it; running tasks continue. Raise Needs you so that the owner can raise the limit or "
@@ -5070,14 +5070,6 @@ def t_record_spend(agent, a):
     goal_history(g["id"], agent, "spend", f"S-{sid}: {cents / 100:.2f} {currency} for {what}")
     return (f"Recorded S-{sid}. {gref(g['id'])} has recorded {(spent + cents) / 100:.2f} of {cap / 100:.2f} {currency}."
             + (" The budget is used up: no new task starts for this goal." if spent + cents >= cap else ""))
-
-
-def new_goal_text(g):
-    gid = gref(g["id"])
-    return (f"[goal {gid}] New goal from the owner: {g['title']}\n{g['text']}\n{limits_text(json.loads(g['limits']))}\n"
-            f"Plan it: create its tasks with goal=\"{gid}\", then call update_goal(goal=\"{gid}\", next_step=..., "
-            f"next_task=...) or give a wake_at date. Before you approve any spend, record it with record_spend; "
-            f"a spend beyond the limit goes to Needs you.")
 
 
 def goal_sweep(t0):
@@ -6822,7 +6814,7 @@ def duty_kept_watches(duty_id):
     return want
 
 
-def duty_save(body, by, t0, duty_id=None, base=None, command=None):
+def duty_save(body, by, t0, duty_id=None, command=None):
     """A new duty, or a change of one: the row, its watches, its history row, the review wake-up of its agent and an
     agent's receipt. Everything that can be refused is checked before the first write."""
     old = None
@@ -6830,8 +6822,6 @@ def duty_save(body, by, t0, duty_id=None, base=None, command=None):
         old = duty_row(duty_id)
         if not old:
             raise Refusal(404, "no such responsibility")
-        if base is not None and base != old["revision"]:
-            raise Conflict("the responsibility changed meanwhile; reload it", revision=old["revision"])
         if old["state"] == "retired":
             raise Refusal(409, f"{rref(duty_id)} is retired; reopen it first")
         body = dict(duty_stored(old), **body)
@@ -8742,27 +8732,6 @@ def trigger_fields(data, create):
     return body
 
 
-def trigger_target(f, old=None):
-    """Checks against the current team, goals and hub checkout when the owner saves a trigger; each run checks the
-    team and goals again. A check is pinned again only when it or its agent changes (owner API 1.8)."""
-    agent, task = f["agent"], f["task"]
-    if agent not in agents():
-        raise Refusal(400, f"there is no agent {agent} in the team")
-    if not agent_active(agent):
-        raise Refusal(400, f"{agent} is in setup; activate it before you give it a trigger")
-    if role_of(agent) not in ("worker", "lead") or reports_to(agent) != manager_name():
-        raise Refusal(400, f"{agent} does not report to the manager; triggers start tasks only for agents that do")
-    if task["needs"] != "none" and task["needs"] not in (agents()[agent].get("can") or []):
-        raise Refusal(400, f"{agent} has no {task['needs']}")
-    if task["goal_id"] is not None and not goal_row(task["goal_id"]):
-        raise Refusal(400, f"there is no goal {gref(task['goal_id'])}")
-    check = f.get("check")
-    if check and (old is None or check != old["check"] or agent != old["agent"]):
-        if "trigger_check" not in helper_features(agent):
-            raise Refusal(409, f"{agent}'s helper cannot run checks yet; update Fleet on that machine first")
-        pin_check(check)
-
-
 def agent_rule_problem(f, old=None):
     """Why an agent's rule cannot be saved, or None: the hub's own checks after the wake-up module's plan (which
     checked authority, route and grant): the task's needs and goal, and the runner's helper for a new check."""
@@ -8859,15 +8828,14 @@ def ask_code_approval(agent, a, need, rule=None):
     return f"{need} P-{pid} asks {requester} for this decision; nothing was saved."
 
 
-def trigger_create(body, by, t0, created_by="owner", source=None, command=None, consume=None):
+def trigger_create(body, by, t0, created_by, source=None, command=None, consume=None):
     """A new trigger, its first history row, its saved code and an agent's receipt, in one transaction."""
     due = trigger_slots(body["schedule"], t0, t0, 1)
     if not due:
         raise Refusal(400, "this time has passed")
-    if created_by != "owner":
-        problem = agent_rule_problem(body)
-        if problem:
-            raise Refusal(400, problem)
+    problem = agent_rule_problem(body)
+    if problem:
+        raise Refusal(400, problem)
     with transaction():
         use_code_prompt(consume, t0)
         tid = DB.execute("INSERT INTO triggers(agent,state,revision,schedule,check_spec,task,late_minutes,"
@@ -8887,7 +8855,7 @@ def trigger_create(body, by, t0, created_by="owner", source=None, command=None, 
 
 def trigger_edit(trigger_id, base, body, by, t0, created_by=..., source=None, command=None, consume=None):
     """A change of a trigger's fields: the runs of the old revision end, and the change, its history row, its saved
-    code and an agent's receipt commit together. created_by stays unless given; an owner edit keeps the author."""
+    code and an agent's receipt commit together. created_by stays unless given."""
     t = trigger_row(trigger_id)
     if not t:
         raise Refusal(404, "no such trigger")
@@ -8901,12 +8869,9 @@ def trigger_edit(trigger_id, base, body, by, t0, created_by=..., source=None, co
            "created_by": t["created_by"]}
     new = dict(old, **{k: body[k] for k in TRIGGER_FIELDS if k in body})
     new["created_by"] = t["created_by"] if created_by is ... else created_by
-    if new["created_by"] == "owner":
-        trigger_target(new, old)
-    else:
-        problem = agent_rule_problem(new, old)
-        if problem:
-            raise Refusal(400, problem)
+    problem = agent_rule_problem(new, old)
+    if problem:
+        raise Refusal(400, problem)
     anchor, due, state = t["anchor"], t["next_due"], t["state"]
     if new["schedule"] != old["schedule"]:          # a new schedule counts from now
         later = trigger_slots(new["schedule"], t0, t0, 1)
@@ -15233,71 +15198,6 @@ class Handler(BaseHTTPRequestHandler):
             result = dict(db=generation, goal=goal_view(g), spends=spends, history=history)
         return self.json(200, scrub(result), {"Cache-Control": "no-store"})
 
-    def ui_goal_create(self):
-        def read(data):
-            return {"request_id": data["request_id"].lower(), "title": goal_text(data.get("title"), "title", 200, True),
-                    "text": goal_text(data.get("text"), "text", 8000), "limits": goal_limits(data.get("limits"))}
-
-        def act(body):
-            t0 = now()
-            gid = ins("INSERT INTO goals(title,text,state,revision,limits,created,updated,request_id) "
-                      "VALUES(?,?,'active',1,?,?,?,?)",
-                      (body["title"], body["text"], json.dumps(body["limits"]), t0, t0, body["request_id"]))
-            q("UPDATE goals SET event_id=? WHERE id=?", (emit(manager_name(), "say", new_goal_text(goal_row(gid))), gid))
-            goal_history(gid, "owner", "created", body["title"])
-            return {"goal": goal_view(goal_row(gid))}
-        return self.ui_command("goals", read, act)
-
-    def ui_goal_edit(self, goal_id):
-        def read(data):
-            body = {"goal": goal_id, "base_revision": base_revision(data)}
-            if "title" in data:
-                body["title"] = goal_text(data["title"], "title", 200, True)
-            if "text" in data:
-                body["text"] = goal_text(data["text"], "text", 8000)
-            if "limits" in data:
-                body["limits"] = goal_limits(data["limits"])
-            if len(body) == 2:
-                raise ValueError("give title, text or limits")
-            return body
-
-        def act(body):
-            g = goal_row(goal_id)
-            if not g:
-                raise Refusal(404, "no such goal")
-            if g["state"] in ("done", "dropped"):
-                raise Refusal(409, f"{gref(goal_id)} is {g['state']}; reopen it first")
-            if body["base_revision"] != g["revision"]:
-                raise Conflict("the goal changed meanwhile; reload it", revision=g["revision"])
-            old = json.loads(g["limits"])
-            title, text, limits = body.get("title", g["title"]), body.get("text", g["text"]), body.get("limits", old)
-            if spent_cents(goal_id) and old["money"] and (limits["money"] or {}).get("currency") != old["money"]["currency"]:
-                raise Refusal(409, f"{gref(goal_id)} has recorded spending in {old['money']['currency']}; keep that "
-                                   f"currency (the amount can change)")
-            changes = ([f'the title "{g["title"]}" is now "{title}"'] if title != g["title"] else []) + \
-                      (["new goal text: " + text] if text != g["text"] else []) + \
-                      (["new " + limits_text(limits)] if limits != old else [])
-            q("UPDATE goals SET title=?, text=?, limits=?, revision=revision+1, updated=?, "
-              "warned=CASE WHEN ? THEN 0 ELSE warned END WHERE id=?",
-              (title, text, json.dumps(limits), now(), limits["money"] != old["money"], goal_id))
-            g = goal_row(goal_id)
-            budget_pause(g, bump=False)             # a limit lowered to the recorded spending or below
-            resumed = g["paused_by"] == "budget" and limits["money"] != old["money"] and (budget_use(g) or 0) < 1
-            if resumed:
-                q("UPDATE goals SET state='active', paused_by=NULL, marker_kind=NULL, marker_since=NULL, "
-                  "marker_detail=NULL WHERE id=?", (goal_id,))
-                tasks, still = release_goal_holds(goal_id, "owner")
-                goal_history(goal_id, "hub", "resumed", "The raised limit is no longer used up." +
-                             (f" Resumed: {', '.join(map(tref, tasks))}." if tasks else "") +
-                             (f" Still held for unknown outcomes: {', '.join(map(tref, still))}." if still else ""))
-            if changes:
-                goal_history(goal_id, "owner", "edited", "; ".join(changes))
-                emit(manager_name(), "say", f"[goal {gref(goal_id)}] The owner changed {gref(goal_id)}: " +
-                     "; ".join(changes) + ". Follow the new version from now on." +
-                     (" It is active again: new tasks may start." if resumed else ""))
-            return {"goal": goal_view(goal_row(goal_id)), "changed": bool(changes)}
-        return self.ui_command(f"goals/{goal_id}", read, act)
-
     def ui_goal_state(self, goal_id):
         def read(data):
             action, note = data.get("action"), data.get("note", "")
@@ -15435,55 +15335,6 @@ class Handler(BaseHTTPRequestHandler):
         if not code:
             return self.json(409, {"error": "the hub has no code with this SHA-256"})
         return self.json(200, {"sha256": spec["sha256"], "source": code["source"]})
-
-    def ui_trigger_preview(self):
-        """The next five due times of a schedule, from now. Nothing is stored, so it has no request_id."""
-        if not self.ui_allowed():
-            return
-        if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
-            return self.json(415, {"error": "application/json required"})
-        if len(self.body()) > 65536:
-            return self.json(413, {"error": "request is too large"})
-        client = self.headers.get("X-Fleet-Client", "").strip()
-        if not client or len(client) > 128:
-            return self.json(400, {"error": "X-Fleet-Client is required (at most 128 characters)"})
-        data = self.form()
-        if data.get("db") != kv_get("db_id"):
-            return self.json(409, {"error": "hub generation changed; refresh state before sending"})
-        if set(data) != {"db", "schedule"}:
-            return self.json(400, {"error": "a preview takes exactly db and schedule"})
-        try:
-            schedule, t0 = trigger_schedule(data["schedule"]), now()
-            upcoming = trigger_slots(schedule, t0, t0, 5)
-            if not upcoming:
-                raise ValueError("this time has passed")
-        except ValueError as e:
-            return self.json(200, {"ok": False, "error": str(e), "upcoming": []})
-        return self.json(200, {"ok": True, "error": None, "upcoming": upcoming})
-
-    def ui_trigger_create(self):
-        def read(data):
-            return dict(trigger_fields(data, create=True), request_id=data["request_id"].lower())
-
-        def act(body):
-            trigger_target(body)
-            t0 = now()
-            t = trigger_create(body, "owner", t0)
-            return {"trigger": trigger_view(t, t0), "upcoming": trigger_upcoming(t)}
-        return self.ui_command("triggers", read, act)
-
-    def ui_trigger_edit(self, trigger_id):
-        def read(data):
-            body = dict(trigger_fields(data, create=False), trigger=trigger_id, base_revision=base_revision(data))
-            if len(body) == 2:
-                raise ValueError("give agent, schedule, task, late_minutes, max_tasks_per_day or check")
-            return body
-
-        def act(body):
-            t0 = now()
-            t = trigger_edit(trigger_id, body["base_revision"], body, "owner", t0)
-            return {"trigger": trigger_view(t, t0), "upcoming": trigger_upcoming(t)}
-        return self.ui_command(f"triggers/{trigger_id}", read, act)
 
     def ui_trigger_state(self, trigger_id):
         def read(data):
@@ -16461,29 +16312,6 @@ class Handler(BaseHTTPRequestHandler):
             result = {"db": generation, "responsibility": duty_view(r), "cases": cases,
                       "next": rows[limit]["id"] + 1 if len(rows) > limit else None, "history": history}
         return self.json(200, scrub(result), {"Cache-Control": "no-store"})
-
-    def ui_duty_create(self):
-        """A new duty of one agent (owner API 1.13). Its watches become wake-up rules of the manager."""
-        def read(data):
-            return dict(duty_fields(data, True), request_id=data["request_id"].lower())
-
-        def act(body):
-            r = duty_save(dict(body), "owner", now())
-            return {"responsibility": duty_view(r)}
-        return self.ui_command("responsibilities", read, act)
-
-    def ui_duty_edit(self, duty_id):
-        def read(data):
-            body = duty_fields(data, False)
-            if not body:
-                raise ValueError("send at least one field to change")
-            return dict(body, responsibility=duty_id, base_revision=base_revision(data))
-
-        def act(body):
-            fields = {k: v for k, v in body.items() if k not in ("responsibility", "base_revision")}
-            r = duty_save(fields, "owner", now(), duty_id=duty_id, base=body["base_revision"])
-            return {"responsibility": duty_view(r)}
-        return self.ui_command(f"responsibilities/{duty_id}", read, act)
 
     def ui_duty_state(self, duty_id):
         def read(data):
@@ -18081,35 +17909,21 @@ class Handler(BaseHTTPRequestHandler):
             return getattr(self, "ui_google_" + parts[2])()
         if len(parts) == 3 and parts[:2] == ["google", "file"]:
             return self.google_file(parts[2])
-        if parts == ["ui", "goals"]:
-            return self.ui_goal_create()
         if parts == ["ui", "backups", "confirm"]:
             return self.ui_backup_confirm()
         if parts == ["ui", "restore"]:
             return self.ui_restore(query)
-        if parts == ["ui", "responsibilities"]:
-            return self.ui_duty_create()
-        if len(parts) in (3, 4) and parts[:2] == ["ui", "responsibilities"] and re.fullmatch(r"[1-9][0-9]*", parts[2]):
-            if len(parts) == 3:
-                return self.ui_duty_edit(int(parts[2]))
-            if parts[3] == "state":
-                return self.ui_duty_state(int(parts[2]))
-        if parts == ["ui", "triggers"]:
-            return self.ui_trigger_create()
-        if parts == ["ui", "triggers", "preview"]:
-            return self.ui_trigger_preview()
+        if len(parts) == 4 and parts[:2] == ["ui", "responsibilities"] and re.fullmatch(r"[1-9][0-9]*", parts[2]) \
+                and parts[3] == "state":
+            return self.ui_duty_state(int(parts[2]))
         if len(parts) == 4 and parts[:2] == ["helper", "trigger"] and re.fullmatch(r"[1-9][0-9]*", parts[3]):
             return self.helper_trigger(parts[2], int(parts[3]))
-        if len(parts) in (3, 4) and parts[:2] == ["ui", "triggers"] and re.fullmatch(r"[1-9][0-9]*", parts[2]):
-            if len(parts) == 3:
-                return self.ui_trigger_edit(int(parts[2]))
-            if parts[3] == "state":
-                return self.ui_trigger_state(int(parts[2]))
-        if len(parts) in (3, 4) and parts[:2] == ["ui", "goals"] and re.fullmatch(r"[1-9][0-9]*", parts[2]):
-            if len(parts) == 3:
-                return self.ui_goal_edit(int(parts[2]))
-            if parts[3] == "state":
-                return self.ui_goal_state(int(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["ui", "triggers"] and re.fullmatch(r"[1-9][0-9]*", parts[2]) \
+                and parts[3] == "state":
+            return self.ui_trigger_state(int(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["ui", "goals"] and re.fullmatch(r"[1-9][0-9]*", parts[2]) \
+                and parts[3] == "state":
+            return self.ui_goal_state(int(parts[2]))
         if len(parts) == 3 and parts[:2] == ["ui", "profiles"]:
             return self.ui_profile_save(parts[2])
         if parts == ["ui", "knowledge"]:
