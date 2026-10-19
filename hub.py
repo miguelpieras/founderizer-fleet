@@ -4940,6 +4940,9 @@ NEXT_STEP_GRACE = 900       # seconds an active goal may have no next step and n
 REVIEW_GRACE = 7200         # seconds the manager has to answer the daily review
 GOAL_ACTIONS = {"pause": (("active",), "paused"), "resume": (("paused",), "active"), "done": (("active", "paused"), "done"),
                 "drop": (("active", "paused"), "dropped"), "reopen": (("done", "dropped"), "active")}
+GOAL_OPEN = ("active", "paused")    # the goals the fleet is working on; the others are there to look back at
+GOAL_LOOK_BACK = 20                 # closed goals, or matches of a search, in one answer
+GOAL_HISTORY = 50                   # the most recent lines of how one goal was managed
 
 
 def goal_settings():
@@ -5166,32 +5169,105 @@ def parse_wake(value):
     return ts
 
 
-def t_see_goals(agent, a):
-    rows = q("SELECT * FROM goals ORDER BY id")
+def goal_tasks_text(goal_id):
+    rows = q("SELECT id, state FROM tasks WHERE goal_id=? ORDER BY id", (goal_id,))
+    return ", ".join(f"{tref(t['id'])} {t['state']}" for t in rows) or "none"
+
+
+def goal_block(g):
+    """One open goal, where it stands today."""
+    v = goal_view(g)
+    out = [f"{gref(g['id'])} [{g['state']}{' by ' + g['paused_by'] if g['paused_by'] else ''}] {g['title']}",
+           "  " + limits_text(v["limits"])]
+    money = v["limits"]["money"]
+    if money:
+        out.append(f"  Recorded spending: {v['spent']:.2f} of {money['amount']:.2f} {money['currency']}.")
+    if v["tokens_used"] is not None:
+        out.append(f"  Measured tokens: {v['tokens_used']:,} (no token limit).")
+    step = v["next_step"]
+    out.append("  Next step: " + (f"{step['text']}" + (f" ({tref(step['task'])})" if step["task"] else "") if step else "none")
+               + (f"; look again {goal_time(g['wake_at'])}" if g["wake_at"] else ""))
+    if g["marker_kind"]:
+        out.append(f"  NEEDS ATTENTION: {g['marker_kind'].replace('_', ' ')}. {g['marker_detail']}")
+    out.append("  Tasks: " + goal_tasks_text(g["id"]))
+    out.append("  Goal text: " + g["text"])
+    return out
+
+
+def goal_line(g):
+    """One closed goal, in one line."""
+    return (f"{gref(g['id'])} [{g['state']}] {g['title']} — "
+            + (g["result"] or "no result written") + f" ({goal_time(g['updated'])})")
+
+
+def goal_story(g):
+    """One goal in full: where it stands, and how it was managed. The history rows are written as the goal is
+    worked on (created, next step, review, spend, budget, and the owner's own pause, resume, done and drop), and
+    this is the one place that reads them back."""
+    if g["state"] in GOAL_OPEN:
+        out = goal_block(g)
+    else:
+        out = [f"{gref(g['id'])} [{g['state']}] {g['title']}",
+               "  Result: " + (g["result"] or "none written."),
+               "  Tasks: " + goal_tasks_text(g["id"]),
+               "  Goal text: " + g["text"]]
+    out.append(f"  Written {goal_time(g['created'])}; last changed {goal_time(g['updated'])}.")
+    rows = q("SELECT ts, by, kind, detail FROM goal_history WHERE goal=? ORDER BY id DESC LIMIT ?",
+             (g["id"], GOAL_HISTORY))
     if not rows:
-        return ("No goals yet. A goal comes from the owner's own words: when he says in chat what he wants the fleet "
-                "to reach, write it down with update_goal (no goal, with title and text). Chat is still no task.")
+        out.append("  Nothing is recorded of how it was managed.")
+        return out
+    older = q1("SELECT COUNT(*) n FROM goal_history WHERE goal=?", (g["id"],))["n"] - len(rows)
+    out.append("  How it was managed:")
+    out += [f"    {goal_time(h['ts'])} {h['by']} {h['kind'].replace('_', ' ')}"
+            + (f": {h['detail']}" if h["detail"] else "") for h in reversed(rows)]
+    if older > 0:
+        out.append(f"    ({older} older line{'s are' if older != 1 else ' is'} not shown.)")
+    return out
+
+
+def goal_look_back(rows, heading, more):
+    """A list of goals to look back at: one line each, and how to open one."""
+    out = [heading] + ["  " + goal_line(g) for g in rows[:GOAL_LOOK_BACK]]
+    if len(rows) > GOAL_LOOK_BACK:
+        out.append(f"  ({len(rows) - GOAL_LOOK_BACK} more. {more})")
+    out.append('see_goals with goal="G-<id>" gives one of them in full, with how it was managed.')
+    return "\n".join(out)
+
+
+def t_see_goals(agent, a):
+    """The goals the fleet is working on, one goal in full, the closed ones, or a search over them all. The default
+    leaves the closed ones out, so a long-lived fleet does not put every goal it ever had into a session."""
+    if a.get("goal") not in (None, ""):
+        return "\n".join(goal_story(goal_ref(a["goal"])))
+    find = str(a.get("search") or "").strip()
+    if find:
+        if len(find) < 2:
+            raise ToolError("Search for at least two characters.")
+        rows = [g for g in q("SELECT * FROM goals ORDER BY id DESC")
+                if find.lower() in f"{g['title']}\n{g['text']}\n{g['result'] or ''}".lower()]
+        if not rows:
+            return f'No goal has "{find}" in its title, its text or its result.'
+        return goal_look_back(rows, f'{len(rows)} goal{"s" if len(rows) != 1 else ""} with "{find}", the newest '
+                                    f'first:', "Use more words.")
+    closed = q("SELECT * FROM goals WHERE state NOT IN ('active','paused') ORDER BY id DESC")
+    if a.get("closed"):
+        if not closed:
+            return "No goal is closed yet."
+        return goal_look_back(closed, f'{len(closed)} closed goal{"s" if len(closed) != 1 else ""}, the newest '
+                                      f'first:', 'Find an older one with search="<words>".')
+    rows = q("SELECT * FROM goals WHERE state IN ('active','paused') ORDER BY id")
+    back = (f'Looking back: {len(closed)} closed goal{"s" if len(closed) != 1 else ""}. see_goals with closed=true, '
+            f'with search="<words>" over every goal, or with goal="G-<id>" for one in full and how it was managed.'
+            if closed else 'see_goals with goal="G-<id>" gives one goal in full, with how it was managed.')
+    if not rows:
+        return ("No goal is open. A goal comes from the owner's own words: when he says in chat what he wants the "
+                "fleet to reach, write it down with update_goal (no goal, with title and text). Chat is still no "
+                "task.\n" + back)
     out = []
     for g in rows:
-        v = goal_view(g)
-        out.append(f"{gref(g['id'])} [{g['state']}{' by ' + g['paused_by'] if g['paused_by'] else ''}] {g['title']}")
-        if g["state"] in ("done", "dropped"):
-            out.append(f"  Result: {g['result']}" if g["result"] else "  Closed.")
-            continue
-        out.append("  " + limits_text(v["limits"]))
-        money = v["limits"]["money"]
-        if money:
-            out.append(f"  Recorded spending: {v['spent']:.2f} of {money['amount']:.2f} {money['currency']}.")
-        if v["tokens_used"] is not None:
-            out.append(f"  Measured tokens: {v['tokens_used']:,} (no token limit).")
-        step = v["next_step"]
-        out.append("  Next step: " + (f"{step['text']}" + (f" ({tref(step['task'])})" if step["task"] else "") if step else "none")
-                   + (f"; look again {goal_time(g['wake_at'])}" if g["wake_at"] else ""))
-        if g["marker_kind"]:
-            out.append(f"  NEEDS ATTENTION: {g['marker_kind'].replace('_', ' ')}. {g['marker_detail']}")
-        tasks = q("SELECT id, state FROM tasks WHERE goal_id=? ORDER BY id", (g["id"],))
-        out.append("  Tasks: " + (", ".join(f"{tref(t['id'])} {t['state']}" for t in tasks) or "none"))
-        out.append("  Goal text: " + g["text"])
+        out += goal_block(g)
+    out.append(back)
     return "\n".join(out)
 
 
@@ -5609,7 +5685,21 @@ def base_revision(data):
 
 
 def request_update(agent, desired):
-    """Ask one worker to update Fleet when idle. Returns "current" or "requested"."""
+    """Ask one machine's helper to update Fleet when it is idle. Returns "current" or "requested".
+
+    **Every agent of the fleet, the manager included.** The manager was left out of this while it shared the hub's
+    own OS user and checkout on the hub machine: a fast-forward there would have moved the very checkout the hub
+    serves. Since owner API 1.12 each agent runs from its own checkout (`fleet.claim_checkout`), and both Linux
+    installers give each agent of the hub machine its own user, its own clone over `git://` and its own systemd
+    user service (HUB-INSTALL.md, "One OS user for each agent"). So the manager's kit update is a worker's —
+    fetch, fast-forward onto the configuration ref, `systemctl --user restart fleet-manager` — and it needs no
+    root and nobody at a console. What still needs root and the owner's own Mac is the hub process itself, the OS
+    and its reboots; the manager's kit is none of those.
+
+    Until 19 October 2026 it was manual, and the cost was not that somebody had to type three lines: it was that
+    a release reached every machine except the hub's, which stayed two releases behind while `/ui/health` warned
+    about it and offered an Update button that called a route refusing the manager. A screen that reports a
+    problem carries its fix, so the route takes the manager and a release asks it like the rest."""
     st = q1("SELECT data FROM machine_status WHERE agent=?", (agent,))
     if st and same_code(json.loads(st["data"]).get("revision"), desired):
         return "current"
@@ -6717,6 +6807,8 @@ DUTY_WATCH_TASKS = 8            # wake-ups a day for one watch
 DUTY_REPEAT_DAYS = 30           # a key that comes back inside this time is a repeat: the preventive action did not work
 DUTY_REVIEW_GRACE = 2 * 86400   # seconds without a finished review task before the duty needs attention
 DUTY_WATCH_MINUTES = 30         # the cadence of a watch that brings no times of its own
+DUTY_LOOK_BACK = 10             # duties or cases named when an agent looks back, newest first, with a count of more
+DUTY_HISTORY_SHOWN = 30         # history rows of one duty: how it was managed, newest kept, oldest of those first
 DUTY_NAME_MAX = 80              # how much of the duty's own words stands for it where a short name is needed
 
 
@@ -7023,6 +7115,8 @@ def duty_save(body, by, t0, duty_id=None, command=None):
     r = duty_row(new_id)
     duty_watch_apply(r, want, by, t0)
     duty_review_watch(r["agent"], by, t0)
+    if old and old["agent"] != r["agent"]:      # the agent it left keeps no daily review for a duty it lost
+        duty_review_watch(old["agent"], by, t0)
     if old is None:
         emit(manager_name(), "say", new_duty_text(r, by))
         if r["agent"] != manager_name():
@@ -7304,8 +7398,10 @@ def duty_sweep(t0):
         kv_set("duty_sweep_sig", ",".join(sig) or None)
         if lines:
             emit(manager_name(), "say", "[hub] Duty sweep. These duties are not in order:\n" + "\n".join(lines) +
-                 "\nYou are the authority over them: ask the agent, put the duty right, change it with set_duty, or "
-                 "give the work to another suitable agent. Raise Needs you only for what the owner alone can do.")
+                 "\nYou are the authority over them: ask the agent, put the duty right, change its words or its "
+                 "holder with set_duty, pause or retire it with change_duty, or give the work to another suitable "
+                 "agent. A duty that nothing needs any more is yours to retire. Raise Needs you only for what the "
+                 "owner alone can do.")
 
 
 def duty_case_text(c, r):
@@ -7321,39 +7417,114 @@ def duty_case_text(c, r):
     return out
 
 
+def duty_text(r, t0, every_case=False):
+    """One duty for an agent's eyes: its heading, its watches, its counters, its marker, its cases and its words.
+    The list gives the open cases only; one duty on its own gives the closed ones too, newest first."""
+    v = duty_view(r, t0)
+    out = [f"{rref(r['id'])} [{r['state']}] {duty_name(r['text'])} — {r['agent']}"]
+    for w in v["watch"]:
+        if w["state"] in ("done", "deleted"):
+            continue
+        out.append(f"  Watch {w['trigger']} ({w['kind']}) [{w['state']}"
+                   + (f" by {w['paused_by']}: {w['paused_reason']}" if w["paused_by"] else "") + "]"
+                   + (f", next {goal_time(w['next_due'])}" if w["next_due"] else "")
+                   + (f", check {w['check']['path']} {CHECK_OPS[w['check']['condition']['op']]} "
+                      f"{w['check']['condition']['value']}" if w["check"] else ""))
+    out.append(f"  Cases: {v['open_cases']} open, {v['cases_30d']} in 30 days, {v['repeats_30d']} of them a repeat.")
+    if v["marker"]:
+        out.append(f"  NOT IN ORDER: {v['marker']['kind'].replace('_', ' ')}. {v['marker']['detail']}")
+    if every_case:
+        rows = q("SELECT * FROM duty_cases WHERE responsibility=? ORDER BY id DESC", (r["id"],))
+        for c in rows[:DUTY_LOOK_BACK]:
+            out += duty_case_text(c, r)
+        if len(rows) > DUTY_LOOK_BACK:
+            out.append(f"    and {len(rows) - DUTY_LOOK_BACK} older cases.")
+    else:
+        for c in q("SELECT * FROM duty_cases WHERE responsibility=? AND state='open' ORDER BY id", (r["id"],)):
+            out += duty_case_text(c, r)
+    out.append("  Duty: " + r["text"])
+    return out
+
+
+def duty_managed_text(duty_id):
+    """How one duty was managed: its history rows, oldest of the kept ones first, so it reads as what happened.
+    The hub has written this table since the duties were built, and until now no agent tool read it."""
+    rows = q("SELECT * FROM duty_history WHERE responsibility=? ORDER BY id DESC LIMIT ?",
+             (duty_id, DUTY_HISTORY_SHOWN + 1))
+    if not rows:
+        return []
+    older = rows[DUTY_HISTORY_SHOWN:]
+    out = ["  How it was managed:"]
+    if older:
+        out.append("    (older rows before these are not shown)")
+    for h in reversed(rows[:DUTY_HISTORY_SHOWN]):
+        out.append(f"    {goal_time(h['ts'])} {h['by']}: {h['kind'].replace('_', ' ')}"
+                   + (f" — {h['detail']}" if h["detail"] else ""))
+    return out
+
+
+def duty_short_text(r):
+    """One line for a duty in a list that looks back: enough to recognise it and to ask for it by id."""
+    return (f"  {rref(r['id'])} [{r['state']}] {duty_name(r['text'])} — {r['agent']}, "
+            f"last changed {goal_time(r['updated'])}")
+
+
 def t_see_responsibilities(agent, a):
     who = str(a.get("agent") or "").strip()
     if who and who not in agents():
         raise ToolError(f"There is no agent {who} in the team.")
     t0 = now()
-    rows = [r for r in q("SELECT * FROM responsibilities WHERE state!='retired' ORDER BY id")
+    mine = [r for r in q("SELECT * FROM responsibilities ORDER BY id")
             if duty_read_allowed(agent, r) and (not who or r["agent"] == who)]
-    if not rows:
+    tail = ("Act inside your duty without asking. record_step keeps one line for each real step of a case, "
+            "close_case ends it, and open_case opens one that you found yourself. Ask your requester only when "
+            "the duty does not cover a step, the step needs a decision that is not yours, or you are blocked.")
+
+    # One duty in full, whatever its state: its cases, and how it was managed.
+    if a.get("responsibility") not in (None, ""):
+        r = duty_ref(a["responsibility"])
+        if not duty_read_allowed(agent, r):
+            raise ToolError(f"{rref(r['id'])} is not your duty.")
+        return "\n".join(duty_text(r, t0, every_case=True) + duty_managed_text(r["id"]) + [tail])
+
+    # Looking back, so that the whole history needs no room in the session: the words, or the retired ones.
+    words = str(a.get("search") or "").strip()
+    if words:
+        hits = [r for r in mine if words.lower() in r["text"].lower()][::-1]
+        if not hits:
+            return (f"No duty of the ones you may see says '{words}'. The search is a plain text match over the "
+                    f"words of every duty, retired ones included.")
+        out = [f"Duties whose words say '{words}' ({len(hits)}), newest first:"]
+        out += [duty_short_text(r) for r in hits[:DUTY_LOOK_BACK]]
+        if len(hits) > DUTY_LOOK_BACK:
+            out.append(f"  and {len(hits) - DUTY_LOOK_BACK} older ones.")
+        out.append("see_responsibilities with responsibility=\"R-<id>\" gives one of them in full.")
+        return "\n".join(out)
+    if a.get("retired"):
+        gone = [r for r in mine if r["state"] == "retired"][::-1]
+        if not gone:
+            return "No duty that you may see has been retired."
+        out = [f"Retired duties ({len(gone)}), newest first:"]
+        out += [duty_short_text(r) for r in gone[:DUTY_LOOK_BACK]]
+        if len(gone) > DUTY_LOOK_BACK:
+            out.append(f"  and {len(gone) - DUTY_LOOK_BACK} older ones.")
+        out.append("change_duty reopen brings one back, and responsibility=\"R-<id>\" gives it in full.")
+        return "\n".join(out)
+
+    # The duties that run now, which is what a session needs in front of it.
+    rows = [r for r in mine if r["state"] != "retired"]
+    gone = [r for r in mine if r["state"] == "retired"]
+    if not mine:
         return ("No duties" + (f" of {who}" if who else " that you may see") + " yet. The owner says what an agent "
                 "answers for, and the manager writes it down (RESPONSIBILITIES.md). A duty stays: it has its own "
                 "words and its watches.")
     out = []
     for r in rows:
-        v = duty_view(r, t0)
-        out.append(f"{rref(r['id'])} [{r['state']}] {duty_name(r['text'])} — {r['agent']}")
-        for w in v["watch"]:
-            if w["state"] in ("done", "deleted"):
-                continue
-            out.append(f"  Watch {w['trigger']} ({w['kind']}) [{w['state']}"
-                       + (f" by {w['paused_by']}: {w['paused_reason']}" if w["paused_by"] else "") + "]"
-                       + (f", next {goal_time(w['next_due'])}" if w["next_due"] else "")
-                       + (f", check {w['check']['path']} {CHECK_OPS[w['check']['condition']['op']]} "
-                          f"{w['check']['condition']['value']}" if w["check"] else ""))
-        out.append(f"  Cases: {v['open_cases']} open, {v['cases_30d']} in 30 days, {v['repeats_30d']} of them a "
-                   f"repeat.")
-        if v["marker"]:
-            out.append(f"  NOT IN ORDER: {v['marker']['kind'].replace('_', ' ')}. {v['marker']['detail']}")
-        for c in q("SELECT * FROM duty_cases WHERE responsibility=? AND state='open' ORDER BY id", (r["id"],)):
-            out += duty_case_text(c, r)
-        out.append("  Duty: " + r["text"])
-    out.append("Act inside your duty without asking. record_step keeps one line for each real step of a case, "
-               "close_case ends it, and open_case opens one that you found yourself. Ask your requester only when "
-               "the duty does not cover a step, the step needs a decision that is not yours, or you are blocked.")
+        out += duty_text(r, t0)
+    if gone:
+        out.append(f"{len(gone)} retired, not listed here: see_responsibilities with retired=true names them, and "
+                   f"change_duty reopen brings one back.")
+    out.append(tail)
     return "\n".join(out)
 
 
@@ -7410,7 +7581,7 @@ def t_record_step(agent, a):
         raise ToolError(f"{cref(c)} is not a case of your duties.")
     if c["state"] != "open":
         raise ToolError(f"{cref(c)} is closed. A closed case keeps its records; a new event is a new case.")
-    step = duty_one_line(a.get("step"), "step", 60).lower()
+    step = duty_one_line(a.get("step"), "step", 60)
     text = duty_one_line(a.get("text"), "text", 500)
     guard(agent, step, text)
     tid = parse_task(a["task_id"]) if a.get("task_id") not in (None, "") else None
@@ -8143,8 +8314,14 @@ TOOLS = [
         "max_results": {"type": "integer", "description": "How many files to show: 1 to 20, default 5"},
         "task_id": wakeups.TASK_ID}, ["query"])),
     ("manager", "see_goals", t_see_goals,
-     "See every owner goal with its limits, recorded spending, next step, attention marker and tasks.",
-     S({})),
+     "The goals the fleet is working on, with their limits, recorded spending, next step, attention marker and "
+     "tasks. The closed ones are left out, so a long-lived fleet does not carry every goal it ever had: look back "
+     "at them when you need them. With goal: that one in full, and how it was managed, line by line, from the day "
+     "it was written down. With closed: the closed ones, the newest first. With search: those words in the title, "
+     "the text or the result of any goal, whatever its state.",
+     S({"goal": {"type": "string", "description": "One goal in full, for example G-3, with how it was managed"},
+        "closed": {"type": "boolean", "description": "The goals that are done or dropped, the newest first"},
+        "search": {"type": "string", "description": "Words to look for in every goal, open or closed"}})),
     ("manager", "update_goal", t_update_goal,
      "Write a goal down, or keep one moving. The owner sets no goal in the app: when he says in chat what he wants "
      "the fleet to reach, record it here with title, text and a request_id, and leave goal out. With goal: set its "
@@ -8176,9 +8353,17 @@ TOOLS = [
        ["title", "why"])),
     # owner API 1.13: the standing duties of an agent (RESPONSIBILITIES.md)
     ("all", "see_responsibilities", t_see_responsibilities,
-     "See the duties that you hold: their watches, their open cases, the close-out steps that are missing, and what "
-     "is not in order. A duty stays; it has no 'done'. The manager sees every agent's duty; pass agent for one agent.",
+     "See the duties that you hold: their watches, their open cases and what is not in order. A duty stays; it "
+     "has no 'done'. Four shapes, and the first one that you give wins: responsibility=\"R-1\" gives that one duty "
+     "in full — every case, newest first, and how it was managed from the day it was written; search=\"<words>\" "
+     "finds a duty by its own words, retired ones included; retired=true names the retired ones, newest first; and "
+     "with none of them you get the duties that run now, with one line saying how many retired ones there are. So "
+     "the whole history stays out of your session until you ask for a piece of it. The manager sees every agent's "
+     "duty; pass agent for one agent.",
      S({"agent": {"type": "string", "description": "Only this agent's duties. The manager sees every agent."},
+        "responsibility": {"type": "string", "description": "One duty in full, for example R-1. Any state."},
+        "search": {"type": "string", "description": "Words to look for in the words of a duty, any state"},
+        "retired": {"type": "boolean", "description": "True to look back at the retired duties"},
         "task_id": TASK_ID})),
     ("all", "open_case", t_open_case,
      "Open a case of one of your duties for an event that you found yourself. One key is one event, so the same "
@@ -8221,8 +8406,11 @@ TOOLS = [
         "detach": {"type": "boolean", "description": "True to take the rule off the duty"}, "task_id": TASK_ID},
        ["request_id", "responsibility", "trigger"])),
     ("manager", "set_duty", t_set_duty,
-     "Write a duty of an agent: a new one, or a change of one that exists (give responsibility). The owner writes "
-     "duties too, and you are the authority that keeps every duty in order. Choose the holder by suitability first "
+     "Write a duty of an agent: a new one, or a change of one that exists (give responsibility). Give the same "
+     "responsibility with another agent to move the duty to that agent, or with other words to change what it "
+     "says. You write duties that the owner asks for, and you write the ones you work out for yourself from the "
+     "conversation: work that keeps coming back, a goal that needs looking after and not one task, something you "
+     "keep doing by hand. A duty for yourself is one of those. Choose the holder by suitability first "
      "(see_capacity): a worker or a lead of your team, or yourself when no agent suits it or the duty is about the "
      "fleet. A duty is two things: the agent, and the words. Say in text what the agent answers for, what it does "
      "itself and what it brings to you first, because nothing else carries that: there is no other field. A watch "
@@ -8252,7 +8440,9 @@ TOOLS = [
                   "read, write or write_shared. gmail: read or write. tool: use."},
         "task_id": TASK_ID}, ["request_id", "agent", "resource", "level"])),
     ("manager", "change_duty", t_change_duty,
-     "Pause, resume, retire or reopen a duty. A pause and a retire pause its watches; its cases stay as history.",
+     "Pause, resume, retire or reopen a duty. Retire is how a duty is removed: it stops, its watches stop, and "
+     "its cases stay as history, so a duty that nothing needs any more is yours to retire without asking. "
+     "see_responsibilities names every retired duty, so reopen brings one back.",
      S({"request_id": {"type": "string", "description": "A new UUID for each write"},
         "responsibility": {"type": "string", "description": "Responsibility id, for example R-1"},
         "action": {"type": "string", "description": "pause, resume, retire or reopen"}, "note": {"type": "string"},
@@ -13522,8 +13712,8 @@ def record_status(agent, data):
               "THEN ? ELSE started END, finished=CASE WHEN ?='failed' THEN ? ELSE finished END WHERE agent=?",
               (state, data["update"]["detail"], state, now(), state, now(), agent))
     up = q1("SELECT * FROM machine_updates WHERE agent=?", (agent,))
-    # The manager's helper too: the hub requests its update only after a change of its own settings (a runtime switch);
-    # the owner maintains the hub machine's code (ui_machine_update).
+    # The manager's helper too: its kit update is a worker's (request_update), so a release, a change of its own
+    # settings and the owner's own button all reach it the same way.
     requested = bool(up and up["state"] in ("requested", "waiting_idle"))
     answer = {"desired_revision": (up["desired"] if requested and up["desired"] else desired), "update_requested": requested}
     if data.get("manager_handover"):
@@ -14554,8 +14744,8 @@ def release_work(applying, automatic=False, fetch=None):
 
 def finish_release(rid, state, step, says, automatic, result=None):
     """Inside LOCK: what came of one update run, and what the fleet does about it. A run that reached the released
-    revision asks every worker and lead for its idle update and restarts the hub's own service; any other state
-    leaves the fleet exactly as it was."""
+    revision asks every machine for its idle update and restarts the hub's own service; any other state leaves the
+    fleet exactly as it was."""
     q("UPDATE releases SET state=?, step=?, says=?, pinned=COALESCE(?,pinned), reached=?, finished=?, automatic=? "
       "WHERE id=?", (state, step, says, (result or {}).get("pinned"), (result or {}).get("reached"), now(),
                      1 if automatic else 0, rid))
@@ -14565,8 +14755,9 @@ def finish_release(rid, state, step, says, automatic, result=None):
     if state != releases.DONE:
         return row
     kit_revision(fresh=True)
-    asked = [name for name, a in agents().items()
-             if a.get("role") in ("worker", "lead") and request_update(name, row["reached"]) == "requested"]
+    # Every machine, the hub's own included: its agent's helper fast-forwards its own checkout and restarts its own
+    # user service, exactly as a worker's does (request_update). The hub process is the line below.
+    asked = [name for name in agents() if request_update(name, row["reached"]) == "requested"]
     emit(manager_name(), "say", f"[hub] This fleet took release {row['version']} ({row['reached'][:12]}). "
          f"Read RULES.md and your profile again when your next session starts."
          + (f" {len(asked)} machine(s) update when they are idle." if asked else ""))
@@ -15059,17 +15250,16 @@ class Handler(BaseHTTPRequestHandler):
                                lambda body: give_login_code(agent, passing["code"]))
 
     def ui_machine_update(self, agent):
-        """Ask one worker to update Fleet when it is idle. The helper never interrupts a task for it. The manager's
-        helper only while its runtime switch waits (manager_held): then a failed update of that switch can go again."""
+        """Ask one machine's helper to update Fleet when it is idle. The helper never interrupts a task for it.
+        Every agent's helper takes this route, the manager's too: `request_update` says why, and why it did not
+        before. So the Update button that `/ui/health` draws beside a `machine_behind` warning works for the
+        machine the warning names, whichever machine that is."""
         def read(data):
             return {"agent": agent}
 
         def act(body):
-            a = agents().get(agent)
-            if a is None:
+            if agents().get(agent) is None:
                 raise Refusal(404, "no such agent")
-            if a.get("role") not in ("worker", "lead") and not manager_held(agent):
-                raise Refusal(409, "only workers and leads update through the hub; the hub machine is maintained from the owner Mac")
             desired = kit_revision(fresh=True)
             if not desired:
                 raise Refusal(503, "the hub cannot read its own revision")

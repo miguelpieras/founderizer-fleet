@@ -764,8 +764,9 @@ class Lifecycle:
             self.state, self.detail = state, detail
 
     def arm(self, desired):
-        """An update that the hub requests. The manager's helper takes it too: the hub requests one for it only after a
-        change of the manager's own settings, such as its runtime switch; the owner maintains the hub machine's code."""
+        """An update that the hub requests. Every helper takes it the same way, the manager's included: its checkout,
+        its home and its user service are its own, so the fast-forward and the restart need no root (hub's
+        `request_update` says why that was not always so)."""
         if desired is not None and not (isinstance(desired, str) and re.fullmatch(r"[0-9a-f]{7,40}", desired)):
             return
         with self.lock:
