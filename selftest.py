@@ -400,7 +400,7 @@ if shutil.which('age') and shutil.which('age-keygen'):
     def vps_helper():
         time.sleep(0.6)
         job = [e for e in events("vps") if e["kind"] == "handover"][-1]
-        code, _, text = raw("POST", "/sealed", {"sender": "vps", "recipient": job["extra"]["to"], "task": job["task"], "label": "pilot-site", "ciphertext": sealed})
+        code, _, text = raw("POST", "/sealed", {"sender": "vps", "recipient": job["extra"]["to"], "task": job["task"], "label": "pilot-site", "ciphertext": sealed, "job": job["extra"]["job"]})
         raw("POST", f"/helper/job/vps/{job['extra']['job']}", {"ok": True, "text": f"{json.loads(text)['ref']} is the name of the locked copy. Only studio can open it."})
     threading.Thread(target=vps_helper, daemon=True).start()
     text, err = tool("vps", "hand_over", task_id=tid, login="bws://22222222-2222-4222-8222-222222222222", to="studio")
