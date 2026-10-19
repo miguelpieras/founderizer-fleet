@@ -2216,6 +2216,7 @@ class Helper:
                 command = runtime_login_command(runtime, program)
             except Refused as e:
                 return report("failed", detail=str(e))
+            ready_runtime_config()                       # the runtime's first screen, not the provider's
             tmux("kill-session", "-t", session)          # a sign-in that was given up leaves no window behind
             ensure_session(session)
             start_window(session, "login", command)
@@ -2239,6 +2240,7 @@ class Helper:
             deadline = time.monotonic() + LOGIN_DONE_WAIT
             while time.monotonic() < deadline:
                 if self.signed_in(runtime):
+                    self.restart_after_login()
                     return report("done", detail=f"{LOGIN_LABELS.get(runtime, runtime)} is signed in on this machine.")
                 time.sleep(5)
             report("failed", detail=f"{LOGIN_LABELS.get(runtime, runtime)} did not report itself signed in. Try again.")
@@ -2253,6 +2255,17 @@ class Helper:
                 pass
         finally:
             tmux("kill-session", "-t", session)
+
+    def restart_after_login(self):
+        """A session that started before this machine had a credential is sitting at the provider's own sign-in
+        screen, and no credential reaches a window that already runs. So the standing manager session is closed
+        here and started again, signed in. A worker has no standing session: its next task window is a new one."""
+        if self.conf.get("role") != "manager":
+            return
+        with contextlib.suppress(subprocess.CalledProcessError, Refused):
+            tmux("kill-window", "-t", f"{self.session}:=manager")
+        self.manager_due = True
+        self.say("manager: signed in, so its session starts again")
 
     def await_login_code(self, lid, session):
         """Wait for the one code the owner pasted in the app, then type it into the sign-in window. True when it was
@@ -3187,6 +3200,7 @@ def cmd_run(args):
     ensure_session(h.session)
     # The helper's start runs the manager session once. With a key it needs its credential, so the start waits in the
     # loop below until the hub answers; a session that runs already, or one closed later, is left as it is.
+    ready_runtime_config()          # before the first session: nobody is there to answer the runtime's first screen
     h.manager_due = conf.get("role") == "manager" and h.manager_first()
     print(f"helper for {agent} is running; persistent inbox delivery; sessions in {h.session}", flush=True)
     collector = Collector(KIT, agent, conf["runtime"],
@@ -4028,8 +4042,40 @@ LOGIN_URLS = {"claude": re.compile(r"https://(?:claude\.ai|console\.anthropic\.c
 # Codex shows the owner a code to type into the browser; Claude gives the owner a code to type in here.
 LOGIN_SHOWN_CODE = {"codex": re.compile(r"\b[A-Z0-9]{4}-[A-Z0-9]{4,6}\b")}
 LOGIN_WANTS_CODE = ("claude",)
-LOGIN_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{3,40}")       # what may be typed into a sign-in, and nothing else
+# What may be typed into a sign-in window, and nothing else: letters, digits, dashes, and the `#` and the
+# second half that Claude's own code carries (`<code>#<state>`, about 94 characters). No space, no control
+# character and no shell or tmux metacharacter, because this text reaches a terminal as keys.
+LOGIN_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._#-]{3,200}")
 LOGIN_LABELS = {"claude": "Claude Code", "codex": "Codex"}
+
+
+def ready_runtime_config(home=None):
+    """Claude Code asks for a theme the first time it runs, and that screen stands in front of everything else: the
+    agent's own session and the owner's sign-in both wait at it for a person who is never there. The helper answers
+    it once, in the runtime's own file, and touches no other key of it. True when it wrote one.
+
+    It is the helper that does this, not the installer, because every machine of every fleet has a helper and it
+    runs before the first session of its agent."""
+    path = os.path.join(home or os.path.expanduser("~"), ".claude.json")
+    try:
+        with open(path) as f:
+            kept = json.load(f)
+    except (OSError, ValueError):
+        kept = {}
+    if not isinstance(kept, dict):
+        kept = {}
+    if kept.get("theme"):
+        return False
+    kept["theme"] = "dark"
+    try:
+        tmp = path + ".fleet-new"
+        with open(tmp, "w") as f:
+            json.dump(kept, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError:
+        return False
+    return True
 
 
 def runtime_login_command(runtime, exe):
