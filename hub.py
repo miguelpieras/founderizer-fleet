@@ -184,6 +184,7 @@ CREATE TABLE IF NOT EXISTS memories(id INTEGER PRIMARY KEY, agent TEXT NOT NULL,
   text TEXT NOT NULL, prevents TEXT NOT NULL, created REAL NOT NULL, by_task INTEGER, request_id TEXT NOT NULL,
   recalls INTEGER NOT NULL DEFAULT 0, recalled REAL,
   responsibility INTEGER, prevents_key TEXT, contradicted INTEGER NOT NULL DEFAULT 0, contradicted_at REAL,
+  reinforced INTEGER NOT NULL DEFAULT 0, reinforced_at REAL,
   dropped REAL, dropped_by TEXT, drop_reason TEXT);
 CREATE INDEX IF NOT EXISTS memory_agent ON memories(agent, dropped, id);
 CREATE TABLE IF NOT EXISTS tool_commands(agent TEXT NOT NULL, request_id TEXT NOT NULL, tool TEXT NOT NULL,
@@ -1063,7 +1064,9 @@ def migrate():
         "triggers": {"failures": "INTEGER NOT NULL DEFAULT 0", "created_by": "TEXT NOT NULL DEFAULT 'owner'",
                      "responsibility": "INTEGER", "watch": "TEXT"},         # owner API 1.13: a duty's watch
         "memories": {"responsibility": "INTEGER", "prevents_key": "TEXT",      # the duty and key
-                     "contradicted": "INTEGER NOT NULL DEFAULT 0", "contradicted_at": "REAL"},
+                     "contradicted": "INTEGER NOT NULL DEFAULT 0", "contradicted_at": "REAL",
+                     # and the other side of the evidence: the agent's own word that a lesson held again
+                     "reinforced": "INTEGER NOT NULL DEFAULT 0", "reinforced_at": "REAL"},
         "machine_checks": {"verify": "TEXT", "revision": "TEXT"},
         "trigger_runs": {"check_now": "INTEGER NOT NULL DEFAULT 0", "attempts": "INTEGER NOT NULL DEFAULT 0",
                          "retry_at": "REAL", "closes": "REAL", "token": "TEXT", "sent": "REAL", "expires": "REAL",
@@ -1109,6 +1112,12 @@ def migrate():
         "CREATE INDEX IF NOT EXISTS agent_message_event ON agent_messages(event_id) WHERE event_id IS NOT NULL",
         "CREATE UNIQUE INDEX IF NOT EXISTS trigger_open_run ON trigger_runs(trigger_id) "
         "WHERE state IN ('waiting','sent') AND check_now=0",
+        # memory_contradicted's lookup, which runs on every case a watch opens. It is here and not in SCHEMA because
+        # SCHEMA runs first: a database that took the memories table from the first push of that feature has no
+        # prevents_key column until the block above adds it, and a step SCHEMA refuses is a step a release reports
+        # as refused (hub.check_schema, releases.schema_summary).
+        "CREATE INDEX IF NOT EXISTS memory_claim ON memories(agent, responsibility, prevents_key) "
+        "WHERE prevents_key IS NOT NULL",
     ]:
         sql_step(statement, problems)
     return problems
@@ -7705,16 +7714,23 @@ def duty_review_watch(agent, by, t0):
                                 "something they do not say, or showed that something in them is wrong. Leave them "
                                 "as they are when nothing changed: a version that says the same thing is noise. "
                                 + NOTES_RULE +
-                                " Then read what you have learned with recall. A lesson the hub has marked "
-                                "CONTRADICTED claimed to stop a case key that has come back since: it was wrong, "
-                                "or right and never acted on — rewrite it with remember so it says which, or drop "
-                                "it with forget. A lesson that names no key can never be contradicted, so it "
-                                "expires: drop the old ones that the work has not taught you again, and keep the "
-                                "ones it has. A lesson with a key that has not come back is the only one with "
-                                "evidence behind it; leave it alone. Join two that say the same thing into one. "
+                                " Then call recall with stale=true: it gives exactly the lessons that need "
+                                "looking at, so you read no others. A CONTRADICTED one claimed to stop a case key "
+                                "that has come back since, so it was wrong, or right and never acted on — write "
+                                "it again with remember instead_of=\"M-<id>\" so it says which, which hands the "
+                                "new lesson the same claim and lets the work judge that one too, or drop it with "
+                                "forget. A plain remember would lose the claim and leave a lesson nothing can "
+                                "check. A keyless one "
+                                "that has aged with nothing to bear it out is not thereby right: drop it unless "
+                                "the work has taught it to you again, and when it has, say so with remember "
+                                "held=\"M-<id>\" instead of writing it twice. A lesson whose key has not come "
+                                "back is the best-evidenced kind you hold, and what that evidence says is that "
+                                "nothing has refuted it, not that it was right: a key can also stay away because "
+                                "the circumstance did. Leave it alone. Join two that say "
+                                "the same thing into one. "
                                 "Then give one line for each duty in your result: is it in order, and what did "
                                 "you do; one line saying whether you changed your notes and what taught you; and "
-                                "one line on what you dropped and what you kept. "
+                                "one line on what you dropped, what you kept and what held. "
                                 "Ask your requester only for what the duty does not cover.",
                      "done_when": "Each duty of this agent is in order, or its problem is named in the result, "
                                   "each case that waited has its first step, the notes are either rewritten or "
@@ -8422,6 +8438,44 @@ MEMORY_ABOUT = 60               # the tag: a product, a tool, a person, the flee
 MEMORY_PREVENTS = 400           # what the agent expects this lesson to prevent
 MEMORY_REASON = 300             # why it was forgotten
 MEMORY_REF = re.compile(r"[Mm]-(\d+)\Z")
+# "A keyless lesson expires and a keyed one earns its life by not coming back" (memory_from_work). This is what
+# makes that true. A lesson written when a case closed carries that case's key, so memory_contradicted can show it
+# wrong; one out of an ordinary task carries none, and nothing will ever contradict it. Most of the fleet's work is
+# ordinary tasks, so most lessons are of the second kind — which is how a store nothing can falsify would quietly
+# become the whole store. So the second kind expires, unless the work met it again and the agent said so.
+MEMORY_KEYLESS_DAYS = 60        # after this a keyless lesson that nothing reinforced is stale: rewrite it or drop it
+
+
+def memory_stale(m, t0):
+    """A keyless lesson that nothing has reinforced and that is older than MEMORY_KEYLESS_DAYS.
+
+    It is not dropped for being stale, exactly as a contradicted one is not: the agent's own review reads it and
+    decides. It needs no column, because the key, the date and one constant say it."""
+    return bool(not m["prevents_key"] and not m["reinforced"]
+                and t0 - m["created"] > MEMORY_KEYLESS_DAYS * 86400)
+
+
+def memory_evidence(m, t0):
+    """What the fleet knows about one lesson, in a few words, or "". This is what a review of these lessons reads:
+    the hub counts, and the agent decides."""
+    said = []
+    if m["contradicted"]:
+        said.append(f"CONTRADICTED {m['contradicted']}×" + (f", last {goal_time(m['contradicted_at'])}"
+                                                            if m["contradicted_at"] else ""))
+    if m["reinforced"]:
+        said.append(f"held {m['reinforced']}×")
+    if m["prevents_key"]:
+        said.append(f"claims to stop {rref(m['responsibility'])}/'{m['prevents_key']}'")
+    elif memory_stale(m, t0):
+        said.append(f"stale: no key, nothing taught it again, written over {MEMORY_KEYLESS_DAYS} days ago")
+    return "; ".join(said)
+
+
+def memory_sort_key(m, t0):
+    """The order the start text's small budget wants: a lesson the fleet has counted nothing against first, a fresh
+    one before a stale one, then the ones the work taught again, then the newest. "Held" is the agent's own word
+    about its own work, so it ranks a lesson and decides nothing; "contradicted" is the hub's own observation."""
+    return (bool(m["contradicted"]), memory_stale(m, t0), -m["reinforced"], -m["id"])
 
 
 def mref(memory_id):
@@ -8476,16 +8530,21 @@ def memory_drop(m, by, reason, t0):
 
 
 def memory_prune(agent, t0, keep=None):
-    """Inside a transaction: the least used memories over the cap, dropped so that a write is never refused for room.
+    """Inside a transaction: the weakest memories over the cap, dropped so that a write is never refused for room.
 
-    The least used first, and among equals the oldest, so a lesson that sessions keep reading outlives one that nothing
-    has read since the day it was written. `keep` is the memory just written: it has been read no times, so without
-    this the write would drop itself and the agent would have asked for nothing."""
-    rows = [m for m in read_rows("SELECT * FROM memories WHERE agent=? AND dropped IS NULL ORDER BY recalls, id",
-                                   (agent,)) if m["id"] != keep]
+    The order is the evidence: a lesson the fleet has counted against goes before one it has not, a stale keyless one
+    before a fresh one, one the work never taught again before one it did, and the least read before the rest.
+    Nothing here drops a lesson *because* it was contradicted — the cap forces a drop either way and this only
+    chooses which, so while there is room a contradicted lesson stays and the agent's own review decides about it.
+    `keep` is the memory just written: nothing has read or reinforced it yet, so without this the write would drop
+    itself and the agent would have asked for nothing."""
+    rows = [m for m in read_rows("SELECT * FROM memories WHERE agent=? AND dropped IS NULL", (agent,))
+            if m["id"] != keep]
+    rows.sort(key=lambda m: (-m["contradicted"], not memory_stale(m, t0), m["reinforced"], m["recalls"], m["id"]))
     gone = rows[:max(0, len(rows) + (1 if keep else 0) - MEMORY_KEEP)]
     for m in gone:
-        memory_drop(m, "hub", f"pruned at the cap of {MEMORY_KEEP} memories: read {m['recalls']} times", t0)
+        said = memory_evidence(m, t0) or f"read {m['recalls']} times, nothing for or against it"
+        memory_drop(m, "hub", f"pruned at the cap of {MEMORY_KEEP} memories ({said})", t0)
     return [mref(m["id"]) for m in gone]
 
 
@@ -8497,17 +8556,20 @@ def memory_mark_read(rows, t0):
           (t0, *[m["id"] for m in rows]))
 
 
-def memory_line(m):
-    """One memory in one line, for a list. A forgotten one carries its reason, which is the point of reading it."""
+def memory_line(m, t0=None):
+    """One memory in one line, for a list, with what the fleet knows about it. A forgotten one carries its reason,
+    which is the point of reading it."""
+    t0 = t0 if t0 is not None else now()
     said = " ".join(m["text"].split())
     return (f"  {mref(m['id'])} [{m['about']}] {said[:160]}" + ("…" if len(said) > 160 else "")
-            + (f" — CONTRADICTED {m['contradicted']}x" if m["contradicted"] else "")
+            + (f" — {memory_evidence(m, t0)}" if memory_evidence(m, t0) else "")
             + (f" — forgotten by {m['dropped_by']}: {m['drop_reason']}" if m["dropped"] else ""))
 
 
-def memory_block(m, full=False):
+def memory_block(m, t0=None, full=False):
     """One memory for an agent's eyes. In full it also says where it came from and how often it was read, which is what
     a review of these lessons needs."""
+    t0 = t0 if t0 is not None else now()
     out = [f"{mref(m['id'])} [{m['about']}] written {goal_time(m['created'])}"
            + (f" in {tref(m['by_task'])}" if m["by_task"] else "")
            + (f", read {m['recalls']} time{'s' if m['recalls'] != 1 else ''}"
@@ -8524,7 +8586,13 @@ def memory_block(m, full=False):
                                                "here has."))
     elif not m["dropped"]:
         out.append("  Nothing can contradict this one: it came out of an ordinary task and names no key, so it "
-                   "expires unless the work teaches it again.")
+                   f"expires unless the work teaches it again. "
+                   + (f"It has, {m['reinforced']} time{'s' if m['reinforced'] != 1 else ''}, last "
+                      f"{goal_time(m['reinforced_at'])}." if m["reinforced"] else
+                      f"It is stale: nothing has, and it is more than {MEMORY_KEYLESS_DAYS} days old. Rewrite it or "
+                      f"forget it." if memory_stale(m, t0) else
+                      f"Nothing has yet; after {MEMORY_KEYLESS_DAYS} days it counts as stale. If your work bears it "
+                      f"out, say so with remember held=\"{mref(m['id'])}\"."))
     if m["dropped"]:
         out.append(f"  Forgotten {goal_time(m['dropped'])} by {m['dropped_by']}: {m['drop_reason']}")
     return out
@@ -8539,8 +8607,58 @@ def memory_tags(rows):
     return ", ".join(f'"{tag}" ({n})' for tag, n in order)
 
 
+def memory_reinforce(m, t0, task=None):
+    """Inside the caller's transaction: the work met this lesson again and it held.
+
+    It is the mirror of a contradiction and deliberately the weaker half: a contradiction is the hub's own
+    observation that a case key came back, while this is the agent's word about its own work. So it ranks a lesson
+    (memory_sort_key), keeps a keyless one from going stale, and drives nothing. Its worth is that "nothing has
+    contradicted it" and "the work bore it out four times" look identical without it."""
+    DB.execute("UPDATE memories SET reinforced=reinforced+1, reinforced_at=?, by_task=COALESCE(by_task,?) "
+               "WHERE id=?", (t0, task, m["id"]))
+
+
+def memory_held(agent, a, tid):
+    """remember with `held`: a lesson the agent already holds was borne out again, so it is not written a second
+    time. Two near-identical lessons are worse than one with a count on it: the store grows and the review learns
+    nothing."""
+    m = memory_ref(a["held"])
+    if not memory_read_allowed(agent, m):
+        raise ToolError(f"{mref(m['id'])} is not your memory. Only its own agent writes about it.")
+    if m["dropped"]:
+        raise ToolError(f"{mref(m['id'])} was forgotten {goal_time(m['dropped'])} by {m['dropped_by']}: "
+                        f"{m['drop_reason']}. It stands no more. If it was right after all, write it again with "
+                        f"remember.")
+    command, stored = agent_write(agent, "remember", a, {"held": m["id"]})
+    if stored:
+        return stored["text"]
+    t0 = now()
+    with transaction():
+        memory_reinforce(m, t0, tid)
+        said = (f"{mref(m['id'])} held, {m['reinforced'] + 1} time{'s' if m['reinforced'] else ''} now. "
+                + ("It is no longer stale. " if memory_stale(m, t0) else "")
+                + f"recall puts a lesson the work taught again before one that has only survived, and your review "
+                  f"reads this count. It is your word about your own work, so it decides nothing by itself: a "
+                  f"lesson the fleet contradicts later is still yours to rewrite or to forget.")
+        keep_command(command, {"memory": m["id"], "text": said}, t0)
+    return said
+
+
 def t_remember(agent, a):
-    """One lesson the agent keeps for its own next session."""
+    """One lesson the agent keeps for its own next session, one it already holds that the work bore out again, or
+    one written again in place of a lesson that was shown to be wrong."""
+    if a.get("held") not in (None, ""):
+        # held says one lesson you already hold was borne out again, and nothing else. Silently dropping a text or
+        # an instead_of given with it would tell the agent it recorded something it did not.
+        also = [k for k in ("text", "about", "prevents", "instead_of") if a.get(k) not in (None, "")]
+        if also:
+            raise ToolError(f"held says that a lesson you already hold was borne out again, so give it on its own: "
+                            f"leave out {', '.join(also)}. To write a new lesson instead, leave held out; to write "
+                            f"one in place of a lesson that was shown wrong, use instead_of without held.")
+        return memory_held(agent, a, parse_task(a["task_id"]) if a.get("task_id") not in (None, "") else None)
+    instead = memory_ref(a["instead_of"]) if a.get("instead_of") not in (None, "") else None
+    if instead and not memory_read_allowed(agent, instead):
+        raise ToolError(f"{mref(instead['id'])} is not yours.")
     try:
         text = goal_text(a.get("text"), "text", MEMORY_TEXT)
         prevents = goal_text(a.get("prevents"), "prevents", MEMORY_PREVENTS, True)
@@ -8549,19 +8667,46 @@ def t_remember(agent, a):
                         f"names nothing cannot be shown to be wrong later.") from None
     tag = memory_tag(a.get("about"))
     guard(agent, text, prevents, tag)
-    fields = {"about": tag, "text": text, "prevents": prevents}
+    fields = {"about": tag, "text": text, "prevents": prevents,
+              "instead_of": instead["id"] if instead else None}
     command, stored = agent_write(agent, "remember", a, fields)
     if stored:
         return stored["text"]
+    # After agent_write and not before it, exactly as t_forget does: the first call of a rewrite forgets the lesson
+    # it replaced, so a check here would refuse every repeat of that same write. A repeat is the documented way back
+    # from an answer that was lost (RULES.md, "Logins"), and an agent told "already forgotten" would write the
+    # lesson again on its own — keyless, losing the very claim this path exists to carry.
+    if instead and instead["dropped"]:
+        raise ToolError(f"{mref(instead['id'])} is already forgotten"
+                        + (f" ({instead['drop_reason']})" if instead["drop_reason"] else "")
+                        + ". Write the lesson on its own instead, or use a new request_id.")
     tid = parse_task(a["task_id"]) if a.get("task_id") not in (None, "") else None
     t0 = now()
     with transaction():
-        mid = DB.execute("INSERT INTO memories(agent,about,text,prevents,created,by_task,request_id) "
-                         "VALUES(?,?,?,?,?,?,?)", (agent, tag, text, prevents, t0, tid, command[1])).lastrowid
+        # A rewrite inherits the claim of the lesson it replaces. Without this every lesson written after a
+        # contradiction is keyless, so the one moment the loop has actually learned something produces a lesson
+        # nothing can ever check — and it then expires as stale. The old one is forgotten, naming its successor,
+        # so a lesson contradicted, rewritten and contradicted again reads as the chain it was.
+        mid = DB.execute("INSERT INTO memories(agent,about,text,prevents,created,by_task,request_id,"
+                         "responsibility,prevents_key) VALUES(?,?,?,?,?,?,?,?,?)",
+                         (agent, tag, text, prevents, t0, tid, command[1],
+                          instead["responsibility"] if instead else None,
+                          instead["prevents_key"] if instead else None)).lastrowid
+        if instead:
+            memory_drop(instead, agent, f"written again as {mref(mid)}", t0)
         pruned = memory_prune(agent, t0, keep=mid)
+        claim = (f"It takes over what {mref(instead['id'])} claimed: it stops {rref(instead['responsibility'])} "
+                 f"opening a case with the key '{instead['prevents_key']}' again, so the work can show this one "
+                 f"wrong as it showed that one. {mref(instead['id'])} is forgotten, naming this one. "
+                 if instead and instead["prevents_key"] else
+                 f"Nothing can contradict this one, because it names no case key, so after {MEMORY_KEYLESS_DAYS} "
+                 f"days it counts as stale unless the work bears it out and you say so with remember "
+                 f"held=\"{mref(mid)}\". "
+                 + (f"{mref(instead['id'])} is forgotten, naming this one. " if instead else ""))
         said = (f"{mref(mid)} is yours, about \"{tag}\". Your next session reads it: a few of your memories are in "
                 f"the start text of each task, and recall gives the rest — recall with about=\"{tag}\" for this tag. "
-                + (f"At the cap of {MEMORY_KEEP} these went, least read first: {', '.join(pruned)}. " if pruned else "")
+                + (f"At the cap of {MEMORY_KEEP} these went: {', '.join(pruned)}. " if pruned else "")
+                + claim
                 + "A lesson that turns out wrong is worse than none: drop it with forget and its reason. A durable "
                   "fact about a product belongs in that product's repository, and this memory is the pointer to it.")
         keep_command(command, {"memory": mid, "text": said}, t0)
@@ -8575,7 +8720,11 @@ def memory_from_work(agent, text, prevents, about, t0, task=None, responsibility
     `responsibility` and `prevents_key` are what make the lesson checkable: a lesson written when a case closed
     claims to prevent that case's key, so when the key comes back duty_new_case can mark it contradicted. A lesson
     out of an ordinary task has neither, and nothing can ever contradict it — which is why a keyless lesson expires
-    and a keyed one earns its life by not coming back."""
+    and a keyed one earns its life by not coming back. The two travel together: a key without its duty names no case
+    and a duty without a key claims nothing, so either half alone would have memory_contradicted, memory_stale and
+    every reader of a lesson reading a claim that is not there."""
+    if bool(responsibility) != bool(prevents_key):
+        raise ToolError("A lesson that claims to stop an event needs both the duty and its key, or neither.")
     mid = DB.execute("INSERT INTO memories(agent,about,text,prevents,created,by_task,request_id,"
                      "responsibility,prevents_key) VALUES(?,?,?,?,?,?,'',?,?)",
                      (agent, about, text, prevents, t0, task, responsibility, prevents_key)).lastrowid
@@ -8600,7 +8749,7 @@ def memory_summary(rows, heading, t0, more):
     """A capped list of memories to look at: one line each, what is not shown, and how to open one in full."""
     shown = rows[:MEMORY_SHOWN]
     memory_mark_read(shown, t0)
-    out = [heading] + [memory_line(m) for m in shown]
+    out = [heading] + [memory_line(m, t0) for m in shown]
     if len(rows) > MEMORY_SHOWN:
         out.append(f"  ({len(rows) - MEMORY_SHOWN} more, not shown. {more})")
     out.append('recall with memory="M-<id>" gives one in full, with what it prevents and how often it was read.')
@@ -8621,7 +8770,7 @@ def t_recall(agent, a):
             raise ToolError(f"{mref(m['id'])} is not your memory. A memory is its own agent's, and no other agent "
                             f"reads it.")
         memory_mark_read([m], t0)
-        return "\n".join(memory_block(memory_row(m["id"]), full=True) + [tail])
+        return "\n".join(memory_block(memory_row(m["id"]), t0, full=True) + [tail])
 
     # Looking back, so that the whole store needs no room in the session: the words, or the forgotten ones.
     words = str(a.get("search") or "").strip()
@@ -8636,6 +8785,19 @@ def t_recall(agent, a):
         return "\n".join(memory_summary(hits, f'{len(hits)} memor{"ies" if len(hits) != 1 else "y"} of yours '
                                                f'ha{"ve" if len(hits) != 1 else "s"} "{words}", the newest first:',
                                         t0, "Use other words.") + [tail])
+    if a.get("stale"):
+        rows = [m for m in memory_live(agent) if memory_stale(m, t0) or m["contradicted"]]
+        if not rows:
+            return (f"Nothing of yours needs looking at: no lesson of yours is contradicted, and none is a keyless "
+                    f"one older than {MEMORY_KEYLESS_DAYS} days that the work has not taught again.")
+        rows.sort(key=lambda m: (-m["contradicted"], -m["id"]))
+        return "\n".join(memory_summary(rows, f"{len(rows)} lesson{'s' if len(rows) != 1 else ''} of yours to look "
+                                               f"at, the contradicted ones first:", t0, "Use search over all of them.")
+                         + ["A lesson the fleet counted against did not stop the case key it claimed: read that "
+                            "case, then rewrite the lesson with remember or drop it with forget and the reason. A "
+                            "stale one names no key, so nothing can ever contradict it: if your work bears it out, "
+                            "say so with remember held=\"M-<id>\"; if it does not, forget it. The hub drops neither "
+                            "by itself — counting is mechanical, deciding is yours."])
     if a.get("forgotten"):
         gone = read_rows("SELECT * FROM memories WHERE agent=? AND dropped IS NOT NULL ORDER BY id DESC", (agent,))
         if not gone:
@@ -8662,6 +8824,10 @@ def t_recall(agent, a):
     out = memory_summary(rows, heading, t0, 'Ask for one tag with about="<tag>", or search="<words>".')
     if not tag:
         out.append(f"  Your tags: {memory_tags(rows)}.")
+    look = [m for m in memory_live(agent) if memory_stale(m, t0) or m["contradicted"]]
+    if look:
+        out.append(f"  {len(look)} of yours need{'s' if len(look) == 1 else ''} looking at — contradicted, or keyless "
+                   f"and older than {MEMORY_KEYLESS_DAYS} days with nothing to bear it out: recall with stale=true.")
     forgotten = len(read_rows("SELECT id FROM memories WHERE agent=? AND dropped IS NOT NULL", (agent,)))
     if forgotten:
         out.append(f"  {forgotten} forgotten, not listed here: recall with forgotten=true names them with the reason.")
@@ -8701,14 +8867,16 @@ def memories_for_start(agent, task_id):
 
     A profile is in the start text because a session needs it in front of it; a lesson the agent wrote for exactly this
     work is the same kind of thing. The budget is small on purpose — recall is the rest of the store, and a start text
-    that carried everything would be the thing this feature exists to avoid. Returns (the memories, how many of them
-    the task's own words named)."""
+    that carried everything would be the thing this feature exists to avoid. So the budget goes to the lessons that
+    earned it (memory_sort_key): a contradicted or stale one sinks below a fresh one the work taught again.
+    Returns (the memories, how many of them the task's own words named)."""
     rows = memory_live(agent)
     if not rows:
         return [], 0
     said_rows = read_rows("SELECT title, details, done_when FROM tasks WHERE id=?", (task_id,)) if task_id else []
     t = said_rows[0] if said_rows else None
     said = " ".join(str(t[k] or "") for k in ("title", "details", "done_when")).lower() if t else ""
+    rows.sort(key=lambda m: memory_sort_key(m, now()))
     named = {m["id"] for m in rows if m["about"].lower() in said}
     shown = ([m for m in rows if m["id"] in named] + [m for m in rows if m["id"] not in named])[:MEMORY_START]
     return shown, sum(1 for m in shown if m["id"] in named)
@@ -8739,10 +8907,15 @@ def memory_start_text(agent, task_id):
     live = len(memory_live(agent))
     out = [f"\nYour own memory, {len(rows)} of {live} lesson{'s' if live != 1 else ''}"
            + (f", the {'one' if named == 1 else named} whose tag this task names first" if named else "") + ":"]
+    t0 = now()
     for m in rows:
-        out.append(f"- {mref(m['id'])} [{m['about']}] {' '.join(m['text'].split())} (prevents: {m['prevents']})")
-    out.append(f"recall reads the rest by tag or by words, remember keeps a new lesson, and forget drops one that "
-               f"turned out wrong, with its reason.\n")
+        shown = memory_evidence(m, t0)
+        out.append(f"- {mref(m['id'])} [{m['about']}] {' '.join(m['text'].split())} (prevents: {m['prevents']})"
+                   + (f" [{shown}]" if shown else ""))
+    out.append(f"These are your own lessons from your own work, not rules: weigh them against what is in front of "
+               f"you. recall reads the rest by tag or by words and recall stale=true the ones that need looking at, "
+               f"remember keeps a new lesson, remember held=\"M-<id>\" says one of these was borne out again, and "
+               f"forget drops one that turned out wrong, with its reason.\n")
     return "\n".join(out)
 
 
@@ -9543,26 +9716,41 @@ TOOLS = [
      "Keep one lesson that your next session needs: which approach failed and why, how the owner wants something "
      "reported, which tool lies, who to ask, what you got wrong last time. It is yours alone — no other agent reads "
      "it. about is a short tag of your own choosing (a product, a tool, a person, the fleet), and prevents says what "
-     "you expect this lesson to prevent, which is what makes it possible to show later that it was wrong. A durable "
-     "fact about a product belongs in that product's own repository, where you have write access: keep the pointer "
-     "here, not the copy. A fact with no repository (an account, a customer, a supplier) goes in a knowledge file "
-     "with write_knowledge. Never a password or a key.",
+     "you expect this lesson to prevent, which is what makes it possible to show later that it was wrong. " +
+     NOTES_RULE + " A durable fact about a product belongs in that product's own repository, where you have write "
+     "access: keep the pointer here, not the copy. A fact with no repository (an account, a customer, a supplier) "
+     "goes in a knowledge file with write_knowledge. Never a password or a key. When a lesson you already hold was "
+     "borne out again by this work, do not write it a second time: give held=\"M-<id>\" and nothing else. Two "
+     "near-identical lessons are worse than one with a count on it, and it is the only thing that tells a lesson "
+     "nothing has contradicted apart from one the work keeps proving right. When a lesson was CONTRADICTED "
+     "and you write a better one, give instead_of=\"M-<id>\": the new lesson takes over what the old one "
+     "claimed, so the work can judge it too, and the old one is forgotten naming the new one. Without that the "
+     "better lesson names no event and nothing can ever check it.",
      S({"request_id": {"type": "string", "description": "A new UUID for each write"},
         "text": {"type": "string", "description": f"The lesson, at most {MEMORY_TEXT} characters"},
         "about": {"type": "string", "description": "Your own short tag: a product, a tool, a person, the fleet"},
         "prevents": {"type": "string", "description": "What you expect this lesson to prevent, in one line"},
+        "held": {"type": "string", "description": "A lesson of yours the work bore out again, for example M-1. Give "
+                                                  "it alone: with text, about, prevents or instead_of it is "
+                                                  "refused, because those are a different write."},
+        "instead_of": {"type": "string", "description": "A lesson of yours this one is written in place of, for "
+                       "example M-1: it is forgotten, and this one takes over what it claimed to prevent, so the "
+                       "work can judge the new one. Use it whenever you rewrite a contradicted lesson."},
         "task_id": TASK_ID},
-       ["request_id", "text", "about", "prevents"])),
+       ["request_id"])),
     ("all", "recall", t_recall,
      "Your own lessons, read back, newest first. A few of them are already in your task's start text; this is the "
-     "rest, and no shape puts the whole store into your session. Four shapes, and the first one that you give wins: "
-     "memory=\"M-1\" gives that one in full, with what it prevents and how often it was read; search=\"<words>\" is a "
-     "plain text match over the tag, the lesson and what it prevents, forgotten ones included; forgotten=true names "
-     "the ones that no longer stand, each with why; about=\"<tag>\" gives one tag. With none of them you get your "
-     f"newest {MEMORY_SHOWN}, your tags with their counts, and how many are forgotten.",
+     "rest, and no shape puts the whole store into your session. Five shapes, and the first one that you give wins: "
+     "memory=\"M-1\" gives that one in full, with what it prevents, where it came from and what the fleet has "
+     "counted about it; search=\"<words>\" is a plain text match over the tag, the lesson and what it prevents, "
+     "forgotten ones included; stale=true gives the ones that need looking at — contradicted, or with no case key "
+     f"and older than {MEMORY_KEYLESS_DAYS} days with nothing to bear them out; forgotten=true names the ones that "
+     "no longer stand, each with why; about=\"<tag>\" gives one tag. With none of them you get your newest "
+     f"{MEMORY_SHOWN}, your tags with their counts, how many need looking at and how many are forgotten.",
      S({"memory": {"type": "string", "description": "One memory in full, for example M-1"},
         "about": {"type": "string", "description": "One of your tags, as you wrote it"},
         "search": {"type": "string", "description": "Words to look for in every memory of yours"},
+        "stale": {"type": "boolean", "description": "True for the ones to look at: contradicted, or keyless and old"},
         "forgotten": {"type": "boolean", "description": "True to look back at the ones you dropped"},
         "task_id": TASK_ID})),
     ("all", "forget", t_forget,
