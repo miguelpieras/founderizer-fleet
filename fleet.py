@@ -4049,14 +4049,18 @@ LOGIN_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._#-]{3,200}")
 LOGIN_LABELS = {"claude": "Claude Code", "codex": "Codex"}
 
 
-def ready_runtime_config(home=None):
-    """Claude Code asks for a theme the first time it runs, and that screen stands in front of everything else: the
-    agent's own session and the owner's sign-in both wait at it for a person who is never there. The helper answers
-    it once, in the runtime's own file, and touches no other key of it. True when it wrote one.
+def ready_runtime_config(home=None, kit=None):
+    """Claude Code runs a first-run wizard — a theme, then a sign-in method — and it stands in front of everything
+    else: the agent's own session and the owner's sign-in both wait at it for a person who is never there. The
+    wizard runs until `hasCompletedOnboarding` is in the runtime's own file, whatever else is in it, and it asks
+    once more for each folder it is started in ("Do you trust the files in this folder?", kept per folder as
+    `hasTrustDialogAccepted`). The folder is the agent's own checkout, which the owner's own installer made. So the
+    helper writes those two answers and the theme with them, and touches no other key. True when it wrote one.
 
     It is the helper that does this, not the installer, because every machine of every fleet has a helper and it
     runs before the first session of its agent."""
     path = os.path.join(home or os.path.expanduser("~"), ".claude.json")
+    folder = os.path.realpath(kit or KIT)
     try:
         with open(path) as f:
             kept = json.load(f)
@@ -4064,9 +4068,19 @@ def ready_runtime_config(home=None):
         kept = {}
     if not isinstance(kept, dict):
         kept = {}
-    if kept.get("theme"):
+    projects = kept.get("projects")
+    if not isinstance(projects, dict):
+        projects = {}
+    mine = projects.get(folder) if isinstance(projects.get(folder), dict) else {}
+    if kept.get("hasCompletedOnboarding") and mine.get("hasTrustDialogAccepted"):
         return False
-    kept["theme"] = "dark"
+    kept["hasCompletedOnboarding"] = True
+    kept.setdefault("theme", "dark")
+    # Its offer of the new renderer comes back until it has been shown three times, and it blocks the window while
+    # it stands there. Nobody is at this terminal to take it, so it is counted out before it is ever drawn.
+    kept["fullscreenUpsellSeenCount"] = max(int(kept.get("fullscreenUpsellSeenCount") or 0), 3)
+    projects[folder] = dict(mine, hasTrustDialogAccepted=True)
+    kept["projects"] = projects
     try:
         tmp = path + ".fleet-new"
         with open(tmp, "w") as f:
