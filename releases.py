@@ -58,6 +58,7 @@ from verify import OWNER_STEPS, SELFTEST_BASELINE
 DEFAULT_CHANNEL = "https://founderizer.com"
 DEFAULT_UPSTREAM = "https://github.com/miguelpieras/founderizer-fleet.git"
 REMOTE = "upstream"                 # PRODUCT.md 4.3: "every hub carries [it] as the git remote `upstream`"
+MOVED = "refs/founderizer/moved"    # where the clone keeps the ref's own tip when a push lost to it
 KEY_FILE = "release-key.pub"        # the release public keys, shipped in the repository beside this file
 ENTITLEMENT_KEY_FILE = "entitlement-key.pub"    # the entitlement public keys: another key, and its own file (4.2)
 
@@ -66,6 +67,7 @@ SELFTEST_WAIT = 300         # seconds for selftest.py, as verify.py gives it
 VERIFY_WAIT = 420           # seconds for fleet.py verify, which runs selftest.py again inside itself
 SCHEMA_WAIT = 120           # seconds for the released code's schema against a copy of this fleet's database
 GIT_WAIT = 300              # seconds for one git step; a fetch of the whole repository is the slow one
+PUSH_TRIES = 4              # the push of the configuration ref, and three more when the hub moved the ref under it
 
 REVISION = re.compile(r"[0-9a-f]{40}")                          # a full commit id, never a short one
 VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._+-]{0,40}")      # the name the owner reads, "2026.10.2"
@@ -480,6 +482,13 @@ def schema_summary(out):
 # back exactly as the pinned revision has them.
 OWNER_PATHS = ("team.json", "profiles", "knowledge/owner")
 
+
+def _owner_file(path):
+    """Is this path one of the owner's own files? `hub.CONFIG_FILES` is the other half: the hub writes these paths
+    and no others, so a commit that touches nothing else is a commit of the owner's own configuration."""
+    return any(path == one or path.startswith(one + "/") for one in OWNER_PATHS)
+
+
 # What an update run says about itself. The app shows the state and the line; nothing else reads them.
 KEPT, ROLLED_BACK, DONE, FAILED = "kept", "rolled_back", "done", "failed"
 STATES = (KEPT, ROLLED_BACK, DONE, FAILED)
@@ -604,7 +613,7 @@ class Update:
     def clone_git(self, *args, timeout=60):
         return self.git(*args, cwd=self.clone, timeout=timeout)
 
-    def merge(self):
+    def merge(self, base=None):
         """The release's code into this fleet's configuration ref, in the clone, with the owner's own files kept.
 
         The owner's files are configuration, not code. The published repository carries a `team.json`, profiles and
@@ -612,8 +621,12 @@ class Update:
         team, the agents and their instructions with a stranger's. And because the owner changes exactly those
         files, a release that touched one of them would otherwise conflict with every fleet there is.
 
-        So the merge is made without a commit, every path of OWNER_PATHS comes back as the pinned revision has it,
-        and a conflict that is still there afterwards is a real one: that release does not fit this fleet."""
+        So the merge is made without a commit, every path of OWNER_PATHS comes back as the base revision has it,
+        and a conflict that is still there afterwards is a real one: that release does not fit this fleet.
+
+        `base` is the commit the merge stands on: the pinned revision, or the configuration ref's own new tip when
+        the ref moved under the push and this run follows it (`catch_up`)."""
+        base = base or self.pinned
         version, author = self.manifest["version"], ["-c", "user.name=Founderizer",
                                                      "-c", "user.email=releases@founderizer.invalid"]
         _code, out, err = self.run(["git", "-C", self.clone, *author, "merge", "--no-commit", "--no-ff",
@@ -621,7 +634,7 @@ class Update:
         if self.clone_git("rev-parse", "--verify", "--quiet", "MERGE_HEAD")[0] != 0:
             return self.answer(ROLLED_BACK, "merge", f"release {version} could not be merged into this fleet: "
                                                      f"{_line(err or out)}. The fleet stays at {self.pinned[:12]}.")
-        answer = self.keep_configuration()
+        answer = self.keep_configuration(base)
         if answer:
             return answer
         left = self.clone_git("diff", "--name-only", "--diff-filter=U")[1]
@@ -635,18 +648,18 @@ class Update:
         if code != 0:
             return self.answer(ROLLED_BACK, "merge", f"the merge of release {version} could not be committed: "
                                                      f"{_line(err or out)}")
-        if self.clone_git("diff", "--quiet", self.pinned, "HEAD", "--", *OWNER_PATHS)[0] != 0:
+        if self.clone_git("diff", "--quiet", base, "HEAD", "--", *OWNER_PATHS)[0] != 0:
             return self.answer(ROLLED_BACK, "keep", f"release {version} changes this fleet's own configuration "
                                                     f"({', '.join(OWNER_PATHS)}), which a release never does. The "
                                                     f"fleet stays at {self.pinned[:12]}.")
         return None
 
-    def keep_configuration(self):
-        """Inside the unfinished merge: every path of OWNER_PATHS exactly as the pinned revision has it. A file the
+    def keep_configuration(self, base):
+        """Inside the unfinished merge: every path of OWNER_PATHS exactly as the base revision has it. A file the
         release brought that this fleet does not have goes out with the rest."""
         for path in OWNER_PATHS:
-            self.clone_git("checkout", "-q", self.pinned, "--", path)       # none at pinned: nothing to restore
-        ours = set(self.clone_git("ls-tree", "-r", "--name-only", self.pinned, "--", *OWNER_PATHS)[1].split("\n"))
+            self.clone_git("checkout", "-q", base, "--", path)              # none at base: nothing to restore
+        ours = set(self.clone_git("ls-tree", "-r", "--name-only", base, "--", *OWNER_PATHS)[1].split("\n"))
         listed = self.clone_git("ls-files", "--", *OWNER_PATHS)[1]
         extra = sorted({one for one in listed.split("\n") if one and one not in ours})
         if extra and self.clone_git("rm", "-f", "-q", "--", *extra)[0] != 0:
@@ -737,16 +750,43 @@ class Update:
 
     def publish(self, merged):
         """The push to the configuration ref, and this checkout's fast-forward onto it. Nothing before this point
-        left the clone."""
+        left the clone.
+
+        **The ref moves under this push.** The hub commits the owner's own files to the same ref
+        (`hub.commit_kit_file`) and the checks above take minutes, so a release that passed every one of them
+        can reach a tip that is no longer the one it was merged onto, and git refuses the push as a
+        non-fast-forward. That is what happened to the owner's own fleet on 19 October 2026, and the release was
+        thrown away over it. It is not a verdict on the release: it is two writers of one ref, and the owner's
+        files and the released code touch different paths by design. So a refused push is followed, not given
+        up: merge the released revision onto the new tip and push that (`catch_up`), up to PUSH_TRIES times.
+        What is given up is the fleet whose ref moves faster than a push takes, and the line says so."""
         version = self.manifest["version"]
         if not self.origin:
             return self.answer(ROLLED_BACK, "push", f"release {version} passed every check, and this fleet has no "
                                                     f"address for its configuration ref, so nothing was pushed")
-        code, _, err = self.run(["git", "-C", self.clone, "push", "-q", self.origin, f"HEAD:{self.branch}"])
-        if code != 0:
-            return self.answer(ROLLED_BACK, "push", f"release {version} passed every check and the push to "
-                                                    f"{self.branch} was refused: {_line(err)}. The fleet stays at "
-                                                    f"{self.pinned[:12]}.")
+        for left in range(PUSH_TRIES - 1, -1, -1):
+            code, _, err = self.run(["git", "-C", self.clone, "push", "-q", self.origin, f"HEAD:{self.branch}"])
+            if code == 0:
+                break
+            # The push is the step that leaves this machine, so what it did is read from the ref and not from
+            # git's exit code (RULES.md rule 9). A ref that carries exactly what was pushed means the push landed
+            # and something after it failed: the fleet has moved, and saying it was rolled back would be a lie
+            # the owner acts on.
+            tip = self.ref_now()
+            if tip == merged:
+                break
+            if tip is None or not self.may_follow(tip, merged):
+                return self.answer(ROLLED_BACK, "push", f"release {version} passed every check and the push to "
+                                                        f"{self.branch} was refused: {_line(err)}. The fleet stays "
+                                                        f"at {self.pinned[:12]}.")
+            if not left:
+                return self.answer(ROLLED_BACK, "push", f"release {version} passed every check, and {self.branch} "
+                                                        f"moved under it {PUSH_TRIES} times while it was pushed, "
+                                                        f"so the fleet stays at {self.pinned[:12]}. Press Update "
+                                                        f"again when this fleet is writing less.")
+            answer, merged = self.catch_up(tip, merged)
+            if answer:
+                return answer
         self.reached = merged           # it is on the ref now, so every machine of this fleet follows it
         if self.git("fetch", "-q", "origin")[0] != 0 or self.git("merge", "-q", "--ff-only", merged)[0] != 0:
             return self.answer(FAILED, "follow", f"release {version} is on {self.branch} as {merged[:12]}, and this "
@@ -754,3 +794,65 @@ class Update:
                                                  f"hand: git -C {self.kit} merge --ff-only {merged[:12]}")
         return self.answer(DONE, "follow", f"release {version} is on {self.branch} as {merged[:12]}; this fleet "
                                            f"moved from {self.pinned[:12]}")
+
+    def ref_now(self):
+        """The configuration ref's own tip in the repository this fleet pushes to, or None when it cannot be
+        read. The ref is read, never the text git printed: "non-fast-forward" is English from a program whose
+        wording is not ours to depend on, and the ref itself says the same thing exactly."""
+        if self.run(["git", "-C", self.clone, "fetch", "-q", self.origin, f"+{self.branch}:{MOVED}"])[0] != 0:
+            return None
+        code, tip, _ = self.clone_git("rev-parse", MOVED)
+        return tip if code == 0 and REVISION.fullmatch(tip) else None
+
+    def may_follow(self, tip, merged):
+        """Is this tip one that a refused push may be merged onto and pushed again? It must hold the revision
+        this fleet runs, and what was just pushed must not already hold it — a ref that is behind this merge did
+        not refuse it for moving, and a second merge would meet whatever did."""
+        return (self.clone_git("merge-base", "--is-ancestor", tip, merged)[0] != 0
+                and self.clone_git("merge-base", "--is-ancestor", self.pinned, tip)[0] == 0)
+
+    def catch_up(self, tip, checked):
+        """The released revision merged again, onto the tip the configuration ref moved to, with the proof that
+        this is still the code the checks passed. Gives (the answer that ends the run, the revision to push).
+
+        **The checks are not run a second time, and this is the one place where "it passed" and "it is what will
+        run" could come apart, so the sameness is proved and not argued.** The second merge is compared with the
+        one the checks read: every path that differs must be one of the owner's own files. If that holds, the
+        tree that will run is the tree `selftest.py`, `fleet.py verify` and the schema check read, file for file,
+        and running them again would answer a question already answered while the ref moves once more.
+
+        It holds for what the hub puts on that ref while a run is going. `hub.commit_kit_file` writes `team.json`,
+        a profile or the owner's knowledge and refuses every other path (`hub.CONFIG_FILES`), and this merge takes
+        those paths from the base and never from the release, so such a commit changes nothing the checks read.
+        Those files themselves are not re-checked and do not need to be: the fleet already runs them. The hub
+        committed them and moved its own checkout onto them before this run reached the push, so they are in force
+        whether this release is taken or not.
+
+        Anything else that reached the ref — code, a task's output, a commit made by hand — is a different tree
+        from the one that passed. Then this run pushes nothing: it rolls back to the pinned revision and names the
+        path, and the owner's next press merges that commit and checks it like any other."""
+        version, pinned = self.manifest["version"], self.pinned[:12]
+        if self.clone_git("reset", "-q", "--hard", tip)[0] != 0:
+            return self.answer(ROLLED_BACK, "push", f"release {version} passed every check, and {self.branch} "
+                                                    f"moved to {tip[:12]} while it was pushed, which this update "
+                                                    f"could not follow. The fleet stays at {pinned}."), checked
+        answer = self.merge(base=tip)
+        if answer:
+            return answer, checked
+        code, again, _ = self.clone_git("rev-parse", "HEAD")
+        if code != 0 or not REVISION.fullmatch(again):
+            return self.answer(ROLLED_BACK, "merge", "the second merge left no commit"), checked
+        code, names, _ = self.clone_git("diff", "--name-only", checked, again)
+        if code != 0:
+            return self.answer(ROLLED_BACK, "push", f"release {version} passed every check, and what the second "
+                                                    f"merge of it holds could not be read. The fleet stays at "
+                                                    f"{pinned}."), checked
+        changed = sorted(one for one in names.split("\n") if one and not _owner_file(one))
+        if changed:
+            return self.answer(ROLLED_BACK, "push", f"release {version} passed every check, and while it was "
+                                                    f"pushed {self.branch} gained a commit that changes "
+                                                    f"{', '.join(changed[:4])}, which is not this fleet's own "
+                                                    f"configuration, so what passed the checks is no longer what "
+                                                    f"would run. The fleet stays at {pinned}. Press Update again "
+                                                    f"to check the release against it."), checked
+        return None, again
