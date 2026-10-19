@@ -22,9 +22,12 @@ def free_port():
         return s.getsockname()[1]
 
 
-# The three agents these checks need. A hub that has them in its own team.json is checked with its own; a hub whose
-# team.json has not got them yet — a fresh install has one manager (hub.sh, HUB-INSTALL.md) — is checked with these,
-# so selftest.py checks the code of any hub and not only this pilot's team.
+# The three agents these checks need, and the whole team of every hub they start: no team.json of the machine is
+# read. A fleet whose owner called his agents manager, vps or studio would otherwise be checked with his own entries,
+# and his studio without a browser fails checks that are about the hub's code (PRODUCT.md 4.1: a self-test that fails
+# for a reason that is not the code's keeps that machine on old code). These three carry no vault and no grant
+# either, so the tool sets below are the hub's own: test_create_login.py, test_call_api.py and test_google_api.py
+# check the tools a grant adds, and test_vault.py broker mode, which this file's file-mode login flow is not.
 REFERENCE = {
     "manager": {"role": "manager", "machine": "hub", "runtime": "claude", "can": ["shell", "web"],
                 "start": "claude --permission-mode bypassPermissions --tools default {settings} {prompt}"},
@@ -39,24 +42,18 @@ REFERENCE = {
 
 def start_hub(name, addresses, *flags, agents=None):
     port = free_port()
-    team = json.load(open(os.path.join(KIT, "team.json"), encoding="utf-8"))
-    if not REFERENCE.keys() <= team.get("agents", {}).keys():
-        team["agents"] = json.loads(json.dumps(REFERENCE))
-    team["addresses"] = addresses
-    if agents:          # agents of the check's own, so that it does not depend on the agents this team.json has
+    team = {"hub": {"machine": "hub", "port": 8765}, "addresses": addresses,
+            "agents": json.loads(json.dumps(REFERENCE))}
+    if agents:          # agents of the check's own
         team["agents"].update(json.loads(json.dumps(agents)))
-    for conf in team["agents"].values():    # the file-mode login flow is checked here; test_vault.py checks broker mode
-        conf.pop("vault", None)
-        conf.pop("vault_recipient", None)
-        # and the grants that add a tool, so that the tool sets below are the hub's own and not this team's:
-        # test_create_login.py, test_call_api.py and test_google_api.py check the tools a grant adds.
-        conf.pop("vault_create", None)
-        conf.pop("google", None)
     path = os.path.join(TMP, f"{name}.json")
     json.dump(team, open(path, "w"))
     proc = subprocess.Popen([sys.executable, os.path.join(KIT, "hub.py"), "--host", "127.0.0.1", "--port", str(port),
                              "--db", os.path.join(TMP, f"{name}.db"), "--team", path, *flags],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            # a home of this run's own: ~/.fleet holds the owner's Google, MCP and GitHub App files,
+                            # which are the machine's and not these checks'
+                            env=dict(os.environ, HOME=TMP))
     base = f"http://127.0.0.1:{port}"
     for _ in range(80):
         try:
