@@ -1254,7 +1254,8 @@ def save_closing(agent, procs, start=True):
     """Keep {pid: args} of the manager session that the helper closes after a switch while they can run, so that a
     helper that restarts meanwhile ends them too and starts nothing first (retire_old_manager), and whether the new
     runtime's session is due when they have ended: not when the owner's `fleet.py start` already started one (start
-    False), which a later close by the owner must not bring back. {} removes the file."""
+    False), whose own window is then the standing session. Once nothing of it is left either, the helper's own watch
+    of the window starts one (Helper.manager_gone). {} removes the file."""
     path = closing_file(agent)
     if not procs:
         with contextlib.suppress(FileNotFoundError):
@@ -2158,6 +2159,14 @@ class Helper:
             self.request_job(task, extra)
         elif kind == "control":
             self.control(task, extra)
+        elif kind == "manager_start":
+            # Owner feature manager_start: the control that the hub's manager_down warning carries. The loop's own
+            # watch starts a missing session by itself (manager_gone); this is the owner's hand on the same switch,
+            # for a start that keeps failing and for the round he does not want to wait for. It only makes the start
+            # due: start_manager reads the windows under the start lock, so a session that runs is left alone.
+            if self.conf.get("role") == "manager":
+                self.manager_due, self.manager_tried = True, None
+                self.say("manager: the owner asked for its session; it starts at this round")
         elif kind == "update":
             if getattr(self, "lifecycle", None):
                 self.lifecycle.request(extra)
@@ -2606,9 +2615,10 @@ class Helper:
     def manager_first(self):
         """At this helper's start: True when the standing session's start is due, with no window, or no answer from
         tmux (the start reads again under its lock); never while saved processes of a session that `fleet.py start`
-        replaced remain (closing_start): a session of the agent's own runtime that the owner closed is not started
-        here. A window of the previous runtime counts as seen (manager_seen_old), so that its end also before this
-        helper's first round starts the new runtime's session."""
+        replaced remain (closing_start), whose own window is then the standing session. A window of the previous
+        runtime counts as seen (manager_seen_old), so that its end also before this helper's first round starts the
+        new runtime's session. Once no window is there at all, the loop's own watch makes the start due at a later
+        round (manager_gone)."""
         try:
             first = self.manager_reading()
         except Refused:
@@ -2700,7 +2710,8 @@ class Helper:
         helper closed it and its processes have ended: then the new runtime's session is due. The session's processes
         are kept in a file from just before the close until they have ended (save_closing), so that this holds across
         a restart of the helper. When the owner closes that session by hand meanwhile, the switch goes on in the same
-        way; a session of the agent's own runtime that the owner closes is never started again here."""
+        way; a session of the agent's own runtime that goes while no switch is open is started again by the loop's
+        own watch of the window instead (manager_gone)."""
         if self.conf.get("role") != "manager":
             return False
         if self.manager_left:           # processes of the closed session that did not end yet
@@ -2856,11 +2867,41 @@ class Helper:
         with contextlib.suppress(urllib.error.URLError, OSError, ValueError):
             http("POST", f"/helper/dialog/{self.agent}/manager", {}, timeout=10)
 
+    def manager_gone(self):
+        """True when no standing manager window is there and nothing is closing or starting one, so its start is due
+        again.
+
+        The manager is the one agent whose session always stands, so its availability is the fleet's. Until
+        19 October 2026 nothing watched that window: the start was due at the helper's start, after a sign-in
+        (restart_after_login) and after a switch, and at no other moment. So a session that ended by itself — a
+        crash, a runtime error, an out-of-memory kill, `tmux kill-window` — stayed gone. The hub raised
+        `manager_down`, the app showed it, and the only way back was `systemctl --user restart fleet-<agent>` on
+        that machine, by hand, once somebody noticed. The owner proved it on the hub machine that night: the window
+        was killed and the manager was still gone five minutes later.
+
+        The care of the rounds that already exist is kept. A reading that tmux does not answer is unknown, never
+        "no window" (manager_reading). A window that still runs the previous runtime is a window: retire_old_manager
+        closes it and makes the start due itself. While such a close is open — its processes have not ended
+        (manager_left), its lock is still held, or a session of the previous runtime was seen (manager_seen_old) —
+        this says nothing, because that close owns the start and holds its order. A start is tried at most each
+        10 seconds (manage), and start_manager reads the windows again under the start lock, so a window that is
+        starting is never fought over."""
+        if self.manager_left or self.manager_lock is not None or self.manager_seen_old is not None:
+            return False
+        try:
+            return self.manager_reading() is None
+        except Refused:
+            return False
+
     def manage(self):
         """One round of the standing manager session in the helper's loop. Its start is due (manager_due) when the
-        helper's start found no window, or when this helper closed the previous runtime's session after a switch; it
-        is tried at most each 10 seconds, and it stays due until a start succeeds, also when a later step of the round
-        fails. A session of the agent's own runtime that the owner closes is never started again here."""
+        helper's start found no window, when this round finds none (manager_gone), when this helper closed the
+        previous runtime's session after a switch, or when the owner pressed the control that the hub's manager_down
+        warning carries (owner feature manager_start); it is tried at most each 10 seconds, and it stays due until a
+        start succeeds, also when a later step of the round fails."""
+        if self.conf.get("role") == "manager" and not self.manager_due and self.manager_gone():
+            self.manager_due = True
+            self.say_manager("manager: its session is not running; the helper starts it again")
         if self.manager_due and (self.manager_tried is None or time.monotonic() - self.manager_tried > 10):
             self.manager_tried = time.monotonic()
             self.manager_due = self.start_manager()

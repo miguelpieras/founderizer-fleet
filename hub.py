@@ -474,7 +474,8 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "agent_messages", "google", "mcp", "mcp_check", "mcp_program", "servers", "responsibilities",
                "server_prepare",
                "mobile", "attachments", "resource_grants", "machine_signin",
-               "releases", "entitlement", "agent_signin", "github_app", "need_options", "restore"]
+               "releases", "entitlement", "agent_signin", "github_app", "need_options", "restore",
+               "manager_start"]
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 
 
@@ -791,7 +792,7 @@ def filed_under(agent, kind, task):
 
 def emit(agent, kind, text, task=None, extra=None):
     """Queue a message for one agent's helper. Kinds: task, say, chat, stop, control, signin, handover, create,
-    capture, request, notify, mcp_program."""
+    capture, request, notify, mcp_program, manager_start."""
     return ins(EVENT, (agent, kind, filed_under(agent, kind, task), str(text), now(), json.dumps(extra or {})))
 
 
@@ -7138,11 +7139,13 @@ def duty_review_watch(agent, by, t0):
     body = {"agent": agent, "check": None, "late_minutes": 240, "max_tasks_per_day": 2, "request_id": str(uuid.uuid4()),
             "schedule": {"kind": "daily", "time": f"{hour:02d}:00", "days": None, "timezone": str(zone)},
             "task": {"title": "Put your duties in order", "needs": "none", "goal_id": None,
-                     "details": "Call see_responsibilities. For each of your duties: make the first step of a case "
-                                "that waits, record a close-out step that is missing, repair a watch that is broken, "
-                                "and open a case with open_case for anything that you find yourself. Then give one "
-                                "line for each duty in your result: is it in order, and what did you do. Ask your "
-                                "requester only for what the duty does not cover.",
+                     "details": "Call see_responsibilities. For each of your duties: work an open case that "
+                                "waits, record what you did with record_step, repair a watch that is broken, and "
+                                "open a case with open_case for anything that you find yourself. Look at the "
+                                "repeats: a key that came back is a preventive action that did not work, so say "
+                                "what you will do differently. Then give one line for each duty in your result: is "
+                                "it in order, and what did you do. Ask your requester only for what the duty does "
+                                "not cover.",
                      "done_when": "Each duty of this agent is in order, or its problem is named in the result, and "
                                   "each case that waited has its first step."}}
     if not trigger_slots(body["schedule"], t0, t0, 1):
@@ -7253,7 +7256,11 @@ def duty_view(r, t0=None):
     t0 = t0 or now()
     cases = q("SELECT * FROM duty_cases WHERE responsibility=? ORDER BY id", (r["id"],))
     live = [c for c in cases if c["state"] == "open"]
-    recent = [c for c in cases if c["opened"] > t0 - DUTY_REPEAT_DAYS * 86400]
+    window = DUTY_REPEAT_DAYS * 86400
+    recent = [c for c in cases if c["opened"] > t0 - window]
+    # The window before it, so that "fewer repeats" can be read without counting anything new: a repeat is the
+    # measure of a preventive action that did not work, and the rate matters, not the count alone.
+    before = [c for c in cases if t0 - 2 * window < c["opened"] <= t0 - window]
     return {"id": r["id"], "agent": r["agent"], "title": duty_name(r["text"]), "text": r["text"],
             "state": r["state"],
             "revision": r["revision"], "created": r["created"], "updated": r["updated"], "created_by": r["created_by"],
@@ -7261,6 +7268,8 @@ def duty_view(r, t0=None):
             "watch": [duty_watch_view(t, t0) for t in duty_watches(r["id"], live=False)],
             "open_cases": len(live), "cases_30d": len(recent),
             "repeats_30d": len([c for c in recent if c["repeated"]]),
+            "cases_prev_30d": len(before),
+            "repeats_prev_30d": len([c for c in before if c["repeated"]]),
             "last_case": duty_case_view(cases[-1]) if cases else None,
             "cases": [duty_case_view(c) for c in live],
             "marker": {"kind": r["marker_kind"], "since": r["marker_since"], "detail": r["marker_detail"]}
@@ -7430,7 +7439,9 @@ def duty_text(r, t0, every_case=False):
                    + (f", next {goal_time(w['next_due'])}" if w["next_due"] else "")
                    + (f", check {w['check']['path']} {CHECK_OPS[w['check']['condition']['op']]} "
                       f"{w['check']['condition']['value']}" if w["check"] else ""))
-    out.append(f"  Cases: {v['open_cases']} open, {v['cases_30d']} in 30 days, {v['repeats_30d']} of them a repeat.")
+    out.append(f"  Cases: {v['open_cases']} open, {v['cases_30d']} in 30 days, {v['repeats_30d']} of them a repeat"
+               + (f"; the 30 days before that, {v['repeats_prev_30d']} of {v['cases_prev_30d']}."
+                  if v["cases_prev_30d"] else "."))
     if v["marker"]:
         out.append(f"  NOT IN ORDER: {v['marker']['kind'].replace('_', ' ')}. {v['marker']['detail']}")
     if every_case:
@@ -14161,7 +14172,11 @@ def health_view():
                  agent=m["agent"])
     flag = manager_warning()
     if flag:
+        # A session that is not running is the one manager warning that a button settles: the app asks that
+        # machine's helper to start it (owner feature manager_start). The others — a usage limit, a question on its
+        # own screen, a silence, a switch that has not finished — are put right where its session is.
         warn("manager_" + flag["kind"], kv_get("mgr_flag"),
+             f"Start the session of {manager_name().capitalize()} again." if flag["kind"] == "down" else
              f"Open {manager_name().capitalize()}, where its session and its machine are.", agent=manager_name())
     free = None
     try:
@@ -15266,6 +15281,34 @@ class Handler(BaseHTTPRequestHandler):
             return {"agent": agent, "state": request_update(agent, desired), "desired_revision": desired}
 
         return self.ui_command(f"machines/{agent}/update", read, act)
+
+    def ui_machine_manager(self, agent):
+        """POST /ui/machines/<agent>/manager: ask this machine's helper to start the standing manager session
+        (owner feature manager_start).
+
+        The `manager_down` warning said "The manager session is not running. Start it again." and the app could
+        offer nothing but that agent's own page, which is a place to look, not a thing to press (the owner,
+        19 October 2026). Since that night the helper's own loop starts a missing session by itself
+        (`fleet.manage`, `Helper.manager_gone`), so this is the owner's hand on the same switch: for a start that
+        keeps failing, and for the ten seconds he does not want to wait.
+
+        It asks and nothing more: the event only makes the start due, and the helper reads its windows again under
+        the start lock, so a session that runs is never closed, replaced or fought over. So pressing it twice, or
+        pressing it after the session came back, changes nothing. The standing session is the manager's alone, so
+        the route refuses every other agent instead of asking a helper that has none."""
+        def read(data):
+            return {"agent": agent}
+
+        def act(body):
+            if agents().get(agent) is None:
+                raise Refusal(404, "no such agent")
+            if agents()[agent].get("role") != "manager":
+                raise Refusal(409, "only the manager has a standing session")
+            emit(agent, "manager_start", "Start the manager session")
+            log("owner", f"asked {agent} to start its manager session")
+            return {"agent": agent, "state": "requested"}
+
+        return self.ui_command(f"machines/{agent}/manager", read, act)
 
     # ---- the release channel (owner features releases and entitlement)
     def ui_releases(self, query):
@@ -18256,6 +18299,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_machine_update(parts[2])
         if len(parts) == 4 and parts[:2] == ["ui", "machines"] and parts[3] == "check":
             return self.ui_machine_check(parts[2])
+        if len(parts) == 4 and parts[:2] == ["ui", "machines"] and parts[3] == "manager":
+            return self.ui_machine_manager(parts[2])
         if parts == ["ui", "releases", "check"]:            # owner feature releases
             return self.ui_release_check()
         if parts == ["ui", "releases", "update"]:
