@@ -50,7 +50,7 @@ import urllib.request
 # The configuration ref and the baseline of selftest.py belong to other packages; this module reads them and
 # changes neither, so the three can never disagree about what "up to date" or "a pass" means.
 from lifecycle import CONFIG_BRANCH
-from verify import SELFTEST_BASELINE
+from verify import OWNER_STEPS, SELFTEST_BASELINE
 
 # Where a release comes from, and where the manifest is asked for. Both are defaults: the hub overrides them from
 # its own configuration (hub.releases region), because P7 settles the host of the channel and the address of the
@@ -712,7 +712,10 @@ class Update:
                                   timeout=self.verify_wait, cwd=self.clone)
         try:
             results = json.loads(out)
-            bad = [one["check"] for one in results if one.get("state") == "fail"]
+            # A check the owner alone can pass says nothing about the release (verify.OWNER_STEPS): a fleet that has
+            # never been signed in would otherwise be held at its first revision for ever.
+            bad = [one["check"] for one in results
+                   if one.get("state") == "fail" and one.get("check") not in OWNER_STEPS]
         except (ValueError, TypeError, KeyError):
             return self.answer(ROLLED_BACK, "verify", f"fleet.py verify did not answer for release {version}: "
                                                       f"{_line(err or out) or 'no output'}. The fleet stays at "

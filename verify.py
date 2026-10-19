@@ -55,6 +55,12 @@ AGENT_CHECKS = ("services", "runtime_installed", "runtime_signed_in")
 # or the code's. The name stays, because releases.py reads it and the release check and `fleet.py verify` must not
 # drift apart about what a pass is; a baseline that ever has to be recorded again goes here.
 SELFTEST_BASELINE = ()
+
+# The checks a release cannot be judged by, because no release can pass them for the owner: signing a machine in to
+# its provider is the owner's own step, in the app, and a fleet whose owner has not taken it yet is not an unhealthy
+# fleet — it is a new one. releases.Update reads this, so the release gate and `fleet.py verify` agree about which
+# failures are the code's. Everything else a release can break stays in the gate.
+OWNER_STEPS = ("runtime_signed_in",)
 SELFTEST_WAIT = 300         # it waits for the hub's own timers, so about a minute on a quiet machine
 CLOCK_LIMIT = 60            # seconds: a minute, because token expiry and signatures depend on this clock
 DISK_FAIL, DISK_WARN = 1.0, 5.0         # GiB free for the database and the checkouts
