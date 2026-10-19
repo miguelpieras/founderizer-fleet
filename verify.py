@@ -114,6 +114,18 @@ def _line(text):
     return " ".join(str(text).split())[:300]
 
 
+def _said(text):
+    """One line the owner reads in the app, so it starts with a capital (the owner, 19 October 2026: every message
+    he reads starts with one). A line that starts with a name this machine itself uses keeps that name as it is: a
+    unit (fleet-hub), a file (team.json), an address, a count or a revision. So the rule reaches the words and not
+    the names, and a fix that is a command to paste keeps the command's own spelling."""
+    line = _line(text)
+    head = line.split(" ", 1)[0]
+    if head[:1].islower() and head.isalpha() and not re.fullmatch(r"[0-9a-f]{7,}", head):
+        return line[0].upper() + line[1:]
+    return line
+
+
 def _passwd(user):
     """(uid, home) of an OS user, or None when this machine has no such user. The password database is readable
     without root, which is how this check knows whose services and whose credential it must read."""
@@ -276,7 +288,8 @@ class Verify:
             return self.answer(WARN, f"{', '.join(self.unit(n) for n in seen)} run, but "
                                      f"{', '.join(no_linger)} {'has' if len(no_linger) == 1 else 'have'} no "
                                      f"lingering, so they stop at a reboot",
-                               "loginctl enable-linger --no-ask-password " + " ".join(no_linger))
+                               "let them run without a login: loginctl enable-linger --no-ask-password "
+                               + " ".join(no_linger))
         return self.answer(OK, f"{', '.join(self.unit(n) for n in seen)} are active and enabled")
 
     def hub_answers(self):
@@ -284,7 +297,7 @@ class Verify:
         if not self.is_hub:
             return None
         if not self.hub:
-            return self.answer(FAIL, "team.json gives the hub no address, so no machine can reach it",
+            return self.answer(FAIL, "this checkout's team.json gives the hub no address, so no machine can reach it",
                                "run on the hub: python3 fleet.py addresses hub=$(tailscale ip -4)")
         code, body, _ = self.fetch(self.hub + "/health")
         try:
@@ -340,7 +353,7 @@ class Verify:
         if state is False:
             return self.answer(FAIL, f"the firewall is off ({how})",
                                "turn it on in System Settings > Network > Firewall" if self.platform == "darwin"
-                               else "sudo ufw --force enable")
+                               else "turn it on: sudo ufw --force enable")
         return self.answer(WARN, f"the firewall could not be read ({how})",
                            "read it by hand: " + ("socketfilterfw --getglobalstate" if self.platform == "darwin"
                                                   else "ufw status"))
@@ -423,12 +436,12 @@ class Verify:
         """selftest.py passes against its recorded baseline, which is not zero failures (COORDINATION.md rule 5)."""
         path = os.path.join(self.kit, "selftest.py")
         if not os.path.exists(path):
-            return self.answer(FAIL, f"selftest.py is not in {self.kit}, so this checkout cannot check itself",
+            return self.answer(FAIL, f"this checkout has no selftest.py in {self.kit}, so it cannot check itself",
                                "fetch the checkout again")
         code, out, err = self.run([sys.executable, path], timeout=self.selftest_wait)
         summary = self.summary(out)
         if not summary:
-            return self.answer(FAIL, f"selftest.py did not answer in {self.selftest_wait} seconds: "
+            return self.answer(FAIL, f"the self-test did not answer in {self.selftest_wait} seconds: "
                                      f"{_line(err or out) or 'no output'}",
                                f"run it by hand: cd {self.kit} && python3 selftest.py")
         passed, total, failed = summary
@@ -438,7 +451,7 @@ class Verify:
             return self.answer(FAIL, f"{says}, and {len(new)} of the failures are not expected: {', '.join(new)}",
                                f"run it by hand: cd {self.kit} && python3 selftest.py -v")
         if code != 0 and not failed:
-            return self.answer(FAIL, f"selftest.py ended with {code}: {says}",
+            return self.answer(FAIL, f"the self-test ended with {code}: {says}",
                                f"run it by hand: cd {self.kit} && python3 selftest.py")
         return self.answer(OK, says + (f"; the {len(failed)} failures are the recorded baseline" if failed else ""))
 
@@ -481,7 +494,7 @@ class Verify:
                                f"put the rule right in {os.path.join(self.kit, 'team.json')}: a hub runs this "
                                f"file as it is, and refuses every owner write of it until the rule is met")
         machines = {a.get("machine") for a in (self.conf.get("agents") or {}).values()}
-        return self.answer(OK, f"team.json is one a hub can run: "
+        return self.answer(OK, f"this team.json is one a hub can run: "
                                f"{_count(len(self.conf.get('agents') or {}), 'agent')} on "
                                f"{_count(len(machines), 'machine')}")
 
@@ -556,17 +569,18 @@ class Verify:
 
     def start_fix(self, units, holders=None):
         if self.platform == "darwin":
-            return f"launchctl kickstart gui/{os.getuid()}/{units[0]}"
+            return f"start it again: launchctl kickstart gui/{os.getuid()}/{units[0]}"
         user = self.holder_of(units[0], holders or {})
         mine = [u for u in units if self.holder_of(u, holders or {}) == user]
-        return self.as_line(user, "systemctl --user restart " + " ".join(mine))
+        return "start it again: " + self.as_line(user, "systemctl --user restart " + " ".join(mine))
 
     def enable_fix(self, units, holders=None):
         if self.platform == "darwin":
-            return f"launchctl bootstrap gui/{os.getuid()} ~/Library/LaunchAgents/{units[0]}.plist"
+            return (f"make it come back after a reboot: launchctl bootstrap gui/{os.getuid()} "
+                    f"~/Library/LaunchAgents/{units[0]}.plist")
         user = self.holder_of(units[0], holders or {})
         mine = [u for u in units if self.holder_of(u, holders or {}) == user]
-        return self.as_line(user, "systemctl --user enable " + " ".join(mine))
+        return "make it come back after a reboot: " + self.as_line(user, "systemctl --user enable " + " ".join(mine))
 
     def backend_state(self):
         ts = self.tailscale()
@@ -678,7 +692,7 @@ class Verify:
         return f"{says}, and {unread}" if unread else says
 
     def answer(self, state, says, fix=None):
-        return {"check": self.asking, "state": state, "says": _line(says), "fix": _line(fix) if fix else None}
+        return {"check": self.asking, "state": state, "says": _said(says), "fix": _said(fix) if fix else None}
 
     def unanswered(self):
         """The agents of this machine that a check which reads an agent does not answer for, each as (one line,

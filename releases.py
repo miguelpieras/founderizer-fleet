@@ -438,6 +438,16 @@ def _line(text):
     return " ".join(str(text or "").split())[:400]
 
 
+def _said(text):
+    """One line the owner reads on the app's Updates page, so it starts with a capital (the owner, 19 October 2026).
+    A line that starts with a name this fleet itself uses keeps it: a revision, a branch or a version."""
+    line = _line(text)
+    head = line.split(" ", 1)[0]
+    if head[:1].islower() and head.isalpha() and not re.fullmatch(r"[0-9a-f]{7,}", head):
+        return line[0].upper() + line[1:]
+    return line
+
+
 def selftest_summary(out):
     """(passed, of, everything it failed, the failures that are not in the baseline) from selftest.py's own last
     line, or None when it printed no summary. The baseline is COORDINATION.md rule 5, read from verify.py so that
@@ -509,7 +519,7 @@ class Update:
         return self.run(["git", "-C", cwd or self.kit, *args], timeout=timeout)
 
     def answer(self, state, step, says):
-        return {"state": state, "step": step, "says": _line(says), "pinned": self.pinned, "reached": self.reached,
+        return {"state": state, "step": step, "says": _said(says), "pinned": self.pinned, "reached": self.reached,
                 "revision": self.manifest["revision"], "version": self.manifest["version"]}
 
     # ---- the run

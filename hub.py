@@ -4943,7 +4943,8 @@ def parse_wake(value):
 def t_see_goals(agent, a):
     rows = q("SELECT * FROM goals ORDER BY id")
     if not rows:
-        return "No goals yet. The owner creates goals in the app. Owner chat messages stay plain requests."
+        return ("No goals yet. A goal comes from the owner's own words: when he says in chat what he wants the fleet "
+                "to reach, write it down with update_goal (no goal, with title and text). Chat is still no task.")
     out = []
     for g in rows:
         v = goal_view(g)
@@ -4968,7 +4969,36 @@ def t_see_goals(agent, a):
     return "\n".join(out)
 
 
+def goal_from_words(agent, a):
+    """A goal the owner asked for in his chat, written down. He fills in no form: he says what he wants the fleet to
+    reach, and the agent that heard it records it here. The goal carries no limits, so every spend on it stays the
+    owner's to approve (record_spend refuses one without a budget)."""
+    try:
+        title = goal_text(a.get("title"), "title", 200, True)
+        text = goal_text(a.get("text"), "text", 8000)
+    except ValueError as e:
+        raise ToolError(f"To write down a new goal, leave goal out and give a title and the goal itself: {e}.") from None
+    guard(agent, title, text)
+    command, stored = agent_write(agent, "update_goal", a, {"title": title, "text": text})
+    if stored:
+        return stored["text"]
+    t0 = now()
+    limits = json.dumps({"money": None, "tokens": None, "deadline": None, "not_to_do": []})
+    with transaction():
+        gid = DB.execute("INSERT INTO goals(title,text,state,revision,limits,created,updated,request_id) "
+                         "VALUES(?,?,'active',1,?,?,?,?)", (title, text, limits, t0, t0, command[1])).lastrowid
+        DB.execute("INSERT INTO goal_history(goal,ts,by,kind,detail) VALUES(?,?,?,?,?)",
+                   (gid, t0, agent, "created", title))
+        said = (f"{gref(gid)} is written down: {title}. Plan it: create its tasks with goal=\"{gref(gid)}\", then "
+                f"call update_goal with a next step or a wake_at date. It has no money budget, so raise Needs you "
+                f"before any spend.")
+        keep_command(command, {"goal": gid, "text": said}, t0)
+    return said
+
+
 def t_update_goal(agent, a):
+    if a.get("goal") in (None, ""):
+        return goal_from_words(agent, a)
     g = goal_ref(a.get("goal"))
     if g["state"] in ("done", "dropped"):
         raise ToolError(f"{gref(g['id'])} is {g['state']}. Only the owner can reopen it.")
@@ -8062,12 +8092,17 @@ TOOLS = [
      "See every owner goal with its limits, recorded spending, next step, attention marker and tasks.",
      S({})),
     ("manager", "update_goal", t_update_goal,
-     "Keep a goal moving: set its next step (and the task that carries it) or a wake_at date when you look at it again, "
-     "add a short review note, or close it with result when its work is done and checked.",
-     S({"goal": {"type": "string", "description": "Goal id, for example G-3"}, "next_step": STR,
+     "Write a goal down, or keep one moving. The owner sets no goal in the app: when he says in chat what he wants "
+     "the fleet to reach, record it here with title, text and a request_id, and leave goal out. With goal: set its "
+     "next step (and the task that carries it) or a wake_at date when you look at it again, add a short review note, "
+     "or close it with result when its work is done and checked.",
+     S({"goal": {"type": "string", "description": "Goal id, for example G-3. Leave it out for a new goal"},
+        "title": {"type": "string", "description": "A new goal's name in one line, in the owner's own sense"},
+        "text": {"type": "string", "description": "A new goal: what the owner wants reached, in his own words"},
+        "request_id": {"type": "string", "description": "A new UUID, for a new goal"}, "next_step": STR,
         "next_task": {"type": "string", "description": "The task of the next step, for example T-7"},
         "wake_at": {"type": "string", "description": "ISO date or date and time, for example 2026-10-14T09:00"},
-        "note": STR, "result": STR}, ["goal"])),
+        "note": STR, "result": STR})),
     ("manager", "record_spend", t_record_spend,
      "Record money for a goal before you approve the spend. The hub refuses a spend beyond the goal's money limit; "
      "then raise Needs you.",
@@ -10604,36 +10639,36 @@ def tick():
         pending = q1("SELECT MIN(created) ts FROM events WHERE agent=? AND kind='say' AND read_at IS NULL", (mgr,))["ts"]
         if pending and t0 - max(float(pending), limit_ended(mgr), switch_ended(mgr)) > CFG["manager_silence"]:
             kind = "silent"
-            flag = (f"the manager has not acted on a message for {span(t0 - float(pending))}. "
+            flag = (f"The manager has not acted on a message for {span(t0 - float(pending))}. "
                     f"Open its session.")
         lim = active_limit(mgr)
         if lim:
             kind = "limited"
-            flag = (f"the manager reached its usage limit. Its messages wait until {clock(lim['until'])}"
+            flag = (f"The manager reached its usage limit. Its messages wait until {clock(lim['until'])}"
                     + ("." if lim["reset_known"] else ", one hour after the limit was seen, because no reset time was given.")
                     + " If its session shows the rate-limit menu, answer it on that machine. The helper never answers it.")
         asks = kv_get("mgr_screen")
         if asks and t0 - float(asks) < 90:
             kind = "screen"
-            flag = "the manager's session shows a question on its own screen. Open its session and answer it."
+            flag = "The manager's session shows a question on its own screen. Open its session and answer it."
         row = q1("SELECT * FROM agents WHERE name=?", (mgr,))
         # A window list from before the end of a switch can still lack the new session's window (switch_ended).
         if row and row["alive_ts"] and t0 - row["alive_ts"] < 60 and "manager" not in (row["alive"] or "").split(",") \
                 and row["alive_ts"] > switch_ended(mgr):
             kind = "down"
-            flag = "the manager session is not running. Start it again."
+            flag = "The manager session is not running. Start it again."
         # Its runtime switch waits for the new session: no reader yet, so neither down nor silent. A usage limit or a
         # question of the new session still shows, and a switch that does not finish becomes a warning of its own.
         if manager_held(mgr) and kind in (None, "silent", "down"):
             since, runtime = float(kv_get("switching:" + mgr)), agents()[mgr].get("runtime")
             if t0 - since > SWITCH_STALL:
                 kind = "switch_stalled"
-                flag = (f"the manager's switch to {runtime} has not finished for {span(t0 - since)}, and its messages "
+                flag = (f"The manager's switch to {runtime} has not finished for {span(t0 - since)}, and its messages "
                         "wait. Open its session on its machine: the previous session can wait for an answer there, or "
                         "the new one does not run. If its Fleet update failed, update its machine in Fleet.")
             else:
                 kind = "switching"
-                flag = f"the manager switches to {runtime}. Its messages wait until its new session runs."
+                flag = f"The manager switches to {runtime}. Its messages wait until its new session runs."
         if kind != kv_get("mgr_flag_kind"):
             kv_set("mgr_flag_kind", kind)
             kv_set("mgr_flag", flag)
@@ -13870,14 +13905,16 @@ def health_view():
         offline = not seen or t0 - seen > CFG.get("offline_after", 90)
         helpers.append({"agent": name, "last_seen": seen, "offline": offline})
         if offline:
-            warnings.append({"kind": "helper_offline", "detail": f"{name}'s helper has not checked in since "
+            warnings.append({"kind": "helper_offline", "detail": f"{name.capitalize()}'s helper has not checked in since "
                              f"{clock(seen) if seen else 'the hub started'}."})
     for m in machines:
         if m["stale"]:
-            warnings.append({"kind": "machine_stale", "detail": f"{m['agent']} has sent no machine status for ten minutes."})
+            warnings.append({"kind": "machine_stale",
+                             "detail": f"{m['agent'].capitalize()} has sent no machine status for ten minutes."})
         elif m["update"]["state"] in ("behind", "failed"):
             warnings.append({"kind": "machine_" + m["update"]["state"],
-                             "detail": f"{m['agent']} does not run the hub revision {(desired or '')[:12]}."})
+                             "detail": f"{m['agent'].capitalize()} does not run the hub revision "
+                                       f"{(desired or '')[:12]}."})
     flag = manager_warning()
     if flag:
         warnings.append({"kind": "manager_" + flag["kind"], "detail": kv_get("mgr_flag")})

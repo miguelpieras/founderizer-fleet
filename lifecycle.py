@@ -782,7 +782,7 @@ class Lifecycle:
                          ["git", "-C", self.kit, "merge", "-q", "--ff-only", target]):
                 code, out, err = self.run(argv, timeout=120)
                 if code != 0:
-                    return self.fail("git %s failed: %s" % (argv[3], (err or out).strip()[-300:]))
+                    return self.fail("The checkout could not %s: %s" % (argv[3], (err or out).strip()[-300:]))
         if desired and not (self.revision() or "").startswith(desired) and not self.has(desired):
             return self.fail("The checkout is not at the requested revision.")
         with self.lock:

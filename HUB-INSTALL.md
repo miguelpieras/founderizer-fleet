@@ -244,10 +244,10 @@ and the installer prints every line it answers:
 
 ```
   ok    services: fleet-hub, fleet-git, fleet-manager are active and enabled
-  ok    hub_answers: the hub answers http://100.80.1.2:8765/health for manager
-  ok    owner_claimed: the owner of this hub is the Mac at 100.80.1.3
+  ok    hub_answers: The hub answers http://100.80.1.2:8765/health for manager
+  ok    owner_claimed: The owner of this hub is the Mac at 100.80.1.3
   ...
-  fail  runtime_signed_in: manager is not signed in to claude  (fix: sign this machine in from the app: Machines, then Sign in)
+  fail  runtime_signed_in: Manager is not signed in to claude  (fix: Sign this machine in from the app: Machines, then Sign in)
 NOT READY: runtime_signed_in
 ```
 
