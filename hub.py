@@ -183,6 +183,7 @@ CREATE TABLE IF NOT EXISTS duty_history(id INTEGER PRIMARY KEY, responsibility I
 CREATE TABLE IF NOT EXISTS memories(id INTEGER PRIMARY KEY, agent TEXT NOT NULL, about TEXT NOT NULL,
   text TEXT NOT NULL, prevents TEXT NOT NULL, created REAL NOT NULL, by_task INTEGER, request_id TEXT NOT NULL,
   recalls INTEGER NOT NULL DEFAULT 0, recalled REAL,
+  responsibility INTEGER, prevents_key TEXT, contradicted INTEGER NOT NULL DEFAULT 0, contradicted_at REAL,
   dropped REAL, dropped_by TEXT, drop_reason TEXT);
 CREATE INDEX IF NOT EXISTS memory_agent ON memories(agent, dropped, id);
 CREATE TABLE IF NOT EXISTS tool_commands(agent TEXT NOT NULL, request_id TEXT NOT NULL, tool TEXT NOT NULL,
@@ -282,18 +283,6 @@ def q1(sql, args=()):
     return rows[0] if rows else None
 
 
-def rq(sql, args=()):
-    """A read that commits nothing, so it is also safe inside transaction(): q and q1 each commit at once, and a
-    commit there would break the all-or-none writes of the caller."""
-    with LOCK:
-        return DB.execute(sql, args).fetchall()
-
-
-def rq1(sql, args=()):
-    rows = rq(sql, args)
-    return rows[0] if rows else None
-
-
 def ins(sql, args=()):
     with LOCK:
         cur = DB.execute(sql, args)
@@ -306,8 +295,16 @@ def read_rows(sql, args=()):
 
     start_text reads an agent's own memories and notes, and admit_task calls start_text inside its transaction: the
     task, its first attempt and its start event are written together or not at all. q() commits at once, so a q() on
-    that path would commit the half-written task. test_runtime and test_triggers measure exactly that."""
-    return DB.execute(sql, args).fetchall()
+    that path would commit the half-written task. test_runtime and test_triggers measure exactly that. The lock is
+    the same reentrant one that q() and transaction() take, so a read from a request thread that holds none is safe
+    too: see_earlier_work reads from there."""
+    with LOCK:
+        return DB.execute(sql, args).fetchall()
+
+
+def read_row(sql, args=()):
+    rows = read_rows(sql, args)
+    return rows[0] if rows else None
 
 
 @contextlib.contextmanager
@@ -1065,6 +1062,8 @@ def migrate():
         "chat_out": {"recipient": "TEXT"},          # chat apps round 2: a Discord user ID when chat is null
         "triggers": {"failures": "INTEGER NOT NULL DEFAULT 0", "created_by": "TEXT NOT NULL DEFAULT 'owner'",
                      "responsibility": "INTEGER", "watch": "TEXT"},         # owner API 1.13: a duty's watch
+        "memories": {"responsibility": "INTEGER", "prevents_key": "TEXT",      # the duty and key
+                     "contradicted": "INTEGER NOT NULL DEFAULT 0", "contradicted_at": "REAL"},
         "machine_checks": {"verify": "TEXT", "revision": "TEXT"},
         "trigger_runs": {"check_now": "INTEGER NOT NULL DEFAULT 0", "attempts": "INTEGER NOT NULL DEFAULT 0",
                          "retry_at": "REAL", "closes": "REAL", "token": "TEXT", "sent": "REAL", "expires": "REAL",
@@ -1886,13 +1885,13 @@ def capped(lines, limit=WARM_CHARS):
 def attempt_window(task_id, attempt):
     """(from, to) of one attempt. A progress note carries no attempt of its own, and the attempt row carries the
     times, so this is how the notes, calls and records of one session are found."""
-    r = rq1("SELECT created, ended FROM attempts WHERE task=? AND attempt=?", (task_id, attempt))
+    r = read_row("SELECT created, ended FROM attempts WHERE task=? AND attempt=?", (task_id, attempt))
     return (r["created"], r["ended"] or now() + 1) if r else None
 
 
 def attempt_notes(task_id, attempt):
     w = attempt_window(task_id, attempt)
-    return rq("SELECT * FROM notes WHERE task=? AND ts>=? AND ts<=? ORDER BY id", (task_id, w[0], w[1])) if w else []
+    return read_rows("SELECT * FROM notes WHERE task=? AND ts>=? AND ts<=? ORDER BY id", (task_id, w[0], w[1])) if w else []
 
 
 def outward_done(task_id, attempt=None):
@@ -1903,7 +1902,7 @@ def outward_done(task_id, attempt=None):
     args = [task_id, *OUTWARD_TOOLS]
     if attempt is not None:
         sql, args = sql + " AND attempt=?", args + [attempt]
-    return rq(sql + " ORDER BY id", args)
+    return read_rows(sql + " ORDER BY id", args)
 
 
 def outward_line(c):
@@ -1913,7 +1912,7 @@ def outward_line(c):
 def tool_work_line(task_id, attempt):
     """One line on the tool work of an attempt, from the records its runner already wrote: how many calls it made,
     how many of them changed something, and the last few of those. One query, and never a transcript."""
-    rows = rq("SELECT data FROM thread_events WHERE task=? AND attempt=? AND type='tool_call' ORDER BY id",
+    rows = read_rows("SELECT data FROM thread_events WHERE task=? AND attempt=? AND type='tool_call' ORDER BY id",
               (task_id, attempt))
     if not rows:
         return None
@@ -1947,12 +1946,12 @@ def warm_follows(follows):
     """The opening of a task that follows another: what the earlier task did, where its output is, how it was
     checked, why it fell short, and the last of what its agent wrote down while doing it. The requester no longer
     has to remember any of that, and no longer has to write it into the details."""
-    p = rq1("SELECT * FROM tasks WHERE id=?", (follows,)) if follows else None
+    p = read_row("SELECT * FROM tasks WHERE id=?", (follows,)) if follows else None
     if not p:
         return ""
     lines = [f"WHAT CAME BEFORE. Your task follows {tref(p['id'])} ({clip(p['title'], 120)}), which {p['owner']} did."]
     lines += result_lines(p)
-    notes = rq("SELECT * FROM notes WHERE task=? ORDER BY id", (p["id"],))
+    notes = read_rows("SELECT * FROM notes WHERE task=? ORDER BY id", (p["id"],))
     if notes:
         lines.append(f"What its agent wrote down ({len(notes)} note(s), the last {min(len(notes), WARM_NOTES)}):")
         lines += [f"  - {clip(n['text'])}" for n in notes[-WARM_NOTES:]]
@@ -1993,7 +1992,7 @@ def earlier_chain(t):
     FOLLOWS_CHAIN. A worker reads the work its task continues, and nothing else."""
     chain, seen, nxt = [], {t["id"]}, t["follows"]
     while nxt and nxt not in seen and len(chain) < FOLLOWS_CHAIN:
-        p = rq1("SELECT * FROM tasks WHERE id=?", (nxt,))
+        p = read_row("SELECT * FROM tasks WHERE id=?", (nxt,))
         if not p:
             break
         chain.append(p)
@@ -2026,10 +2025,10 @@ def task_in_full(p):
     lines = [f"{tref(p['id'])} [{p['state']}] {p['title']}",
              f"  Owner: {p['owner']}; requester: {p['requester']}; done when: {clip(p['done_when'], 300)}"]
     lines += [f"  {x}" for x in result_lines(p)]
-    notes = rq("SELECT * FROM notes WHERE task=? ORDER BY id", (p["id"],))
+    notes = read_rows("SELECT * FROM notes WHERE task=? ORDER BY id", (p["id"],))
     if notes:
         lines += ["  " + x for x in notes_block(notes, "Progress notes", "  ")]
-    for qu in rq("SELECT * FROM questions WHERE task=? ORDER BY id", (p["id"],)):
+    for qu in read_rows("SELECT * FROM questions WHERE task=? ORDER BY id", (p["id"],)):
         lines.append(f"  Q-{qu['id']}: {clip(qu['text'], 200)} -> " +
                      (clip(qu["answer"], 200) if qu["answer"] is not None else "never answered"))
     sent = outward_done(p["id"])
@@ -2044,7 +2043,7 @@ def task_in_full(p):
 
 def attempt_in_full(t, attempt):
     """One earlier attempt of this task: what it wrote down, what its tools did, and what it sent outside."""
-    r = rq1("SELECT * FROM attempts WHERE task=? AND attempt=?", (t["id"], attempt))
+    r = read_row("SELECT * FROM attempts WHERE task=? AND attempt=?", (t["id"], attempt))
     lines = [f"Attempt {attempt} of {tref(t['id'])}: started {when(r['created'])}, ended " +
              (when(r["ended"]) if r["ended"] else "not recorded") + f"; it began because: {r['reason']}."]
     notes = attempt_notes(t["id"], attempt)
@@ -2056,7 +2055,7 @@ def attempt_in_full(t, attempt):
     if sent:
         lines.append(f"  What it sent outside ({len(sent)}):")
         lines += [f"    {outward_line(c)}" for c in sent]
-    found = [o for o in rq("SELECT * FROM outcomes WHERE task=? AND attempt=? ORDER BY id", (t["id"], attempt))]
+    found = [o for o in read_rows("SELECT * FROM outcomes WHERE task=? AND attempt=? ORDER BY id", (t["id"], attempt))]
     for o in found:
         lines.append(f"  O-{o['id']} {o['title']}: {o['state']}" + (f" ({o['by']}: {o['note']})" if o["note"] else ""))
     return lines
@@ -2068,10 +2067,10 @@ def earlier_hits(t, chain, find):
     hits = []
     for p in chain:
         text = "\n".join([p["title"], p["what"] or "", p["where_"] or "", p["how"] or "", p["check_note"] or ""] +
-                          [n["text"] for n in rq("SELECT text FROM notes WHERE task=?", (p["id"],))])
+                          [n["text"] for n in read_rows("SELECT text FROM notes WHERE task=?", (p["id"],))])
         if find in text.lower():
             hits.append(earlier_short(p))
-    for r in rq("SELECT * FROM attempts WHERE task=? AND attempt<? ORDER BY attempt", (t["id"], t["attempt"])):
+    for r in read_rows("SELECT * FROM attempts WHERE task=? AND attempt<? ORDER BY attempt", (t["id"], t["attempt"])):
         if any(find in n["text"].lower() for n in attempt_notes(t["id"], r["attempt"])):
             hits.append(attempt_short(t, r))
     return hits
@@ -2083,7 +2082,7 @@ def t_see_earlier_work(agent, a):
     follow-ups and restarts never has to sit in the session."""
     t = get_task(parse_task(a.get("task_id")), owner=agent)
     chain = earlier_chain(t)
-    attempts = rq("SELECT * FROM attempts WHERE task=? AND attempt<? ORDER BY attempt", (t["id"], t["attempt"]))
+    attempts = read_rows("SELECT * FROM attempts WHERE task=? AND attempt<? ORDER BY attempt", (t["id"], t["attempt"]))
 
     # One earlier task in full: the chain of this task, and nothing else.
     if a.get("task") not in (None, ""):
@@ -2273,19 +2272,42 @@ def t_ask_my_requester(agent, a):
             f"Stop working on {tref(tid)} now. The answer will arrive as a message in this session.")
 
 
+def work_was_hard(t):
+    """Why this task looks like it taught something, or None. Only from rows the hub already has: a second attempt,
+    a restart, or a task that follows one the manager refused or that failed. A refusal is the valuable one, because
+    a task can be delivered completed and still be refused against its "done when", which no counter catches."""
+    if t["attempt"] > 1:
+        return f"this was attempt {t['attempt']}"
+    if (t["restarts"] or 0) > 0:
+        return "this task was restarted"
+    before = q1("SELECT outcome, accepted, check_note FROM tasks WHERE id=?", (t["follows"],)) if t["follows"] else None
+    if before and before["accepted"] == 0:
+        return f"it follows {tref(t['follows'])}, which was not accepted: {before['check_note'] or 'no reason given'}"
+    if before and before["outcome"] in ("failed", "rejected"):
+        return f"it follows {tref(t['follows'])}, which {before['outcome']}"
+    return None
+
+
 def t_deliver_result(agent, a):
     tid = parse_task(a.get("task_id"))
     outcome = str(a.get("outcome") or "completed").strip().lower()
     what = str(a.get("what_was_done") or "").strip()
     where = str(a.get("where_output_is") or "").strip()
     how = str(a.get("how_checked") or "").strip()
+    learned = a.get("learned")
+    learned = None if learned in (None, "") else goal_text_or_error(learned, "learned", MEMORY_TEXT)
+    prevents = a.get("prevents")
+    prevents = None if prevents in (None, "") else goal_text_or_error(prevents, "prevents", MEMORY_PREVENTS)
+    if learned and not prevents:
+        raise ToolError("With learned, say in prevents what you expect it to prevent. A lesson that names nothing "
+                        "cannot be weighed later, and this one carries no case key that could contradict it.")
     if outcome not in ("completed", "failed", "rejected"):
         raise ToolError("outcome must be completed, failed or rejected.")
     if not what:
         raise ToolError("Say what was done (or, for failed or rejected, the reason).")
     if outcome == "completed" and (not where or not how):
         raise ToolError("A completed result needs where_output_is and how_checked.")
-    guard(agent, what, where, how)
+    guard(agent, what, where, how, learned or "", prevents or "")
     t = get_task(tid, owner=agent)
     if t["state"] in TERMINAL:
         raise ToolError(f"{tref(tid)} is already {t['state']}. A finished task is never reopened.")
@@ -2298,12 +2320,29 @@ def t_deliver_result(agent, a):
     q("UPDATE attempts SET ended=? WHERE task=? AND attempt=?", (now(), tid, t["attempt"]))
     end_holds(tid)
     activity(tid, "deliver_result")
+    said = ""
+    if learned:
+        # A task of a duty's case carries that case's key, so the work itself can contradict this lesson later.
+        # This is the common path, not close_case: a worker cannot close its own case while its task is open.
+        case = case_row(t["duty_case"]) if t["duty_case"] else None
+        with transaction():
+            mid = memory_from_work(agent, learned, prevents, (t["title"] or "work")[:MEMORY_ABOUT], now(), task=tid,
+                                   responsibility=case["responsibility"] if case else None,
+                                   prevents_key=case["key"] if case else None)
+        said = (f" {mref(mid)} keeps what you learned."
+                + (f" It claims to stop {cref(case)}'s key '{case['key']}' coming back, so the hub marks it "
+                   f"contradicted if it does." if case else
+                   " Nothing can contradict it, because this was not a duty's case, so it expires unless the work "
+                   "teaches it again."))
+    elif (hard := work_was_hard(t)):
+        said = (f" You recorded nothing learned and {hard}. If something would have saved that, say it in learned "
+                f"when you next deliver, or keep it now with remember.")
     duty_after_deliver(t, agent, outcome)       # owner API 1.13: a case whose steps are all recorded closes itself
     emit(t["requester"], "say",
          f"[hub] Result for {tref(tid)} ({t['title']}) from {agent}: {outcome}. Done: {what.rstrip('.')}. "
          f"Output: {(where or '-').rstrip('.')}. Checked: {(how or '-').rstrip('.')}. "
          f"-- Check it, then call check_result(task_id=\"{tref(tid)}\", accepted=true or false).", task=tid)
-    return f"Delivered. {tref(tid)} is {outcome}. You are done with it: stop now."
+    return f"Delivered. {tref(tid)} is {outcome}.{said} You are done with it: stop now."
 
 
 LEAD_TEAM_TOOLS = ("create_task", "cancel_task", "restart_task", "answer", "check_result", "decide_permission", "see_team",
@@ -7666,12 +7705,21 @@ def duty_review_watch(agent, by, t0):
                                 "something they do not say, or showed that something in them is wrong. Leave them "
                                 "as they are when nothing changed: a version that says the same thing is noise. "
                                 + NOTES_RULE +
-                                " Then give one line for each duty in your result: is it in order, and what did "
-                                "you do; and one line saying whether you changed your notes and what taught you. "
+                                " Then read what you have learned with recall. A lesson the hub has marked "
+                                "CONTRADICTED claimed to stop a case key that has come back since: it was wrong, "
+                                "or right and never acted on — rewrite it with remember so it says which, or drop "
+                                "it with forget. A lesson that names no key can never be contradicted, so it "
+                                "expires: drop the old ones that the work has not taught you again, and keep the "
+                                "ones it has. A lesson with a key that has not come back is the only one with "
+                                "evidence behind it; leave it alone. Join two that say the same thing into one. "
+                                "Then give one line for each duty in your result: is it in order, and what did "
+                                "you do; one line saying whether you changed your notes and what taught you; and "
+                                "one line on what you dropped and what you kept. "
                                 "Ask your requester only for what the duty does not cover.",
                      "done_when": "Each duty of this agent is in order, or its problem is named in the result, "
-                                  "each case that waited has its first step, and the notes are either rewritten "
-                                  "or left as they are on purpose, with the reason in the result."}}
+                                  "each case that waited has its first step, the notes are either rewritten or "
+                                  "left as they are on purpose, and every contradicted lesson has been rewritten "
+                                  "or dropped, with the reasons in the result."}}
     if not trigger_slots(body["schedule"], t0, t0, 1):
         return None
     made = trigger_create(body, by, t0, created_by=manager_name())
@@ -7853,6 +7901,8 @@ def duty_new_case(r, key, title, source, by, t0):
     """Inside the caller's transaction: one open case for one key, with the repeat mark when the same key came back
     inside DUTY_REPEAT_DAYS. Returns the case id."""
     old = DB.execute(DUTY_REPEAT_CASE, duty_repeat_args(r["id"], key, t0)).fetchone()
+    if old:                 # the verdict of the loop, and the hub works it out: no agent asserts this about itself
+        memory_contradicted(r["id"], key, r["agent"], t0)
     return DB.execute("INSERT INTO duty_cases(responsibility,key,title,source,state,opened,by,repeated) "
                       "VALUES(?,?,?,?,'open',?,?,?)",
                       (r["id"], key, title[:200], source, t0, by, 1 if old else 0)).lastrowid
@@ -7870,6 +7920,12 @@ def duty_first_step(task_id, t0):
     """The first step of a case: the first tool call of any task of that case."""
     q("UPDATE duty_cases SET first_step=? WHERE id=(SELECT duty_case FROM tasks WHERE id=?) AND first_step IS NULL "
       "AND state='open'", (t0, task_id))
+
+
+def t_of_case(case_id):
+    """The newest task of a case, so a lesson written when it closed says which work taught it."""
+    row = q1("SELECT id FROM tasks WHERE duty_case=? ORDER BY id DESC LIMIT 1", (case_id,))
+    return row["id"] if row else None
 
 
 def duty_close(c, outcome, by, note=""):
@@ -8208,8 +8264,10 @@ def t_close_case(agent, a):
     if outcome not in DUTY_OUTCOMES:
         raise ToolError(f"outcome must be one of {', '.join(DUTY_OUTCOMES)}.")
     note = duty_one_line(a.get("note"), "note", 500)
-    guard(agent, note)
-    fields = {"case": c["id"], "outcome": outcome, "note": note}
+    learned = a.get("learned")
+    learned = None if learned in (None, "") else goal_text_or_error(learned, "learned", MEMORY_TEXT)
+    guard(agent, note, learned or "")
+    fields = {"case": c["id"], "outcome": outcome, "note": note, "learned": learned}
     command, stored = agent_write(agent, "close_case", a, fields)
     if stored:
         return stored["text"]
@@ -8226,6 +8284,15 @@ def t_close_case(agent, a):
         DB.execute("INSERT INTO duty_history(responsibility,ts,by,kind,detail) VALUES(?,?,?,'case_closed',?)",
                    (r["id"], t0, agent, f"{cref(c)} {outcome}: {note}"))
         text = f"{cref(c)} is closed ({outcome})."
+        if learned:
+            # The key is what makes it checkable later: the same event again contradicts this lesson by itself.
+            mid = memory_from_work(agent, learned, f"{rref(r['id'])} opening a case with the key '{c['key']}' again",
+                                   duty_name(r["text"])[:MEMORY_ABOUT], t0, task=t_of_case(c["id"]),
+                                   responsibility=r["id"], prevents_key=c["key"])
+            DB.execute("INSERT INTO duty_history(responsibility,ts,by,kind,detail) VALUES(?,?,?,'learned',?)",
+                       (r["id"], t0, agent, f"{mref(mid)} from {cref(c)}: {learned}"))
+            text += (f" {mref(mid)} keeps what you learned, and it claims to stop the key '{c['key']}' coming back. "
+                     f"If it comes back, the hub marks this lesson contradicted and your next review reads that.")
         keep_command(command, {"case": c["id"], "text": text}, t0)
     if outcome == "failed":
         emit(manager_name(), "say", f"[duty {rref(r['id'])}] {agent} closed {cref(c)} as failed: {note}. The watch "
@@ -8434,6 +8501,7 @@ def memory_line(m):
     """One memory in one line, for a list. A forgotten one carries its reason, which is the point of reading it."""
     said = " ".join(m["text"].split())
     return (f"  {mref(m['id'])} [{m['about']}] {said[:160]}" + ("…" if len(said) > 160 else "")
+            + (f" — CONTRADICTED {m['contradicted']}x" if m["contradicted"] else "")
             + (f" — forgotten by {m['dropped_by']}: {m['drop_reason']}" if m["dropped"] else ""))
 
 
@@ -8446,6 +8514,17 @@ def memory_block(m, full=False):
               + (f", last {goal_time(m['recalled'])}" if m["recalled"] else "") if full else "")]
     out.append("  " + m["text"].replace("\n", "\n  "))
     out.append("  It is here to prevent: " + m["prevents"])
+    if m["prevents_key"]:
+        out.append(f"  Checkable: it claims to stop {rref(m['responsibility'])} opening a case with the key "
+                   f"'{m['prevents_key']}' again."
+                   + (f" That key HAS come back {m['contradicted']} time"
+                      f"{'s' if m['contradicted'] != 1 else ''} since, last {goal_time(m['contradicted_at'])}: this "
+                      f"lesson was wrong, or right and never acted on. Rewrite it or forget it."
+                      if m["contradicted"] else " It has not come back since, which is the only evidence any lesson "
+                                               "here has."))
+    elif not m["dropped"]:
+        out.append("  Nothing can contradict this one: it came out of an ordinary task and names no key, so it "
+                   "expires unless the work teaches it again.")
     if m["dropped"]:
         out.append(f"  Forgotten {goal_time(m['dropped'])} by {m['dropped_by']}: {m['drop_reason']}")
     return out
@@ -8487,6 +8566,34 @@ def t_remember(agent, a):
                   "fact about a product belongs in that product's repository, and this memory is the pointer to it.")
         keep_command(command, {"memory": mid, "text": said}, t0)
     return said
+
+
+def memory_from_work(agent, text, prevents, about, t0, task=None, responsibility=None, prevents_key=None):
+    """Inside the caller's transaction: one lesson written by the work that taught it, rather than by an agent that
+    remembered to call remember. close_case and deliver_result write here.
+
+    `responsibility` and `prevents_key` are what make the lesson checkable: a lesson written when a case closed
+    claims to prevent that case's key, so when the key comes back duty_new_case can mark it contradicted. A lesson
+    out of an ordinary task has neither, and nothing can ever contradict it — which is why a keyless lesson expires
+    and a keyed one earns its life by not coming back."""
+    mid = DB.execute("INSERT INTO memories(agent,about,text,prevents,created,by_task,request_id,"
+                     "responsibility,prevents_key) VALUES(?,?,?,?,?,?,'',?,?)",
+                     (agent, about, text, prevents, t0, task, responsibility, prevents_key)).lastrowid
+    memory_prune(agent, t0, keep=mid)
+    return mid
+
+
+def memory_contradicted(duty_id, key, agent, t0):
+    """Inside the caller's transaction: the key of a case came back, so every lesson that claimed to prevent it was
+    wrong, or right and never acted on. The hub counts; it never drops. Which of the two it was is a judgement about
+    words the hub cannot read, so the agent's own review decides (owner direction, 19 October 2026)."""
+    marked = [mref(m["id"]) for m in
+              read_rows("SELECT id FROM memories WHERE agent=? AND responsibility=? AND prevents_key=? "
+                        "AND dropped IS NULL", (agent, duty_id, key))]
+    if marked:
+        DB.execute("UPDATE memories SET contradicted=contradicted+1, contradicted_at=? WHERE agent=? AND "
+                   "responsibility=? AND prevents_key=? AND dropped IS NULL", (t0, agent, duty_id, key))
+    return marked
 
 
 def memory_summary(rows, heading, t0, more):
@@ -9138,9 +9245,14 @@ TOOLS = [
        ["task_id", "question"])),
     ("worker", "deliver_result", t_deliver_result,
      "Finish a task. outcome is completed, failed or rejected. Say what was done, where the output is, "
-     "and how you checked it. After this call the task is closed for good.",
+     "and how you checked it. After this call the task is closed for good. If the work taught you something worth "
+     "having in your next sessions, say it in learned, with what you expect it to prevent: this is the only moment "
+     "an ordinary task offers, and nothing will ask again.",
      S({"task_id": TASK_ID, "outcome": {"type": "string", "enum": ["completed", "failed", "rejected"]},
-        "what_was_done": STR, "where_output_is": STR, "how_checked": STR},
+        "what_was_done": STR, "where_output_is": STR, "how_checked": STR,
+        "learned": {"type": "string", "description": "What this work taught you, if anything. Leave it out when it "
+                    "taught you nothing."},
+        "prevents": {"type": "string", "description": "With learned: what you expect it to prevent, in one line"}},
        ["task_id", "outcome", "what_was_done"])),
     ("worker", "sign_in", t_sign_in,
      "Have this machine's helper sign in to a site in Chrome with a login you name. Open the site's sign-in page "
@@ -9388,12 +9500,18 @@ TOOLS = [
         "task_id": TASK_ID},
        ["request_id", "case", "step"])),
     ("all", "close_case", t_close_case,
-     "End one case of a duty: handled, no_action (nothing had to be done) or failed (nobody could handle it, with the "
-     "reason). Every required close-out step needs a record first, and no task of the case may be open.",
+     "End one case of a duty: handled, no_action (nothing had to be done) or failed (nobody could handle it, with "
+     "the reason). No task of the case may be open. This is the moment you know what the event taught you, so say "
+     "it in learned when there is something: it is kept for your own next sessions, and because it names this "
+     "case's key, the work itself can later show it was wrong.",
      S({"request_id": {"type": "string", "description": "A new UUID for each write"},
         "case": {"type": "string", "description": "Case id, for example R-1/C-3"},
         "outcome": {"type": "string", "description": "handled, no_action or failed"},
-        "note": {"type": "string", "description": "The result in one line"}, "task_id": TASK_ID},
+        "note": {"type": "string", "description": "The result in one line"},
+        "learned": {"type": "string", "description": "What this event taught you, if anything, for your own next "
+                    "sessions. It is kept as a memory that claims to stop this key coming back, so the hub marks "
+                    "it contradicted if it does. Leave it out when the case taught you nothing."},
+        "task_id": TASK_ID},
        ["request_id", "case", "outcome", "note"])),
     ("all", "see_notes", t_see_notes,
      "Your own working notes: what you have worked out about how you work, which your next task session starts "
