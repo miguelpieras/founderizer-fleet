@@ -13420,6 +13420,7 @@ def record_status(agent, data):
         q("UPDATE jobs SET finished=COALESCE(finished,?) WHERE agent=? AND kind='probe' AND finished IS NULL", (now(), agent))
     q("INSERT INTO machine_status(agent,data,reported) VALUES(?,?,?) "
       "ON CONFLICT(agent) DO UPDATE SET data=excluded.data, reported=excluded.reported", (agent, json.dumps(data), now()))
+    end_signed_in_waits(agent)          # a sign-in this report says is made is over, whatever is still waiting for it
     # The new runtime is loaded, nothing of the previous runtime's session is left, and a session of the new runtime
     # runs (manager_bound is not null). From now on only that session can read the manager's messages, and a question
     # on its screen, a failed start or a usage limit shows as for any manager session.
@@ -13982,6 +13983,39 @@ def signed_in_now(agent, runtime):
     return None
 
 
+def end_signed_in_waits(agent, t0=None):
+    """A sign-in the machine has already made is over, whoever was waiting for it.
+
+    The owner signs in on the provider's own page, and that takes as long as it takes: he opens a browser, finds his
+    password, passes a second factor, types a device code. No wait on a machine can be the measure of that, and every
+    one of them was: the helper gave the runtime three minutes to report itself signed in, and a server service
+    fifteen. So **the machine's own report is what says the sign-in worked**, and this is where that report arrives.
+    An open sign-in of that runtime ends here, and so does the job that waits at its sign-in step.
+
+    The owner, 19 October 2026, on an agent he had just added: "I entered the code, signed in but the app still said
+    waiting for sign in?" Codex had taken his code, the credential was on the machine, its helper was reporting that
+    the runtime was signed in — and the install job still sat at needs_owner with the code on the screen, because
+    nothing read the one thing that knew. The screen follows the machine now, and never a clock.
+    """
+    t0 = t0 or now()
+    for row in q("SELECT * FROM signin_jobs WHERE agent=? AND state IN ('starting','needs_owner','signing_in')",
+                 (agent,)):
+        if signed_in_now(agent, row["runtime"]) is not True:
+            continue
+        q("UPDATE signin_jobs SET state='done', detail=NULL, updated=? WHERE id=?", (t0, row["id"]))
+        LIVE_LOGINS.pop(row["id"], None)        # the link and any code go, as on any other end of a sign-in
+        log("hub", f"{agent}: sign-in L-{row['id']} ({row['runtime']}) done, as that machine reports it")
+    # The sign-in is the last step of both an install and a preparation, so a job that waits there is finished when
+    # the machine is signed in. Its words go with its prompt: the app says what a finished job of that kind did.
+    for row in q("SELECT * FROM server_jobs WHERE agent=? AND state='needs_owner' AND step='sign_in'", (agent,)):
+        if signed_in_now(agent, row["runtime"]) is not True:
+            continue
+        q("UPDATE server_jobs SET state='done', step='sign_in', detail=NULL, prompt=NULL, updated=? WHERE id=?",
+          (t0, row["id"]))
+        log("hub", f"server {row['server']}: job {row['id']} ({row['kind']} {agent}) done, as that machine reports "
+                   f"{login_label(row['runtime'])} signed in")
+
+
 def start_machine_login(agent, runtime):
     """POST /ui/machines/<agent>/signin: ask this machine to start its runtime's own sign-in. One at a time."""
     a = agents().get(agent)
@@ -14035,6 +14069,10 @@ def login_report(agent, lid, update):
     if not row:
         raise Refusal(404, "no such sign-in")
     if row["state"] not in LOGIN_STATES:
+        # The machine's own report may have ended it here first (end_signed_in_waits), and then the machine saying
+        # the same thing is not a conflict: it is the same news, a few seconds later.
+        if update["state"] == row["state"]:
+            return {"ok": True, "state": row["state"]}
         raise Refusal(409, f"this sign-in is {row['state']}")
     state, detail = update["state"], update["detail"]
     if state == "needs_owner":

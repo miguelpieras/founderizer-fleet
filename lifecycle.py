@@ -341,7 +341,7 @@ def follow_config_ref(kit, run=None):
 class Lifecycle:
     def __init__(self, kit, agent, conf, post, busy, restart=None, run=_run, clock=time.time,
                  platform_name=sys.platform, home=None, vault=None, probe=None, models=codex_model_list, legacy=None,
-                 switch=None):
+                 switch=None, which=None):
         self.kit, self.agent, self.conf, self.post, self.busy = kit, agent, conf, post, busy
         self.legacy = legacy            # () -> the windows without a session credential (owner API 1.12)
         self.switch = switch            # () -> {other_runtime_windows, owner_chat_bound}, for a manager also
@@ -352,6 +352,7 @@ class Lifecycle:
         self.models = None              # the latest reading of the runtime's model options
         self.screen_models = None       # the same for the screen runtime (owner API 1.11)
         self.run, self.clock, self.platform = run, clock, platform_name
+        self.which = which              # (runtime) -> its executable, where this process cannot look for it itself
         self.home = home or os.path.expanduser("~")
         self.restart = restart or self.restart_service
         self.pending = None             # the hub revision of a requested update
@@ -460,7 +461,15 @@ class Lifecycle:
         return {"ssh": ssh, "screen_sharing": None}
 
     def exe(self, name):
-        return exe(name, self.home)
+        """This runtime's executable.
+
+        A reading made for ANOTHER OS user has to be given `which`, because this process cannot find that user's
+        executable itself: its PATH is not that user's, and that user's home is its own at mode 700, so a look in
+        its `~/.local/bin` is refused. Both ways of getting it wrong were live on 19 October 2026 — on one machine
+        the service found nothing and read `signed_in: None`, on another it found its OWN codex and ran it as the
+        agent, which answered for neither of them. The agent was signed in on both.
+        """
+        return self.which(name) if self.which else exe(name, self.home)
 
     def runtime(self, name=None):
         """{name, version, signed_in} of the agent's runtime, or of another one: status commands only, no model."""

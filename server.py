@@ -312,11 +312,17 @@ class Service:
 
     def agent_lifecycle(self, user):
         """One agent's reading, made in that user's own home. It is the reading lifecycle makes everywhere else, so
-        this service and the agent's own helper never disagree."""
+        this service and the agent's own helper never disagree.
+
+        Every part of it runs as that agent, the look for the executable first of all: this service may not open a
+        home of mode 700, and its own PATH is not that agent's. Without that the reading was of the wrong user or
+        of nobody, and the sign-in step of an install waited out its fifteen minutes on a machine that was signed
+        in."""
         if user not in self.kept:
             self.kept[user] = lifecycle.Lifecycle(self.kit, None, {}, None, lambda: False,
                                                   platform_name=self.platform, home=self.home_of(user),
-                                                  run=self.agent_run(user))
+                                                  run=self.agent_run(user),
+                                                  which=lambda name: self.agent_exe(name, user))
         return self.kept[user]
 
     def user_step(self, job, agent):

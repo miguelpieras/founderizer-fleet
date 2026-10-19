@@ -4036,7 +4036,10 @@ PROVIDER_REFUSAL = ("Fleet signs in to no model provider: " + ", ".join(PROVIDER
 LOGIN_SESSION = "fleet-login-%s"            # a tmux session of its own: the agent's own session keeps its windows
 LOGIN_URL_WAIT = 90                         # seconds for the provider's link to appear on the screen
 LOGIN_CODE_WAIT = 840                       # seconds for the owner's code to come back through the hub
-LOGIN_DONE_WAIT = 180                       # seconds for the runtime to report that it is signed in
+LOGIN_DONE_WAIT = 900                       # seconds for the runtime to report that it is signed in: as long
+                                            # as the hub keeps the sign-in open (hub.LOGIN_LIFE), because the
+                                            # owner is in a browser and three minutes called a real sign-in
+                                            # failed. The hub ends it the moment this machine reports it.
 LOGIN_URLS = {"claude": re.compile(r"https://(?:claude\.ai|console\.anthropic\.com)/[A-Za-z0-9/_?=&.%#+-]{0,400}"),
               "codex": re.compile(r"https://auth\.openai\.com/[A-Za-z0-9/_?=&.%-]{0,400}")}
 # Codex shows the owner a code to type into the browser; Claude gives the owner a code to type in here.
