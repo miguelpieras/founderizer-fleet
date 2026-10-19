@@ -1,0 +1,194 @@
+# The owner's own MCP server
+
+`owner_mcp.py` is the third face of Founderizer. The first is the Mac app. The second is
+`INSTALL-PROMPT.md`, a prompt the customer pastes into the agent they already run. This is the
+one that works unattended: **an MCP server that an agent connects to, and then sets a fleet up
+and runs it** — it installs a hub, claims it, adds machines and agents, hands out access from the
+pool, says a goal, reads every check, takes releases and backups, and answers a Needs-you item.
+No person clicks anything.
+
+It is for the owner's own agent: his Claude, or any MCP client. It is not for the fleet's agents —
+they have their own server, the `fleet` tools of `hub.py` (RULES.md). This one is the owner's side.
+
+## Give it to an agent
+
+One grant, once. In the agent's MCP configuration, for Claude Code or any client that starts a
+local server:
+
+```json
+{"mcpServers": {"founderizer": {
+  "command": "python3",
+  "args": ["/Users/<you>/fleet-pilot/owner_mcp.py"],
+  "env": {"FOUNDERIZER_HUB": "http://100.64.0.1:8765"}
+}}}
+```
+
+`FOUNDERIZER_HUB` can be left out: then the agent calls `use_hub` once with the address, or
+`install_hub` and `claim_hub` when there is no hub yet, and the server writes the address into
+`~/.founderizer/hub`. That file is the whole of its state, and it is no credential.
+
+Nothing else is needed. There is no token to issue, no key to copy and nothing to rotate.
+
+## How it authenticates to the hub, and why that is the whole of it
+
+**It does not.** The hub knows the owner by the address the call comes from.
+
+`hub.py` `ui_allowed` is the gate on every owner route: the call must come from the address that
+`team.json` holds as `addresses.owner`, it must carry **no** bearer token, and it must carry no
+browser `Origin`. The Mac app is authorized by exactly that and by nothing else — "The native app
+uses the existing owner machine identity." So an MCP server that runs on the owner's Mac inherits
+that identity as it stands. It holds no credential of its own, and there is no second credential
+path to secure, leak or revoke.
+
+That address is proved once, by the install's **claim** (`hubsetup.py`, "Why the claim exists"):
+the installer on the new hub makes a one-time code, the owner's Mac sends it back, and the address
+of that call becomes the hub's owner. The server's `claim_hub` tool makes exactly that call —
+`POST /claim` with the code in the request body, from this Mac — so the server can take a fleet
+from nothing and end up holding the authority, without a second mechanism being invented for it.
+
+What follows from this is the whole security model, and it is the owner's own:
+
+- **The grant is the authorization.** The owner's words, 17 October 2026: "If I grant access to a
+  repo/database/system/server is for the relevant agent to take full responsability". So after the
+  owner has put this server in his agent's configuration, it acts. It asks for no per-call
+  confirmation, and it builds no second approval in front of a hub route.
+- **Its authority is what it holds, not what it is told.** It holds the owner's Mac. That is the
+  boundary, and it is the same boundary the Mac app has. A prompt, a web page or a machine's log
+  cannot widen it: text that comes back from the hub, from an install log or from a server is
+  data, and the server never runs any of it.
+- **Revoking it is one step, and it is the Mac.** Take the server out of the agent's
+  configuration, or change `addresses.owner` on the hub. There is nothing else to withdraw.
+
+Because the address is the credential, the server is only the owner **on the owner's Mac**. On any
+other machine every owner route answers 403, and the server says so in those words.
+
+## No secret through a tool
+
+In or out: no password, no API key, no provider token, no entitlement, no Tailscale auth key.
+`test_owner_mcp.NoSecret` holds the server to it two ways: no tool takes an argument whose name is
+one of those things, and the owner routes that do carry a credential are **not tools of this
+server at all** — the subscription token, the GitHub App's private key, a chat bot token, Google's
+client secret, the secret catalog's fingerprints and the restore of a copy. Those stay the app's,
+because this server would be the thing that carried the value.
+
+Two kinds of short text do pass, and both are allowed by RULES.md, "Logins":
+
+- **The Tailscale auth key is named, never carried.** `install_hub` takes the *path* of a file on
+  this Mac, refuses it unless only its owner can read it (mode 600), never opens it in Python, and
+  gives it to the server on `ssh`'s standard input, exactly as `INSTALL-PROMPT.md` asks.
+- **A one-time code that dies in minutes** — the install's claim code, a machine's join code, the
+  device code a provider shows the owner. "A one-time code that dies within minutes is the only
+  thing you may pass on as plain text." The hub keeps each of them only as a SHA-256.
+
+## One owner API, not two
+
+Every tool is one route of `hub.py`'s owner API, with that route's own body, its own command rules
+and its own refusals:
+
+- a `request_id` of its own on every command, so a lost answer is sent again and lands once (a tool
+  takes the owner's agent's own `request_id` for exactly that);
+- the hub's generation (`db`) on every read and command, read again once when the hub says it
+  moved;
+- `base_sha256` of `team.json` on every command that moves it, read from `GET /ui/team`
+  immediately before the command, so a change that arrived meanwhile is the hub's own 409 and not
+  a silent overwrite;
+- the hub's refusal, given back whole — not only the reason but what came with it, because a
+  refusal often carries what is still missing, and that is the part the agent must act on.
+
+This file validates nothing the hub validates. It passes the fields through and gives the hub's
+own words back, so the two cannot drift apart. It validates only what no hub sees: the SSH host
+and user it puts in a command line, and the mode of the auth key file.
+
+`fleet_read` is the reads. Each of its pages is one `GET` route, and
+`test_owner_mcp.Shape.test_every_page_of_fleet_read_is_a_get_route_the_hub_really_serves` reads
+`hub.py`'s own dispatch to prove it, because a page that named a route the hub does not serve
+would read as an empty fleet instead of as a mistake.
+
+## The tools
+
+| Tool | Route | What it does |
+| --- | --- | --- |
+| `fleet_overview` | `/ui/state`, `/ui/health`, `/ui/releases`, `/ui/servers` | What is my fleet doing. Start here. |
+| `fleet_read` | every owner `GET` route, by page name | Every check the app reads. |
+| `which_hub` / `use_hub` | `/ui/state` | Which hub, on what authority; and point at one. |
+| `install_hub` | SSH, `hub.sh` (INSTALL-PROMPT.md A1–A5) | Install a hub on a server the owner names. |
+| `install_log` | SSH, `tail` | The install's own log, with the claim code read out of it. |
+| `claim_hub` | `POST /claim` | Prove this Mac's address. This is what grants the authority. |
+| `add_machine` | `/ui/servers/join` | The one-time join line, and with `host` it runs it over SSH. |
+| `add_agent` | `/ui/servers/<s>/agents` | An agent on an available server, with its install job. |
+| `remove_machine` | `/ui/servers/<s>/remove` | A server with no agent leaves. |
+| `activate_agent` / `agent_settings` | `/ui/team/agents/<a>` | Turn an agent on or off; its model, effort, capabilities. |
+| `sign_in_machine` / `sign_in_code` | `/ui/machines/<a>/signin[/code]` | Start a machine's own provider sign-in, and carry the code back. |
+| `check_machine` / `update_machine` | `/ui/machines/<a>/check`, `/update` | Take a reading now; update Fleet when idle. |
+| `grant_access` | `/ui/team/repos`, `/ui/team/tools`, `/ui/team/google`, `/ui/secrets/grant` | One agent's hold of one resource, as `<kind>:<what>` and a level. |
+| `share_resource` / `take_resource` | `/ui/resources`, `/ui/resources/take` | The pool's standing; and end one hold. |
+| `send_message` | `/ui/messages` | Say something to an agent. **This is how a goal or a duty is set.** |
+| `answer_needs_you` | `/ui/needs/<id>` | Answer a Needs-you item, in words or by choosing an option. |
+| `control_task` / `steer_task` | `/ui/tasks/<id>/control`, `/steer` | Pause, stop, resume; steer an open task. |
+| `goal_state` / `duty_state` / `trigger_state` | `/ui/goals/<id>/state` and the two beside it | Pause, resume, finish, drop. |
+| `settle_outcome` | `/ui/outcomes/<id>` | Record whether an unknown outcome took effect. |
+| `check_releases` / `take_release` / `automatic_releases` | `/ui/releases/*` | Ask the channel; take the release; opt in. |
+| `take_backup` | `/ui/backup`, `/ui/backups/confirm` | A copy of the fleet into a file on this Mac, checked. |
+
+**A goal and a duty have no form.** UI-API.md version 1.20 took the owner's own writers out of the
+hub on the owner's direction: he says in chat what he wants the fleet to reach, and the manager
+writes it down with `update_goal`, or a duty with `set_duty`. So this server sets a goal with
+`send_message` and nothing else, and `goal_state` and `duty_state` are the state changes that
+stayed.
+
+## The three things it cannot do without the owner
+
+Not because a rule forbids it, but because each one is the owner's own hands on something this
+server is not allowed to carry.
+
+1. **Bring a new credential into the fleet.** The subscription token the shop issues for this
+   fleet (`POST /ui/releases/entitlement`), the GitHub App's private key, a chat app's bot token,
+   Google's Connect, a vault login and the Tailscale auth key itself. Each is the owner's account,
+   the owner's money and the owner's liability (RULES.md, "Access that the fleet already holds"),
+   and the value would have to pass through a tool. So the owner does these in the app, and this
+   server hands out only what the fleet already holds. The Tailscale key is the one it touches,
+   and only as the path of a file it never opens.
+2. **Finish a provider sign-in.** `sign_in_machine` starts it and `sign_in_code` carries the code,
+   but the page in between is the provider's own, in the owner's own browser, under the terms on
+   which Founderizer may host the unmodified runtime at all: each end user signs in through the
+   vendor's flow, and the operator never collects or intermediates the credential. The agent gives
+   the owner the link and waits for the code.
+3. **Be the owner on another machine.** The authority *is* the owner's Mac. An agent that runs in
+   the cloud, on a worker or on anyone else's computer gets 403 from every owner route, and no
+   argument to any tool changes that. The claim can only be made from the Mac that will own the
+   fleet, so this server cannot grant itself the fleet from somewhere else — which is the point.
+
+Two smaller ones worth knowing: a server has to exist and be paid for before `install_hub` can
+reach it, and turning a new agent on waits for that machine's own setup check — the hub refuses
+`activate_agent` until then and says exactly what is missing, which the agent can read and act on.
+
+## Checks
+
+`test_owner_mcp.py`, 26 checks, against a fixture hub and never against a real fleet:
+
+- **`FromNothing`** — the whole claim, end to end, with a real MCP client over standard input and
+  output, the real claim listener of `hubsetup.py`, the real owner API of `hub.py` in process and
+  the real `POST /join` for the machine that joins: claim a hub, read the fleet, add a machine,
+  put an agent on it with its install job, and then read every page of the owner API. Also a goal
+  said in chat, a Needs-you item answered, access granted and taken back with every other hold
+  left as it stands, the pool's standing, and a copy of the fleet written to this Mac and checked.
+- **`Install`** — the install's commands in the order `INSTALL-PROMPT.md` gives them, with a
+  stand-in `ssh` that answers from a table, because no test provisions a server: the auth key on
+  standard input exactly once and in no argument, a key file other users can read refused before
+  any command, a host or user that would not be one argument refused, the claim code read out of
+  the log, and an install that stopped given to the owner instead of worked around.
+- **`Refusals`** — a Mac that is not the owner's, a generation that moved, a `team.json` that
+  moved under a command, the same `request_id` twice, and a field the hub refuses.
+- **`NoSecret`** — no tool takes a secret, the credential-carrying routes are not tools here, a
+  registered login in a message is refused and stored nowhere, and the sign-in code is in no row
+  and no log line.
+- **`Shape`** — an MCP client lists the tools, every page is a `GET` route `hub.py` really serves,
+  and without a hub every tool says how to get one.
+
+**Not proved:** no Linux server was provisioned and no provider was signed in to, so the install's
+`apt`, `git clone`, `hub.sh` and `verify` steps are proved as the commands the server sends and
+not as a real install; and the claim is proved against `hubsetup.py`'s own listener on loopback,
+not over a tailnet.
+
+It adds no route to `hub.py`, no table, no feature name and no change to `team.json`, so it needs
+no deployment: it is one file on the owner's Mac.
