@@ -37,6 +37,11 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "manager_switch",       # the manager's helper closes its previous runtime's session after a switch
             "mcp_program"]          # it resolves a command MCP server's program for POST /ui/mcp/check
 SWITCH_RUNTIMES = ("codex", "claude")       # the runtimes that an owner can switch between (owner feature runtime_switch)
+# Where this helper leaves its sign-in reading for `fleet.py verify` to read, in the home of the user whose agents
+# these are: ~/.fleet/signed-in-<agent>.json. verify imports this one path, so the writer and the reader of the file
+# cannot drift apart (Lifecycle.remember_signed_in says why only a Mac needs it).
+FLEET_DIR = ".fleet"
+SIGNED_IN_FILE = "signed-in-%s.json"
 MODELS_EVERY = 6 * 3600         # seconds between readings of the runtime's model options
 MODEL_NAME = re.compile(r"[A-Za-z0-9._:/\[\]-]{1,120}")
 EFFORT_NAME = re.compile(r"[a-z]{1,20}")
@@ -71,6 +76,11 @@ MCP_VAR = re.compile(r"[A-Z][A-Z0-9_]{0,59}")        # a variable name, as the s
 MCP_RESERVED = re.compile(r"(?:FLEET|BWS|LD|DYLD|ANTHROPIC|CLAUDE|CODEX)_[A-Z0-9_]*|PATH|HOME|SHELL|USER|LOGNAME|"
                           r"TMPDIR|TERM|PWD|IFS|ENV|BASH_ENV|ZDOTDIR|NODE_OPTIONS|PYTHONPATH|PYTHONHOME")
 MCP_FIELDS = {"title", "url", "command", "args", "env", "auth", "key", "runtimes"}
+
+
+def signed_in_path(home, agent):
+    """The file where that agent's helper leaves its sign-in reading."""
+    return os.path.join(home, FLEET_DIR, SIGNED_IN_FILE % agent)
 
 
 def mcp_variable(name):
@@ -499,6 +509,7 @@ class Lifecycle:
             update = {"state": self.state, "detail": self.detail}
         # owner feature runtime_switch: both runtimes that an owner can switch between, with the same status commands
         runtimes = {name: self.runtime(name) for name in SWITCH_RUNTIMES}
+        self.remember_signed_in(runtimes)
         name = self.conf.get("runtime")
         return {"revision": self.running(), "os": self.os_info(), "security": self.security(),
                 "runtime": runtimes[name] if name in runtimes else self.runtime(),
@@ -509,6 +520,31 @@ class Lifecycle:
                 **(self.switch() if self.switch else {"other_runtime_windows": [], "owner_chat_bound": None}),
                 "settings": self.settings(), "models": self.read_models(),
                 "screen_settings": self.screen_settings(), "screen_models": self.read_screen_models()}
+
+    def remember_signed_in(self, runtimes):
+        """Leave this sign-in reading in ~/.fleet, where a later `fleet.py verify` of this machine reads it.
+
+        Only a Mac needs it, and this is the reason: there the runtime keeps its credential in the login Keychain,
+        which opens for the login session alone. This process is a LaunchAgent of that session and reads it; the
+        same reading taken over the owner's SSH connection, where the app runs the check, reads `loggedIn: false`
+        on a machine that is signed in - as the same user, and as root through `launchctl asuser` too (both proved
+        on the owner's Mac Studio, 19 October 2026; an SSH session's keychain search list holds the System
+        keychain and not the user's login one). So the check answers from the reading made here, and the app's two
+        screens cannot disagree about one machine. A failure to write is no failure of the status: the next report
+        writes it again.
+        """
+        if self.platform != "darwin":
+            return
+        path = signed_in_path(self.home, self.agent)
+        said = {"at": self.clock(), "signed_in": {name: r.get("signed_in") for name, r in runtimes.items()}}
+        try:
+            os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+            tmp = path + ".new"
+            with open(tmp, "w") as f:
+                json.dump(said, f)
+            os.replace(tmp, path)       # whole or not at all: verify reads this file while the helper writes it
+        except OSError:
+            pass
 
     # ---- agent setup (owner API 1.9)
     def settings(self):

@@ -16,7 +16,9 @@ team.json, because a hub starts on a file that does not validate and nothing els
 
 It changes nothing, ever: every command it runs reads, and it needs no root. It runs on Linux and on macOS, and
 reads the places the helper's own status reading reads (lifecycle.Lifecycle.security and .runtime), so the two
-never disagree. On Linux each agent's session runs as its own OS user, so the three checks that read a user -
+never disagree - and on a Mac, where the runtime's credential is in the login Keychain and only the login session
+opens it, `runtime_signed_in` is that helper's own reading (signed_in). On Linux each agent's session runs as its
+own OS user, so the three checks that read a user -
 services, runtime_installed and runtime_signed_in - are taken as that agent's user, and a reading this command
 cannot take is named and warns, never passes (PRODUCT.md 4.1). Three lanes read this shape: the installers end with it, the app shows it as the owner's
 checklist, and the support duty runs it from a heartbeat.
@@ -37,7 +39,7 @@ import time
 import urllib.error
 import urllib.request
 
-from lifecycle import CONFIG_BRANCH, checkout_branch, exe
+from lifecycle import CONFIG_BRANCH, checkout_branch, exe, signed_in_path
 
 # PRODUCT.md 4.1: these ids and nothing else. The order is the order of the readable lines.
 CHECKS = ("services", "hub_answers", "owner_claimed", "tailnet", "firewall", "clock", "disk",
@@ -62,6 +64,9 @@ SELFTEST_BASELINE = ()
 # failures are the code's. Everything else a release can break stays in the gate.
 OWNER_STEPS = ("runtime_signed_in",)
 SELFTEST_WAIT = 300         # it waits for the hub's own timers, so about a minute on a quiet machine
+# How old a helper's own sign-in reading may be and still answer for this machine: three of its reports
+# (lifecycle.REPORT_EVERY), so one missed report is not an unread check. Only a Mac answers from it (signed_in).
+HELPER_READING = 900
 CLOCK_LIMIT = 60            # seconds: a minute, because token expiry and signatures depend on this clock
 DISK_FAIL, DISK_WARN = 1.0, 5.0         # GiB free for the database and the checkouts
 UFW_CONF = "/etc/ufw/ufw.conf"          # readable without root, which `ufw status` is not
@@ -121,7 +126,8 @@ def _said(text):
     the names, and a fix that is a command to paste keeps the command's own spelling."""
     line = _line(text)
     head = line.split(" ", 1)[0]
-    if head[:1].islower() and head.isalpha() and not re.fullmatch(r"[0-9a-f]{7,}", head):
+    word = head[:-2] if head.endswith("'s") else head      # an agent's name in the possessive is a word too
+    if word[:1].islower() and word.isalpha() and not re.fullmatch(r"[0-9a-f]{7,}", word):
         return line[0].upper() + line[1:]
     return line
 
@@ -407,17 +413,21 @@ class Verify:
 
     def runtime_signed_in(self):
         """The runtime of each agent is signed in, read as that agent's own user, because the credential is in that
-        user's home and belongs to it alone. The owner signs each agent in from the app, and only they can."""
+        user's home and belongs to it alone. The owner signs each agent in from the app, and only they can. On a
+        Mac the credential is in the login Keychain instead, so the reading comes from the one process that can
+        open it, the agent's own helper in the login session (signed_in)."""
         if not self.agents:
             return None
         readings = {}
         for name in self.agents:
             runtime = self.runtime_of(name)
             path, read = self.runtime_path(name)
-            readings[name] = (runtime, self.signed_in(runtime, path, self.agent_user(name)) if path else None, read)
+            readings[name] = (runtime, self.signed_in(runtime, path, self.agent_user(name), name) if path else None,
+                              read)
         out = [f"{name} is not signed in to {rt}" for name, (rt, state, read) in sorted(readings.items())
                if read and state is False]
-        unknown = [f"{name}'s {rt} sign-in could not be read" for name, (rt, state, read) in sorted(readings.items())
+        why, by_hand = self.unread_signin()
+        unknown = [f"{name}'s {rt} {why}" for name, (rt, state, read) in sorted(readings.items())
                    if read and state is None]
         blind = [f"{name}'s {rt} sign-in could not be read: it belongs to another user of this machine"
                  for name, (rt, _s, read) in sorted(readings.items()) if not read]
@@ -425,8 +435,7 @@ class Verify:
             return self.answer(FAIL, self.and_unread(", ".join(out), ", ".join(blind)),
                                "sign this machine in from the app: Machines, then Sign in")
         if unknown:
-            return self.answer(WARN, self.and_unread(", ".join(unknown), ", ".join(blind)),
-                               "read it by hand on this machine: claude auth status, or codex login status")
+            return self.answer(WARN, self.and_unread(", ".join(unknown), ", ".join(blind)), by_hand)
         if blind:
             return self.answer(WARN, ", ".join(blind), BLIND_FIX)
         return self.answer(OK, ", ".join(f"{name} is signed in to {rt}"
@@ -653,10 +662,50 @@ class Verify:
         code, out, _err = self.run(argv)
         return (((out or "").strip() or None) if code == 0 else None), True
 
-    def signed_in(self, runtime, path, user=None):
+    def login_session(self):
+        """Whether this run is inside the Mac's login session, the one session that opens the login Keychain.
+        `Aqua` is launchd's own name for it: an SSH session answers `Background` and a daemon `System`."""
+        code, out, _ = self.run(["launchctl", "managername"])
+        return (out or "").strip() == "Aqua" if code == 0 else False
+
+    def helper_signed_in(self, agent, runtime):
+        """What this machine's own helper last read about that runtime's sign-in - True or False - or None when
+        there is no reading of the last HELPER_READING seconds. The helper writes it as the user whose agents
+        these are, which on a Mac is the user running this check (agent_user), so the file is this user's own."""
+        try:
+            with open(signed_in_path(self.home, agent)) as f:
+                said = json.load(f)
+            at = float(said["at"])
+            state = said["signed_in"][runtime]
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
+        return state if isinstance(state, bool) and self.now() - at <= HELPER_READING else None
+
+    def unread_signin(self):
+        """Why a sign-in reading was not taken here, and what takes it, as (the words after the name, the fix). On
+        a Mac outside the login session the reason is the machine's and not the agent's, and the answer is no
+        command the owner can run from where the app runs this check: its helper reads it in that session."""
+        if self.platform == "darwin" and not self.login_session():
+            return ("sign-in is in the login Keychain, which opens for the login session alone, and this machine's "
+                    "helper has left no reading of it",
+                    "start this machine's helper, which reads the sign-in in that session, and check again")
+        return ("sign-in could not be read",
+                "read it by hand on this machine: claude auth status, or codex login status")
+
+    def signed_in(self, runtime, path, user=None, agent=None):
         """True, False or None, from the runtime's own status command: the reading lifecycle.Lifecycle.runtime
         makes, so the app and verify never disagree, run as the user whose credential it is. No model runs and
-        nothing is written."""
+        nothing is written.
+
+        A Mac answers from the helper's own reading of that same command, because there the credential is in the
+        login Keychain and no run outside the login session can open it (lifecycle.Lifecycle.remember_signed_in
+        says what was proved). In that session - an installer in a Terminal, the agent's own duty session - the
+        command is run here as everywhere else. With neither, the reading is not taken: never a pass and never a
+        failure (PRODUCT.md 4.1)."""
+        if self.platform == "darwin":
+            said = self.helper_signed_in(agent, runtime)
+            if said is not None or not self.login_session():
+                return said
         if runtime == "codex":
             argv = self.as_user(user, [path, "login", "status"])
             _code, out, err = self.run(argv) if argv else (1, "", "")
