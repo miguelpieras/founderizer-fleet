@@ -759,9 +759,26 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
 
 MANAGER_RUNTIMES = ("claude", "codex")         # the runtimes whose standing session continues its own conversation
 MANAGER_START = ('You are the manager in Founderizer. Read RULES.md and profiles/{agent}.md in this folder '
-                 'first, then call read_messages and see_team. On every new-message signal call read_messages; its read is the receipt. Messages that start with [hub] come from the hub and '
+                 'first. {resume}On every new-message signal call read_messages; its read is the receipt. Messages that start with [hub] come from the hub and '
                  'messages that start with [owner] come from the owner: act on each one. Before you give work, choose by suitability, '
                  'then availability, with see_capacity. Then wait for the first message.')
+# The tail that this prompt had before the hub sent a brief: a cold start, and see_team is over a hundred lines of
+# everything. It is what a start without the hub's answer still says.
+MANAGER_COLD = "Then call read_messages and see_team. "
+
+
+def manager_resume(agent):
+    """The hub's brief of where the fleet stood, for the first prompt of the standing session (hub.manager_resume_text):
+    the goals and their next step, the duties not in order, the open tasks with the why they were given for, the
+    results waiting to be checked, the reports waiting to be decided, what is with the owner, and the manager's own
+    last decisions. It is cheaper than the see_team it replaces, and nothing in it is only in that session. A hub that
+    cannot be reached or an older hub gives none, and the start says what it always said."""
+    try:
+        code, data = http("GET", f"/events/{agent}?after=-1&wait=0", timeout=10)
+    except (urllib.error.URLError, OSError, Refused, ValueError):
+        return MANAGER_COLD
+    said = (data or {}).get("resume") if code == 200 else None
+    return f"{said.strip()}\n\n" if isinstance(said, str) and said.strip() else MANAGER_COLD
 
 
 def screen_settings(conf):
@@ -1177,7 +1194,7 @@ def manager_start(agent, conf, generation, token):
     Refused when the record cannot be read or is not valid, or when its conversation file is not found: then nothing
     starts and the record stays, so that the conversation is never replaced without notice. Another runtime starts as
     before and has no record."""
-    prompt, runtime, record = MANAGER_START.format(agent=agent), conf.get("runtime"), None
+    runtime, record = conf.get("runtime"), None
     if runtime in MANAGER_RUNTIMES:
         record = load_chat_record(agent, runtime, "manager")
     env = session_env(agent, conf, "manager")
@@ -1189,7 +1206,10 @@ def manager_start(agent, conf, generation, token):
                 keep = dict(record, begun=True) if record.get("begun") is False else None
             else:
                 keep = dict(record, session=found) if record.get("session") != found else None
-            return (session_command(agent, conf, prompt, session=found, token=token, resume=True, env=env), window, keep,
+            # A continued conversation gets no first prompt, so it needs no brief either: that session has what it
+            # worked out. The brief is for the one that starts cold.
+            return (session_command(agent, conf, MANAGER_START.format(agent=agent, resume=""), session=found,
+                                    token=token, resume=True, env=env), window, keep,
                     "it continues its recorded conversation")
         note = "a new conversation: the recorded start never began one"
     session, new = str(uuid.uuid4()), None
@@ -1199,6 +1219,7 @@ def manager_start(agent, conf, generation, token):
         new = {"generation": generation, "session": session, "started": time.time(), "begun": False}
     elif runtime == "codex":
         new = {"generation": generation, "marker": session, "session": None, "started": time.time()}
+    prompt = MANAGER_START.format(agent=agent, resume=manager_resume(agent))
     return (session_command(agent, conf, prompt, session=session, token=token, env=env), session, new, note)
 
 
@@ -2390,7 +2411,7 @@ class Helper:
         if re.fullmatch(r"[0-9a-f-]{36}", rows["manager"]):
             self.manager_session = rows["manager"]
         elif not self.manager_session:
-            self.manager_session = manager_transcript(os.path.expanduser("~"), KIT, MANAGER_START.format(agent=self.agent))
+            self.manager_session = manager_transcript(os.path.expanduser("~"), KIT, MANAGER_START.format(agent=self.agent, resume=""))
         return [("manager", "", 0, self.manager_session)] if self.manager_session else []
 
     def report_limit(self, batch):

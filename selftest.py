@@ -74,9 +74,10 @@ EVERY_AGENT = ["read_messages", "search_knowledge", "write_knowledge", "see_resp
 MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "answer", "check_result",
                                "decide_permission", "set_reminder", "see_team", "see_capacity", "see_goals",
                                "update_goal", "record_spend", "raise_needs_you", "tell_owner", "grant_access",
-                               "set_duty", "change_duty"]
+                               "set_duty", "change_duty", "see_history", "decide_report"]
 WORKER_TOOLS = EVERY_AGENT + ["list_my_tasks", "report_progress", "read_attachment", "ask_my_requester",
-                              "deliver_result", "sign_in", "hand_over", "resolve_outcome", "see_earlier_work"]
+                              "deliver_result", "sign_in", "hand_over", "resolve_outcome", "see_earlier_work",
+                              "report_up"]
 
 
 def tool_set(got, want):
