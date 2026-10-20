@@ -237,7 +237,11 @@ class Service:
     """The loop of one server's service. run(argv, cwd, timeout, env) -> (code, out, err) runs a command; tests replace
     it, popen, the clock and the sleep."""
 
-    def __init__(self, conf, hub, kit=KIT, home=HOME, run=None, clock=time.time, sleep=time.sleep,
+    # clock measures only how long something has taken here — the report cadence and the two waits of a sign-in —
+    # and nothing of it is ever reported or written down, so it is the monotonic clock and not the wall clock. A wall
+    # clock steps (NTP correcting a drifted server, a VM's host setting it back), and a step backwards would stop
+    # this service's five-minute reading for the whole of the step while the hub went on showing the last one.
+    def __init__(self, conf, hub, kit=KIT, home=HOME, run=None, clock=time.monotonic, sleep=time.sleep,
                  platform=sys.platform, life=None, popen=subprocess.Popen, users=account, lives=None):
         self.name, self.repo, self.hub, self.kit, self.home = conf["name"], conf.get("repo"), hub, kit, home
         self.run, self.popen = run or self.command, popen

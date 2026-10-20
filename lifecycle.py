@@ -351,7 +351,7 @@ def follow_config_ref(kit, run=None):
 class Lifecycle:
     def __init__(self, kit, agent, conf, post, busy, restart=None, run=_run, clock=time.time,
                  platform_name=sys.platform, home=None, vault=None, probe=None, models=codex_model_list, legacy=None,
-                 switch=None, which=None):
+                 switch=None, which=None, monotonic=time.monotonic):
         self.kit, self.agent, self.conf, self.post, self.busy = kit, agent, conf, post, busy
         self.legacy = legacy            # () -> the windows without a session credential (owner API 1.12)
         self.switch = switch            # () -> {other_runtime_windows, owner_chat_bound}, for a manager also
@@ -362,12 +362,23 @@ class Lifecycle:
         self.models = None              # the latest reading of the runtime's model options
         self.screen_models = None       # the same for the screen runtime (owner API 1.11)
         self.run, self.clock, self.platform = run, clock, platform_name
+        # clock is the machine's own wall clock, which is what a reading's time has to be said in: the hub and the
+        # app show it, and `fleet.py verify` reads it out of the sign-in file. tick measures with `monotonic`
+        # instead, because a wall clock steps: NTP corrects a drifted machine, a VM's host sets it back, a Mac wakes
+        # up somewhere else. Measured on the wall clock, a step backwards would hold the update gate for the whole
+        # of the step (no task and no chat session starts, lifecycle.Updating at every event) and send no status
+        # report in that time, so the machine would stop taking work while every screen showed it fine.
+        self.monotonic = monotonic
         self.which = which              # (runtime) -> its executable, where this process cannot look for it itself
         self.home = home or os.path.expanduser("~")
         self.restart = restart or self.restart_service
         self.pending = None             # the hub revision of a requested update
         self.state = self.detail = None
-        self.last_report = 0.0
+        # Due at once, and said as a number rather than None because `monotonic` is time since this machine booted:
+        # a plain 0.0 would hold the first report back for the rest of the first five minutes of uptime, which is
+        # exactly when a helper starts (a user service at boot, launchd at login), and the hub would raise
+        # `machine_stale` about a machine that had just come up.
+        self.last_report = monotonic() - REPORT_EVERY
         self.lock = threading.Lock()
         self.report_lock = threading.Lock()     # one report at a time, so that the hub gets them in the order read
         self.gate = threading.Lock()    # held while a session starts, and from the idle check to the restart
@@ -742,7 +753,7 @@ class Lifecycle:
         """Send the status. The status thread and the helper's loop both report; one at a time, each from its own
         reading, so that an older reading never arrives after a newer one and stands at the hub until the next."""
         with self.report_lock:
-            self.last_report = self.clock()
+            self.last_report = self.monotonic()
             try:
                 if check:
                     self.read_models(force=True)    # a machine check reads the model options again
@@ -845,11 +856,11 @@ class Lifecycle:
         return self.run(argv, timeout=30)[0] == 0
 
     def tick(self):
-        if self.restarting is not None and self.clock() - self.restarting >= RESTART_GRACE:
+        if self.restarting is not None and self.monotonic() - self.restarting >= RESTART_GRACE:
             self.restarting = None
             self.fail("Updated the checkout, but the helper did not restart. Restart its service to load it.")
             self.gate.release()
-        if self.clock() - self.last_report >= REPORT_EVERY:
+        if self.monotonic() - self.last_report >= REPORT_EVERY:
             self.report()
         with self.lock:
             ready = self.state == "waiting_idle"
@@ -864,7 +875,7 @@ class Lifecycle:
             self.fail("The update stopped: %s." % type(e).__name__)
         finally:
             if restarted:
-                self.restarting = self.clock()      # keep the gate until this process ends
+                self.restarting = self.monotonic()  # keep the gate until this process ends
             else:
                 self.gate.release()
 

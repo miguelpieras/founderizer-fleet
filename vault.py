@@ -1584,7 +1584,8 @@ def handle(conf, line, uid):
     op = req.get("op")
     if op == "status":
         status = {"ok": True, "v": PROTOCOL, "agent": conf["agent"], "store": "user", "backend": backend(conf),
-                  "user": pwd.getpwuid(os.getuid()).pw_name, "recipient": recipient(conf), "callers": True}
+                  "user": pwd.getpwuid(os.getuid()).pw_name, "recipient": recipient(conf), "callers": True,
+                  "source": conf.get("_source")}
         if conf.get("_journal") is not None:        # this broker can make a login: its own store, or the write setup
             status["creates"] = True
         if conf.get("_requests") is not None:       # only with a curl program: this broker can send a request
@@ -1662,6 +1663,27 @@ def with_writes(conf):
     return conf
 
 
+def with_source(conf):
+    """The configuration with the SHA-256 of the broker program's own file (`_source`), or without it and the reason
+    in the log.
+
+    A release never reaches this file. The broker runs a root-owned copy outside every checkout that a helper
+    updates (WORKER-INSTALL.md, "Vault broker"), and `lifecycle.OWNER_ONLY` lists vault.py among the files a helper
+    never loads, so a commit that changes only this program advances the revision that every machine reports and
+    reaches no broker. A machine's revision therefore says nothing about its vault, and this checksum is the one
+    thing that does.
+
+    It is read once, at the start, because what the broker runs is the file as it was then: a copy installed under
+    a broker that was not restarted has not reached the running code, and the status must go on saying the old one
+    until the service restarts."""
+    try:
+        with open(os.path.realpath(__file__), "rb") as f:
+            return dict(conf, _source=hashlib.sha256(f.read()).hexdigest())
+    except OSError as e:
+        log(f"no program checksum: {e}")         # the status then says nothing, which is not the same as current
+        return conf
+
+
 def with_requests(conf, lock):
     """The configuration with the broker's requests (`_requests`) when it names a curl program and the record of the
     started requests can be read; else the configuration as it is, and the reason in the log. A broker without it
@@ -1680,7 +1702,7 @@ class Broker:
         # One request works at a time, as before. Only a request's wait for its curl child is outside this lock, so
         # that a cancel and a status are served meanwhile.
         self.lock, self.room = threading.Lock(), threading.BoundedSemaphore(SERVED)
-        self.conf, self.sock = with_requests(with_writes(conf), self.lock), None
+        self.conf, self.sock = with_source(with_requests(with_writes(conf), self.lock)), None
 
     def open(self):
         path = self.conf["socket"]

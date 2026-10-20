@@ -197,8 +197,11 @@ def windows(session, *, checked=False):
 
 
 def ensure_session(session):
-    if tmux("has-session", "-t", session).returncode != 0:
-        tmux("new-session", "-d", "-s", session, "-n", "home", "-c", KIT, check=True)
+    """Make this agent's tmux session if it is not there. True when it had to be made."""
+    if tmux("has-session", "-t", session).returncode == 0:
+        return False
+    tmux("new-session", "-d", "-s", session, "-n", "home", "-c", KIT, check=True)
+    return True
 
 
 def launch_words(start):
@@ -1837,6 +1840,30 @@ class Helper:
     def look(self):
         return [w for w in windows(self.session) if w != "home"]
 
+    def keep_session(self):
+        """Make this agent's tmux session again when it is gone. One round of the helper's loop; True when it had to.
+
+        This helper does not own the tmux server, so the session it made at its own start is not its to assume. A
+        tmux session ends with its last window, and the server itself can go under the helper: `tmux kill-server`,
+        a logout that takes it, a crash of the server, or its last window killed by hand. Then `new-window` answers
+        "no server running" and no window starts at all.
+
+        Until 19 October 2026 only the standing manager's start made the session again (`start_manager`), so a
+        worker or a lead that lost its session was finished: every task event failed at its start, waited longer
+        (`handle_events`), failed again, and nothing in the fleet said so. The helper went on polling and reporting
+        its machine, `/ui/health` stayed `ok`, the agent counted as available in `see_capacity`, and the tasks given
+        to that machine simply sat there until somebody restarted its service by hand. It is the same fault as the
+        manager window that nothing watched (`manager_gone`): what the helper starts, it must not assume stays
+        started."""
+        try:
+            if not ensure_session(self.session):
+                return False
+        except subprocess.CalledProcessError:
+            self.say(f"the tmux session {self.session} is gone and could not be made again; the helper tries again")
+            return False
+        self.say(f"the tmux session {self.session} was gone; the helper made it again")
+        return True
+
     def sync_checkout(self):
         """Before a task session starts, the helper brings this folder onto the configuration ref and up to date with
         it (fast-forward only), so that the agent reads the current RULES.md, its profile, the owner's knowledge and
@@ -2158,7 +2185,21 @@ class Helper:
             else:
                 self.signal(task)
         elif kind == "say":
-            self.signal(task if self.worker else "manager")
+            if not self.worker:
+                self.signal("manager")
+            elif task:
+                self.signal(task)
+            else:
+                # A message the hub could file under no task: a result or a cancellation told to the requester, a
+                # duty given to its holder, a permission somebody decided, a question that has waited. For a
+                # worker or a lead that is every open task session of this agent, because `read_messages` gives it
+                # every unread message whichever task the call names, and a `C-<id>` window is one person's and
+                # gets nothing of the fleet. With no session open nothing is typed and nothing is lost: the hub
+                # keeps the message until a session reads it. Until 19 October 2026 this signalled a window named
+                # None, which raised TypeError at every poll for as long as the message stayed unread — so a lead
+                # was never told that its subtask had ended, and its helper's log filled with the same line.
+                for window in [w for w in self.look() if re.fullmatch(r"T-\d+", w)]:
+                    self.signal(window)
         elif kind == "stop":
             # Owner API 1.12: for a browser or screen task this acknowledgement frees the machine's desktop for the
             # next one, so nothing that the task started may still run: the cleanup of a confirmed Stop, with the
@@ -3281,6 +3322,7 @@ def cmd_run(args):
     has_key, keyed, enrolled_at = False, False, 0.0
     while True:
         try:
+            h.keep_session()        # the tmux session is not this helper's to assume (keep_session says why)
             h.manage()
             has_key = has_key or register_key(agent)
             # Owner API 1.12: enroll the agent key while no task window runs, so that no hook of a running task can
@@ -3574,6 +3616,17 @@ def cmd_check(args):
                  "this broker is older than the fleet's own store")
             line(status.get("recipient") == conf.get("vault_recipient"), "vault broker key is the one pinned in team.json",
                  "set vault_recipient for this agent to the broker's public key")
+            # The broker runs a root-owned copy of vault.py that no release reinstalls, so this is the one line that
+            # says whether it runs the vault of this checkout. The hub says the same against the revision it serves.
+            try:
+                with open(os.path.join(KIT, "vault.py"), "rb") as f:
+                    mine = hashlib.sha256(f.read()).hexdigest()
+            except OSError:
+                mine = None
+            line(None if not (status.get("source") and mine) else status["source"] == mine,
+                 "vault broker runs the vault.py of this checkout",
+                 "this broker says nothing about its program" if not status.get("source") else
+                 "install vault.py again and restart fleet-vault (WORKER-INSTALL.md, \"Vault broker\")")
         except Refused as e:
             line(False, "vault broker", str(e))
     elif os.path.exists(token):
@@ -3840,15 +3893,22 @@ def vault_readable():
 
 def vault_status(agent):
     """For the machine report: the vault mode, whether this machine's agents can read neither vault file, and, in
-    every mode, the public status of this machine's broker (shared broker callers): callers, its public key and when
-    it was read. The hub compares that key with the store key that the owner trusts; it never takes it."""
+    every mode, the public status of this machine's broker (shared broker callers): callers, its public key, what its
+    own program hashes to and when it was read. The hub compares that key with the store key that the owner trusts;
+    it never takes it.
+
+    `broker_source` is the SHA-256 of the broker program that the broker runs. A release never reinstalls that file
+    (WORKER-INSTALL.md, "Vault broker"), so this machine's revision says nothing about its vault, and the hub
+    compares this checksum with its own vault.py instead. None when no broker answers, or when the one that answers
+    does not say — a Mac's signed helper, or a broker older than this — because unknown is not behind."""
     status = broker_status()
-    recipient = status.get("recipient") if status else None
+    recipient, source = (status.get("recipient"), status.get("source")) if status else (None, None)
     broker = {"callers": (status.get("callers") is True) if status else None,
               "creates": (status.get("creates") is True) if status else None,       # create_login
               "captures": (status.get("captures") is True) if status else None,     # save_key
               "requests": (status.get("requests") is True) if status else None,     # call_api
               "broker_recipient": recipient if isinstance(recipient, str) else None,
+              "broker_source": source if isinstance(source, str) and re.fullmatch(r"[0-9a-f]{64}", source) else None,
               "broker_read_at": time.time() if status else None}
     mode = vault_mode(agent)
     if mode == "none":

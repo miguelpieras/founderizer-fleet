@@ -8,7 +8,7 @@ Needs nothing but Python. The sealed-handover checks are skipped when `age` is n
 Takes about a minute because it waits for the hub's timers. It tests hub.py only: fleet.py needs
 tmux and real sessions, which is what the pilot itself is for.
 """
-import hashlib, json, os, shutil, socket, subprocess, sys, tempfile, threading, time
+import ast, hashlib, json, os, re, shutil, socket, subprocess, sys, tempfile, threading, time
 import urllib.error, urllib.parse, urllib.request
 
 VERBOSE = "-v" in sys.argv
@@ -78,12 +78,115 @@ MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "an
 WORKER_TOOLS = EVERY_AGENT + ["list_my_tasks", "report_progress", "read_attachment", "ask_my_requester",
                               "deliver_result", "sign_in", "hand_over", "resolve_outcome", "see_earlier_work",
                               "report_up"]
+# A lead: its own task's worker tools, and the nine team tools of RULES.md, limited to that task's subtasks. No
+# check ever listed a lead's tools, because the hub these checks start has no lead -- which is how LEAD_TEAM_TOOLS
+# came to hold nine where RULES.md named eight, for weeks. Section 1b starts a lead of its own for this one line.
+LEAD_TOOLS = WORKER_TOOLS + ["create_task", "cancel_task", "restart_task", "answer", "check_result",
+                             "decide_permission", "see_team", "see_capacity", "decide_report"]
 
 
 def tool_set(got, want):
     """Empty when the names are the same set, else which names are missing and which are extra."""
     missing, extra = sorted(set(want) - set(got)), sorted(set(got) - set(want))
     return "" if not missing and not extra else f"missing {missing}, extra {extra}"
+
+
+# ---------------------------------------------------------------- every tool is named where an agent reads it
+# The two checks above prove that RULES.md names every tool. That is the catalog test, and it is not enough: an
+# agent reads RULES.md once, at the start of a session, before it knows which tool the work will need. In one day
+# four capabilities shipped complete, tested and inert -- an agent's own notes, folding duplicate lessons, the whole
+# needs_access grant route, and the manager's own reason for a task -- because nothing in an agent's own path ever
+# named them. Each was found by a person noticing, which is not a process.
+#
+# So the stronger rule: every tool is named somewhere an agent is read to IN THE MOMENT it would reach for it. In
+# this codebase that corpus is the hub's own prose -- a session's start text, the details the hub writes into a
+# task, what a tool answers, a refusal, a [hub] message, a wake-up's words -- which is the string literals of
+# hub.py and wakeups.py, plus one real start text read off a running hub below.
+#
+# What does not count, and why:
+#   * a tool's own description in TOOLS and wakeups.TOOL_SPECS: that is the catalog again, the thing under test. A
+#     tool only a conscientious agent finds there is a tool that ships inert, and "conscientious under pressure" is
+#     not a design.
+#   * RULES.md and profiles/: RULES.md is the check above, and a profile is the owner's own prose, which the fleet's
+#     code can neither rely on nor keep current.
+#   * docstrings: notes to whoever reads the code. No session ever sees one.
+#   * the hub's own log: the owner reads it; no agent does.
+#   * SQL: a column named like a tool says nothing to anybody.
+#   * comments: the tree leaves them out by itself, which is the point -- hub.py explains itself in comments that
+#     name tools no agent is ever told about, and they must not let a tool pass.
+SQL_VERB = re.compile(r"(SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|PRAGMA|BEGIN|COMMIT|VACUUM)\b", re.I)
+SQL_CALLS = ("q", "q1", "ins", "read_row", "read_rows", "execute", "executemany", "executescript", "sql_step")
+# Five tools are named with ordinary English words, so finding "answer" or "remember" in a sentence proves nothing
+# at all. For those five the name must read as a call: "call answer", "with recall", "answer(" or "forget=".
+AMBIGUOUS = ("answer", "reply", "recall", "remember", "forget")
+# Tools with no honest place to be named in the moment, one line each for why. It is empty today: of the sixty-three
+# every one has a moment, and the five that had none got a sentence in text that already existed (the Google levels
+# now name their tools, rule 4's other half is in every task's start text, see_capacity's "wait for it" says what
+# waiting is made of, a goal's spending line names the tool that writes it, and tell_owner's refusal in a chat
+# points at message_owner). Anything put here must be written down deliberately, with its reason, rather than the
+# rule being bent until it passes.
+NO_PROMPT = {}
+
+
+def tool_table(path, which, at):
+    """The names in one tool table, as the source has it: TOOLS in hub.py, TOOL_SPECS in wakeups.py."""
+    names = []
+    for node in ast.parse(open(path).read()).body:
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == which for t in node.targets):
+            names += [e.elts[at].value for e in node.value.elts
+                      if isinstance(e, ast.Tuple) and len(e.elts) > at and isinstance(e.elts[at], ast.Constant)]
+    return names
+
+
+def prose(path):
+    """The strings of one module that an agent can end up reading: every string literal except the tool table, the
+    docstrings, the log's own words and the SQL. A literal with no space in it is a name in code, not a sentence."""
+    tree = ast.parse(open(path).read())
+    out, skip = [], set()
+
+    def mark(node):
+        skip.update(id(n) for n in ast.walk(node))
+
+    for node in tree.body:          # the catalog: the tool table itself
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", "") in ("TOOLS", "TOOL_SPECS") for t in node.targets):
+            mark(node.value)
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            first = n.body[0] if n.body else None       # a docstring
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+                skip.add(id(first.value))
+        elif isinstance(n, ast.Call):
+            called = getattr(n.func, "id", None) or getattr(n.func, "attr", None)
+            if called == "log":
+                for arg in n.args:
+                    mark(arg)
+            elif called in SQL_CALLS and n.args:
+                mark(n.args[0])
+
+    def walk(node, dead):
+        for child in ast.iter_child_nodes(node):
+            gone = dead or id(child) in skip
+            if not gone and isinstance(child, ast.Constant) and isinstance(child.value, str):
+                out.append(child.value)
+            elif not gone and isinstance(child, ast.JoinedStr):
+                # an f-string: its own text, with each {...} standing in as a space, so no name is read across one
+                out.append(" ".join(v.value for v in child.values
+                                    if isinstance(v, ast.Constant) and isinstance(v.value, str)))
+                for v in child.values:
+                    if not isinstance(v, ast.Constant):
+                        walk(v, gone)
+                continue
+            walk(child, gone)
+
+    walk(tree, False)
+    return [t for t in out if " " in t.strip() and not SQL_VERB.match(t.strip())]
+
+
+def named_in_the_moment(name, corpus):
+    """True when some text an agent reads names this tool."""
+    shape = (r"(?:[Cc]all|[Uu]se|[Ww]ith|and)\s+" + name + r"\b|\b" + name + r"\s*[(=]" if name in AMBIGUOUS
+             else r"(?<![\w.])" + name + r"(?![\w])")
+    return any(re.search(shape, text) for text in corpus)
 
 
 HUB_PROC, HUB = start_hub("main", {"vps": "", "mac-studio": "", "owner": ""},
@@ -141,8 +244,8 @@ def rpc(agent, method, params=None, notify=False, base=None):
     except ValueError:
         return code, headers, None
 
-def tool(agent, name, **args):
-    code, headers, resp = rpc(agent, "tools/call", {"name": name, "arguments": args})
+def tool(agent, name, base=None, **args):
+    code, headers, resp = rpc(agent, "tools/call", {"name": name, "arguments": args}, base=base)
     res = resp["result"]
     return res["content"][0]["text"], res["isError"]
 
@@ -171,6 +274,47 @@ wt = [t["name"] for t in rpc("studio", "tools/list")[2]["result"]["tools"]]
 mdiff, wdiff = tool_set(mt, MANAGER_TOOLS), tool_set(wt, WORKER_TOOLS)
 check("the manager's tools are the ones RULES.md names", not mdiff, mdiff)
 check("a worker's tools are the ones RULES.md names", not wdiff, wdiff)
+
+# 1b a lead, and every tool named where an agent reads it. A hub of its own: the main hub's team stays the three
+# agents the rest of these checks are written for, and this one carries the two agents those checks cannot have --
+# a lead, whose tools nothing ever listed, and a worker with Google, whose start text names the tools its levels
+# give (the clause renders them from GOOGLE_TOOLS, so only the real text proves they are there).
+MOMENT = {"pa": {"role": "lead", "machine": "pa", "runtime": "claude", "can": ["shell", "web"],
+                 "start": "claude --permission-mode bypassPermissions {prompt}"},
+          "gw": {"role": "worker", "machine": "gw", "runtime": "claude", "can": ["shell", "web"],
+                 "google": {"gmail": {"account": "a@b.com", "level": "send"},
+                            "drive": {"account": "a@b.com", "level": "write"}},
+                 "start": "claude --permission-mode bypassPermissions {prompt}"}}
+procL, hubL = start_hub("moment", {"vps": "", "mac-studio": "", "owner": ""}, "--tick", "1", agents=MOMENT)
+lt = [t["name"] for t in rpc("pa", "tools/list", base=hubL)[2]["result"]["tools"]]
+ldiff = tool_set(lt, LEAD_TOOLS)
+check("a lead's tools are the ones RULES.md names", not ldiff, ldiff)
+text, err = tool("manager", "create_task", base=hubL, owner="gw", title="Read the mail",
+                 done_when="nothing; this task is only here for the words its session starts with")
+check("create_task for the agent with Google", not err and "T-1" in text, text)
+told = json.loads(raw("GET", "/events/gw?after=0&wait=0", base=hubL)[2])["events"]
+opening = "\n".join(e["text"] for e in told)
+check("a session is told the tools its Google levels give, by name and not by the name of the level",
+      all(t in opening for t in ("drive_search", "drive_write", "drive_move", "gmail_read", "gmail_send")),
+      opening[:500])
+procL.terminate()
+
+# The universe this check reads: the tool tables as the source has them. Tied to the three tool lists above, so a
+# tool added in a shape the parser cannot see, that an agent can nevertheless call, fails here instead of hiding.
+TOOL_UNIVERSE = sorted(set(tool_table(os.path.join(KIT, "hub.py"), "TOOLS", 1))
+                       | set(tool_table(os.path.join(KIT, "wakeups.py"), "TOOL_SPECS", 0)))
+check("the tool tables this check reads hold every tool a session is offered",
+      set(mt) | set(wt) | set(lt) <= set(TOOL_UNIVERSE),
+      str(sorted((set(mt) | set(wt) | set(lt)) - set(TOOL_UNIVERSE))))
+CORPUS = prose(os.path.join(KIT, "hub.py")) + prose(os.path.join(KIT, "wakeups.py")) + [opening]
+unnamed = [t for t in TOOL_UNIVERSE if t not in NO_PROMPT and not named_in_the_moment(t, CORPUS)]
+check("every tool is named in text an agent reads in the moment, not only in the catalog", not unnamed,
+      f"named nowhere a session reads: {unnamed}. Name each one where it belongs, in the prompt of the moment it "
+      f"is for, or write it into NO_PROMPT with the reason it needs none.")
+check("the check itself reports a tool that nothing names",
+      named_in_the_moment("deliver_result", CORPUS) and not named_in_the_moment("bottle_the_moon", CORPUS))
+check("every tool excused from a prompt carries its reason",
+      all(t in TOOL_UNIVERSE and str(NO_PROMPT[t]).strip() for t in NO_PROMPT), str(NO_PROMPT))
 text, err = tool("studio", "raise_needs_you", title="x", why="y")
 check("a worker cannot reach the owner", err and "no tool" in text, text)
 check("ping", rpc("studio", "ping")[2]["result"] == {})

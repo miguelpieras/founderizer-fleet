@@ -59,6 +59,7 @@ DESKTOP = Frames()
 SUPPORTED_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
 TERMINAL = ("completed", "failed", "rejected", "canceled")
 LOCK = threading.RLock()
+TX = threading.local()          # transactions this thread has open, for in_transaction's guard
 DB = None
 TEAM = {}
 CFG = {}
@@ -338,12 +339,36 @@ def transaction():
     """Plain DB.execute statements that commit together or not at all. q, q1, ins, emit and kv_get each commit at
     once, so none of them may run inside; read_rows is the read that may."""
     with LOCK:
+        TX.open = getattr(TX, "open", 0) + 1
         try:
             yield
             DB.commit()
         except BaseException:
             DB.rollback()
             raise
+        finally:
+            TX.open -= 1
+
+
+def in_transaction(what):
+    """Refuse a write that belongs to the caller's transaction when the caller opened none.
+
+    A helper that writes with a plain DB.execute leaves its row uncommitted, so called outside a transaction it is
+    committed by the next unrelated commit on this connection, or lost when the connection closes — and silently
+    either way. The comment that says "inside the caller's transaction" does not hold that, so this does: the next
+    caller written outside one reads this exception instead of getting a row that is sometimes there.
+
+    Guarded: keep_command, event_rows, dispatch_check, resource_record, log_row, duty_new_case,
+    memory_from_work, and the row writers of the six crash windows — record_outcome_rows, stop_request_rows,
+    request_unknown_rows, duty_history_row, duty_watch_rows, duty_review_rows, trigger_create_rows,
+    trigger_edit_rows and trigger_state_rows. Each of those has a committing twin for the callers that have no
+    transaction of their own, so the guard never stands between a caller and the write it meant to make.
+
+    Not guarded yet, in the same shape and each one line from it: attempt_rows, pause_trigger, record_trigger,
+    end_open_runs, once_done, memory_contradicted and memory_indexed."""
+    if not getattr(TX, "open", 0):
+        raise RuntimeError(f"{what} writes inside the caller's transaction, and none is open. Put the call in a "
+                           f"`with transaction():` block.")
 
 
 def kv_get(k, default=None):
@@ -381,8 +406,19 @@ def span(seconds):
     return f"{s // 60} minutes"
 
 
+LOG = "INSERT INTO log(ts,agent,what) VALUES(?,?,?)"
+
+
+def log_row(agent, what):
+    """Inside the caller's transaction: one log line, which lands with it or rolls back with it. log() commits at
+    once, so it is the wrong one to reach from a transaction's path — memory_indexed did, and committed the
+    half-written lesson around it."""
+    in_transaction("log_row")
+    DB.execute(LOG, (now(), agent, what[:400]))
+
+
 def log(agent, what):
-    ins("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (now(), agent, what[:400]))
+    ins(LOG, (now(), agent, what[:400]))
 
 
 def agents():
@@ -530,7 +566,7 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "server_prepare",
                "mobile", "attachments", "resource_grants", "machine_signin",
                "releases", "entitlement", "agent_signin", "github_app", "need_options", "restore",
-               "manager_start"]
+               "manager_start", "agent_notes"]
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 
 
@@ -854,6 +890,7 @@ def emit(agent, kind, text, task=None, extra=None):
 def event_rows(rows, t0):
     """Inside a transaction: emit's rows, each (agent, kind, task, text, extra). The task is the one from
     filed_under, which the caller reads before its transaction starts."""
+    in_transaction("event_rows")
     for agent, kind, task, text, extra in rows:
         DB.execute(EVENT, (agent, kind, task, str(text), t0, json.dumps(extra or {})))
 
@@ -963,7 +1000,17 @@ MASK = "[Registered login removed]"
 
 
 def mask_secrets(text):
-    """Replace each registered login in a text, found the way secret_hit finds one."""
+    """Replace each registered login in a text. It is never weaker than secret_hit, which is what guard refuses with.
+
+    It used to be. secret_hit reads a text twice -- as it stands and with the JSON string escapes undone -- because a
+    login can arrive inside JSON; secret_spans reads it once, so a login written `p\\"assw0rd` was refused at the
+    write and carried through every render. Every tool that answers with json.dumps is that shape (message_agent,
+    sign_in, call_api), and a password with a quote, a backslash or an accent in it is ordinary.
+
+    Finding the escaped span and mapping it back is not the fix: json_plain changes the length of the text, so the
+    offsets do not line up. So where the hub cannot say *where* the login is but still sees that one is there, it
+    says the whole text is gone, exactly as scrub does. That also makes this the self-checking gate: anything a
+    later secret_spans cannot place is masked whole rather than let out."""
     text = str(text or "")
     merged = []
     for start, end in secret_spans(text):
@@ -975,7 +1022,13 @@ def mask_secrets(text):
     for start, end in merged:
         out += [text[last:start], MASK]
         last = end
-    return "".join(out) + text[last:]
+    said = "".join(out) + text[last:]
+    # Only where secret_hit looks further than secret_spans did, which is only in a text that has a backslash in it
+    # (json_plain undoes JSON string escapes and nothing else). Masking adds no backslash, so this is the same
+    # guarantee at no cost to the ordinary render: nothing this lets out is something secret_hit still sees.
+    # A caller that can say more than one mask about such a text compares the answer with MASK: request_done does,
+    # because "the hub held the body back: it had a registered login" tells an agent why its body is gone.
+    return MASK if "\\" in text and secret_hit(said) else said
 
 
 def scrub(value):
@@ -1249,7 +1302,7 @@ def t_read_messages(agent, a):
 # that to its session. The session is simply told, in its first words, what the fleet will actually let it use, and
 # that there is nothing else -- so that needs_access is a thing it can name, instead of something it discovers by
 # being refused.
-HOLDINGS_CHARS = 900            # the most that the holdings block adds to a session's opening text
+HOLDINGS_CHARS = 1020           # the most that the holdings block adds to a session's opening text
 HOLDINGS_ITEMS = 8              # named things of one kind, before the rest become a count
 ALLOWANCE_LOUD = 60             # percent used: below this a session is told nothing about its allowance
 
@@ -1258,6 +1311,21 @@ def named_few(things, limit=HOLDINGS_ITEMS):
     """Up to `limit` names, then a count. One agent with thirty logins must not push the rest of a start text out."""
     kept = list(things)
     return ", ".join(kept[:limit]) + (f" and {len(kept) - limit} more" if len(kept) > limit else "")
+
+
+def google_clauses(agent):
+    """What an agent's Google levels give it, by the names of the tools and not by the name of the level. A session
+    told "Drive at the level write" still has to find drive_write among sixty names in the catalog, which is how
+    five of these ten tools came to be named nowhere an agent reads in the moment. Both texts that tell an agent
+    what it holds -- a task's start text and a duty task's toolbox -- say it from here."""
+    google = (agents().get(agent) or {}).get("google") or {}
+    out = []
+    for service in ("gmail", "drive"):
+        if google.get(service):
+            gave = [t for t in GOOGLE_TOOLS if GOOGLE_TOOLS[t][0] == service and google_allowed(agent, t)]
+            out.append(f"{GOOGLE_NAMES[service]} of {google[service]['account']} at the level "
+                       f"{google[service]['level']} ({', '.join(gave)})")
+    return out
 
 
 def holdings_parts(agent):
@@ -1275,11 +1343,7 @@ def holdings_parts(agent):
         parts.append("you can use " + named_few(sorted(a["can"])))
     if a.get("repos"):
         parts.append("GitHub " + named_few(f"{r} ({v})" for r, v in sorted(a["repos"].items())))
-    google = a.get("google") or {}
-    for service in ("gmail", "drive"):
-        if google.get(service):
-            parts.append(f"{GOOGLE_NAMES[service]} of {google[service]['account']} at the level "
-                         f"{google[service]['level']}")
+    parts += google_clauses(agent)
     if a.get("tools"):
         parts.append("MCP servers " + named_few(sorted(a["tools"])))
     keys = [name for _, name in read_secrets(agent)]
@@ -1344,6 +1408,14 @@ def allowance_start_text(agent, task_id):
             "mid-task, one report_progress is worth more than anything else you do with that turn.\n")
 
 
+# Rule 4, both halves, in the words a session reads before it does anything. The blocking half was always here; the
+# other one was in RULES.md alone, which an agent reads once, at the start, before it has found anything -- so
+# report_up was named nowhere an agent reads at the moment it would reach for it.
+RULE_FOUR = (" Never contact the owner: if you are blocked, use ask_my_requester. If you are not blocked but found "
+             "something this task does not cover -- an event that belongs to another agent's duty, a fact the other "
+             "agents need, something the fleet does not have, a risk -- say it with report_up, which pauses nothing.")
+
+
 def start_text(agent, task_id, resume=False):
     head = (f'You are agent "{agent}" in Founderizer. Read RULES.md and '
             f'profiles/{agent}.md in this folder first. Your helper brought this folder up to date just before this '
@@ -1355,6 +1427,8 @@ def start_text(agent, task_id, resume=False):
             # the lessons it wrote about the things it works on. agent_notes_text is the reader the notes left for
             # this shelf; both are carried AS the agent's own words, never as rules, so a later session weighs them.
             + notes_start_text(agent) + memory_start_text(agent, task_id))
+    # Masked on the way out, not only where each part was written: this text carries the agent's own notes, its
+    # lessons and its holdings, and a login registered after any of them was stored was never masked at the write.
     if role_of(agent) == "lead":
         team = ", ".join(n for n in agents() if reports_to(n) == agent) or "nobody yet"
         head += (f'You lead {team}. Give parts of {tref(task_id)} to them with create_task: each becomes a subtask of '
@@ -1362,12 +1436,15 @@ def start_text(agent, task_id, resume=False):
                  f'result with check_result, answer with answer, and decide prompts with decide_permission. Deliver '
                  f'{tref(task_id)} only when its subtasks are finished. ')
     if resume:
-        return head + (f'You are RESUMING task {tref(task_id)} after your earlier session stopped. '
-                       f'Call the fleet tool list_my_tasks with task_id "{tref(task_id)}". First check what '
-                       f'was already done (rule 9: check before repeating), then continue and finish with deliver_result.')
-    return head + (f'Your task is {tref(task_id)}. Call the fleet tool list_my_tasks with task_id '
-                   f'"{tref(task_id)}", do the task, report progress as you go, and finish with deliver_result. '
-                   f'Never contact the owner: if you are blocked, use ask_my_requester.')
+        return mask_secrets(head + (
+            f'You are RESUMING task {tref(task_id)} after your earlier session stopped. '
+            f'Call the fleet tool list_my_tasks with task_id "{tref(task_id)}". First check what '
+            f'was already done (rule 9: check before repeating), then continue and finish with '
+            f'deliver_result.' + RULE_FOUR))
+    return mask_secrets(head + (
+        f'Your task is {tref(task_id)}. Call the fleet tool list_my_tasks with task_id '
+        f'"{tref(task_id)}", do the task, report progress as you go, and finish with deliver_result.'
+        + RULE_FOUR))
 
 
 def get_task(task_id, owner=None, requester=None):
@@ -1501,17 +1578,19 @@ def request_hold(task_id, kind, by, note=""):
     return q1("SELECT * FROM holds WHERE id=?", (hid,)), True
 
 
-def record_outcomes(h, ran=False):
-    """After a confirmed stop: each effectful tool call with no finish, or cut off by the stop, is unknown.
-    A session that ran but left no records (a screen runner, or a session older than records) is unknown as a whole."""
-    if ran and not q1("SELECT 1 FROM thread_events WHERE task=? AND attempt=? LIMIT 1", (h["task"], h["attempt"])):
-        q("INSERT OR IGNORE INTO outcomes(task,attempt,hold,tool_call_id,title,kind,state,created) VALUES(?,?,?,?,?,?,'unknown',?)",
-          (h["task"], h["attempt"], h["id"], f"attempt-{h['attempt']}",
-           f"Attempt {h['attempt']}: its actions were not recorded. Check what it did before it stopped", "other", now()))
+def record_outcome_rows(h, ran=False):
+    """Inside a transaction: after a confirmed stop, each effectful tool call with no finish, or cut off by the stop,
+    is unknown. A session that ran but left no records (a screen runner, or a session older than records) is unknown
+    as a whole."""
+    in_transaction("record_outcome_rows")
+    if ran and not read_row("SELECT 1 FROM thread_events WHERE task=? AND attempt=? LIMIT 1", (h["task"], h["attempt"])):
+        DB.execute("INSERT OR IGNORE INTO outcomes(task,attempt,hold,tool_call_id,title,kind,state,created) VALUES(?,?,?,?,?,?,'unknown',?)",
+                   (h["task"], h["attempt"], h["id"], f"attempt-{h['attempt']}",
+                    f"Attempt {h['attempt']}: its actions were not recorded. Check what it did before it stopped", "other", now()))
         return [f"attempt-{h['attempt']}"]
     calls = {}
-    for r in q("SELECT type, data, created FROM thread_events WHERE task=? AND attempt=? "
-               "AND type IN ('tool_call','tool_call_update') ORDER BY id", (h["task"], h["attempt"])):
+    for r in read_rows("SELECT type, data, created FROM thread_events WHERE task=? AND attempt=? "
+                       "AND type IN ('tool_call','tool_call_update') ORDER BY id", (h["task"], h["attempt"])):
         d = json.loads(r["data"])
         if r["type"] == "tool_call":
             calls[d["tool_call_id"]] = dict(d, interrupted=False, ended=r["created"])
@@ -1523,10 +1602,16 @@ def record_outcomes(h, ran=False):
             continue            # fleet tools have hub receipts; reads change nothing
         cut = c["interrupted"] or (c["status"] == "failed" and c["ended"] >= h["created"])
         if c["status"] in ("pending", "in_progress") or cut:
-            q("INSERT OR IGNORE INTO outcomes(task,attempt,hold,tool_call_id,title,kind,state,created) "
-              "VALUES(?,?,?,?,?,?,'unknown',?)", (h["task"], h["attempt"], h["id"], call, c.get("title"), c["kind"], now()))
+            DB.execute("INSERT OR IGNORE INTO outcomes(task,attempt,hold,tool_call_id,title,kind,state,created) "
+                       "VALUES(?,?,?,?,?,?,'unknown',?)", (h["task"], h["attempt"], h["id"], call, c.get("title"), c["kind"], now()))
             found.append(call)
     return found
+
+
+def record_outcomes(h, ran=False):
+    """record_outcome_rows on its own, for a caller that has no transaction of its own."""
+    with transaction():
+        return record_outcome_rows(h, ran)
 
 
 def settle_hold(h, confirmed, detail, ran=False, ended=0):
@@ -1534,20 +1619,27 @@ def settle_hold(h, confirmed, detail, ran=False, ended=0):
     background shell whose call ended at once), they become one unknown outcome, so Resume still needs a check.
     An open call that an earlier hold of the attempt recorded explains nothing: that hold ended its processes."""
     state = "stopped" if confirmed else "not_confirmed"
-    q("UPDATE holds SET state=?, confirmed=?, detail=? WHERE id=?", (state, now(), detail, h["id"]))
-    # A stop for a task that was canceled meanwhile (stop_for_cancel): its requests are settled also without the
-    # vault's proof, because no later stop comes. One that the vault asked for stays unknown in both cases.
-    over = q1("SELECT state FROM tasks WHERE id=?", (h["task"],))["state"] in TERMINAL
-    found = record_outcomes(h, ran) + stop_requests(h, over) if confirmed else stop_requests(h, over) if over else []
-    if confirmed and ended and not q1("SELECT 1 FROM outcomes WHERE hold=? LIMIT 1", (h["id"],)):
-        q("INSERT OR IGNORE INTO outcomes(task,attempt,hold,tool_call_id,title,kind,state,created) VALUES(?,?,?,?,?,?,'unknown',?)",
-          (h["task"], h["attempt"], h["id"], f"ended-{h['id']}",
-           f"The stop ended {ended} running command process(es); check what they did", "other", now()))
-        found.append(f"ended-{h['id']}")
-    log("hub", f"H-{h['id']} on {tref(h['task'])}: {state} ({detail}); {len(found)} unknown outcome(s)")
-    if over:        # the hold ends with its task; the row keeps what the helper proved, or that it proved nothing
-        q("UPDATE holds SET state='released', released=?, released_by='hub', resume_mode='task ended', detail=? WHERE id=?",
-          (now(), ("stop confirmed: " if confirmed else "stop not confirmed: ") + detail, h["id"]))
+    t0 = now()
+    # The hold's own state and the unknown outcomes are one write. The hold used to be marked `stopped` first and the
+    # outcomes written after it, each with its own commit: a hub that died in between left a stopped hold with
+    # nobody told to check whether a send, a post or a payment went out, which is the one thing rule 9 exists to
+    # prevent. The helper's report is final, so there is no second report to write them.
+    with transaction():
+        DB.execute("UPDATE holds SET state=?, confirmed=?, detail=? WHERE id=?", (state, t0, detail, h["id"]))
+        # A stop for a task that was canceled meanwhile (stop_for_cancel): its requests are settled also without the
+        # vault's proof, because no later stop comes. One that the vault asked for stays unknown in both cases.
+        over = read_row("SELECT state FROM tasks WHERE id=?", (h["task"],))["state"] in TERMINAL
+        found = record_outcome_rows(h, ran) + stop_request_rows(h, over) if confirmed else \
+            stop_request_rows(h, over) if over else []
+        if confirmed and ended and not read_row("SELECT 1 FROM outcomes WHERE hold=? LIMIT 1", (h["id"],)):
+            DB.execute("INSERT OR IGNORE INTO outcomes(task,attempt,hold,tool_call_id,title,kind,state,created) VALUES(?,?,?,?,?,?,'unknown',?)",
+                       (h["task"], h["attempt"], h["id"], f"ended-{h['id']}",
+                        f"The stop ended {ended} running command process(es); check what they did", "other", t0))
+            found.append(f"ended-{h['id']}")
+        log_row("hub", f"H-{h['id']} on {tref(h['task'])}: {state} ({detail}); {len(found)} unknown outcome(s)")
+        if over:    # the hold ends with its task; the row keeps what the helper proved, or that it proved nothing
+            DB.execute("UPDATE holds SET state='released', released=?, released_by='hub', resume_mode='task ended', detail=? WHERE id=?",
+                       (t0, ("stop confirmed: " if confirmed else "stop not confirmed: ") + detail, h["id"]))
     return state
 
 
@@ -2625,6 +2717,8 @@ def t_deliver_result(agent, a):
         raise ToolError("cost_minutes says what a repeat of a dead end would cost, so it goes with tried.")
     if a.get("recheck") not in (None, "") and not tried:
         raise ToolError("recheck says how to find out cheaply whether a wall still stands, so it goes with tried.")
+    if tried:
+        memory_dead_end_fields(a.get("cost_minutes"), a.get("recheck"))     # before the task is delivered, not after
     if outcome not in ("completed", "failed", "rejected"):
         raise ToolError("outcome must be completed, failed or rejected.")
     if not what:
@@ -3472,8 +3566,8 @@ def capacity_text(view, filters, needs, restricted=False, parent=None):
     if not restricted:          # only the manager can act on the pool
         advice.append("Access that an agent lacks can be yours to give: grant it from the pool above instead of "
                       "asking the owner, and ask the owner only for what the fleet does not hold yet.")
-    advice.append("If no eligible agent is available, wait for it, or tell the owner what capacity is missing. Fleet "
-                  "buys and provisions nothing.")
+    advice.append("If no eligible agent is available, wait for it -- set_reminder brings you back to this in so "
+                  "many minutes -- or tell the owner what capacity is missing. Fleet buys and provisions nothing.")
     out.append(" ".join(advice))
     return "\n".join(out)
 
@@ -4079,16 +4173,26 @@ def api_text(job):
     return (job["result"] or f"HTTP {job['status']}") + (f"\n{job['response']}" if job["response"] else "")
 
 
-def request_unknown(job, text=None, hold=0):
-    """A request whose outcome is not known: its job stays open, and the task gets one unknown outcome for a check
-    (resolve_outcome). hold: the confirmed pause or stop that cut the request; 0 for a lost answer."""
-    q("UPDATE jobs SET unknown=?, result=COALESCE(?, result) WHERE id=?", (now(), text, job["id"]))
-    q("INSERT OR IGNORE INTO outcomes(task,attempt,hold,tool_call_id,title,kind,state,created) VALUES(?,?,?,?,?,'other','unknown',?)",
-      (job["task"], job["attempt"], hold, f"request-{job['request_id']}",
-       f"call_api {job['method']} {job['path'][:120]} with {job['login']}: the request can have reached the service", now()))
+def request_unknown_rows(job, text=None, hold=0):
+    """Inside a transaction: a request whose outcome is not known: its job stays open, and the task gets one unknown
+    outcome for a check (resolve_outcome). hold: the confirmed pause or stop that cut the request; 0 for a lost
+    answer. The job and its outcome are one fact, so they land together: a job left open with no outcome is a
+    request nobody is told to check."""
+    in_transaction("request_unknown_rows")
+    t0 = now()
+    DB.execute("UPDATE jobs SET unknown=?, result=COALESCE(?, result) WHERE id=?", (t0, text, job["id"]))
+    DB.execute("INSERT OR IGNORE INTO outcomes(task,attempt,hold,tool_call_id,title,kind,state,created) VALUES(?,?,?,?,?,'other','unknown',?)",
+               (job["task"], job["attempt"], hold, f"request-{job['request_id']}",
+                f"call_api {job['method']} {job['path'][:120]} with {job['login']}: the request can have reached the service", t0))
     if hold:        # the helper's own report of the cut request can come a moment before the stop's result
-        q("UPDATE outcomes SET hold=? WHERE task=? AND attempt=? AND tool_call_id=? AND hold=0",
-          (hold, job["task"], job["attempt"], f"request-{job['request_id']}"))
+        DB.execute("UPDATE outcomes SET hold=? WHERE task=? AND attempt=? AND tool_call_id=? AND hold=0",
+                   (hold, job["task"], job["attempt"], f"request-{job['request_id']}"))
+
+
+def request_unknown(job, text=None, hold=0):
+    """request_unknown_rows on its own, for a caller that has no transaction of its own."""
+    with transaction():
+        request_unknown_rows(job, text, hold)
 
 
 def request_settled(job, finding, note):
@@ -4099,20 +4203,28 @@ def request_settled(job, finding, note):
         settle_outcome(o["id"], finding, "hub", note)
 
 
-def stop_requests(h, canceled=False):
-    """After a confirmed pause or stop, or after the stop of a canceled task: each request of the task that is not
-    finished. A request that the vault never asked for was not sent. One that the vault confirmed can have reached
-    the service: it is unknown, with an outcome of this hold. Returns the names of the new unknown outcomes."""
+def stop_request_rows(h, canceled=False):
+    """Inside a transaction: after a confirmed pause or stop, or after the stop of a canceled task: each request of
+    the task that is not finished. A request that the vault never asked for was not sent. One that the vault
+    confirmed can have reached the service: it is unknown, with an outcome of this hold. Returns the names of the new
+    unknown outcomes."""
+    in_transaction("stop_request_rows")
     found, word = [], "canceled" if canceled else "stopped"
-    for job in q("SELECT * FROM jobs WHERE kind='request' AND task=? AND attempt=? AND finished IS NULL",
-                 (h["task"], h["attempt"])):
+    for job in read_rows("SELECT * FROM jobs WHERE kind='request' AND task=? AND attempt=? AND finished IS NULL",
+                         (h["task"], h["attempt"])):
         if job["released"]:
-            request_unknown(job, f"the task was {word} while the request ran.", hold=h["id"])
+            request_unknown_rows(job, f"the task was {word} while the request ran.", hold=h["id"])
             found.append(f"request-{job['request_id']}")
         else:
-            q("UPDATE jobs SET ok=0, result=?, finished=? WHERE id=?",
-              (f"The request was not sent: the task was {word} first.", now(), job["id"]))
+            DB.execute("UPDATE jobs SET ok=0, result=?, finished=? WHERE id=?",
+                       (f"The request was not sent: the task was {word} first.", now(), job["id"]))
     return found
+
+
+def stop_requests(h, canceled=False):
+    """stop_request_rows on its own, for a caller that has no transaction of its own."""
+    with transaction():
+        return stop_request_rows(h, canceled)
 
 
 def api_headers(value, auth_name=None):
@@ -4362,7 +4474,10 @@ def t_tell_owner(agent, a):
     if agents()[agent].get("role") in ("worker", "lead"):
         chat_fence(agent)
         if not reply:
-            raise ToolError("Reply with in_reply_to set to the owner request UUID from read_messages.")
+            # The one moment an agent is already reaching for the owner with nothing of his to answer, which is
+            # what message_owner is for. Nothing else an agent reads named it.
+            raise ToolError("Reply with in_reply_to set to the owner request UUID from read_messages. To write to "
+                            "the owner first, with no message of his to answer, use message_owner: short and rare.")
     if reply is not None:
         try:
             reply = str(uuid.UUID(reply))
@@ -4700,7 +4815,10 @@ def chat_item(r):
     """One outbound item as the bridge gets it."""
     item = {"id": r["id"], "kind": r["kind"], "account": r["account"]}
     if r["kind"] == "message":       # chat null: a Discord direct message to recipient, a user ID (16.4)
-        item.update(chat=r["chat"], recipient=r["recipient"], text=r["text"], reply_to=r["reply_to"],
+        # mask_secrets here and not only at the write: this is the one render that leaves the hub for somebody
+        # else's server, and a login registered after the item was queued was never masked by guard.
+        item.update(chat=r["chat"], recipient=r["recipient"], text=mask_secrets(r["text"]),
+                    reply_to=r["reply_to"],
                     prefix=None)        # 17.5: one agent for each account, so no name before the text
     elif r["kind"] == "typing":
         item.update(chat=r["chat"], seconds=r["seconds"])
@@ -6000,7 +6118,8 @@ def goal_block(g):
            "  " + limits_text(v["limits"])]
     money = v["limits"]["money"]
     if money:
-        out.append(f"  Recorded spending: {v['spent']:.2f} of {money['amount']:.2f} {money['currency']}.")
+        out.append(f"  Recorded spending: {v['spent']:.2f} of {money['amount']:.2f} {money['currency']}. "
+                   f"Record each spend with record_spend, before it is spent.")
     if v["tokens_used"] is not None:
         out.append(f"  Measured tokens: {v['tokens_used']:,} (no token limit).")
     step = v["next_step"]
@@ -7740,9 +7859,13 @@ def agent_notes_text(agent):
 
     This is the reader that the memory section calls. It is deliberately the only way in: the notes are the
     agent's own words about how it works, and whatever carries them must carry them AS that — never as rules —
-    so that a later session weighs them instead of obeying them."""
+    so that a later session weighs them instead of obeying them.
+
+    Masked here and not only at the write, exactly as memory_said does it for a lesson: t_write_notes masks the
+    logins that are registered at the moment of the write, and the owner registers a login whenever he adds one,
+    so a key written in the clear last week was carried into every later start text of this agent."""
     row = notes_row(agent)
-    return row["text"] if row else None
+    return mask_secrets(row["text"]) if row else None
 
 
 def notes_save(agent, text, why, by, t0, task=None, duty_case=None):
@@ -7755,11 +7878,13 @@ def notes_save(agent, text, why, by, t0, task=None, duty_case=None):
 
 
 def notes_view(agent):
-    """One agent's notes with their history, for the owner's route."""
+    """One agent's notes with their history, for the owner's route and for see_notes. Every version is masked as it
+    is read, because a login registered after a version was written was never masked by the write."""
     rows = q("SELECT * FROM agent_notes WHERE agent=? ORDER BY revision DESC", (agent,))
-    return {"agent": agent, "text": rows[0]["text"] if rows else None,
+    return {"agent": agent, "text": mask_secrets(rows[0]["text"]) if rows else None,
             "revision": rows[0]["revision"] if rows else 0,
-            "versions": [{"revision": r["revision"], "text": r["text"], "why": r["why"], "by": r["by"],
+            "versions": [{"revision": r["revision"], "text": mask_secrets(r["text"]),
+                          "why": mask_secrets(r["why"]), "by": r["by"],
                           "at": r["created"], "task": r["task"], "duty_case": r["duty_case"]} for r in rows]}
 
 
@@ -7816,9 +7941,11 @@ def case_ref(value):
     return c
 
 
-def duty_history(duty_id, by, kind, detail=""):
-    ins("INSERT INTO duty_history(responsibility,ts,by,kind,detail) VALUES(?,?,?,?,?)",
-        (duty_id, now(), by, kind, str(detail)[:2000]))
+def duty_history_row(duty_id, by, kind, detail="", t0=None):
+    """Inside the caller's transaction: one line of a duty's history."""
+    in_transaction("duty_history_row")
+    DB.execute("INSERT INTO duty_history(responsibility,ts,by,kind,detail) VALUES(?,?,?,?,?)",
+               (duty_id, now() if t0 is None else t0, by, kind, str(detail)[:2000]))
 
 
 def duty_watch_spec(value, create):
@@ -7892,11 +8019,7 @@ def duty_toolbox(agent):
     parts = []
     if a.get("can"):
         parts.append("you can use " + ", ".join(sorted(a["can"])))
-    google = a.get("google") or {}
-    for service in ("gmail", "drive"):
-        if google.get(service):
-            parts.append(f"{GOOGLE_NAMES[service]} of {google[service]['account']} at the level "
-                         f"{google[service]['level']}")
+    parts += google_clauses(agent)
     if a.get("repos"):
         parts.append("GitHub " + ", ".join(f"{r} ({v})" for r, v in sorted(a["repos"].items())))
     if a.get("tools"):
@@ -7985,39 +8108,51 @@ def duty_watch_target(body, want, t0):
                 raise Refusal(400, f"watch.trigger {w['trigger']} is not a live watch of this duty")
 
 
-def duty_watches(duty_id, live=True, managed=False):
-    """The wake-up rules of a duty, oldest first. managed: only the kinds that a watch list writes (`check` and
-    `clock`), never a rule that the agent attached itself."""
+def duty_watch_query(duty_id, live=True, managed=False):
+    """(the SQL, its arguments) for the wake-up rules of a duty, oldest first. managed: only the kinds that a watch
+    list writes (`check` and `clock`), never a rule that the agent attached itself."""
     states = ("active", "paused") if live else ("active", "paused", "done", "deleted")
     marks = ",".join("?" * len(states))
     kinds = " AND watch IN ('check','clock')" if managed else ""
-    return q(f"SELECT * FROM triggers WHERE responsibility=? AND state IN ({marks}){kinds} ORDER BY id",
-             (duty_id, *states))
+    return (f"SELECT * FROM triggers WHERE responsibility=? AND state IN ({marks}){kinds} ORDER BY id",
+            (duty_id, *states))
 
 
-def duty_watch_apply(r, want, by, t0):
-    """The watches of a duty as wake-up rules: a named rule changes, a new watch becomes a rule, and a rule that the
-    list does not name is deleted. duty_watch_target checked everything that can be refused."""
+def duty_watches(duty_id, live=True, managed=False):
+    """The wake-up rules of a duty, oldest first."""
+    return q(*duty_watch_query(duty_id, live, managed))
+
+
+def duty_watches_read(duty_id, live=True, managed=False):
+    """duty_watches as a read that commits nothing, so it is safe inside a transaction: it also sees the rules that
+    the transaction around it has just written."""
+    return read_rows(*duty_watch_query(duty_id, live, managed))
+
+
+def duty_watch_rows(r, want, by, t0):
+    """Inside the caller's transaction: the watches of a duty as wake-up rules — a named rule changes, a new watch
+    becomes a rule, and a rule that the list does not name is deleted. duty_watch_target checked everything that can
+    be refused, agent_rule_problem's part of it included, so none of these reads the goals or the team again."""
+    in_transaction("duty_watch_rows")
     body, kept = duty_stored(r), []
     for w in want:
         payload = duty_watch_body(body, w)
         if w["trigger"] is not None:
-            row = trigger_row(w["trigger"])
+            row = read_row("SELECT * FROM triggers WHERE id=?", (w["trigger"],))
             fields = {k: payload[k] for k in TRIGGER_FIELDS}
             stored = {"agent": row["agent"], "schedule": json.loads(row["schedule"]), "task": json.loads(row["task"]),
                       "late_minutes": row["late_minutes"], "max_tasks_per_day": row["max_tasks_per_day"],
                       "check": json.loads(row["check_spec"]) if row["check_spec"] else None}
             if fields != stored:
-                trigger_edit(row["id"], row["revision"], fields, by, t0,
-                             created_by=row["created_by"])
+                trigger_edit_rows(row["id"], row["revision"], fields, by, t0, created_by=row["created_by"])
             kept.append(row["id"])
             continue
-        made = trigger_create(payload, by, t0, created_by=manager_name())
-        q("UPDATE triggers SET responsibility=?, watch=? WHERE id=?", (r["id"], w["kind"], made["id"]))
-        kept.append(made["id"])
-    for row in duty_watches(r["id"], managed=True):      # an attached rule of the agent is not in this list
+        made = trigger_create_rows(payload, by, t0, created_by=manager_name())
+        DB.execute("UPDATE triggers SET responsibility=?, watch=? WHERE id=?", (r["id"], w["kind"], made))
+        kept.append(made)
+    for row in duty_watches_read(r["id"], managed=True):  # an attached rule of the agent is not in this list
         if row["id"] not in kept:
-            trigger_action(row["id"], row["revision"], "delete", by, t0)
+            trigger_state_rows(row["id"], row["revision"], "delete", by, t0)
     return kept
 
 
@@ -8035,8 +8170,13 @@ def duty_kept_watches(duty_id):
 
 
 def duty_save(body, by, t0, duty_id=None, command=None):
-    """A new duty, or a change of one: the row, its watches, its history row, the review wake-up of its agent and an
-    agent's receipt. Everything that can be refused is checked before the first write."""
+    """A new duty, or a change of one: the row, its watches, its history row, the review wake-up of its agent, the
+    message that says the duty exists and an agent's receipt, in one transaction. Everything that can be refused is
+    checked before the first write.
+
+    The receipt used to be inside the transaction and the watches, the review rule and the two messages after it. A
+    repeat of the same request_id short-circuits on the receipt, so a hub that died in that window left a duty with
+    no watch, nobody told that it exists, and no way to finish it: the manager's repeat answered "R-1 saved"."""
     old = None
     if duty_id is not None:
         old = duty_row(duty_id)
@@ -8050,6 +8190,8 @@ def duty_save(body, by, t0, duty_id=None, command=None):
     if want is None:
         want = duty_kept_watches(duty_id)
     duty_watch_target(body, want, t0)
+    review = duty_review_plan(body["agent"], t0)
+    left_review = duty_review_plan(old["agent"], t0) if old and old["agent"] != body["agent"] else (None, None)
     with transaction():
         if old is None:
             new_id = DB.execute(
@@ -8069,28 +8211,24 @@ def duty_save(body, by, t0, duty_id=None, command=None):
                        (new_id, t0, by, ", ".join(changed) or "no field"))
         keep_command(command, {"responsibility": new_id, "revision": (old["revision"] + 1) if old else 1,
                                "text": f"{rref(new_id)} saved."}, t0)
-    r = duty_row(new_id)
-    duty_watch_apply(r, want, by, t0)
-    duty_review_watch(r["agent"], by, t0)
-    if old and old["agent"] != r["agent"]:      # the agent it left keeps no daily review for a duty it lost
-        duty_review_watch(old["agent"], by, t0)
-    if old is None:
-        emit(manager_name(), "say", new_duty_text(r, by))
-        if r["agent"] != manager_name():
-            emit(r["agent"], "say", new_duty_text(r, by))
+        r = read_row("SELECT * FROM responsibilities WHERE id=?", (new_id,))
+        duty_watch_rows(r, want, by, t0)
+        duty_review_rows(r["agent"], by, t0, review)
+        if old and old["agent"] != r["agent"]:  # the agent it left keeps no daily review for a duty it lost
+            duty_review_rows(old["agent"], by, t0, left_review)
+        if old is None:                         # the message names the watches this transaction has just written
+            told = [(manager_name(), "say", None, new_duty_text(r, by), None)]
+            if r["agent"] != manager_name():
+                told.append((r["agent"], "say", None, new_duty_text(r, by), None))
+            event_rows(told, t0)
     return duty_row(new_id)
 
 
-def duty_review_watch(agent, by, t0):
-    """One review wake-up for each agent that holds an active duty, daily at the review hour of team.json: it reads
-    its duties, puts the late work in order and reports one line to the manager (R6). The hub owns this rule."""
-    row = q1("SELECT * FROM triggers WHERE agent=? AND watch='review' AND state IN ('active','paused')", (agent,))
-    if not q1("SELECT COUNT(*) n FROM responsibilities WHERE agent=? AND state='active'", (agent,))["n"]:
-        if row:
-            trigger_action(row["id"], row["revision"], "delete", by, t0)
-        return None
-    if row:
-        return row["id"]
+def duty_review_plan(agent, t0):
+    """What duty_review_rows needs to make the agent's daily review wake-up, worked out before the transaction
+    starts: (the trigger body, the refusal that body would raise), or (None, None) when its time has passed.
+    trigger_slots and agent_rule_problem read the goals and the team, and those reads commit, so a caller that is
+    about to write cannot run them itself. A caller that only deletes the rule never looks at this."""
     _, hour, zone = goal_settings()
     body = {"agent": agent, "check": None, "late_minutes": 240, "max_tasks_per_day": 2, "request_id": str(uuid.uuid4()),
             "schedule": {"kind": "daily", "time": f"{hour:02d}:00", "days": None, "timezone": str(zone)},
@@ -8132,50 +8270,79 @@ def duty_review_watch(agent, by, t0):
                                   "left as they are on purpose, and every contradicted lesson has been rewritten "
                                   "or dropped, with the reasons in the result."}}
     if not trigger_slots(body["schedule"], t0, t0, 1):
+        return None, None
+    return body, agent_rule_problem(body)
+
+
+def duty_review_rows(agent, by, t0, plan):
+    """Inside the caller's transaction: one review wake-up for each agent that holds an active duty, daily at the
+    review hour of team.json — it reads its duties, puts the late work in order and reports one line to the manager
+    (R6). The hub owns this rule. `plan` is duty_review_plan(agent, t0), from before the transaction."""
+    in_transaction("duty_review_rows")
+    row = read_row("SELECT * FROM triggers WHERE agent=? AND watch='review' AND state IN ('active','paused')", (agent,))
+    if not read_row("SELECT COUNT(*) n FROM responsibilities WHERE agent=? AND state='active'", (agent,))["n"]:
+        if row:
+            trigger_state_rows(row["id"], row["revision"], "delete", by, t0)
         return None
-    made = trigger_create(body, by, t0, created_by=manager_name())
-    q("UPDATE triggers SET watch='review' WHERE id=?", (made["id"],))
-    return made["id"]
+    if row:
+        return row["id"]
+    body, problem = plan
+    if body is None:
+        return None
+    if problem:
+        raise Refusal(400, problem)
+    made = trigger_create_rows(body, by, t0, created_by=manager_name())
+    DB.execute("UPDATE triggers SET watch='review' WHERE id=?", (made,))
+    return made
 
 
 def new_duty_text(r, by):
-    rules = ", ".join(f"{t['watch'] or 'clock'} rule {t['id']}" for t in duty_watches(r["id"])) or "none yet"
+    rules = ", ".join(f"{t['watch'] or 'clock'} rule {t['id']}" for t in duty_watches_read(r["id"])) or "none yet"
     return (f"[duty {rref(r['id'])}] New duty for {r['agent']}, from {by}:\n{r['text']}\n"
             + f"Watches: {rules}.\n"
             f"{r['agent']} acts alone inside this duty and asks only when the duty does not cover a step. The "
             f"manager sees every duty, case and marker with see_responsibilities, and keeps them in order.")
 
 
-def duty_state_change(r, action, by, note=""):
-    """One state action on a duty. A pause and a retire pause its watches, a resume starts them again, and a retire
-    keeps its cases as history."""
+def duty_state_change(r, action, by, note="", command=None, receipt=None):
+    """One state action on a duty, in one transaction: the row, its history line, its watches, the review wake-up of
+    its agent, the message to the manager and the caller's receipt. A pause and a retire pause its watches, a resume
+    starts them again, and a retire keeps its cases as history.
+
+    The duty used to change with a commit of its own and the receipt to be kept afterwards. A hub that died in
+    between retired the duty with no receipt, and then the manager's repeat of the same request_id was refused with
+    "is retired; retire does not apply" — which tells the caller its write did not apply when it did, and that is
+    the one answer a repeat must never give (RULES.md: a repeat does the work once and answers the same thing)."""
     t0 = now()
     if action not in DUTY_ACTIONS:
         raise Refusal(400, "action must be pause, resume, retire or reopen")
     if r["state"] not in DUTY_ACTIONS[action]:
         raise Refusal(409, f"{rref(r['id'])} is {r['state']}; {action} does not apply")
-    open_cases = [c["id"] for c in q("SELECT id FROM duty_cases WHERE responsibility=? AND state='open' ORDER BY id",
-                                     (r["id"],))]
-    q("UPDATE responsibilities SET state=?, revision=revision+1, updated=?, marker_kind=NULL, "
-      "marker_since=NULL, marker_detail=NULL WHERE id=?", (DUTY_STATE[action], t0, r["id"]))
-    duty_history(r["id"], by, action, note)
-    for row in duty_watches(r["id"]):
-        try:
-            if action in ("pause", "retire") and row["state"] == "active":
-                trigger_action(row["id"], row["revision"], "pause", by, t0)
-            elif action in ("resume", "reopen") and row["state"] == "paused":
-                trigger_action(row["id"], row["revision"], "resume", by, t0)
-        except Refusal:
-            continue                # a rule whose time has passed stays paused, and the sweep marks the duty
-    duty_review_watch(r["agent"], by, t0)
-    cases = ", ".join(f"C-{c}" for c in open_cases) or "none"
-    say = {"pause": f"paused. Its watches are paused. Its open cases stay: {cases}.",
-           "resume": "active again. Its watches run again.",
-           "retire": f"retired. Its watches are paused, and its cases stay as history. Still open: {cases}.",
-           "reopen": "active again after its retirement. Its watches run again."}[action]
-    emit(manager_name(), "say", f"[duty {rref(r['id'])}] {by} set {rref(r['id'])} "
-                                f"({duty_name(r['text'])}, {r['agent']}) to "
-                                f"{say}" + (f" Note: {note}" if note else ""))
+    review = duty_review_plan(r["agent"], t0)       # its reads commit, so it runs before the transaction
+    with transaction():
+        open_cases = [c["id"] for c in read_rows(
+            "SELECT id FROM duty_cases WHERE responsibility=? AND state='open' ORDER BY id", (r["id"],))]
+        DB.execute("UPDATE responsibilities SET state=?, revision=revision+1, updated=?, marker_kind=NULL, "
+                   "marker_since=NULL, marker_detail=NULL WHERE id=?", (DUTY_STATE[action], t0, r["id"]))
+        duty_history_row(r["id"], by, action, note, t0)
+        for row in duty_watches_read(r["id"]):
+            try:
+                if action in ("pause", "retire") and row["state"] == "active":
+                    trigger_state_rows(row["id"], row["revision"], "pause", by, t0)
+                elif action in ("resume", "reopen") and row["state"] == "paused":
+                    trigger_state_rows(row["id"], row["revision"], "resume", by, t0)
+            except Refusal:
+                continue            # a rule whose time has passed stays paused, and the sweep marks the duty
+        duty_review_rows(r["agent"], by, t0, review)
+        cases = ", ".join(f"C-{c}" for c in open_cases) or "none"
+        say = {"pause": f"paused. Its watches are paused. Its open cases stay: {cases}.",
+               "resume": "active again. Its watches run again.",
+               "retire": f"retired. Its watches are paused, and its cases stay as history. Still open: {cases}.",
+               "reopen": "active again after its retirement. Its watches run again."}[action]
+        event_rows([(manager_name(), "say", None, f"[duty {rref(r['id'])}] {by} set {rref(r['id'])} "
+                     f"({duty_name(r['text'])}, {r['agent']}) to {say}" + (f" Note: {note}" if note else ""),
+                     None)], t0)
+        keep_command(command, receipt, t0)
     return {"open_cases": open_cases}
 
 
@@ -8311,6 +8478,7 @@ def duty_block(t, due, t0):
 def duty_new_case(r, key, title, source, by, t0):
     """Inside the caller's transaction: one open case for one key, with the repeat mark when the same key came back
     inside DUTY_REPEAT_DAYS. Returns the case id."""
+    in_transaction("duty_new_case")
     old = DB.execute(DUTY_REPEAT_CASE, duty_repeat_args(r["id"], key, t0)).fetchone()
     if old:                 # the verdict of the loop, and the hub works it out: no agent asserts this about itself
         memory_contradicted(r["id"], key, r["agent"], t0)
@@ -8334,17 +8502,25 @@ def duty_first_step(task_id, t0):
 
 
 def t_of_case(case_id):
-    """The newest task of a case, so a lesson written when it closed says which work taught it."""
-    row = q1("SELECT id FROM tasks WHERE duty_case=? ORDER BY id DESC LIMIT 1", (case_id,))
+    """The newest task of a case, so a lesson written when it closed says which work taught it.
+
+    read_row and not q1, because t_close_case reads this **inside** the transaction that closes the case, writes the
+    lesson and keeps the receipt. q1 commits at once, so it committed the closed case on its own: a dead end whose
+    cost_minutes or recheck memory_from_work then refused left the case closed, the lesson lost and no receipt, and
+    the agent's repeat was answered "already closed. A new event is a new case"."""
+    row = read_row("SELECT id FROM tasks WHERE duty_case=? ORDER BY id DESC LIMIT 1", (case_id,))
     return row["id"] if row else None
 
 
 def duty_close(c, outcome, by, note=""):
-    """Close one case. The caller checked the steps and the open tasks."""
+    """Close one case, in one transaction with the history line that says it closed. The caller checked the steps
+    and the open tasks. The two used to commit on their own, so a hub that died between them left a closed case the
+    owner reads with no record of its closing."""
     t0 = now()
-    q("UPDATE duty_cases SET state='closed', closed=?, closed_by=?, outcome=?, note=? WHERE id=?",
-      (t0, by, outcome, note[:2000] or None, c["id"]))
-    duty_history(c["responsibility"], by, "case_closed", f"{cref(c)} {outcome}: {note or c['title']}")
+    with transaction():
+        DB.execute("UPDATE duty_cases SET state='closed', closed=?, closed_by=?, outcome=?, note=? WHERE id=?",
+                   (t0, by, outcome, note[:2000] or None, c["id"]))
+        duty_history_row(c["responsibility"], by, "case_closed", f"{cref(c)} {outcome}: {note or c['title']}", t0)
 
 
 def duty_after_deliver(t, agent, outcome):
@@ -8813,13 +8989,11 @@ def t_change_duty(agent, a):
     command, stored = agent_write(agent, "change_duty", a, fields)
     if stored:
         return stored["text"]
+    text = f"{rref(r['id'])} is {DUTY_STATE[action]}."
     try:
-        duty_state_change(r, action, agent, note)
+        duty_state_change(r, action, agent, note, command, {"responsibility": r["id"], "text": text})
     except Refusal as e:
         raise ToolError(str(e)) from None
-    text = f"{rref(r['id'])} is {DUTY_STATE[action]}."
-    with transaction():
-        keep_command(command, {"responsibility": r["id"], "text": text}, now())
     return text
 
 
@@ -8945,7 +9119,9 @@ def memory_indexed(mid):
                        "SELECT id, text, prevents, about FROM memories WHERE id=?", (mid,))
         except sqlite3.Error as e:
             MEMORY_FTS[0] = False
-            log("hub", f"memory search fell back to a scan: {e}")
+            # log_row and not log, which commits: this runs inside the caller's transaction, and a commit here
+            # committed the lesson that t_remember, close_case or deliver_result had only half written.
+            log_row("hub", f"memory search fell back to a scan: {e}")
 
 
 def memory_found(agent, words, limit):
@@ -9491,6 +9667,21 @@ def memory_kind_of(value):
     return kind
 
 
+def memory_dead_end_fields(cost_minutes, recheck):
+    """(cost_minutes, recheck) of a dead end, checked, or a ToolError saying which is wrong.
+
+    Its own function so the check can run **before** the work is written. deliver_result updates the task outside the
+    transaction that writes the lesson, so a bad cost_minutes used to refuse the call with the task already
+    delivered: the result stood, the dead end was lost, and rule 2 forbids reopening a finished task to record it."""
+    cost = memory_cost(cost_minutes)
+    try:
+        text = goal_text(recheck, "recheck", MEMORY_RECHECK) if str(recheck or "").strip() else None
+    except ValueError as e:
+        raise ToolError(f"{e}. Say in one or two lines how to find out cheaply whether the wall still stands.") \
+            from None
+    return cost, text
+
+
 def memory_cost(value):
     """How long the work that found a dead end took, in minutes, or None. The only number that says what a repeat
     would cost, so it is what breaks a tie on the shelf."""
@@ -9530,8 +9721,9 @@ def memory_from_work(agent, text, prevents, about, t0, task=None, responsibility
     event coming back, and its `prevents` is the same sentence every time, so it is filled in here rather than asked
     for: one field of ceremony is one field too many. `cost_minutes` is what a repeat would cost and `recheck` is how
     to find out cheaply whether the wall still stands."""
+    in_transaction("memory_from_work")
     kind = memory_kind_of(kind)
-    cost_minutes = memory_cost(cost_minutes)
+    cost_minutes, recheck = memory_dead_end_fields(cost_minutes, recheck)
     if kind == "dead_end" and (responsibility or prevents_key):
         raise ToolError("A dead end takes no duty and no case key: it is not a claim about an event coming back, so "
                         "nothing can contradict it automatically. It ages instead, and an agent re-tests it.")
@@ -9539,11 +9731,6 @@ def memory_from_work(agent, text, prevents, about, t0, task=None, responsibility
         raise ToolError("A lesson that claims to stop an event needs both the duty and its key, or neither.")
     if kind == "dead_end" and not str(prevents or "").strip():
         prevents = DEAD_END_PREVENTS           # always the same sentence, so the agent writes one field and not two
-    try:
-        recheck = goal_text(recheck, "recheck", MEMORY_RECHECK) if str(recheck or "").strip() else None
-    except ValueError as e:
-        raise ToolError(f"{e}. Say in one or two lines how to find out cheaply whether the wall still stands.") \
-            from None
     mid = DB.execute("INSERT INTO memories(agent,about,text,prevents,created,by_task,request_id,"
                      "responsibility,prevents_key,read_untrusted,kind,cost_minutes,recheck) "
                      "VALUES(?,?,?,?,?,?,'',?,?,?,?,?,?)",
@@ -10073,11 +10260,23 @@ def resource_uses(kind, what, team=None):
 
 
 def resource_record(rid, agent, level, by, revision, t0=None):
-    """One row of resource_grants: who gave this agent this resource at this level, or took it back (level None), and
-    the commit that did it. Since the grant is the authorization, this record and the commit are what the owner reads
+    """Inside the caller's transaction: one row of resource_grants: who gave this agent this resource at this level,
+    or took it back (level None), and the commit that did it. Since the grant is the authorization, this record and the commit are what the owner reads
     afterwards, so every change of a hold writes one, the owner's own and the manager's alike."""
-    return ins("INSERT INTO resource_grants(ts,resource,agent,level,by,revision) VALUES(?,?,?,?,?,?)",
-               (t0 or now(), rid, agent, level, by, revision))
+    in_transaction("resource_record")
+    return DB.execute("INSERT INTO resource_grants(ts,resource,agent,level,by,revision) VALUES(?,?,?,?,?,?)",
+                      (t0 or now(), rid, agent, level, by, revision)).lastrowid
+
+
+def resource_recorded(rid, agent):
+    """The level that this agent's newest record of one resource says it holds, or None when no record gave it one.
+
+    The grant is the authorization, so the record is the control: a hold in force with no row of its own is a hold
+    nobody can be asked about. A commit of team.json cannot join a database transaction, so a grant_access whose hub
+    died after the commit leaves exactly that, and the manager's repeat of the same request_id reads this to find
+    out that its own first attempt got the hold in force and the record no further."""
+    row = q1("SELECT level FROM resource_grants WHERE resource=? AND agent=? ORDER BY id DESC LIMIT 1", (rid, agent))
+    return row["level"] if row else None
 
 
 def resource_history(rid, limit=RESOURCE_HISTORY):
@@ -10171,6 +10370,9 @@ def take_resource(body):
     phrase = resource_phrase(kind, what)
     held = next((h["level"] for h in resource_holders(kind, what) if h["agent"] == agent), None)
     result = grant_resource("owner", rid, agent, None, phrase)
+    if result["changed"] or resource_recorded(rid, agent) is not None:
+        with transaction():
+            resource_record(rid, agent, None, "owner", result["revision"])
     # One receipt for every kind, so the page reads a secret's hold like a repository's.
     return {"resource": rid, "agent": agent, "had": held,
             **{k: result[k] for k in ("revision", "sha256", "changed")}}
@@ -10233,9 +10435,13 @@ def grant_check(agent, rid, level):
 
 def grant_resource(by, rid, agent, level, phrase):
     """Give or take back one agent's hold of one resource, through the path that the owner's own grant routes use: one
-    commit of the hub's checkout, checked by validate_team and applied at once, and one row of resource_grants. level
-    None takes the hold back. So every change is a commit in git, a record the owner reads and a line of the log, and
-    the owner takes any of it back in one step. Nothing about a value changes: the vault stays as it is."""
+    commit of the hub's checkout, checked by validate_team and applied at once. level None takes the hold back. So
+    every change is a commit in git, a record the owner reads and a line of the log, and the owner takes any of it
+    back in one step. Nothing about a value changes: the vault stays as it is.
+
+    The caller writes the resource_grants row, in the transaction that keeps its own receipt: a commit of team.json
+    cannot join a database transaction, so the record, the receipt and the owner's line are at least one write among
+    themselves, and resource_recorded is how a repeat finds a record that its first attempt did not reach."""
     kind, what = resource_parts(rid)
     if kind == "secret":
         result = save_grant({"login": what, "agent": agent, "grant": level}, by=by)
@@ -10277,9 +10483,6 @@ def grant_resource(by, rid, agent, level, phrase):
             return True
         done = f"gave {agent} {phrase} ({level})" if level else f"took {phrase} back from {agent}"
         result = save_integration(None, change, f"{by.capitalize()} {done}", by=by)
-    if result["changed"]:
-        with transaction():
-            resource_record(rid, agent, level, by, result["revision"])
     return result
 
 
@@ -10304,8 +10507,13 @@ def t_grant_access(agent, a):
         result = grant_resource(agent, rid, target, level, phrase)
     except Refusal as e:
         raise ToolError(f"The hub refused the grant: {e}") from None
-    text = (f"{target} {'now has' if result['changed'] else 'already had'} {phrase} at level {level}. "
-            f"{'Revision ' + result['revision'][:12] + '. ' if result['changed'] else ''}"
+    # The commit of team.json is in force now and cannot join the transaction below, so a hub that dies here leaves
+    # the hold given with nothing the owner can read about it. `gave` is therefore the answer of the call that got
+    # the hold in force and not of the commit alone: a repeat of the same request_id whose first attempt reached the
+    # commit and no further finds no record of it, writes that record, and answers what the first attempt would have.
+    gave = result["changed"] or resource_recorded(rid, target) != level
+    text = (f"{target} {'now has' if gave else 'already had'} {phrase} at level {level}. "
+            f"{'Revision ' + result['revision'][:12] + '. ' if gave else ''}"
             f"It gets it in its next task session; a running session keeps what it started with. The grant is the "
             f"authorization: {target} does what this access allows and answers for it, and you answer for giving it. "
             f"The owner reads who gave what to whom on the Access page of the app and takes it back there.")
@@ -10323,13 +10531,15 @@ def t_grant_access(agent, a):
     # The owner's own rule makes the manager answerable for giving access, which is the reason giving has to be
     # visible without his looking for it: one record of each grant in his chat with the manager, with no
     # notification, exactly as tell_owner writes one.
-    said = (f"{target} now holds {phrase} at level {level}." if result["changed"] else
+    said = (f"{target} now holds {phrase} at level {level}." if gave else
             f"{target} already held {phrase} at level {level}; nothing changed.")
     said += f" I gave it because: {why}." if why else " I gave no reason for it."
     said += (" The grant is the authorization: it does what this access allows and answers for it, and I answer for "
              "giving it. You end it on the Resources page in one step.")
     t0 = now()
     with transaction():
+        if gave:
+            resource_record(rid, target, level, agent, result["revision"], t0)
         keep_command(command, {"text": text}, t0)
         DB.execute("INSERT INTO owner_reports(text,about,created,agent,in_reply_to) VALUES(?,?,?,?,NULL)",
                    (said, f"grant {rid} to {target}", t0, agent))
@@ -10367,6 +10577,7 @@ REPORT_NOW_DAY = 3              # reports a day from one sender that the hub let
 REPORT_COLLAPSE_DAYS = 7        # inside this, the same report is one line for the receiver
 REPORT_COLLAPSE_CHARS = 120     # of the text, for the collapse key
 REPORT_GRACE = 7200             # seconds a report may wait for its decision before the hub says so
+REPORT_OWNER_WAIT = 86400       # and before it reaches the owner's own screen, because by then nobody is deciding
 REPORT_SHOWN = 12               # reports of one list
 REPORT_FEEDBACK_DAYS = 7        # how far back a session reads the decisions on its own reports
 REPORT_FEEDBACK_SHOWN = 3
@@ -10834,6 +11045,7 @@ CIRCLE_RESTARTS = 3             # restarts on one task
 CIRCLE_REFUSALS = 5             # identical refusals inside one task
 CIRCLE_PAIR = 8                 # messages between two agents in a day, with no task made
 CIRCLE_SHOWN = 10
+CIRCLE_OWNER_WAIT = 86400       # seconds a circle may stand after the manager was told, before the owner is
 
 
 def circle_chain(t):
@@ -10906,6 +11118,49 @@ def circles(t0):
     return found
 
 
+def circle_watched(found, t0):
+    """When each circle the hub can see now was first seen, kept in kv. It is what lets the owner be told only about
+    the ones the manager has already had and not settled: a circle the hub noticed a minute ago is the manager's to
+    decide. A circle that is gone leaves the map, so the same thing coming back later is a new sighting."""
+    try:
+        was = json.loads(kv_get("circle_watch") or "{}")
+    except ValueError:
+        was = {}
+
+    def first(sig):
+        try:
+            return float(was[sig][0])
+        except (KeyError, TypeError, ValueError, IndexError):
+            return t0
+    kept = {sig: [first(sig), line] for sig, line in found}
+    kv_set("circle_watch", json.dumps(kept) if kept else None)
+    return kept
+
+
+def circles_waiting(t0):
+    """[(when it was first seen, its line)] of the circles that have stood longer than CIRCLE_OWNER_WAIT since the
+    manager was told, oldest first. health_view reads the sweep's own map and never recomputes the circles: the
+    owner's screen is polled, and a warning that says what the last sweep found is both cheaper and honest."""
+    try:
+        watch = json.loads(kv_get("circle_watch") or "{}")
+    except ValueError:
+        return []
+    out = []
+    for sig, entry in watch.items():
+        try:
+            seen, line = float(entry[0]), str(entry[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if t0 - seen > CIRCLE_OWNER_WAIT:
+            out.append((seen, line))
+    return sorted(out)
+
+
+def reports_waiting(t0):
+    """The reports that have waited longer than REPORT_OWNER_WAIT for a decision, oldest first."""
+    return [r for r in open_reports(kinds=False) if t0 - r["created"] > REPORT_OWNER_WAIT]
+
+
 def circle_sweep(t0):
     """From the hub tick: the circles the fleet is running in, to the manager, when the set changes. The hub reports;
     the decision stays the manager's."""
@@ -10913,6 +11168,7 @@ def circle_sweep(t0):
         return
     kv_set("circle_sweep_at", t0)
     found = circles(t0)
+    circle_watched(found, t0)       # before the signature check: an unchanged set keeps its first sighting
     sig = ",".join(s for s, _ in found)
     if sig == (kv_get("circle_sweep_sig") or ""):
         return
@@ -11002,9 +11258,11 @@ def manager_resume_text():
     """Where the fleet stood at the moment this session started, for the first prompt of the standing session. It
     carries no plan of its own: every line of it is written down somewhere the next session can read again."""
     t0 = now()
-    return ("Where the fleet stands, as the hub has it (nothing here is only in this session):\n"
-            + "\n".join(resume_lines(t0))
-            + "\nThen call read_messages: its read is the receipt.")
+    # Masked on the way out, as start_text is: these lines carry what agents wrote — report texts, task titles,
+    # question texts — and a login registered after any of them was stored was never masked at the write.
+    return mask_secrets("Where the fleet stands, as the hub has it (nothing here is only in this session):\n"
+                        + "\n".join(resume_lines(t0))
+                        + "\nThen call read_messages: its read is the receipt.")
 
 
 def S(props, required=()):
@@ -11762,6 +12020,12 @@ def call_tool(agent, name, args, context=None):
                             fence(agent, tid, context)
                         text = fn(agent, args)
                 log(agent, f"{name} ok")
+                # The last gate before any text reaches a session. Each tool that renders stored words masks its
+                # own (memory_said, search_knowledge), but a tool that only reads a column masked nothing: a
+                # progress note in see_team, an agent's message in read_messages, an agent's notes in see_notes.
+                # guard refuses a login that is registered at the moment of the write; this catches the ones
+                # registered after it, which is every login the owner added since.
+                text = mask_secrets(text)
                 ins("INSERT INTO calls(ts,agent,task,attempt,name,args,ok,detail) VALUES(?,?,?,?,?,?,1,?)",
                     (now(), agent, tid, attempt, name,
                      "[blocked]" if secret_hit(json.dumps(args)) else json.dumps(args),
@@ -11770,9 +12034,10 @@ def call_tool(agent, name, args, context=None):
         raise ToolError(f"You have no tool named {name}.")
     except ToolError as e:
         log(agent, f"{name} refused: {e}")
+        said = mask_secrets(str(e))
         ins("INSERT INTO calls(ts,agent,task,attempt,name,args,ok,detail) VALUES(?,?,?,?,?,?,0,?)",
-            (now(), agent, tid, attempt, name, "[blocked]" if secret_hit(json.dumps(args)) else json.dumps(args), str(e)))
-        return str(e), True
+            (now(), agent, tid, attempt, name, "[blocked]" if secret_hit(json.dumps(args)) else json.dumps(args), said))
+        return said, True
     finally:
         CALL.context = None
 
@@ -12185,50 +12450,67 @@ def ask_code_approval(agent, a, need, rule=None):
     return f"{need} P-{pid} asks {requester} for this decision; nothing was saved."
 
 
-def trigger_create(body, by, t0, created_by, source=None, command=None, consume=None):
-    """A new trigger, its first history row, its saved code and an agent's receipt, in one transaction."""
+def trigger_create_rows(body, by, t0, created_by, source=None, command=None, consume=None):
+    """Inside the caller's transaction: a new trigger, its first history row, its saved code and an agent's receipt.
+    Returns its id. agent_rule_problem reads the team and the goals, and its reads commit, so the caller runs it
+    before the transaction starts: trigger_create does, and duty_watch_target does it for a duty's watches."""
+    in_transaction("trigger_create_rows")
     due = trigger_slots(body["schedule"], t0, t0, 1)
     if not due:
+        raise Refusal(400, "this time has passed")
+    use_code_prompt(consume, t0)
+    tid = DB.execute("INSERT INTO triggers(agent,state,revision,schedule,check_spec,task,late_minutes,"
+                     "max_tasks_per_day,anchor,next_due,created,updated,request_id,created_by) "
+                     "VALUES(?,'active',1,?,?,?,?,?,?,?,?,?,?,?)",
+                     (body["agent"], json.dumps(body["schedule"]), json.dumps(body["check"]) if body["check"] else None,
+                      json.dumps(body["task"]), body["late_minutes"], body["max_tasks_per_day"], t0, due[0], t0, t0,
+                      body["request_id"], created_by)).lastrowid
+    if source is not None:
+        DB.execute("INSERT OR IGNORE INTO trigger_code(sha256,source,bytes,created,by) VALUES(?,?,?,?,?)",
+                   (body["check"]["sha256"], source, len(source.encode("utf-8")), t0, by))
+    record_trigger(tid, by, "create", wakeups.history_detail("create", {}, dict(body, created_by=created_by)), t0)
+    keep_command(command, wakeups.receipt("create", tid, 1), t0)
+    return tid
+
+
+def trigger_create(body, by, t0, created_by, source=None, command=None, consume=None):
+    """trigger_create_rows on its own, for a caller that has no transaction: the checks whose reads commit, then the
+    one transaction. The order of the refusals is the order a caller reads them in."""
+    if not trigger_slots(body["schedule"], t0, t0, 1):
         raise Refusal(400, "this time has passed")
     problem = agent_rule_problem(body)
     if problem:
         raise Refusal(400, problem)
     with transaction():
-        use_code_prompt(consume, t0)
-        tid = DB.execute("INSERT INTO triggers(agent,state,revision,schedule,check_spec,task,late_minutes,"
-                         "max_tasks_per_day,anchor,next_due,created,updated,request_id,created_by) "
-                         "VALUES(?,'active',1,?,?,?,?,?,?,?,?,?,?,?)",
-                         (body["agent"], json.dumps(body["schedule"]), json.dumps(body["check"]) if body["check"] else None,
-                          json.dumps(body["task"]), body["late_minutes"], body["max_tasks_per_day"], t0, due[0], t0, t0,
-                          body["request_id"], created_by)).lastrowid
-        if source is not None:
-            DB.execute("INSERT OR IGNORE INTO trigger_code(sha256,source,bytes,created,by) VALUES(?,?,?,?,?)",
-                       (body["check"]["sha256"], source, len(source.encode("utf-8")), t0, by))
-        record_trigger(tid, by, "create", wakeups.history_detail(
-            "create", {}, dict(body, created_by=created_by)), t0)
-        keep_command(command, wakeups.receipt("create", tid, 1), t0)
+        tid = trigger_create_rows(body, by, t0, created_by, source, command, consume)
     return trigger_row(tid)
 
 
-def trigger_edit(trigger_id, base, body, by, t0, created_by=..., source=None, command=None, consume=None):
-    """A change of a trigger's fields: the runs of the old revision end, and the change, its history row, its saved
-    code and an agent's receipt commit together. created_by stays unless given."""
-    t = trigger_row(trigger_id)
-    if not t:
-        raise Refusal(404, "no such trigger")
-    if base != t["revision"]:
-        raise Conflict("the trigger changed meanwhile; reload it", revision=t["revision"])
-    if t["state"] in ("done", "deleted"):
-        raise Refusal(409, f"trigger {trigger_id} is {t['state']}; it cannot change")
+def trigger_edit_fields(t, body, created_by):
+    """(the trigger's fields now, the fields this edit asks for). created_by stays unless given."""
     old = {"agent": t["agent"], "schedule": json.loads(t["schedule"]), "task": json.loads(t["task"]),
            "late_minutes": t["late_minutes"], "max_tasks_per_day": t["max_tasks_per_day"],
            "check": json.loads(t["check_spec"]) if t["check_spec"] else None,
            "created_by": t["created_by"]}
     new = dict(old, **{k: body[k] for k in TRIGGER_FIELDS if k in body})
     new["created_by"] = t["created_by"] if created_by is ... else created_by
-    problem = agent_rule_problem(new, old)
-    if problem:
-        raise Refusal(400, problem)
+    return old, new
+
+
+def trigger_edit_rows(trigger_id, base, body, by, t0, created_by=..., source=None, command=None, consume=None):
+    """Inside the caller's transaction: the runs of the old revision end, and the change, its history row, its saved
+    code and an agent's receipt land with it. agent_rule_problem reads the team and the goals, and its reads commit,
+    so the caller runs it before the transaction starts: trigger_edit does, and duty_watch_target does it for a
+    duty's watches."""
+    in_transaction("trigger_edit_rows")
+    t = read_row("SELECT * FROM triggers WHERE id=?", (trigger_id,))
+    if not t:
+        raise Refusal(404, "no such trigger")
+    if base != t["revision"]:
+        raise Conflict("the trigger changed meanwhile; reload it", revision=t["revision"])
+    if t["state"] in ("done", "deleted"):
+        raise Refusal(409, f"trigger {trigger_id} is {t['state']}; it cannot change")
+    old, new = trigger_edit_fields(t, body, created_by)
     anchor, due, state = t["anchor"], t["next_due"], t["state"]
     if new["schedule"] != old["schedule"]:          # a new schedule counts from now
         later = trigger_slots(new["schedule"], t0, t0, 1)
@@ -12237,20 +12519,68 @@ def trigger_edit(trigger_id, base, body, by, t0, created_by=..., source=None, co
         anchor, due = t0, (later[0] if state == "active" else None)
     if state == "active" and due is None:           # a one-off whose open check run this edit ends
         state = "done"
-    with transaction():                             # the runs of the old revision end: their results are stale
-        use_code_prompt(consume, t0)
-        end_open_runs(trigger_id, "The trigger changed.", t0)
-        DB.execute("UPDATE triggers SET agent=?, schedule=?, check_spec=?, task=?, late_minutes=?, max_tasks_per_day=?, "
-                   "anchor=?, next_due=?, state=?, created_by=?, revision=revision+1, updated=? WHERE id=?",
-                   (new["agent"], json.dumps(new["schedule"]), json.dumps(new["check"]) if new["check"] else None,
-                    json.dumps(new["task"]), new["late_minutes"], new["max_tasks_per_day"], anchor, due, state,
-                    new["created_by"], t0, trigger_id))
-        if source is not None:
-            DB.execute("INSERT OR IGNORE INTO trigger_code(sha256,source,bytes,created,by) VALUES(?,?,?,?,?)",
-                       (new["check"]["sha256"], source, len(source.encode("utf-8")), t0, by))
-        record_trigger(trigger_id, by, "edit", wakeups.history_detail("edit", old, new), t0)
-        keep_command(command, wakeups.receipt("edit", trigger_id, t["revision"] + 1), t0)
+    use_code_prompt(consume, t0)
+    end_open_runs(trigger_id, "The trigger changed.", t0)      # their results are stale
+    DB.execute("UPDATE triggers SET agent=?, schedule=?, check_spec=?, task=?, late_minutes=?, max_tasks_per_day=?, "
+               "anchor=?, next_due=?, state=?, created_by=?, revision=revision+1, updated=? WHERE id=?",
+               (new["agent"], json.dumps(new["schedule"]), json.dumps(new["check"]) if new["check"] else None,
+                json.dumps(new["task"]), new["late_minutes"], new["max_tasks_per_day"], anchor, due, state,
+                new["created_by"], t0, trigger_id))
+    if source is not None:
+        DB.execute("INSERT OR IGNORE INTO trigger_code(sha256,source,bytes,created,by) VALUES(?,?,?,?,?)",
+                   (new["check"]["sha256"], source, len(source.encode("utf-8")), t0, by))
+    record_trigger(trigger_id, by, "edit", wakeups.history_detail("edit", old, new), t0)
+    keep_command(command, wakeups.receipt("edit", trigger_id, t["revision"] + 1), t0)
+
+
+def trigger_edit(trigger_id, base, body, by, t0, created_by=..., source=None, command=None, consume=None):
+    """trigger_edit_rows on its own, for a caller that has no transaction: the checks whose reads commit, then the
+    one transaction. The order of the refusals is the order a caller reads them in."""
+    t = trigger_row(trigger_id)
+    if not t:
+        raise Refusal(404, "no such trigger")
+    if base != t["revision"]:
+        raise Conflict("the trigger changed meanwhile; reload it", revision=t["revision"])
+    if t["state"] in ("done", "deleted"):
+        raise Refusal(409, f"trigger {trigger_id} is {t['state']}; it cannot change")
+    old, new = trigger_edit_fields(t, body, created_by)
+    problem = agent_rule_problem(new, old)
+    if problem:
+        raise Refusal(400, problem)
+    with transaction():
+        trigger_edit_rows(trigger_id, base, body, by, t0, created_by, source, command, consume)
     return trigger_row(trigger_id)
+
+
+def trigger_state_rows(trigger_id, base, action, by, t0, command=None):
+    """Inside the caller's transaction: pause, resume or delete of a trigger, its history row and the caller's
+    receipt. trigger_action is the same write on its own, and it also carries run_now and check_now, which start
+    work instead of changing a setting."""
+    in_transaction("trigger_state_rows")
+    t = read_row("SELECT * FROM triggers WHERE id=?", (trigger_id,))
+    if not t:
+        raise Refusal(404, "no such trigger")
+    if base != t["revision"]:
+        raise Conflict("the trigger changed meanwhile; reload it", revision=t["revision"])
+    if t["state"] not in TRIGGER_ACTIONS[action]:
+        raise Refusal(409, f"trigger {trigger_id} is {t['state']}; {action} does not apply")
+    if action == "resume":          # no backlog: the first due time after now
+        later = trigger_slots(json.loads(t["schedule"]), t["anchor"], t0, 1)
+        if not later:
+            raise Refusal(409, "this time has passed; change the time first")
+        DB.execute("UPDATE triggers SET state='active', paused_by=NULL, paused_reason=NULL, next_due=?, "
+                   "revision=revision+1, updated=? WHERE id=?", (later[0], t0, trigger_id))
+        record_trigger(trigger_id, by, "resume", wakeups.history_detail("resume", {"state": t["state"]},
+                                                                        {"state": "active"}), t0)
+    elif action == "pause":
+        pause_trigger(trigger_id, by, None, t0)
+    else:
+        end_open_runs(trigger_id, "The trigger was deleted.", t0)
+        DB.execute("UPDATE triggers SET state='deleted', paused_by=NULL, paused_reason=NULL, next_due=NULL, "
+                   "revision=revision+1, updated=? WHERE id=?", (t0, trigger_id))
+        record_trigger(trigger_id, by, "delete", wakeups.history_detail("delete", {"state": t["state"]},
+                                                                        {"state": "deleted"}), t0)
+    keep_command(command, wakeups.receipt(action, trigger_id, t["revision"] + 1), t0)
 
 
 def trigger_action(trigger_id, base, action, by, t0, command=None):
@@ -12268,28 +12598,9 @@ def trigger_action(trigger_id, base, action, by, t0, command=None):
         run = run_trigger(t, t0, True, t0)
     elif action == "check_now":     # one execution of the check, never a task (owner API 1.8)
         run = check_now(t, t0, command)
-    elif action == "resume":        # no backlog: the first due time after now
-        later = trigger_slots(json.loads(t["schedule"]), t["anchor"], t0, 1)
-        if not later:
-            raise Refusal(409, "this time has passed; change the time first")
-        with transaction():
-            DB.execute("UPDATE triggers SET state='active', paused_by=NULL, paused_reason=NULL, next_due=?, "
-                       "revision=revision+1, updated=? WHERE id=?", (later[0], t0, trigger_id))
-            record_trigger(trigger_id, by, "resume", wakeups.history_detail("resume", {"state": t["state"]},
-                                                                            {"state": "active"}), t0)
-            keep_command(command, wakeups.receipt("resume", trigger_id, t["revision"] + 1), t0)
-    elif action == "pause":
-        with transaction():
-            pause_trigger(trigger_id, by, None, t0)
-            keep_command(command, wakeups.receipt("pause", trigger_id, t["revision"] + 1), t0)
     else:
         with transaction():
-            end_open_runs(trigger_id, "The trigger was deleted.", t0)
-            DB.execute("UPDATE triggers SET state='deleted', paused_by=NULL, paused_reason=NULL, next_due=NULL, "
-                       "revision=revision+1, updated=? WHERE id=?", (t0, trigger_id))
-            record_trigger(trigger_id, by, "delete", wakeups.history_detail("delete", {"state": t["state"]},
-                                                                            {"state": "deleted"}), t0)
-            keep_command(command, wakeups.receipt("delete", trigger_id, t["revision"] + 1), t0)
+            trigger_state_rows(trigger_id, base, action, by, t0, command)
     return trigger_row(trigger_id), run
 
 
@@ -12999,6 +13310,7 @@ def record_trigger(trigger_id, by, action, detail, t0):
 
 def keep_command(command, receipt, t0):
     """Inside a transaction: an agent's write keeps its receipt under its request_id, with the write."""
+    in_transaction("keep_command")
     if command:
         agent, rid, tool, digest = command
         DB.execute("INSERT INTO tool_commands(agent,request_id,tool,digest,receipt,created) VALUES(?,?,?,?,?,?)",
@@ -13014,6 +13326,7 @@ def once_done(t):
 def dispatch_check(t, run, t0):
     """Inside a transaction: a new claim on a run for one execution of the check, and the helper work for it. The
     event wakes no model."""
+    in_transaction("dispatch_check")
     spec = json.loads(t["check_spec"])
     token, expires = str(uuid.uuid4()), t0 + spec["timeout_seconds"] + CHECK_GRACE
     generation = DB.execute("SELECT v FROM kv WHERE k='db_id'").fetchone()
@@ -14814,11 +15127,15 @@ def validate_status(data):
         if read_at is not None and not (isinstance(read_at, (int, float)) and not isinstance(read_at, bool)
                                         and math.isfinite(read_at)):
             raise ValueError("broker_read_at must be a time or null")
+        source = vault.get("broker_source")             # the SHA-256 of the broker's own program (vault_revision)
+        if source is not None and not (isinstance(source, str) and re.fullmatch(r"[0-9a-f]{64}", source)):
+            raise ValueError("broker_source must be a sha256 or null")
         vault = {"mode": mode, "isolated": _optional(vault.get("isolated"), bool),       # shared broker callers:
                  "callers": _optional(vault.get("callers"), bool), "broker_recipient": recipient,
                  "broker_read_at": read_at, "creates": _optional(vault.get("creates"), bool),      # create_login
                  "captures": _optional(vault.get("captures"), bool),                                # save_key
-                 "requests": _optional(vault.get("requests"), bool)}                                # call_api
+                 "requests": _optional(vault.get("requests"), bool),                                # call_api
+                 "broker_source": source}
     features = data.get("features") or []
     if not isinstance(features, list) or len(features) > 16 or \
             not all(isinstance(f, str) and re.fullmatch(r"[a-z_]{1,40}", f) for f in features):
@@ -15326,6 +15643,47 @@ def broker_report(name, t0=None):
         return None
     data = json.loads(st["data"])
     return dict((data.get("security") or {}).get("vault") or {}, features=data.get("features") or [])
+
+
+VAULT_PROGRAM = "vault.py"      # the broker's program: a root-owned copy outside every checkout a helper updates
+_vault_source = {}              # what it must hash to, by revision: {revision: sha256 or None}
+
+
+def vault_source(rev):
+    """The SHA-256 of vault.py at a revision of the configuration ref: what an installed broker's own copy must
+    hash to when it runs the vault of that revision. None when the revision or the file cannot be read."""
+    if not rev:
+        return None
+    if rev not in _vault_source:
+        try:
+            r = subprocess.run(["git", "-C", kit_dir(), "cat-file", "blob", f"{rev}:{VAULT_PROGRAM}"],
+                               capture_output=True, timeout=30, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            return None                     # not kept: a transient failure must not freeze the answer
+        if len(_vault_source) > 64:
+            _vault_source.clear()
+        _vault_source[rev] = hashlib.sha256(r.stdout).hexdigest() if r.returncode == 0 else None
+    return _vault_source[rev]
+
+
+def broker_programs(t0=None):
+    """For each machine with a vault broker that says what its own program hashes to: that checksum, the agent whose
+    helper read it last and that machine's worker user, for the one line that reinstalls it.
+
+    One broker serves every agent of its machine, so this is by machine and not by agent. A broker that says nothing
+    is left out — a Mac's signed helper, which the app updates itself, and a broker older than this one — because
+    unknown is not behind."""
+    out = {}
+    for name, a in agents().items():
+        report, machine = broker_report(name, t0), a.get("machine")
+        if not machine or not report or not report.get("broker_source"):
+            continue
+        at = report.get("broker_read_at") or 0
+        if at >= out.get(machine, {"at": -1})["at"]:
+            st = q1("SELECT data FROM machine_status WHERE agent=?", (name,))
+            out[machine] = {"at": at, "agent": name, "source": report["broker_source"],
+                            "user": ((json.loads(st["data"]) if st else {}).get("access") or {}).get("user")}
+    return out
 
 
 def broker_serves(name, team, t0=None):
@@ -17268,6 +17626,25 @@ def health_view():
                  f"Update {m['agent'].capitalize()}." + (" Its machine kept the revision it had."
                                                          if m["update"]["state"] == "failed" else ""),
                  agent=m["agent"])
+    # The vault broker is the one piece of the fleet that a release does not reach: it runs a root-owned copy of
+    # vault.py outside every checkout a helper updates, and `lifecycle.OWNER_ONLY` lets a commit that changes only
+    # that file count as taken, so every machine reports "current" while its broker runs whatever was installed by
+    # hand. The broker says what its own program hashes to and the hub compares it with its own vault.py, because
+    # nothing else can. A machine that is stale or behind is left out: it has not taken the release at all, its own
+    # warning already carries that, and two lines for one cause say less than one.
+    want = vault_source(desired)
+    held = {m["machine"] for m in machines if m["stale"] or m["update"]["state"] != "current"}
+    for machine, broker in (broker_programs(t0).items() if want else ()):
+        if machine in held or broker["source"] == want:
+            continue
+        warn("vault_behind",
+             f"The vault broker on {machine} does not run the vault.py of revision {desired[:12]}, which is the "
+             f"revision that machine reports. A release updates the agents' checkout and never this program, so the "
+             f"broker kept the copy that was installed by hand.",
+             f"On {machine}, as root: install -o root -g root -m 644 "
+             f"~{broker['user'] or '<worker>'}/fleet-pilot/{VAULT_PROGRAM} /usr/local/lib/fleet-vault/"
+             f"{VAULT_PROGRAM} && systemctl restart fleet-vault",
+             agent=broker["agent"])
     flag = manager_warning()
     if flag:
         # A session that is not running is the one manager warning that a button settles: the app asks that
@@ -17276,6 +17653,32 @@ def health_view():
         warn("manager_" + flag["kind"], kv_get("mgr_flag"),
              f"Start the session of {manager_name().capitalize()} again." if flag["kind"] == "down" else
              f"Open {manager_name().capitalize()}, where its session and its machine are.", agent=manager_name())
+    # The two findings of the fleet's own sweeps, on the owner's screen (his rule, 19 October 2026: a screen that
+    # reports something wrong must carry the way to put it right). He is told only what the manager has already had
+    # and not settled: a circle the hub noticed a minute ago is the manager's to decide, and interrupting the owner
+    # with it is the drowning this work set out to stop. The hub still changes nothing about either.
+    hours = int(CIRCLE_OWNER_WAIT // 3600)
+    stuck = circles_waiting(t0)
+    if stuck:
+        warn("circles_stuck",
+             f"{len(stuck)} thing(s) have looked like running in circles for more than {hours} hours, and "
+             f"{manager_name().capitalize()} was told: " + " | ".join(line for _, line in stuck[:2])
+             + (f" | and {len(stuck) - 2} more." if len(stuck) > 2 else ""),
+             f"Open {manager_name().capitalize()} and tell it what to do about them. The hub reports a circle and "
+             f"changes nothing by itself, because the third attempt is sometimes the right one.",
+             agent=manager_name())
+    waiting = reports_waiting(t0)
+    if waiting:
+        oldest, leads = waiting[0], {r["to_agent"] for r in waiting if r["to_agent"] != manager_name()}
+        warn("reports_undecided",
+             f"{len(waiting)} report(s) from your agents have waited more than "
+             f"{int(REPORT_OWNER_WAIT // 3600)} hours for a decision. The oldest is {upref(oldest['id'])} from "
+             f"{oldest['from_agent']} to {oldest['to_agent']}, {ago(oldest['created'])} ago: "
+             + clip(oldest["text"], 160),
+             f"Open {manager_name().capitalize()} and have it decide them with decide_report"
+             + (f"; {', '.join(sorted(leads))} owe(s) one, which it can ask for." if leads else ".")
+             + " An agent that reports something and hears nothing back stops reporting.",
+             agent=manager_name())
     free = None
     try:
         st = os.statvfs(os.path.dirname(CFG.get("db_path") or ".") or ".")
@@ -17366,9 +17769,17 @@ def last_login(agent):
 
 
 def signed_in_now(agent, runtime):
-    """What this machine last reported about that runtime: True, False or None when it has not said."""
-    row = q1("SELECT data FROM machine_status WHERE agent=?", (agent,))
-    if not row:
+    """What this machine last reported about that runtime: True, False or None when it has not said.
+
+    A reading older than MACHINE_STALE has not said: it is what that machine was, not what it is, and every other
+    reader of machine_status already holds to that (`broker_report`, `switch_view`, `/ui/machines` `stale`). This
+    one did not, and `start_machine_login` reads it before it looks at whether the helper is reporting at all — so
+    a machine that said "signed in" an hour ago and then lost the credential answered the owner's Sign in with
+    "Claude Code is signed in on this machine. Its own sign-out comes first.", which is a dead end with the wrong
+    reason on it. Unknown is the honest answer, and then the route refuses for the reason that is true or starts
+    the sign-in."""
+    row = q1("SELECT data, reported FROM machine_status WHERE agent=?", (agent,))
+    if not row or now() - row["reported"] > MACHINE_STALE:
         return None
     data = json.loads(row["data"])
     for where in (data.get("runtimes") or {}, {(data.get("runtime") or {}).get("name"): data.get("runtime") or {}}):
@@ -19924,7 +20335,14 @@ class Handler(BaseHTTPRequestHandler):
     def ui_command(self, route, read, act, limit=65536, keep=None):
         """Owner task controls. The same UUID, generation and client rules as owner messages.
         An exact repeat returns the first result; a refused command leaves no record. keep(result): what the hub keeps
-        of a result that must not be stored whole (a link code); a repeat returns that."""
+        of a result that must not be stored whole (a link code); a repeat returns that.
+
+        act() is not a database write alone: it commits team.json, it reaches a helper, it fetches a page. So it
+        cannot join the transaction that keeps the receipt, and the receipt used to be written after it with a
+        commit of its own -- a hub that died in between left the action applied with no receipt, and the same
+        request_id then did the action a second time. So the row is claimed first, with an empty result, and filled
+        in afterwards: a repeat that finds the claim unfilled is told the outcome is not known, which is the same
+        thing the fleet tells an agent about its own cut-off call (resolve_outcome, rule 9)."""
         if not self.ui_allowed():
             return
         if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
@@ -19958,15 +20376,23 @@ class Handler(BaseHTTPRequestHandler):
             if old:
                 if (old["route"], old["body"], old["client"]) != (route, canonical, client):
                     return self.json(409, {"error": "request_id was already used for a different command"})
+                if not old["result"]:
+                    return self.json(409, {"error": "this command was interrupted and the hub does not know what "
+                                                    "came of it. Read the thing it was about, and send the command "
+                                                    "again with a new request_id if it did not take effect"})
                 return self.json(200, dict(json.loads(old["result"]), replayed=True))
+            ins("INSERT INTO ui_controls(request_id,route,body,client,created,result) VALUES(?,?,?,?,?,'')",
+                (request_id, route, canonical, client, now()))
             try:
                 result = act(body)
-            except Refusal as e:
+            except Refusal as e:        # checked before any write of its own, so it leaves no record
+                q("DELETE FROM ui_controls WHERE request_id=?", (request_id,))
                 return self.json(e.status, dict(getattr(e, "extra", {}), error=str(e)))
             result = dict(result, ok=True, request_id=request_id, client=client, replayed=False)
-            ins("INSERT INTO ui_controls(request_id,route,body,client,created,result) VALUES(?,?,?,?,?,?)",
-                (request_id, route, canonical, client, now(), json.dumps(keep(result) if keep else result)))
-            log("owner", f"UI {route} {request_id} accepted")
+            with transaction():
+                DB.execute("UPDATE ui_controls SET result=? WHERE request_id=?",
+                           (json.dumps(keep(result) if keep else result), request_id))
+                log_row("owner", f"UI {route} {request_id} accepted")
         return self.json(200, result)
 
     def ui_control(self, task_id):
@@ -21070,25 +21496,41 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(404, {"error": f"no key registered for {parts[1]}"})
             return self.json(200, {"agent": parts[1], "pubkey": key})
         if parts[:1] == ["sealed"] and len(parts) == 2:
+            # Who is asking, before one word of the handover is read out. These checks were in the other order:
+            # the row was read first, a missing one answered 404 and another agent's handover 403, and only then
+            # was the caller asked for its key. So any caller that reached the hub on the private network, with no
+            # key at all, could walk the ids and tell "that one is not mine" from "that one does not exist" -- and
+            # each probe wrote a REFUSED line naming the real recipient into the hub's log. This is the one route
+            # that moves a credential from one agent to another, so identity comes first and the record second.
+            who = query.get("agent") or "?"
+            if not self.allowed(who, broker=True):
+                return
+            if who not in agents():
+                return self.json(403, {"error": "name the agent that opens this handover"})
+            if agents()[who].get("vault") == "none":
+                return self.json(403, {"error": "this agent has no credential access"})
             sid = int(re.sub(r"\D", "", parts[1]) or 0)
             row = q1("SELECT * FROM sealed WHERE id=?", (sid,))
             if not row:
                 return self.json(404, {"error": "no such sealed handover"})
-            who = query.get("agent") or "?"
             if who != row["recipient"]:
                 log("hub", f"REFUSED {who}: sealed handover S-{sid} is for {row['recipient']}")
                 return self.json(403, {"error": f"S-{sid} is not for you"})
-            if not self.allowed(who, broker=True):
-                return
-            if agents()[who].get("vault") == "none":
-                return self.json(403, {"error": "this agent has no credential access"})
             if row["expired"] or row["ciphertext"] is None:
                 return self.json(410, {"error": f"S-{sid} has expired: a handover lasts for one task only"})
             task = int(re.sub(r"\D", "", query.get("task") or "") or 0) or None
-            if task and row["bound_task"] and task != row["bound_task"]:
+            if not task:
+                # A handover lasts for one task: the task that first opens it (RULES.md "Logins"), and that is
+                # held by binding the copy to the task named here. A request that named none was answered with the
+                # locked copy all the same and bound nothing, so the recipient could open the same handover from
+                # every later task of that day by leaving the task out — and `expire_handovers` had no task whose
+                # end would throw it away either. The task is what makes the rule a rule, so it is required.
+                log("hub", f"REFUSED {who}: sealed handover S-{sid} opened without a task")
+                return self.json(400, {"error": f"name the task that opens S-{sid}: a handover lasts for one task"})
+            if row["bound_task"] and task != row["bound_task"]:      # `task` is required above, so never 0 here
                 log("hub", f"REFUSED {who}: sealed handover S-{sid} belongs to {tref(row['bound_task'])}")
                 return self.json(403, {"error": f"S-{sid} belongs to {tref(row['bound_task'])}"})
-            if task and not row["bound_task"]:
+            if not row["bound_task"]:
                 q("UPDATE sealed SET bound_task=? WHERE id=?", (task, sid))       # used for that task, then thrown away
             q("UPDATE sealed SET fetched=fetched+1 WHERE id=?", (sid,))
             log(row["recipient"], f"opened sealed handover S-{sid}")
@@ -22109,7 +22551,11 @@ class Handler(BaseHTTPRequestHandler):
         # (JSON escapes) holds the whole body back. Only then is the body cut.
         answer = f["body"].encode("utf-16", "surrogatepass").decode("utf-16", "replace") if isinstance(f.get("body"), str) else ""
         answer = mask_secrets(answer)
-        answer = None if secret_hit(answer) else answer
+        # `== MASK` is the same statement `secret_hit` used to make here: the hub saw a login in this body and could
+        # not say where it was, so none of the body goes out. mask_secrets says that now by masking the whole text
+        # (it reads a text with a backslash in it the way secret_hit does), and this route turns it into its own
+        # sentence instead of a body that is one mask -- the agent reads why the body is gone.
+        answer = None if answer == MASK or secret_hit(answer) else answer
         with LOCK:
             row = q1("SELECT * FROM jobs WHERE id=? AND agent=?", (int(re.sub(r"\D", "", job) or 0), agent))
             if not row or row["finished"]:

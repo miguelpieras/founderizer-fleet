@@ -338,7 +338,10 @@ the checkout and the service of an agent that was added since.
   reports its output in its result instead.
 - **A vault broker**, which an agent needs before it can use a saved login
   (WORKER-INSTALL.md, "Vault broker"). The hub itself needs none: the manager holds no
-  credential.
+  credential. A broker is also installed by hand once and updated by hand: a release
+  changes no root-owned file, so `/ui/health` raises `vault_behind` for a machine whose
+  broker is behind the hub's own `vault.py`, and the owner runs the one line it gives
+  (WORKER-INSTALL.md, "When a release changes vault.py").
 - **The apps.** The Mac app and the iPhone app are installed on the owner's own
   machines, not here.
 - **Backups.** The records are `~fleet/.fleet/pilot.db` and the repository is

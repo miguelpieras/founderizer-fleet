@@ -152,11 +152,42 @@ Set `"vault": "broker"` and `"vault_recipient": "<the public half>"` for `<agent
 worker user with passwordless sudo can read the vault as root, so the broker is no
 boundary for it. `sudo -u <worker> cat /var/lib/fleet-vault/bws-token` and
 `sudo -u <worker> cat /var/lib/fleet-vault/age.key` must fail with "Permission denied"; `python3 fleet.py check <agent>` as the worker
-must show "vault broker answers (kept by fleet-vault)" and "vault broker key is the
-one pinned in team.json"; and the machine row must show `security.vault`
+must show "vault broker answers (kept by fleet-vault)", "vault broker key is the
+one pinned in team.json" and "vault broker runs the vault.py of this checkout"; and the machine row must show `security.vault`
 `{"mode": "broker", "isolated": true}`. To undo: set `"vault": "file"`, move both
 files back to `~<worker>/.fleet/` (owner `<worker>`, mode 600), and
 `systemctl disable --now fleet-vault`.
+
+### When a release changes vault.py
+
+**A release never reaches the broker.** It updates each agent's own checkout and
+its own user service; the broker runs the root-owned copy at
+`/usr/local/lib/fleet-vault/vault.py` as a system service, and nothing in the
+fleet may touch that without root. `lifecycle.OWNER_ONLY` also lists `vault.py`
+among the files a helper never loads, so a commit that changes only that file
+advances the revision every machine reports: the Updates page says the fleet is
+current and each broker goes on running the copy that was installed by hand.
+
+The fleet says so instead of hiding it. The broker's `status` answers `source`,
+the SHA-256 of the program it runs, the helper sends it to the hub as
+`security.vault.broker_source`, and `/ui/health` raises one `vault_behind`
+warning for each machine whose broker differs from the hub's own `vault.py`. The
+checksum is read once, when the broker starts, so a copy installed under a broker
+that was not restarted does not clear the warning — the running code is still the
+old one.
+
+So after a release that changed `vault.py`, run this as root on each worker that
+has a broker, which is the warning's own `fix` line:
+
+```bash
+install -o root -g root -m 644 ~<worker>/fleet-pilot/vault.py /usr/local/lib/fleet-vault/vault.py && systemctl restart fleet-vault
+```
+
+Then `python3 fleet.py check <agent>` as the worker shows "vault broker runs the
+vault.py of this checkout", and the warning goes at that machine's next status
+report (within ten minutes). A broker that says nothing about its program — one
+older than this, or a Mac's signed helper, which the app updates itself — raises
+no warning, because unknown is not behind.
 
 ### New logins on a Linux broker (`create_login`): the write setup
 
