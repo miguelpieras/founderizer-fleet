@@ -36,7 +36,198 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "app_server_tasks",     # helper abilities that the hub may use; app_server_tasks: app_server_task below
             "manager_switch",       # the manager's helper closes its previous runtime's session after a switch
             "mcp_program"]          # it resolves a command MCP server's program for POST /ui/mcp/check
-SWITCH_RUNTIMES = ("codex", "claude")       # the runtimes that an owner can switch between (owner feature runtime_switch)
+# ---------------------------------------------------------------- the runtimes
+#
+# What the fleet knows about a runtime is here, in one entry for each provider, and nowhere else. hub.py, fleet.py and
+# both installers import this module, so a fact written here once is the fact the whole fleet acts on, and a new
+# provider is an entry and not a lane. The owner's words, 20 October 2026: "the idea is to support many different
+# providers".
+#
+# Every field is named for what it MEANS and not for who has it, so a check that reads one says what it is really
+# asking. A field the fleet writes nothing for is None, which is a fact of its own: a runtime with no manager_access
+# cannot be the manager, a runtime with no sign_in is one the owner signs in to themselves.
+#
+#   label             what the owner is shown, never the key
+#   driver            "terminal" (a CLI in a tmux window) or "acp" (Agent Client Protocol, through acp_runner.py)
+#   acp_command       the agent command of an acp runtime, when team.json "start" gives none
+#   can               the kinds of work its sessions do, where the fleet writes a set; None when it writes none, and
+#                     then no agent can be switched to it (hub.switch_offer)
+#   full_access       Fleet's full-access form of a worker or a lead, {start, allow}; None when Fleet writes none.
+#                     Full access is no runtime limit on files, commands or the network and no permission prompt.
+#                     Fleet's own deny rules still apply to every Claude session, and Claude's bypassPermissions is
+#                     not the form used for it, because that shows a prompt at start unless the user turned it off.
+#                     The separately opted-in app_server_pair has different permissions.
+#   manager_access    the form a manager of this runtime starts with, {start}; None when it cannot be the manager.
+#                     The owner's correction of 13 October 2026: Claude Code with every built-in tool and no
+#                     permission check (its settings turn the start prompt off and add no Fleet deny rule), and
+#                     Codex as its own full_access. A switch of the manager keeps this access both ways.
+#   first_worker      the start the hub installer writes for the first worker of a fleet, which has no other worker to
+#                     copy from (hubsetup.WORKER_STARTS); None when it writes none
+#   manager           its standing session continues its own conversation, so a manager can run on it
+#   owner_chat        the owner can talk to an agent of this runtime in that agent's own chat window
+#   agent_messages    its agents send and answer agent messages
+#   conversation      its session can be locked down to the conversation tools of another person (C-<id>)
+#   conversation_why  why it cannot be, in the words that person reads; None when it can
+#   mcp_servers       its task sessions load the owner's MCP servers and the catalog tools
+#   app_server        the fleet drives it over its own app-server protocol: screen tasks, and the app-server start
+#                     policy of a worker or a lead (screen_runner.py)
+#   switch            the owner can switch an agent to it and from it (owner feature runtime_switch)
+#   session_settings  Fleet writes the session's permissions, deny rules and hooks as a settings argument
+#                     (fleet.settings_arg)
+#   token_in_env      its session reads the session credential from the environment; a runtime without it takes that
+#                     credential in its MCP configuration instead (owner API 1.12)
+#   model_flags       how a model and an effort reach a new session, as this runtime's own flags; None for one that
+#                     takes neither
+#   local_model       the start-command flag by which it runs a model on the machine itself; None when it has none
+#   sign_in           the sign-in the fleet drives for it, or None: {args, after the executable; url, the provider's
+#                     own link as it is read from the screen; shows_code, the code the provider prints, or None;
+#                     wants_code, it waits for a code the owner pastes}
+#   no_sign_in        why the fleet drives none, in the words the owner reads ({where}: this machine or that one);
+#                     None when it drives one
+#   sandbox           how its start command says what it may touch, as the owner reads it; None when Fleet cannot
+#                     read it
+#
+# What is NOT here, because it is code and not a fact: how a runtime's records become a transcript (threads.py), how
+# its allowance is read (usage.py), what its own installer is (onboard.py), and how its sign-in window is driven to
+# the end (fleet.do_signin). A fourth provider needs real work in each of those.
+RUNTIMES = {
+    "codex": {
+        "label": "Codex",
+        "driver": "terminal",
+        "acp_command": None,
+        "can": {"shell", "web", "screen"},              # screen tasks use the agent's own screen runtime
+        # One line for all three forms, as it is on the pilot's own workers: this runtime has no narrower mode
+        # Founderizer uses, so its manager and a fleet's first worker start exactly as any worker does.
+        "full_access": {"start": "codex --no-daemon --sandbox danger-full-access --ask-for-approval never {prompt}"},
+        "manager_access": {"start": "codex --no-daemon --sandbox danger-full-access --ask-for-approval never {prompt}"},
+        "first_worker": "codex --no-daemon --sandbox danger-full-access --ask-for-approval never {prompt}",
+        "manager": True,
+        "owner_chat": True,
+        "agent_messages": True,
+        "conversation": False,
+        # Why a Codex agent has no conversations yet (CHAT-APPS.md 7.2), from test_conversation_lockdown's live proof
+        # with Codex 0.160: no option takes away the global AGENTS.md of its CODEX_HOME, its MCP resource tools, or
+        # the tools that OpenAI's model catalog gives each model (code mode, apply_patch, sub-agents).
+        "conversation_why": ("a Codex agent has no conversations yet: no start option limits its tools to the Fleet "
+                             "tools, and its global AGENTS.md always loads"),
+        "mcp_servers": True,
+        "app_server": True,
+        "switch": True,
+        "session_settings": False,
+        "token_in_env": True,
+        "model_flags": {"model": ["-m", "{}"], "effort": ["-c", 'model_reasoning_effort="{}"']},
+        "local_model": "--oss",
+        # Codex shows the owner a code to type into the browser; Claude gives the owner a code to type in here.
+        "sign_in": {"args": ["login", "--device-auth"],
+                    "url": re.compile(r"https://auth\.openai\.com/[A-Za-z0-9/_?=&.%-]{0,400}"),
+                    "shows_code": re.compile(r"\b[A-Z0-9]{4}-[A-Z0-9]{4,6}\b"), "wants_code": False},
+        "no_sign_in": None,
+        "sandbox": {"name": "Codex", "flag": "--sandbox", "value": "[a-z-]+", "unset": "the default",
+                    "words": {"danger-full-access": "the runtime does not limit file or network access",
+                              "workspace-write": "the runtime limits writes to the workspace",
+                              "read-only": "the runtime allows reads only"},
+                    "otherwise": "see the Codex settings"},
+    },
+    "claude": {
+        "label": "Claude Code",
+        "driver": "terminal",
+        "acp_command": None,
+        "can": {"shell", "web", "browser", "screen"},
+        "full_access": {"start": "claude --permission-mode dontAsk {settings} {prompt}",
+                        "allow": ["Bash", "Read", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch",
+                                  "mcp__fleet__*"]},
+        "manager_access": {"start": "claude --permission-mode bypassPermissions --tools default {settings} {prompt}"},
+        # Narrower than the manager's on purpose: a Claude worker asks before it edits, so a fleet's first worker is
+        # not broader than every worker the owner adds after it. It carries no allow, so that agent gets Founderizer's
+        # own tools and nothing else (fleet.settings_arg).
+        "first_worker": "claude --permission-mode acceptEdits {chrome} {settings} {prompt}",
+        "manager": True,
+        "owner_chat": True,
+        "agent_messages": True,
+        "conversation": True,
+        "conversation_why": None,
+        "mcp_servers": True,
+        "app_server": False,
+        "switch": True,
+        "session_settings": True,
+        "token_in_env": False,
+        "model_flags": {"model": ["--model", "{}"], "effort": ["--effort", "{}"]},
+        "local_model": None,
+        "sign_in": {"args": ["/login"],
+                    "url": re.compile(r"https://(?:claude\.ai|console\.anthropic\.com)/[A-Za-z0-9/_?=&.%#+-]{0,400}"),
+                    "shows_code": None, "wants_code": True},
+        "no_sign_in": None,
+        "sandbox": {"name": "Claude", "flag": "--permission-mode", "value": "[A-Za-z]+", "unset": "default",
+                    "words": {},
+                    "otherwise": "the session settings allow and deny tools; they are not an OS boundary"},
+    },
+    "grok": {
+        "label": "Grok",
+        "driver": "acp",
+        "acp_command": "grok agent stdio",
+        "can": None,
+        "full_access": None,
+        "manager_access": None,
+        "first_worker": None,
+        "manager": False,
+        "owner_chat": False,
+        "agent_messages": False,
+        "conversation": False,
+        "conversation_why": None,
+        "mcp_servers": False,
+        "app_server": False,
+        "switch": False,
+        "session_settings": False,
+        "token_in_env": True,
+        "model_flags": None,
+        "local_model": None,
+        "sign_in": None,
+        "no_sign_in": ("Fleet drives no Grok sign-in: xAI's terms do not let a third party run it this way. "
+                       "Sign in to Grok yourself on {where} machine."),
+        "sandbox": None,
+    },
+}
+# Every fact above in one list, so that a new entry cannot quietly leave one out (test_runtime_table).
+RUNTIME_FACTS = ("label", "driver", "acp_command", "can", "full_access", "manager_access", "first_worker", "manager",
+                 "owner_chat", "agent_messages", "conversation", "conversation_why", "mcp_servers", "app_server",
+                 "switch", "session_settings", "token_in_env", "model_flags", "local_model", "sign_in", "no_sign_in",
+                 "sandbox")
+
+
+def runtime_fact(runtime, fact, otherwise=None):
+    """One fact of one runtime's entry, and the only way to ask for it. `otherwise` is the answer for a name that is
+    no runtime of this fleet, so that a check reads as the question it asks: such a name has no owner chat and holds
+    no conversation."""
+    return (RUNTIMES.get(runtime) or {}).get(fact, otherwise)
+
+
+def runtimes_with(fact):
+    """The runtimes whose entry says yes to one fact, in the table's own order."""
+    return tuple(name for name, entry in RUNTIMES.items() if entry.get(fact))
+
+
+def no_sign_in(runtime, where="this"):
+    """Why the fleet drives no sign-in for this runtime, in the words the owner reads, or None when it drives one.
+    `where` is the machine as its reader sees it: "this" on the machine itself, "that" from the hub or the app."""
+    said = runtime_fact(runtime, "no_sign_in")
+    return said.format(where=where) if said else None
+
+
+SWITCH_RUNTIMES = runtimes_with("switch")   # the runtimes an owner can switch between (owner feature runtime_switch)
+# The one runtime the fleet drives over its own app-server protocol: a screen task runs on it (screen_runner.py),
+# and so does a worker or a lead whose start policy is exactly APP_SERVER. None when no entry carries the fact.
+APP_SERVER_RUNTIME = (runtimes_with("app_server") or (None,))[0]
+
+
+def switch_target(runtime):
+    """The runtime an owner can switch this one to, or None for one that no switch reaches.
+
+    Today the offer is one target, because exactly two entries carry `switch`: the other one. An offer of several
+    targets is the next step, and it changes this function and nothing else."""
+    others = [name for name in SWITCH_RUNTIMES if name != runtime]
+    return others[0] if runtime in SWITCH_RUNTIMES and len(others) == 1 else None
+
+
 # Where this helper leaves its sign-in reading for `fleet.py verify` to read, in the home of the user whose agents
 # these are: ~/.fleet/signed-in-<agent>.json. verify imports this one path, so the writer and the reader of the file
 # cannot drift apart (Lifecycle.remember_signed_in says why only a Mac needs it).
@@ -46,7 +237,7 @@ MODELS_EVERY = 6 * 3600         # seconds between readings of the runtime's mode
 MODEL_NAME = re.compile(r"[A-Za-z0-9._:/\[\]-]{1,120}")
 EFFORT_NAME = re.compile(r"[a-z]{1,20}")
 LOGIN_REASONS = ("ok", "not_found", "no_access", "bad_format", "no_token", "timeout", "error")
-APP_SERVER = "app-server"       # the start policy of a Codex worker or lead whose tasks run in screen_runner.py
+APP_SERVER = "app-server"       # the start policy of a worker or lead of APP_SERVER_RUNTIME: screen_runner.py
 # GitHub repositories (owner feature integrations): owner/name in lower case, and the access that the owner gives.
 REPO_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,38}/(?!\.\.?$)[a-z0-9._-]{1,100}")
 REPO_ACCESS = ("read", "write")
@@ -59,14 +250,16 @@ GITHUB_TOKEN = re.compile(r"[A-Za-z0-9_.-]{20,4096}")
 # variable whose value is a url server's bearer token. A session that lacks one of these variables gets no such server.
 TOOL_CATALOG = {
     "github": {"title": "GitHub", "command": "github-mcp-server", "args": ["stdio"],
-               "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "GH_TOKEN"}, "runtimes": ["claude", "codex"]},
+               "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "GH_TOKEN"},
+               # every runtime whose task sessions load a server at all (RUNTIMES "mcp_servers")
+               "runtimes": sorted(runtimes_with("mcp_servers"))},
 }
 # The owner's own MCP servers (owner feature mcp): team.json "mcp" holds them, the hub checks each one and the owner
 # gives them to agents as it gives a catalog tool. mcp_server turns one into a catalog entry, so the hub, the helper
 # and the sessions handle an owner server and a catalog tool in exactly one way.
 MCP_NAME = re.compile(r"[a-z][a-z0-9-]{0,30}")       # the server's name, which is also the prefix of its tools
 MCP_LIMIT = 32                                       # the most servers that team.json holds
-MCP_RUNTIMES = ("claude", "codex")                   # the runtimes whose task sessions load a server
+MCP_RUNTIMES = tuple(sorted(runtimes_with("mcp_servers")))   # the runtimes whose task sessions load a server
 # How a url server proves who it is: nothing (a public server), the hub's own OAuth tokens (the owner connects it
 # once and no refresh token ever leaves the hub), or an API key that the agent reads (owner feature secret_grants).
 MCP_AUTH = ("none", "oauth", "key")
@@ -191,8 +384,9 @@ def app_server_task(conf, needs):
     """True when a task with these needs runs in screen_runner.py (Codex app-server) and not in a terminal CLI: every
     screen task, and every task of a Codex worker or lead whose start policy is exactly app-server. The helper and the
     hub use this one rule."""
-    return needs == "screen" or (conf.get("runtime") == "codex" and conf.get("start") == APP_SERVER
-                                 and conf.get("role") in ("worker", "lead"))
+    return needs == "screen" or bool(runtime_fact(conf.get("runtime"), "app_server")
+                                     and conf.get("start") == APP_SERVER
+                                     and conf.get("role") in ("worker", "lead"))
 
 
 def exe(name, home=None):
@@ -581,7 +775,7 @@ class Lifecycle:
             return self.screen_models
         options, error = self.codex_models(command) if os.path.isfile(command) else \
             (None, "the screen runtime is not installed")
-        self.screen_models = {"runtime": "codex", "ok": options is not None, "read_at": self.clock(),
+        self.screen_models = {"runtime": APP_SERVER_RUNTIME, "ok": options is not None, "read_at": self.clock(),
                               "source": "codex app-server model/list", "other_names": False,
                               "error": None if options is not None else error, "options": options or []}
         return self.screen_models

@@ -15,6 +15,8 @@ import sqlite3
 import subprocess
 import time
 
+import lifecycle
+
 POLL_SECONDS = 300
 SCAN_SECONDS = 30
 MAX_BYTES = 256 * 1024 * 1024
@@ -515,8 +517,10 @@ def screen_tokens(kit, agent, home=None):
 
 
 def local_model(conf):
-    """A Codex worker that runs a local model (--oss): its tokens count, but no vendor account limit applies."""
-    return conf.get("runtime") == "codex" and bool(re.search(r"(?:^|\s)--oss(?:\s|$)", str(conf.get("start") or "")))
+    """A worker that runs a model on the machine itself, by the flag its runtime has for that (lifecycle.RUNTIMES
+    "local_model"): its tokens count, but no vendor account limit applies."""
+    flag = lifecycle.runtime_fact(conf.get("runtime"), "local_model")
+    return bool(flag) and bool(re.search(rf"(?:^|\s){re.escape(flag)}(?:\s|$)", str(conf.get("start") or "")))
 
 
 class Collector:

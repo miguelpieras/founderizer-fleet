@@ -62,8 +62,9 @@ import uuid
 
 from threads import MARKER, THREAD_ID, CodexFiles, Tailer, Translator, complete_rows, manager_transcript, text_of
 from usage import Collector, local_model
-from lifecycle import (GITHUB_TOKEN, MCP_PROGRAM, REPO_ACCESS, REPO_NAME, TOOL_CATALOG, Lifecycle, Updating,
-                       app_server_task, exe, follow_config_ref, mcp_variable, tool_catalog, tool_needs)
+from lifecycle import (GITHUB_TOKEN, MCP_PROGRAM, REPO_ACCESS, REPO_NAME, RUNTIMES, TOOL_CATALOG, Lifecycle,
+                       Updating, app_server_task, exe, follow_config_ref, mcp_variable, no_sign_in, runtime_fact,
+                       runtimes_with, tool_catalog, tool_needs)
 from desktop import Publisher
 
 KIT = os.path.dirname(os.path.abspath(__file__))
@@ -473,7 +474,7 @@ def settings_arg(agent, conf, task, tools=()):
     that carry a worker's permission prompts and activity to the hub. The owner's full-access manager has no
     Fleet-added deny rules and starts with the recorded unattended permission-mode choice. tools: the catalog tools
     of this task session, which the owner gave the agent; they run without asking (owner feature integrations)."""
-    if conf.get("runtime") != "claude":
+    if not runtime_fact(conf.get("runtime"), "session_settings"):
         return ""
     if conf.get("role") == "manager":
         settings = {"skipDangerousModePermissionPrompt": True, "permissions": {"allow": [], "deny": []}}
@@ -684,23 +685,27 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
     if resume and (task or conf.get("runtime") not in MANAGER_RUNTIMES or not session):
         raise Refused("only the standing Claude or Codex session continues a conversation")
     values = dict(env or {})
-    if token and (conf.get("runtime") != "claude" or needs == "screen"):
+    if token and (runtime_fact(conf.get("runtime"), "token_in_env", True) or needs == "screen"):
         values["FLEET_SESSION_TOKEN"] = token
     prefix = env_prefix(agent, task or "manager", values)
-    # The catalog tools that this session loads (owner feature integrations): Claude Code and Codex in a terminal only.
+    # The catalog tools that this session loads (owner feature integrations): a runtime whose entry loads servers
+    # (lifecycle.RUNTIMES "mcp_servers"), in a terminal only.
     catalog = team_catalog()
-    tools = [] if conf.get("runtime") == "grok" or app_server_task(conf, needs) else \
+    runtime = conf.get("runtime")
+    tools = [] if not runtime_fact(runtime, "mcp_servers") or app_server_task(conf, needs) else \
         [t for t in values.get("FLEET_TOOLS", "").split() if t in catalog]
     if task:
         prompt += github_text(values, tools)
-    if conf.get("runtime") == "grok":
+    if runtime_fact(runtime, "driver") == "acp":
         # An ACP agent (Grok Build: "grok agent stdio") runs inside acp_runner.py, with the task-bound fleet tools.
+        # Its own command comes from team.json, else from its entry (lifecycle.RUNTIMES "acp_command").
         if not task or not generation or not session:
-            raise Refused("a Grok agent runs managed task sessions only")
+            raise Refused(f"a {runtime_fact(runtime, 'label', runtime)} agent runs managed task sessions only")
         return prefix + shlex.join(["env", f"FLEET_ATTEMPT={attempt}", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}",
                            f"FLEET_AGENT={agent}", f"FLEET_TASK={task}", sys.executable,
-                           os.path.join(KIT, "acp_runner.py"), "--agent-command", conf.get("start") or "grok agent stdio",
-                           "--runtime", "grok", "--mcp-url", f"{HUB}/mcp/{agent}/{generation}/{task}/{attempt}",
+                           os.path.join(KIT, "acp_runner.py"), "--agent-command",
+                           conf.get("start") or runtime_fact(runtime, "acp_command"),
+                           "--runtime", runtime, "--mcp-url", f"{HUB}/mcp/{agent}/{generation}/{task}/{attempt}",
                            "--session", session, "--prompt", prompt])
     if app_server_task(conf, needs):
         if not task or not generation or (needs == "screen" and not conf.get("screen_command")):
@@ -760,7 +765,8 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
     return f"{prefix}env {env} {cmd}"
 
 
-MANAGER_RUNTIMES = ("claude", "codex")         # the runtimes whose standing session continues its own conversation
+# The runtimes whose standing session continues its own conversation (lifecycle.RUNTIMES "manager").
+MANAGER_RUNTIMES = tuple(sorted(runtimes_with("manager")))
 MANAGER_START = ('You are the manager in Founderizer. Read RULES.md and profiles/{agent}.md in this folder '
                  'first. {resume}On every new-message signal call read_messages; its read is the receipt. Messages that start with [hub] come from the hub and '
                  'messages that start with [owner] come from the owner: act on each one. Before you give work, choose by suitability, '
@@ -810,14 +816,9 @@ def screen_settings(conf):
 def model_flags(conf):
     """The requested model and effort for a new session, as the runtime's own flags (owner API 1.9); "" for the
     runtime's defaults. Screen tasks use the screen settings instead (screen_settings)."""
-    model, effort, runtime = conf.get("model"), conf.get("effort"), conf.get("runtime")
-    if runtime == "codex":
-        parts = (["-m", model] if model else []) + (["-c", f'model_reasoning_effort="{effort}"'] if effort else [])
-    elif runtime == "claude":
-        parts = (["--model", model] if model else []) + (["--effort", effort] if effort else [])
-    else:
-        parts = []
-    return shlex.join(parts)
+    flags = runtime_fact(conf.get("runtime"), "model_flags") or {}
+    return shlex.join([word.format(conf[key]) for key in ("model", "effort") if conf.get(key)
+                       for word in flags.get(key, ())])
 
 
 CHAT_SIGNAL = "New fleet messages. Call read_messages now."     # the helper's signal to an owner chat window
@@ -854,8 +855,9 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
     where a tmux command would otherwise be too long (chat_fit). env:
     {NAME: value} of session_env, from a file that the window reads and removes, as the credential of a Codex
     chat."""
-    if conf.get("runtime") == "grok":
-        raise Refused("a Grok agent has no direct chat yet: its tools cannot be limited to discussion")
+    if not runtime_fact(conf.get("runtime"), "owner_chat"):
+        raise Refused(f"a {runtime_fact(conf.get('runtime'), 'label', conf.get('runtime'))} agent has no direct chat "
+                      f"yet: its tools cannot be limited to discussion")
     with open(os.path.join(KIT, "profiles", agent + ".md"), encoding="utf-8") as file:
         profile = file.read()
     prompt = (f'You are {agent}, speaking directly with the owner in this agent\'s chat. '
@@ -900,7 +902,8 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
              "--settings", json.dumps(settings), "--append-system-prompt", prompt] + shlex.split(model_flags(conf))
     else:
         raise Refused("direct chat is not configured for this runtime")
-    values = dict(env or {}, **({"FLEET_SESSION_TOKEN": token} if token and conf.get("runtime") == "codex" else {}))
+    values = dict(env or {}, **({"FLEET_SESSION_TOKEN": token}
+                                if token and runtime_fact(conf.get("runtime"), "token_in_env", True) else {}))
     words = ["env", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}", f"FLEET_AGENT={agent}", "FLEET_TASK="]
     return env_prefix(agent, "owner-chat", values) + shlex.join(words + args)
 
@@ -916,11 +919,6 @@ CONVERSATION_ID = re.compile(r"[1-9][0-9]{0,11}")
 # a remote feature flag is on, and neither --tools, --disallowedTools nor a deny rule takes it away. It reaches no file,
 # command or site. Its second call ends the conversation: the window stays and shows "Claude has ended this chat.".
 CLAUDE_BUILT_IN = "EndConversation"
-# Why a Codex agent has no conversations yet (CHAT-APPS.md 7.2), from test_conversation_lockdown's live proof with
-# Codex 0.160: no option takes away the global AGENTS.md of its CODEX_HOME, its MCP resource tools, or the tools that
-# OpenAI's model catalog gives each model (code mode, apply_patch, sub-agents).
-CODEX_NOT_LOCKED = ("a Codex agent has no conversations yet: no start option limits its tools to the Fleet tools, and "
-                    "its global AGENTS.md always loads")
 
 
 def conversation_folder(conversation):
@@ -941,12 +939,12 @@ def conversation_command(agent, conf, generation, conversation, url, token, prom
     file (a tmux command must stay under 16 KiB). No hook, browser, catalog tool, API key or GitHub token, and no
     user, project or local settings, CLAUDE.md, memory, skill or plugin: test_conversation_lockdown proves the offered
     tools (the Fleet tools, and CLAUDE_BUILT_IN when its flag is on) and the prompt against stand-ins. The window starts
-    in conversation_folder; Claude Code asks its workspace trust question there unless it trusts CHATS. Codex and Grok
-    are refused: their tools cannot be limited yet."""
-    if conf.get("runtime") == "codex":
-        raise Refused(CODEX_NOT_LOCKED)
-    if conf.get("runtime") != "claude":
-        raise Refused("conversations are only for Claude agents: the tools of this runtime cannot be limited")
+    in conversation_folder; Claude Code asks its workspace trust question there unless it trusts CHATS. A runtime
+    whose entry does not carry "conversation" is refused with the reason that entry gives (lifecycle.RUNTIMES): its
+    tools cannot be limited yet."""
+    if not runtime_fact(conf.get("runtime"), "conversation"):
+        raise Refused(runtime_fact(conf.get("runtime"), "conversation_why") or
+                      "conversations are only for Claude agents: the tools of this runtime cannot be limited")
     if not CONVERSATION_ID.fullmatch(str(conversation)):
         raise Refused("a conversation id is a number")
     address = urllib.parse.urlsplit(url or "")
@@ -1033,7 +1031,7 @@ def cmd_chat_session(args):
     after a switch (owner feature runtime_switch); its record is that runtime's own."""
     agent, conf = args.agent, agent_conf(args.agent)
     runtime = getattr(args, "runtime", None) or conf.get("runtime")
-    if runtime not in ("codex", "claude"):
+    if runtime not in MANAGER_RUNTIMES:
         die("only a Codex or Claude owner chat is continued this way")
     if not THREAD_ID.fullmatch(args.session):
         die("give the conversation id (a UUID) of the owner chat")
@@ -1953,7 +1951,7 @@ class Helper:
         cannot be read, stops the start: the chat event stays pending and the record stays, so that the conversation is
         never replaced without notice."""
         runtime = self.conf.get("runtime")
-        if runtime not in ("codex", "claude"):
+        if runtime not in MANAGER_RUNTIMES:
             return None
         try:
             record = load_chat_record(self.agent, runtime)
@@ -2155,7 +2153,7 @@ class Helper:
                 runtime = self.conf.get("runtime")
                 resume = self.chat_resume(extra["generation"])      # first: a chat that cannot continue gets no credential
                 token = session_credential(self.agent, "chat", extra["generation"])
-                marker = None if resume or runtime not in ("codex", "claude") else str(uuid.uuid4())
+                marker = None if resume or runtime not in MANAGER_RUNTIMES else str(uuid.uuid4())
                 # No conversation to continue here: a first chat, or the first after a runtime switch, because the
                 # record is this runtime's own. The hub's record of what was said takes the place of the session's
                 # own memory, so the chat does not start blind. A chat that resumes keeps its own context instead.
@@ -2519,8 +2517,8 @@ class Helper:
         needs = r.stdout.strip() if r.returncode == 0 else ""
         if needs and app_server_task(self.conf, needs):
             return True
-        if needs and self.conf.get("runtime") != "grok":
-            return False                    # a Claude or Codex task window runs its terminal CLI
+        if needs and runtime_fact(self.conf.get("runtime"), "driver") == "terminal":
+            return False                    # a terminal runtime's task window runs its own CLI
         try:
             words = launch_words(tmux("display-message", "-p", "-t", target, "#{pane_start_command}").stdout)
         except ValueError:
@@ -3074,7 +3072,8 @@ class Helper:
             self.retiring = None
             problem = (f"owner-chat: the chat of the previous runtime ({old or 'unknown'}) stays open, because its "
                        f"conversation is not recorded" + (f"; record it with: fleet.py chat-session {self.agent} "
-                                                          f"<conversation id> --runtime {old}" if old in ("codex", "claude")
+                                                          f"<conversation id> --runtime {old}"
+                                                          if old in MANAGER_RUNTIMES
                                                           else "; its program cannot be read"))
             if getattr(self, "chat_problem", (None, 0.0))[0] != problem or time.monotonic() - self.chat_problem[1] > 300:
                 self.chat_problem = (problem, time.monotonic())
@@ -4206,16 +4205,17 @@ LOGIN_DONE_WAIT = 900                       # seconds for the runtime to report 
                                             # as the hub keeps the sign-in open (hub.LOGIN_LIFE), because the
                                             # owner is in a browser and three minutes called a real sign-in
                                             # failed. The hub ends it the moment this machine reports it.
-LOGIN_URLS = {"claude": re.compile(r"https://(?:claude\.ai|console\.anthropic\.com)/[A-Za-z0-9/_?=&.%#+-]{0,400}"),
-              "codex": re.compile(r"https://auth\.openai\.com/[A-Za-z0-9/_?=&.%-]{0,400}")}
-# Codex shows the owner a code to type into the browser; Claude gives the owner a code to type in here.
-LOGIN_SHOWN_CODE = {"codex": re.compile(r"\b[A-Z0-9]{4}-[A-Z0-9]{4,6}\b")}
-LOGIN_WANTS_CODE = ("claude",)
+# The sign-in a runtime's entry describes (lifecycle.RUNTIMES "sign_in"): the provider's own link as it is read
+# from the screen, the code the provider prints, and whether it waits for a code the owner pastes back.
+LOGIN_URLS = {name: e["sign_in"]["url"] for name, e in RUNTIMES.items() if e["sign_in"]}
+LOGIN_SHOWN_CODE = {name: e["sign_in"]["shows_code"] for name, e in RUNTIMES.items()
+                    if e["sign_in"] and e["sign_in"]["shows_code"]}
+LOGIN_WANTS_CODE = tuple(name for name, e in RUNTIMES.items() if (e["sign_in"] or {}).get("wants_code"))
 # What may be typed into a sign-in window, and nothing else: letters, digits, dashes, and the `#` and the
 # second half that Claude's own code carries (`<code>#<state>`, about 94 characters). No space, no control
 # character and no shell or tmux metacharacter, because this text reaches a terminal as keys.
 LOGIN_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._#-]{3,200}")
-LOGIN_LABELS = {"claude": "Claude Code", "codex": "Codex"}
+LOGIN_LABELS = {name: e["label"] for name, e in RUNTIMES.items() if e["sign_in"]}
 
 
 def ready_runtime_config(home=None, kit=None):
@@ -4262,16 +4262,16 @@ def ready_runtime_config(home=None, kit=None):
 
 
 def runtime_login_command(runtime, exe):
-    """The provider's own sign-in, as one window command. Grok has none: its terms do not let a third party run it
-    this way, so it is refused here as conversation_command refuses Codex."""
-    if runtime == "grok":
-        raise Refused("Fleet drives no Grok sign-in: xAI's terms do not let a third party run it this way. "
-                      "Sign in to Grok yourself on this machine.")
-    if runtime == "codex":
-        return "exec " + shlex.join([exe, "login", "--device-auth"])
-    if runtime == "claude":
-        return "exec " + shlex.join([exe, "/login"])
-    raise Refused(f"Fleet drives no sign-in for {runtime}")
+    """The provider's own sign-in, as one window command, from that runtime's own entry (lifecycle.RUNTIMES
+    "sign_in"). A runtime whose entry carries none is refused here, and says why itself: Grok's terms do not let a
+    third party run it this way, as conversation_command refuses Codex."""
+    why = no_sign_in(runtime)
+    if why:
+        raise Refused(why)
+    flow = runtime_fact(runtime, "sign_in")
+    if not flow:
+        raise Refused(f"Fleet drives no sign-in for {runtime}")
+    return "exec " + shlex.join([exe, *flow["args"]])
 
 
 def login_screen(session):
@@ -4516,7 +4516,7 @@ def main():
     p = sub.add_parser("key"); p.add_argument("agent"); p.add_argument("--rotate", action="store_true")
     p.set_defaults(fn=cmd_key)
     p = sub.add_parser("chat-session"); p.add_argument("agent"); p.add_argument("session")
-    p.add_argument("--runtime", choices=("codex", "claude"),
+    p.add_argument("--runtime", choices=MANAGER_RUNTIMES,
                    help="the runtime of that conversation, when it is not the agent's runtime now (after a switch)")
     p.set_defaults(fn=cmd_chat_session)
     p = sub.add_parser("verify"); p.add_argument("--json", action="store_true"); p.set_defaults(fn=cmd_verify)

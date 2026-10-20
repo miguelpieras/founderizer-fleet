@@ -60,17 +60,13 @@ KIT = os.path.dirname(os.path.abspath(__file__))
 CODE_LENGTH = 12                # hub.LINK_ALPHABET: 12 characters, 60 bits, as a join code
 CLAIM_TRIES = hub.JOIN_TRIES    # wrong codes from one address; then the claim refuses that address
 CLAIM_LIFE = hub.JOIN_LIFE      # seconds the claim waits for the owner's Mac
-# The manager's start policy, as team.json has it on the pilot hub. The runtime signs in by itself, in the owner's
-# own session: no argument of it carries a key, and the installer sets none.
-STARTS = {"claude": "claude --permission-mode bypassPermissions --tools default {settings} {prompt}",
-          "codex": "codex --no-daemon --sandbox danger-full-access --ask-for-approval never {prompt}"}
-# A worker's or a lead's, for the first one of a fleet, where the hub has no other worker to copy from
-# (hub.py `server_agent_entry`). It is narrower than the manager's on purpose: a Claude worker asks before it
-# edits, so a fleet's first worker is not broader than every worker the owner adds after it. It carries no
-# `allow`, so that agent gets Founderizer's own tools and nothing else (fleet.py `settings_arg`). Codex is the same
-# line for both, as it is on the pilot's own workers: that runtime has no narrower mode Founderizer uses.
-WORKER_STARTS = {"claude": "claude --permission-mode acceptEdits {chrome} {settings} {prompt}",
-                 "codex": STARTS["codex"]}
+# The manager's start policy, as team.json has it on the pilot hub, and a worker's or a lead's for the first one of a
+# fleet, where the hub has no other worker to copy from (hub.py `server_agent_entry`). Both are that runtime's own
+# entry of the runtime table (lifecycle.RUNTIMES "manager_access" and "first_worker"), so the installer writes the
+# same start the hub would. The runtime signs in by itself, in the owner's own session: no argument of either form
+# carries a key, and the installer sets none.
+STARTS = {name: e["manager_access"]["start"] for name, e in lifecycle.RUNTIMES.items() if e["manager_access"]}
+WORKER_STARTS = {name: e["first_worker"] for name, e in lifecycle.RUNTIMES.items() if e["first_worker"]}
 FIRST_COMMIT = "The first team.json of this hub: one manager, and the owner's own Mac"
 # One OS user for each agent (PRODUCT.md P2), in this one place: both installers call the command that uses it, so
 # no second copy of the name can drift from it. The agent's name comes from the hub's own pattern.

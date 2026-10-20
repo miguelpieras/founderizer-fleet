@@ -51,8 +51,10 @@ from desktop import Frames
 import google
 import mcp
 import releases
-from lifecycle import (APP_SERVER, GITHUB_TOKEN, MCP_LIMIT, MCP_NAME, REPO_ACCESS, REPO_NAME, TOOL_CATALOG,
-                       app_server_task, mcp_server, mcp_variable, tool_catalog, tool_needs)
+from lifecycle import (APP_SERVER, APP_SERVER_RUNTIME, GITHUB_TOKEN, MCP_LIMIT, MCP_NAME, REPO_ACCESS,
+                       REPO_NAME, RUNTIMES, SWITCH_RUNTIMES, TOOL_CATALOG, app_server_task, mcp_server,
+                       mcp_variable, no_sign_in, runtime_fact, runtimes_with, switch_target, tool_catalog,
+                       tool_needs)
 
 DESKTOP = Frames()
 
@@ -437,6 +439,24 @@ def agent_active(name):
     return (agents().get(name) or {}).get("active", True) is not False
 
 
+def runtime_label(runtime):
+    """What the owner is shown for a runtime (lifecycle.RUNTIMES), or the name itself for one the fleet does not
+    know."""
+    return runtime_fact(runtime, "label", runtime)
+
+
+def runtime_form(form):
+    """A copy of one start form of the table, so that nothing a caller keeps or writes into team.json can reach the
+    table itself."""
+    return {k: (list(v) if isinstance(v, list) else v) for k, v in form.items()}
+
+
+def owner_chat(a):
+    """True when the owner can talk to this agent in its own chat window: the manager always, and every other agent
+    whose runtime has an owner chat (lifecycle.RUNTIMES "owner_chat")."""
+    return a.get("role") == "manager" or bool(runtime_fact(a.get("runtime"), "owner_chat"))
+
+
 def agent_settings(name):
     """What the agent's next sessions need (owner API 1.9): its requested model and effort, and its capabilities."""
     a = agents().get(name) or {}
@@ -768,7 +788,7 @@ def mobile_agent(name, config):
               "UNION ALL SELECT created, text, 'agent' AS side FROM owner_reports WHERE agent=? "
               "ORDER BY created DESC LIMIT 1", (name, name))
     return {"name": name, "role": config["role"], "runtime": config["runtime"], "active": agent_active(name),
-            "can": config.get("can", []), "direct_chat": config["role"] == "manager" or config.get("runtime") != "grok",
+            "can": config.get("can", []), "direct_chat": owner_chat(config),
             "last_seen": row["last_seen"] if row else None, "alive": row["alive"] if row else None,
             "alive_ts": row["alive_ts"] if row else None,
             "open_tasks": q1("SELECT COUNT(*) n FROM tasks WHERE owner=? AND state NOT IN "
@@ -3213,7 +3233,7 @@ def usage_routes(name):
     data = json.loads(row["data"]) if row else {}
     routes = [("primary", a.get("runtime"), data.get("limits"))]
     if a.get("screen_command") or "screen" in data:
-        routes.append(("screen", "codex", (data.get("screen") or {}).get("limits")))
+        routes.append(("screen", APP_SERVER_RUNTIME, (data.get("screen") or {}).get("limits")))
     return routes
 
 
@@ -4833,7 +4853,7 @@ def chat_route(account, acc, m, t0, hit, preview):
     chat_count("*", "inbound", t0, 1)
     agent = acc["agents"][0]
     a = agents().get(agent) or {}
-    if not a or not agent_active(agent) or not (a.get("role") == "manager" or a.get("runtime") != "grok"):
+    if not a or not agent_active(agent) or not owner_chat(a):
         chat_reply(account, m["chat"], f"{agent_display(agent)} cannot chat now.", t0)
         return "stored", None
     if hit:
@@ -5197,8 +5217,9 @@ def agent_message_refusal(agent, to, parent_id, t0):
         here = ", ".join(n for n in agents() if n != agent and agent_active(n)) or "nobody else"
         return None, f"Refused: there is no active agent named {to[:40]}. The agents are: {here}."
     for name in (agent, to):
-        if agents()[name].get("runtime") == "grok":
-            return None, f"Refused: {name} runs on Grok, and a Grok agent has no agent messages yet."
+        if not runtime_fact(agents()[name].get("runtime"), "agent_messages"):
+            label = runtime_label(agents()[name].get("runtime"))
+            return None, f"Refused: {name} runs on {label}, and a {label} agent has no agent messages yet."
     parent = q1("SELECT * FROM agent_messages WHERE id=?", (parent_id,)) if parent_id else None
     if parent_id and (not parent or parent["sender"] != to or parent["recipient"] != agent):
         return None, f"in_reply_to must name a message that {to} sent to you."
@@ -5377,7 +5398,8 @@ def conversation_refusal(agent):
     is never reachable (CHAT-APPS.md decision D6), and neither is a runtime whose session the helper cannot lock down
     to the conversation tools (decision D5: Claude, until the lockdown test passes for another one)."""
     a = agents().get(agent) or {}
-    if not a or not agent_active(agent) or a.get("role") not in ("worker", "lead") or a.get("runtime") != "claude":
+    if not a or not agent_active(agent) or a.get("role") not in ("worker", "lead") or \
+            not runtime_fact(a.get("runtime"), "conversation"):
         return f"{agent_display(agent)} cannot chat now."
     return None
 
@@ -5800,7 +5822,7 @@ def person_agent_view(agent):
         why = "The fleet's manager never talks with other people."
     elif not agent_active(agent):
         why = f"{agent_display(agent)} is still in setup."
-    elif a.get("runtime") != "claude":
+    elif not runtime_fact(a.get("runtime"), "conversation"):
         why = (f"{agent_display(agent)} runs on {a.get('runtime')}, and a session of that runtime cannot be locked "
                f"down to a conversation yet, so other people never reach it.")
     return {"agent": agent, "can_chat": why is None, "says": why}
@@ -13669,18 +13691,15 @@ def profile_knowledge_files(agent, rev):
 
 
 def start_sandbox(conf):
-    """What the runtime's own settings in the start command allow: a fact for the owner, not an OS boundary."""
-    start = conf.get("start") or ""
-    if conf.get("runtime") == "codex":
-        mode = (re.search(r"--sandbox\s+([a-z-]+)", start) or [None, "the default"])[1]
-        words = {"danger-full-access": "the runtime does not limit file or network access",
-                 "workspace-write": "the runtime limits writes to the workspace",
-                 "read-only": "the runtime allows reads only"}.get(mode, "see the Codex settings")
-        return f"Codex --sandbox {mode}: {words}."
-    if conf.get("runtime") == "claude":
-        mode = (re.search(r"--permission-mode\s+([A-Za-z]+)", start) or [None, "default"])[1]
-        return f"Claude --permission-mode {mode}: the session settings allow and deny tools; they are not an OS boundary."
-    return "The runtime's sandbox is unknown."
+    """What the runtime's own settings in the start command allow: a fact for the owner, not an OS boundary. Which
+    flag says it, and what each of its values means, is that runtime's own entry (lifecycle.RUNTIMES "sandbox"); a
+    runtime whose entry carries none says so instead of guessing."""
+    sandbox = runtime_fact(conf.get("runtime"), "sandbox")
+    if not sandbox:
+        return "The runtime's sandbox is unknown."
+    found = re.search(rf"{sandbox['flag']}\s+({sandbox['value']})", conf.get("start") or "")
+    mode = found.group(1) if found else sandbox["unset"]
+    return f"{sandbox['name']} {sandbox['flag']} {mode}: {sandbox['words'].get(mode, sandbox['otherwise'])}."
 
 
 def verify_merge(agent, items, status):
@@ -13773,7 +13792,7 @@ def offered(agent, model, effort, reading="models"):
     when = f" (reading at {clock(r['read_at'])})" if r.get("read_at") else ""
     screen = reading == "screen_models"
     if not r.get("ok") or not r.get("read_at") or now() - r["read_at"] > MODELS_MAX_AGE or \
-            (screen and r.get("runtime") != "codex"):           # a screen runtime is Codex: never a Claude list
+            (screen and not runtime_fact(r.get("runtime"), "app_server")):      # never a terminal CLI's list
         raise Refusal(409, f"{agent} has no current {'Codex screen ' if screen else ''}model list{when}. "
                            f"Check this machine first.")
     runtime = (agents().get(agent) or {}).get("runtime")
@@ -13881,21 +13900,13 @@ def save_agent_settings(agent, body):
 
 # ---------------------------------------------------------------- runtime switch (owner feature runtime_switch)
 
-SWITCH_RUNTIMES = ("codex", "claude")
-# The default full-access pair: no runtime limit on files, commands or the network, and no permission prompt.
-# Fleet's deny rules apply to every Claude session. The separately opted-in app_server_pair has different permissions.
-# Claude's bypassPermissions is not used: it shows a prompt at start unless the user turned it off.
-FULL_ACCESS = {"codex": {"start": "codex --no-daemon --sandbox danger-full-access --ask-for-approval never {prompt}"},
-               "claude": {"start": "claude --permission-mode dontAsk {settings} {prompt}",
-                          "allow": ["Bash", "Read", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch",
-                                    "mcp__fleet__*"]}}
-RUNTIME_CAN = {"codex": {"shell", "web", "screen"},              # screen tasks use the agent's own screen runtime
-               "claude": {"shell", "web", "browser", "screen"}}
-# The fleet manager's full-access form (owner correction, 13 October 2026): Claude Code with every built-in tool and no
-# permission check (its settings turn the start prompt off and add no Fleet deny rule), and Codex as FULL_ACCESS. A
-# switch of the manager keeps this access in both directions.
-MANAGER_ACCESS = {"codex": {"start": FULL_ACCESS["codex"]["start"]},
-                  "claude": {"start": "claude --permission-mode bypassPermissions --tools default {settings} {prompt}"}}
+# Every fact about a runtime is one entry of lifecycle.RUNTIMES, which hub.py, fleet.py and both installers read.
+# These three names are the shapes the hub's own code and its tests ask for, each the same read of that one table:
+# the full-access form of a worker or a lead, what the runtime's sessions can do, and the manager's own form (owner
+# correction, 13 October 2026). SWITCH_RUNTIMES comes from the table as well (owner feature runtime_switch).
+FULL_ACCESS = {name: runtime_form(e["full_access"]) for name, e in RUNTIMES.items() if e["full_access"]}
+RUNTIME_CAN = {name: set(e["can"]) for name, e in RUNTIMES.items() if e["can"]}
+MANAGER_ACCESS = {name: runtime_form(e["manager_access"]) for name, e in RUNTIMES.items() if e["manager_access"]}
 
 
 def runtime_policy(a):
@@ -13918,16 +13929,17 @@ def manager_access(runtime, policy):
 
 
 def app_server_pair(a, to):
-    """True for the owner's explicit opt-in pair, a different permission policy and not equivalent access (full_access):
-    a Claude worker or lead to Codex only when its stored Codex policy is exactly {"start": "app-server"}, and back
-    only when its policy is exactly that and it has a stored Claude policy, which a switch back restores as it was."""
-    stored = a.get("runtime_policies") or {}
-    if a.get("role") not in ("worker", "lead"):
+    """True for the owner's explicit opt-in pair, a different permission policy and not equivalent access
+    (full_access): a worker or a lead to the runtime the fleet drives over app-server (lifecycle.RUNTIMES
+    "app_server") only when its stored policy for that runtime is exactly {"start": "app-server"}, and back only
+    when its policy is exactly that and it has a stored policy for the one it returns to, which a switch back
+    restores as it was. Today that is a Claude worker to Codex and back."""
+    stored, runtime = a.get("runtime_policies") or {}, a.get("runtime")
+    if a.get("role") not in ("worker", "lead") or switch_target(runtime) != to:
         return False
-    if (a.get("runtime"), to) == ("claude", "codex"):
-        return stored.get("codex") == {"start": APP_SERVER}
-    return (a.get("runtime"), to) == ("codex", "claude") and runtime_policy(a) == {"start": APP_SERVER} and \
-        "claude" in stored
+    if runtime_fact(to, "app_server"):
+        return stored.get(to) == {"start": APP_SERVER}
+    return bool(runtime_fact(runtime, "app_server")) and runtime_policy(a) == {"start": APP_SERVER} and to in stored
 
 
 def full_access(runtime, policy):
@@ -13939,7 +13951,7 @@ def full_access(runtime, policy):
     words = [w for w in policy["start"].split() if w != "--no-daemon"]
     if words != [w for w in want["start"].split() if w != "--no-daemon"]:
         return False
-    return runtime != "claude" or sorted(policy.get("allow") or []) == sorted(want["allow"])
+    return not want.get("allow") or sorted(policy.get("allow") or []) == sorted(want["allow"])
 
 
 def runtime_pending(name):
@@ -14084,7 +14096,7 @@ def runtime_switch(name, team=None):
     manager_switch), and that session's conversation must be recorded, so that a switch back continues it."""
     a = (team or TEAM)["agents"].get(name) or {}
     runtime = a.get("runtime")
-    to = {"codex": "claude", "claude": "codex"}.get(runtime)
+    to = switch_target(runtime)
     if to is None:
         return {"to": None, "ready": False, "missing": ["runtime_not_supported"], "busy": None, "rules": []}
     manager = a.get("role") == "manager"
@@ -15355,10 +15367,13 @@ def validate_team(team):
     for name, a in team["agents"].items():
         if not AGENT_NAME.match(name) or not isinstance(a, dict):
             raise ValueError(f"invalid agent name {name!r}")
-        if a.get("role") not in ("manager", "lead", "worker") or a.get("runtime") not in ("claude", "codex", "grok"):
-            raise ValueError(f"agent {name} needs role manager, lead or worker and runtime claude, codex or grok")
-        if a["role"] == "manager" and a["runtime"] == "grok":
-            raise ValueError("the manager runs claude or codex: a Grok agent has no persistent session yet")
+        if a.get("role") not in ("manager", "lead", "worker") or a.get("runtime") not in RUNTIMES:
+            known = sorted(RUNTIMES)
+            raise ValueError(f"agent {name} needs role manager, lead or worker and runtime "
+                             f"{', '.join(known[:-1])} or {known[-1]}")
+        if a["role"] == "manager" and not runtime_fact(a["runtime"], "manager"):
+            raise ValueError(f"the manager runs {' or '.join(sorted(runtimes_with('manager')))}: a "
+                             f"{runtime_label(a['runtime'])} agent has no persistent session yet")
         if a.get("machine") not in addresses:
             raise ValueError(f"agent {name} has no machine address")
         # An entry that says nothing about an agent means "none", no credential access (PRODUCT.md P5), which is
@@ -15394,9 +15409,11 @@ def validate_team(team):
         # The app-server start policy (app_server_task) is only for a Codex worker or lead, also as a stored Codex
         # policy, and it has no allow list. It is not a full-access form (full_access): a runtime switch takes it only
         # as the owner's opt-in pair (app_server_pair).
-        if any(p.get("start") == APP_SERVER and (runtime != "codex" or a["role"] not in ("worker", "lead") or "allow" in p)
+        if any(p.get("start") == APP_SERVER and (not runtime_fact(runtime, "app_server")
+                                                 or a["role"] not in ("worker", "lead") or "allow" in p)
                for runtime, p in [(a["runtime"], a), *stored.items()]):
-            raise ValueError(f"agent {name}: the start policy app-server is only for a Codex worker or lead, with no allow")
+            raise ValueError(f"agent {name}: the start policy app-server is only for a "
+                             f"{runtime_label(APP_SERVER_RUNTIME)} worker or lead, with no allow")
         screen = a.get("screen")
         if screen is not None:
             if not a.get("screen_command"):
@@ -16049,7 +16066,7 @@ JOIN_TAGS = "tag:claude-code-dev,tag:terminal-relay-worker"     # onboard.DEFAUL
 JOB_OPEN = ("queued", "running", "needs_owner")
 JOB_STEPS = ("user", "runtime", "checkout", "service", "sign_in")       # `user`: the agent's own OS user, on Linux
 JOB_SILENT = 1800               # seconds after which an open job whose server sent nothing has failed
-CODEX_SIGN_IN = re.compile(r"https://auth\.openai\.com/[A-Za-z0-9/_?=&.%-]{0,400}")
+CODEX_SIGN_IN = RUNTIMES["codex"]["sign_in"]["url"]     # the link of its own device sign-in (sign_in_prompt)
 SERVER_PROFILE = """# Profile: %(name)s
 
 Written by the owner. Agents cannot change it.
@@ -16332,7 +16349,7 @@ def start_server_login(server, agent, runtime):
         raise Refusal(400, "runtime must be claude or codex")
     open_one = open_login(agent)
     if open_one and open_one["runtime"] != runtime:
-        raise Refusal(409, f"{agent} has an open {login_label(open_one['runtime'])} sign-in. Finish that one or let "
+        raise Refusal(409, f"{agent} has an open {runtime_label(open_one['runtime'])} sign-in. Finish that one or let "
                            f"it run out, then try again.")
     if not open_one and runtime in LOGIN_RUNTIMES and not q1(
             "SELECT last_seen FROM agents WHERE name=? AND last_seen>?", (agent, now() - MACHINE_STALE)):
@@ -16448,7 +16465,7 @@ def prepare_server_agent(server, body):
         raise Refusal(409, f"{agent} is not on {server}")
     if a.get("runtime") == runtime:
         raise Refusal(409, f"{agent} runs {runtime} already")
-    if {"codex": "claude", "claude": "codex"}.get(a.get("runtime")) != runtime:
+    if switch_target(a.get("runtime")) != runtime:
         raise Refusal(409, f"{agent} cannot switch to {runtime}")
     expire_server_jobs(t0)
     last = q1("SELECT * FROM server_jobs WHERE server=? ORDER BY id DESC LIMIT 1", (server,))
@@ -17870,21 +17887,17 @@ def health_view():
 #   - the browser step happens on the owner's own machine, never on the server and never here,
 #   - the link, the code the provider shows and the code the owner pastes are kept in memory only, for one reader,
 #     and are forgotten when used (LIVE_LOGINS). Nothing of them reaches the records, an event or the log.
-#   - Grok has no sign-in path: its terms do not let a third party run it this way.
-LOGIN_RUNTIMES = ("claude", "codex")        # the runtimes a sign-in can be driven for; never grok
+#   - a runtime whose entry carries no `sign_in` has no sign-in path here: Grok's terms do not let a third party
+#     run it this way, and the entry says so in the words the owner reads (lifecycle.no_sign_in).
+LOGIN_RUNTIMES = tuple(sorted(runtimes_with("sign_in")))        # the runtimes a sign-in can be driven for
 LOGIN_STATES = ("starting", "needs_owner", "signing_in")        # a sign-in that is still going on
 LOGIN_LIFE = 900                # seconds a sign-in may take before the hub gives it up
 LOGIN_CODE_LIFE = 180           # seconds the owner's code waits in memory for the machine to take it
-LOGIN_URLS = {"claude": re.compile(r"https://(?:claude\.ai|console\.anthropic\.com)/[A-Za-z0-9/_?=&.%#+-]{0,400}"),
-              "codex": CODEX_SIGN_IN}
+LOGIN_URLS = {name: RUNTIMES[name]["sign_in"]["url"] for name in LOGIN_RUNTIMES}      # the provider's own link
 USER_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{3,40}")        # a code a provider shows or gives the owner
 # The live part of every open sign-in, by its id: {"url", "show_code", "wants_code", "code", "at"}. In memory, on
 # purpose (see above). A hub restart drops it, which is right: the window on the machine is gone with it.
 LIVE_LOGINS = {}
-
-
-def login_label(runtime):
-    return {"claude": "Claude Code", "codex": "Codex"}.get(runtime, runtime)
 
 
 def login_view(row, live=True):
@@ -17980,7 +17993,7 @@ def end_signed_in_waits(agent, t0=None):
         q("UPDATE server_jobs SET state='done', step='sign_in', detail=NULL, prompt=NULL, updated=? WHERE id=?",
           (t0, row["id"]))
         log("hub", f"server {row['server']}: job {row['id']} ({row['kind']} {agent}) done, as that machine reports "
-                   f"{login_label(row['runtime'])} signed in")
+                   f"{runtime_label(row['runtime'])} signed in")
 
 
 def start_machine_login(agent, runtime):
@@ -17988,23 +18001,23 @@ def start_machine_login(agent, runtime):
     a = agents().get(agent)
     if a is None:
         raise Refusal(404, "no such agent")
-    if runtime == "grok":
-        raise Refusal(409, "Fleet drives no Grok sign-in: xAI's terms do not let a third party run it this way. "
-                           "Sign in to Grok yourself on that machine.")
+    why = no_sign_in(runtime, "that")       # a runtime the fleet knows and drives no sign-in for says why itself
+    if why:
+        raise Refusal(409, why)
     if runtime not in LOGIN_RUNTIMES:
         raise Refusal(400, "runtime must be claude or codex")
     open_one = open_login(agent)
     if open_one:
         return {"agent": agent, "login": login_view(open_one, live=False), "changed": False}
     if signed_in_now(agent, runtime) is True:
-        raise Refusal(409, f"{login_label(runtime)} is signed in on this machine. Its own sign-out comes first.")
+        raise Refusal(409, f"{runtime_label(runtime)} is signed in on this machine. Its own sign-out comes first.")
     if not q1("SELECT last_seen FROM agents WHERE name=? AND last_seen>?", (agent, now() - MACHINE_STALE)):
         raise Refusal(409, f"{agent}'s helper is not reporting, so nothing can start the sign-in on that machine.")
     t0 = now()
     lid = ins("INSERT INTO signin_jobs(agent,runtime,state,created,updated) VALUES(?,?,'starting',?,?)",
               (agent, runtime, t0, t0))
-    emit(agent, "login", f"Sign in to {login_label(runtime)}", extra={"login": lid, "runtime": runtime})
-    log("owner", f"asked {agent} to sign in to {login_label(runtime)} (L-{lid})")      # never a code and never a link
+    emit(agent, "login", f"Sign in to {runtime_label(runtime)}", extra={"login": lid, "runtime": runtime})
+    log("owner", f"asked {agent} to sign in to {runtime_label(runtime)} (L-{lid})")      # never a code and never a link
     return {"agent": agent, "changed": True,
             "login": login_view(q1("SELECT * FROM signin_jobs WHERE id=?", (lid,)), live=False)}
 
@@ -18045,7 +18058,7 @@ def login_report(agent, lid, update):
     if state == "needs_owner":
         url, shown = update["url"], update["shows_code"]
         if not LOGIN_URLS[row["runtime"]].fullmatch(url or ""):
-            raise Refusal(400, f"the sign-in link must be {login_label(row['runtime'])}'s own address")
+            raise Refusal(400, f"the sign-in link must be {runtime_label(row['runtime'])}'s own address")
         if shown is not None and not USER_CODE.fullmatch(shown):
             raise Refusal(400, "shows_code must be the code that the runtime printed")
         live = LIVE_LOGINS.setdefault(lid, {})
@@ -18841,7 +18854,7 @@ class Handler(BaseHTTPRequestHandler):
                     can=config.get("can", []), usage=json.loads(usage["data"]) if usage else None,
                     reports_to=None if config["role"] == "manager" else
                     (config["reports_to"] if config.get("reports_to") in agents() else manager_name()),
-                    direct_chat=config["role"] == "manager" or config.get("runtime") != "grok",
+                    direct_chat=owner_chat(config),
                     local_model=local_model(config),
                     limit=dict(since=lim["since"], until=lim["until"], reset_known=bool(lim["reset_known"]),
                                task=lim["task"]) if lim else None, **(dict(row) if row else
@@ -20772,8 +20785,10 @@ class Handler(BaseHTTPRequestHandler):
                         message_request_id=previous["request_id"],
                         recipient=recipient, replaces_request_id=replaces, attachments=[], chosen=None))
             worker_chat = need_id is None and agents()[recipient].get("role") in ("worker", "lead")
-            if worker_chat and agents()[recipient].get("runtime") == "grok":
-                return self.json(409, {"error": "direct chat with a Grok agent is not available yet"})
+            if worker_chat and not owner_chat(agents()[recipient]):
+                return self.json(409, {"error": f"direct chat with a "
+                                                f"{runtime_label(agents()[recipient].get('runtime'))} agent is not "
+                                                f"available yet"})
             rows = [DB.execute("SELECT * FROM attachments WHERE id=?", (f,)).fetchone() for f in files]
             if any(r is None for r in rows):
                 return self.json(404, {"error": "an attachment does not exist"})

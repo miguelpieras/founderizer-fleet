@@ -49,7 +49,9 @@ SIGN_IN_WAIT = 900              # seconds a sign-in may take
 HELPER_WAIT = 120               # seconds for a new agent's own helper to reach the hub, before its sign-in can start
 PATH_ENV = os.pathsep.join([os.path.join(HOME, ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
                             "/usr/sbin", "/sbin"])
-LABELS = {"codex": "Codex", "claude": "Claude Code"}
+# The runtimes this service installs and signs an agent in to, with the word the owner reads for each
+# (lifecycle.RUNTIMES): a runtime the fleet drives no sign-in for is none of this service's business.
+LABELS = {name: e["label"] for name, e in lifecycle.RUNTIMES.items() if e["sign_in"]}
 NAME = re.compile(r"[a-z][a-z0-9-]{1,30}")
 # One agent's own OS user (hubsetup.AGENT_USER), the one root command that makes it (hubsetup.HELPER), and the PATH
 # of a command run as that user: its own ~/.local/bin, then the machine's.

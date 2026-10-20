@@ -490,14 +490,17 @@ def main():
     agent = os.environ.get("FLEET_AGENT", "")
     fleet.AGENT = agent or None         # its hook calls send the agent key (owner API 1.12)
     conf = fleet.agent_conf(agent)
+    # This runner drives one runtime, the one the fleet speaks app-server to (lifecycle.APP_SERVER_RUNTIME), and
+    # names it as the owner reads it.
+    label = lifecycle.runtime_fact(lifecycle.APP_SERVER_RUNTIME, "label", lifecycle.APP_SERVER_RUNTIME)
     if args.needs == "screen":
         command = conf.get("screen_command")
         if not command or not Path(command).is_file():
-            fleet.die("the configured Codex screen runner is not installed")
-    else:                               # the primary Codex: the executable of the helper's own runtime status
-        command = lifecycle.exe("codex")
+            fleet.die(f"the configured {label} screen runner is not installed")
+    else:                               # the primary runtime: the executable of the helper's own runtime status
+        command = lifecycle.exe(lifecycle.APP_SERVER_RUNTIME)
         if not command:
-            fleet.die("the Codex runtime is not installed")
+            fleet.die(f"the {label} runtime is not installed")
     runner = Runner(agent, os.environ.get("FLEET_TASK", ""), os.environ.get("FLEET_ATTEMPT", "0"),
                     os.environ.get("FLEET_GENERATION", ""), args.prompt, command,
                     session=os.environ.get("FLEET_SESSION", ""), model=args.model, effort=args.effort, needs=args.needs)
