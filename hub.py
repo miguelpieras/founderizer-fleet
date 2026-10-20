@@ -129,7 +129,7 @@ CREATE TABLE IF NOT EXISTS ui_requests(request_id TEXT PRIMARY KEY, kind TEXT, n
   recipient TEXT NOT NULL DEFAULT 'manager', replaces_request_id TEXT, edits TEXT);
 CREATE TABLE IF NOT EXISTS attachments(id INTEGER PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
   mime TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL, created REAL NOT NULL, client TEXT NOT NULL,
-  message TEXT);
+  message TEXT, kept REAL, knowledge TEXT);
 CREATE TABLE IF NOT EXISTS owner_reports(id INTEGER PRIMARY KEY, text TEXT NOT NULL,
   about TEXT NOT NULL, created REAL NOT NULL, agent TEXT NOT NULL DEFAULT 'manager', in_reply_to TEXT);
 CREATE TABLE IF NOT EXISTS thread_events(id INTEGER PRIMARY KEY, task INTEGER NOT NULL, attempt INTEGER NOT NULL,
@@ -595,7 +595,8 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "server_prepare",
                "mobile", "attachments", "resource_grants", "machine_signin",
                "releases", "entitlement", "agent_signin", "github_app", "need_options", "restore",
-               "manager_start", "agent_notes", "edit_in_place", "machine_access", "push"]
+               "manager_start", "agent_notes", "edit_in_place", "machine_access", "push",
+               "attachment_knowledge"]
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 
 
@@ -1288,6 +1289,8 @@ def migrate():
                  "method": "TEXT", "path": "TEXT", "body": "TEXT", "auth": "TEXT",   # call_api: the request
                  "headers": "TEXT",                                                  # and the agent's own headers
                  "status": "INTEGER", "response": "TEXT"},                           # and the service's answer
+        # attachment_knowledge: the day the owner said this one matters, and the knowledge file made from it
+        "attachments": {"kept": "REAL", "knowledge": "TEXT"},
         "ui_requests": {"recipient": "TEXT NOT NULL DEFAULT 'manager'", "replaces_request_id": "TEXT",
                         "origin": "TEXT",           # owner feature chat_apps: the chat app message, as JSON
                         "edits": "TEXT"},           # edit_in_place: each edit of this message, as JSON
@@ -7907,10 +7910,12 @@ ATTACH_TYPES = {"image/png": (".png", (b"\x89PNG\r\n\x1a\n",)),
                 "text/plain": (".txt", ()), "text/markdown": (".md", ()), "text/csv": (".csv", ()),
                 "application/json": (".json", ())}
 # Which rows the sweep lets go, with the upload hour and the retention as its two arguments: one definition, read
-# by the SELECT that counts them and by the DELETE that removes them.
+# by the SELECT that counts them and by the DELETE that removes them. A row the owner kept (attachment_knowledge) is
+# outside it whatever its age, and that is the whole of the keeping: the file half of the sweep leaves every file that
+# a remaining row names, so the row that stays keeps its bytes by itself.
 ATTACH_GOING = ("FROM attachments a LEFT JOIN ui_requests r ON r.request_id=a.message "
-                "WHERE (a.message IS NULL AND a.created<?) "
-                "OR (a.message IS NOT NULL AND COALESCE(r.created, a.created)<?)")
+                "WHERE a.kept IS NULL AND ((a.message IS NULL AND a.created<?) "
+                "OR (a.message IS NOT NULL AND COALESCE(r.created, a.created)<?))")
 ATTACH_LOCK = threading.Lock()
 ATTACH_LINKS = {}                           # token -> one right to download one attachment, one time
 
@@ -7981,6 +7986,13 @@ def attachment_bytes(row):
     return data if len(data) == row["size"] and hashlib.sha256(data).hexdigest() == row["sha256"] else None
 
 
+def attachment_on_disk(row):
+    """Whether the bytes of one attachment are still on the hub. attachment_bytes reads them, which is 25 MiB and a
+    SHA-256 under the hub's one lock when the question was only whether the file is there."""
+    name = attachment_disk_name(row["sha256"], row["mime"])
+    return os.path.exists(os.path.join(CFG.get("attachment_dir") or ATTACH_DIR, name))
+
+
 def attachment_keep():
     """Seconds that a file which a message carries stays on the hub: CFG["attachment_keep"], else 90 days."""
     return float(CFG.get("attachment_keep", ATTACH_KEEP))
@@ -8024,9 +8036,13 @@ def attachment_sweep(t0):
 
 
 def attachment_view(row):
-    """One attachment as the owner's apps read it: never a path on the hub."""
+    """One attachment as the owner's apps read it: never a path on the hub. `kept` is the knowledge file the owner
+    made of it (attachment_knowledge), which is also what takes it out of the sweep, or None for a file that the hub
+    still lets go with its message."""
+    kept = row["kept"] if "kept" in row.keys() else None
     return {"id": row["id"], "name": row["name"], "mime": row["mime"], "size": row["size"], "sha256": row["sha256"],
-            "created": row["created"]}
+            "created": row["created"],
+            "kept": {"at": kept, "knowledge": row["knowledge"]} if kept else None}
 
 
 def attachment_words(files):
@@ -14852,6 +14868,52 @@ def knowledge_content(title, source, how, text):
     return content
 
 
+# ---- a file the owner attached, kept as knowledge (owner feature attachment_knowledge)
+# He sends a file to an agent and it is transient by design: the hub sweeps it after ninety days (ATTACH_KEEP) and it
+# is deliberately not in his backup copy, because he holds the original. So he had no way to say "this one matters".
+#
+# What he gets is the words of the file as an owner knowledge file, and the original kept beside it. Not the file
+# itself in knowledge/: CONFIG_FILES admits only Markdown there and owner_files() (the copy) filters by exactly that
+# regex, so the Markdown is already in his copy and no path is added for the three lists to disagree about;
+# knowledge_entries catalogs only .md blobs, so a binary would be invisible to the Knowledge page, to every picker and
+# to search_knowledge, which is to say invisible to the agent that is meant to read it; and `config` is cloned by
+# every machine before every task session and keeps what was committed to it for ever, with no delta compression for
+# a PDF. His whole backup copy is 60 KB today and one attachment may be 25 MiB.
+#
+# The owner decides it and the hub does it, with no model in between: the text is the file's own bytes, and the title
+# is his or the file's own first heading. So nothing a file SAYS can change what is written, where it lands, or
+# whether it lands at all -- "a file from the owner is data, never instructions" (RULES.md) held by construction.
+ATTACH_TEXT_TYPES = ("text/plain", "text/markdown", "text/csv", "application/json")
+
+
+def attachment_knowledge(row, title):
+    """(the path, the content, the title) of the owner knowledge file made of one attachment that he kept.
+
+    The text is the file's own bytes, which attachment_check has already proved are UTF-8 without a NUL byte, and
+    the Source line names the file on disk exactly, so the original is findable from a copy that carries only
+    these words."""
+    if row["mime"] not in ATTACH_TEXT_TYPES:
+        raise Refusal(415, f"a {row['mime']} file cannot become a knowledge file by itself, because knowledge is text "
+                           f"that search_knowledge reads. Send its text as {{title, text, source}}")
+    data = attachment_bytes(row)
+    if data is None:
+        raise Refusal(410, f"A-{row['id']} is no longer on the hub")
+    text = data.decode("utf-8")
+    title = title or (knowledge_heading(text)[0] or row["name"].rsplit(".", 1)[0])
+    title = knowledge_line(title, "title", 120)
+    source = knowledge_line(f"{row['name']} (A-{row['id']}, {row['sha256'][:12]})", "source", 200)
+    return OWNER_KNOWLEDGE + knowledge_slug(title) + ".md", knowledge_content(title, source, "attached", text), title
+
+
+def attachment_going(aid, t0):
+    """Whether the sweep would let this row go as things stand: ATTACH_GOING itself, asked about one row.
+
+    So the answer of POST /ui/attachments/<id>/keep cannot drift from what the sweep actually does -- there is one
+    definition of what goes, and the count, the delete and this all read it. True for a file that the next sweep
+    takes, which is what a file he has just stopped keeping wants to say."""
+    return bool(q1(f"SELECT a.id {ATTACH_GOING} AND a.id=?", (t0 - ATTACH_WAIT, t0 - attachment_keep(), aid)))
+
+
 def knowledge_line(value, what, limit):
     """A title or a source name: one line of 1 to `limit` characters, without control characters."""
     text = " ".join(CONTROL.sub(" ", value).split()) if isinstance(value, str) else ""
@@ -15021,8 +15083,23 @@ def page_markdown(content_type, body):
     return page_text(text) if html_page else (None, text)
 
 
-def knowledge_add(path, content):
-    """Commit one new owner knowledge file. A file of the same name is never replaced: the owner deletes it first."""
+def knowledge_readers(path, rev):
+    """Which agents will read this knowledge file, as search_knowledge decides it: the ones whose profile's
+    "Knowledge files" section lists the path, and **every manager for a file of the owner's own**, because
+    t_search_knowledge gives a manager every owner file whatever its profile says.
+
+    It is here for the empty answer. A knowledge file that no profile lists and no manager reaches is a file that was
+    written for nothing, and the owner cannot see that from the file: the Knowledge files section is in the profile,
+    which is his own and which nothing else writes. So every add says who will read what it just wrote, at the moment
+    he writes it, instead of leaving him to work it out from four profiles."""
+    owner_file = knowledge_scope(path) == "owner"
+    return sorted(name for name in agents()
+                  if (owner_file and role_of(name) == "manager") or path in profile_knowledge_files(name, rev))
+
+
+def knowledge_add(path, content, attachment=None):
+    """Commit one new owner knowledge file. A file of the same name is never replaced: the owner deletes it first.
+    attachment: the id of the file he attached that this one was made of, for the commit message he reads."""
     rev = kit_revision(fresh=True)
     if not rev:
         raise Refusal(503, "the hub cannot read its own revision")
@@ -15032,10 +15109,13 @@ def knowledge_add(path, content):
     owner = [k for k in knowledge_entries() if k["scope"] == "owner"]
     if len(owner) >= files or sum(k["bytes"] for k in owner) + len(content) > in_all:
         raise Refusal(413, f"the owner's knowledge has room for {files} files and {in_all // MIB} MiB")
-    commit = commit_kit_file(path, content, f"Owner added {path}")
-    log("owner", f"added {path} in {commit[:12]}")
+    said = f"Owner added {path}" + (f" from the file he attached (A-{attachment})" if attachment else "")
+    commit = commit_kit_file(path, content, said)
+    log("owner", f"added {path} in {commit[:12]}" + (f" from A-{attachment}" if attachment else ""))
     title, source = knowledge_heading(content.decode())
-    return {"path": path, "title": title, "scope": "owner", "bytes": len(content), "source": source, "commit": commit}
+    # The profiles did not move with this commit, so `rev` reads the same ones that are current now.
+    return {"path": path, "title": title, "scope": "owner", "bytes": len(content), "source": source, "commit": commit,
+            "read_by": knowledge_readers(path, rev)}
 
 
 def knowledge_delete(path):
@@ -17657,6 +17737,19 @@ def hub_only_files():
     except OSError:
         pass                            # no folder, or none the hub user may read: nothing to count
     found["attachments"] = {"present": bool(files), "files": files, "bytes": size}
+    # And how many of them he said to keep (attachment_knowledge): the ones the sweep never takes, so the paragraph
+    # below cannot go on saying that the hub throws every one of them away after ninety days. Only when there are
+    # any, as for the MCP servers: "the 0 files you kept" is the kind of sentence that stops a man reading.
+    # `kept_alone` is the ones he kept with no knowledge file made of them -- a screenshot, a mockup, a zip -- and
+    # they are counted apart because they are a different loss: the words of a kept text file are in this copy and
+    # these bytes are in nothing, which the paragraph then has to say in its own words.
+    mine = q1("SELECT COUNT(*) n, COALESCE(SUM(size),0) b, COUNT(*)-COUNT(knowledge) a, "
+              "COALESCE(SUM(CASE WHEN knowledge IS NULL THEN size END),0) ab "
+              "FROM attachments WHERE kept IS NOT NULL")
+    if mine["n"]:
+        found["attachments"].update(kept=mine["n"], kept_bytes=mine["b"])
+        if mine["a"]:
+            found["attachments"].update(kept_alone=mine["a"], kept_alone_bytes=mine["ab"])
     return found
 
 
@@ -17711,8 +17804,9 @@ def hub_only_notes(found):
             holds = f"the {n} Google accounts you connected{client}." + lost
         said.append("**Your Google sign-in.** `~/.fleet/google.json` on the hub machine holds " + holds)
         steps.append(
-            "**Connect Google again**, one account at a time, in the app under Resources. You need the client "
-            "file of the Desktop client from your Google Cloud project — Credentials, download the JSON again — "
+            "**Connect Google again**, one account at a time, in the app under Settings > Apps. You need the "
+            "client file of the Desktop client from your Google Cloud project — Credentials, download the JSON "
+            "again — "
             "and to be signed in to each account in the browser that opens. `config/team.json` in this copy "
             "names the accounts and which agent had which level, so nothing has to be remembered.")
     else:
@@ -17725,13 +17819,48 @@ def hub_only_notes(found):
             f"**Your MCP sign-ins.** `~/.fleet/mcp.json` on the hub machine holds {many}. Without it the agents "
             "that had those tools are told the server is not connected, and the tools do not load.")
         steps.append(
-            "**Connect each MCP server again**, in the app under Resources. A server that signs you in through "
-            "your browser needs nothing but that; one with a key of its own needs that key, from wherever you "
-            "keep it. `config/team.json` in this copy names the servers and their addresses.")
+            "**Connect each MCP server again**, in the app under Settings > MCPs. A server that signs you in "
+            "through your browser needs nothing but that; one with a key of its own needs that key, from "
+            "wherever you keep it. `config/team.json` in this copy names the servers and their addresses.")
     else:
         had_none.append("MCP server connected")
     if files.get("present"):
         n, weight = files.get("files") or 0, bytes_in_words(files.get("bytes") or 0)
+        kept, alone = files.get("kept") or 0, files.get("kept_alone") or 0
+        # What he said to keep, in two halves, because they are two different losses. A file kept as knowledge has
+        # its own words in this copy and that knowledge file names the original. A file kept alone -- what could
+        # not become text: a screenshot, a mockup, a zip, a PDF -- has nothing here at all, so the only copy of it
+        # is the folder itself. Saying "each one became a knowledge file" of those would be false.
+        also = ""
+        if kept:
+            one = kept == 1
+            also = (f" {kept} of them, {bytes_in_words(files.get('kept_bytes') or 0)}, "
+                    f"{'is one you' if one else 'are ones you'} said to keep, so the hub never sweeps "
+                    f"{'it' if one else 'them'} and that much of the folder only grows.")
+        if kept and not alone:
+            # Every kept file became a knowledge file: the sentence as it was written, for the case it was
+            # written for. The two branches below are the ones a file kept alone makes necessary.
+            also += (f" What you kept {'it' if kept == 1 else 'them'} for is in this copy: "
+                     f"{'it became a knowledge file' if kept == 1 else 'each one became a knowledge file'} under "
+                     f"`config/knowledge/owner/`, and that file names the one it was made from.")
+        elif kept - alone:
+            words, one = kept - alone, kept - alone == 1
+            also += (f" {'One of those became a knowledge file' if one else f'{words} of those became knowledge files'}"
+                     f" under `config/knowledge/owner/` in this copy, which is what you kept "
+                     f"{'it' if one else 'them'} for, and {'that file names' if one else 'each of them names'} "
+                     f"the one it was made from.")
+        if alone:
+            one = alone == 1
+            # When every kept file was kept alone, this is the same count and the same weight as the sentence
+            # above, so it says neither a second time.
+            also += ((f" The other {'one' if one else alone}, "
+                      f"{bytes_in_words(files.get('kept_alone_bytes') or 0)}, "
+                      f"{'is one you' if one else 'are ones you'} kept as the "
+                      f"{'file itself' if one else 'files themselves'}, with no knowledge file made of "
+                      f"{'it' if one else 'them'},") if kept - alone else
+                     f" No knowledge file was made of {'it' if one else 'them'},")
+            also += (f" so {'it is' if one else 'they are'} in no copy at all — the "
+                     f"{'original is' if one else 'originals are'} on this hub machine and nowhere else.")
         said.append(
             f"**The files you attached to messages.** `~/.fleet/attachments` on the hub machine held {n} "
             f"file{'' if n == 1 else 's'}, {weight} in all, when this copy was made. These are your own files "
@@ -17740,7 +17869,7 @@ def hub_only_notes(found):
             "costs you is that the records in this copy still name every one of them — what it was called, how "
             "big it was, which message carried it — and the file itself will not open. If that is the wrong "
             f"trade for you, that folder is an ordinary folder: copy it off the hub machine whenever you like, "
-            f"and it is {weight}.")
+            f"and it is {weight}." + also)
         steps.append(
             "**Put the attachments back**, if you took a copy of that folder: write it to `~/.fleet/attachments` "
             "on the new hub machine, owned by the hub user, mode 700. Nothing breaks if you do not. The messages "
@@ -17754,7 +17883,7 @@ def hub_only_notes(found):
         said.append("Your hub had no " + " and no ".join(had_none) + ", so there is nothing of those to put back.")
     said = "\n\n".join(textwrap.fill(one, 110) for one in said)
     steps = "".join(f"{n}. {textwrap.fill(one, 110, subsequent_indent='   ')}\n"
-                    for n, one in enumerate(steps, 5))
+                    for n, one in enumerate(steps, 6))
     if steps:
         steps += "\n" + textwrap.fill(
             "Until each of those is done, an agent that reaches for what is missing is told so and stops. "
@@ -17802,11 +17931,24 @@ different object, and it would need somewhere to hide.
 
 ## Putting it back when the hub machine is gone
 
-1. Install a hub on the new machine the usual way, and let the app claim it. You now have an empty fleet.
-2. In the app, open Health and choose Restore, and give it this file. The app sends it to the new hub.
-3. The hub checks the copy, writes your configuration back onto its configuration ref, puts the records in place
-   and restarts itself. It keeps the new machine's own addresses, so the app stays connected.
-4. Each agent machine joins again as it did the first time, and each vault store is made again.
+**This is written for the day this file is the only thing you have.** No checkout, no notes, nothing you
+remembered. Everything in this section is public and holds no secret of yours, which is exactly why it is in
+here: the day somebody reads it is the day nothing else is left.
+
+1. **Founderizer for Mac is at founderizer.com.** Download it there and open it. That address is the only one
+   you have to know, because the app carries both ways of putting a hub on a machine and asks you for what it
+   needs as it goes.
+2. **Any small Linux server becomes the hub.** Ubuntu 22.04 or 24.04, or Debian 12, with root, and nothing else
+   on port 8765; a €5 VPS is enough. You type nothing in its console: the app either installs over your own SSH
+   connection, or hands you one block to paste into the agent you already run. It claims the hub at the end,
+   which is what makes your Mac its owner, and you now have an empty fleet.
+3. **Restore from a copy**, in the app, and give it this file. The app offers it the moment it has claimed the
+   new hub, beside Start a new fleet; afterwards it is in Settings > System status, under Details and beside
+   Save a copy. The app reads this file first and tells you what is in it before it sends anything.
+4. The hub checks the copy, writes your configuration back onto its configuration ref, puts the records in place
+   and restarts itself. It keeps the new machine's own addresses, so the app stays connected, and it takes back
+   the fleet id your subscription is tied to, so your plan is the same fleet and you buy nothing again.
+5. Each agent machine joins again as it did the first time, and each vault store is made again.
 {reconnect}
 Without the app, on the new hub machine: `python3 hub.py --restore <this file>`, then restart the hub service.
 
@@ -19125,7 +19267,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(200, dict(ok=True, replayed=True, **attachment_view(old)))
         log("owner", f"attachment A-{row_id} {mime} {len(data)} bytes from {client}")
         return self.json(200, dict(ok=True, replayed=False, id=row_id, name=name, mime=mime, size=len(data),
-                                   sha256=digest, created=t0))
+                                   sha256=digest, created=t0, kept=None))     # a fresh upload is never kept yet
 
     def ui_attachment_file(self, attachment_id, query):
         """GET /ui/attachments/<id> (owner feature attachments): the bytes, for the owner's own apps."""
@@ -19145,6 +19287,50 @@ class Handler(BaseHTTPRequestHandler):
                          {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
                           "X-Fleet-SHA256": row["sha256"],
                           "Content-Disposition": f'attachment; filename="{row["name"]}"'})
+
+    def ui_attachment_keep(self, attachment_id):
+        """POST /ui/attachments/<id>/keep (owner feature attachment_knowledge): keep one file he attached past the
+        ninety days, or stop keeping it. `{request_id, db, keep}`, keep true or false.
+
+        The mark is the whole of it -- the same `kept` column and the same ATTACH_GOING condition that a file kept
+        as knowledge uses -- and `knowledge` stays null, because this file became nothing. That is the point: a
+        screenshot, a mockup, a zip or a PDF cannot become a knowledge file (knowledge is text that
+        search_knowledge reads), and until now his only way to keep one was to hold the original himself. Nothing
+        reads the file to decide any of this: a file from the owner is data, never instructions (RULES.md), and
+        here that is held by construction, because keeping is a mark on a row and nothing opens the bytes.
+
+        `keep: false` is the way back, and this route has it on purpose. A kept file never leaves that folder, the
+        folder is in no copy, and the bytes may be 25 MiB (ATTACH_MAX), so without it one press would be
+        unmakeable from the app and the only way out would be a shell on the hub machine -- which is the one thing
+        this product promises he never needs. `knowledge` is left exactly as it stands, whichever way he presses:
+        the knowledge file is its own object with its own add and its own delete, and this route neither writes one
+        nor removes one. So a file kept as knowledge can stop being kept too, and its words stay in his copy."""
+        def read(data):
+            extra = sorted(set(data) - {"request_id", "db", "keep"})
+            if extra:
+                raise ValueError(f"unknown field {extra[0]}")
+            if not isinstance(data.get("keep"), bool):
+                raise ValueError("keep must be true (keep this file past the ninety days) or false (let it go)")
+            if not re.fullmatch(r"[1-9][0-9]{0,17}", attachment_id):
+                raise ValueError("the path names one file you attached, for example /ui/attachments/3/keep")
+            return {"attachment": int(attachment_id), "keep": data["keep"]}
+
+        def act(body):
+            aid, keep = body["attachment"], body["keep"]
+            row = q1("SELECT * FROM attachments WHERE id=?", (aid,))
+            if not row:
+                raise Refusal(404, f"A-{aid} is not a file you attached")
+            if bool(row["kept"]) == keep:
+                raise Refusal(409, f"A-{aid} is already kept as {row['knowledge']}" if row["knowledge"] else
+                              f"A-{aid} is {'already kept' if keep else 'not kept'}")
+            if keep and not attachment_on_disk(row):
+                raise Refusal(410, f"A-{aid} is no longer on the hub")
+            with transaction():
+                DB.execute("UPDATE attachments SET kept=? WHERE id=?", (now() if keep else None, aid))
+            log("owner", f"A-{aid} is {'kept past the ninety days' if keep else 'no longer kept'}")
+            row = q1("SELECT * FROM attachments WHERE id=?", (aid,))
+            return {"attachment": aid, "kept": attachment_view(row)["kept"], "going": attachment_going(aid, now())}
+        return self.ui_command("attachment_keep", read, act)
 
     def attachment_file(self, token):
         """GET /attachment/file/<token>: one use of the line that read_attachment gave. The token is the right: no
@@ -20792,8 +20978,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def ui_knowledge_change(self):
         """The owner's knowledge files (owner feature owner_knowledge): add a file's text {title, text, source}, add a
-        page {url}, or delete one file {path, delete: true}. One commit in knowledge/owner/ for each change. The hub
-        reads a page before it takes the lock; the body that a repeat compares keeps the text's digest only."""
+        page {url}, keep a file he attached {attachment, title?} (attachment_knowledge), or delete one file
+        {path, delete: true}. One commit in knowledge/owner/ for each change. The hub reads a page, and an
+        attachment's own bytes, before it takes the lock; the body that a repeat compares keeps the text's digest
+        only."""
         made = {}
 
         def read(data):
@@ -20813,6 +21001,26 @@ class Handler(BaseHTTPRequestHandler):
                 title, text = page_markdown(*fetch_page(url))
                 made["content"] = knowledge_content(title or url, url, "fetched", text)
                 return {"url": url, "path": OWNER_KNOWLEDGE + knowledge_slug(url.split("://", 1)[1]) + ".md"}
+            if "attachment" in data:
+                extra = sorted(fields - {"attachment", "title"})
+                if extra:
+                    raise ValueError(f"unknown field {extra[0]}")
+                try:
+                    aid = int(str(data["attachment"]).strip().upper().removeprefix("A-"))
+                    if aid < 1:
+                        raise ValueError()
+                except (ValueError, TypeError, AttributeError):
+                    raise ValueError("attachment names one file the owner attached, for example A-3") from None
+                if data.get("title") is not None and not isinstance(data["title"], str):
+                    raise ValueError("title must be one line of 1 to 120 characters, or absent")
+                row = q1("SELECT * FROM attachments WHERE id=?", (aid,))
+                if not row:
+                    raise Refusal(404, f"A-{aid} is not a file you attached")
+                if row["kept"]:
+                    raise Refusal(409, f"A-{aid} is already kept as {row['knowledge']}")
+                path, made["content"], title = attachment_knowledge(row, data.get("title"))
+                return {"attachment": aid, "path": path, "title": title,
+                        "sha256": hashlib.sha256(made["content"]).hexdigest()}
             extra = sorted(fields - {"title", "text", "source"})
             if extra:
                 raise ValueError(f"unknown field {extra[0]}")
@@ -20825,7 +21033,27 @@ class Handler(BaseHTTPRequestHandler):
                     "sha256": hashlib.sha256(data["text"].encode()).hexdigest()}
 
         def act(body):
-            return knowledge_delete(body["path"]) if body.get("delete") else knowledge_add(body["path"], made["content"])
+            if body.get("delete"):
+                return knowledge_delete(body["path"])
+            if body.get("attachment"):
+                # read() ran before the lock, as the {url} shape's fetch does, so the row is checked again here:
+                # between the two the sweep may have taken it, or another command may have kept it.
+                row = q1("SELECT * FROM attachments WHERE id=?", (body["attachment"],))
+                if not row:
+                    raise Refusal(404, f"A-{body['attachment']} is not a file you attached")
+                if row["kept"]:
+                    raise Refusal(409, f"A-{body['attachment']} is already kept as {row['knowledge']}")
+            added = knowledge_add(body["path"], made["content"], body.get("attachment"))
+            if body.get("attachment"):
+                # The row that stays is the keeping: ATTACH_GOING lets no kept row go, and the file half of the sweep
+                # leaves every file a remaining row names. So this one UPDATE is what takes the file out of the
+                # ninety days, and it follows the commit: a file marked kept whose knowledge file was never
+                # committed would be a file the hub keeps for ever for nothing.
+                with transaction():
+                    DB.execute("UPDATE attachments SET kept=?, knowledge=? WHERE id=?",
+                               (now(), body["path"], body["attachment"]))
+                added = dict(added, attachment=body["attachment"])
+            return added
         return self.ui_command("knowledge", read, act, limit=4 * MIB)
 
     def helper_status(self, agent):
@@ -22320,6 +22548,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_submit()
         if parts == ["ui", "attachments"]:
             return self.ui_attachment_upload(query)
+        if len(parts) == 4 and parts[:2] == ["ui", "attachments"] and parts[3] == "keep":
+            return self.ui_attachment_keep(parts[2])
         if parts == ["ui", "owner", "devices"]:
             return self.ui_owner_device()
         if len(parts) == 5 and parts[:3] == ["ui", "owner", "devices"] and parts[4] == "code":
