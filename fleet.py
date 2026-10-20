@@ -784,6 +784,20 @@ def manager_resume(agent):
     return f"{said.strip()}\n\n" if isinstance(said, str) and said.strip() else MANAGER_COLD
 
 
+def chat_recap(agent):
+    """The hub's own record of what was said in this agent's owner chat (hub.chat_recap_text), for a chat that starts
+    without its conversation: a first chat, or the first chat on the runtime the owner just switched to, because the
+    record is per runtime (chat_resume). Its own first line says that it is the hub's record and not the session's
+    memory of the work. "" when nothing was said yet, and "" from a hub that cannot be reached or an older hub: then
+    the chat starts as it did before."""
+    try:
+        code, data = http("GET", f"/events/{agent}?after=-1&wait=0", timeout=10)
+    except (urllib.error.URLError, OSError, Refused, ValueError):
+        return ""
+    said = (data or {}).get("chat_recap") if code == 200 else None
+    return said.strip() if isinstance(said, str) and said.strip() else ""
+
+
 def screen_settings(conf):
     """{"model", "effort"} of the agent's screen runtime (owner API 1.11; None means its default), or None for an
     agent without one. They are apart from the primary runtime's model and effort, which never reach it."""
@@ -807,9 +821,25 @@ def model_flags(conf):
 
 
 CHAT_SIGNAL = "New fleet messages. Call read_messages now."     # the helper's signal to an owner chat window
+# Characters of a chat's quoted first prompt. A tmux command must stay under 16 KiB (start_window; tmux refuses a
+# longer one with "command too long"), and a Codex chat has nowhere else to put its prompt. The instructions and the
+# profile are what the chat is, so the recap is what gives way.
+CHAT_PROMPT_MAX = 14000
 
 
-def chat_command(agent, conf, generation, token=None, marker=None, resume=None, env=None):
+def chat_fit(recap, room):
+    """The hub's record of a chat (chat_recap) cut to `room` quoted characters: its oldest messages go first, and its
+    first line, which says what the recap is, stays with the newest message. "" when not even those two fit, and then
+    the chat starts with no recap rather than not starting at all; one message that long is the unread one, which
+    read_messages brings anyway."""
+    note, _, said = recap.partition("\n")
+    lines = said.splitlines()
+    while lines and len(shlex.quote("\n\n" + note + "\n" + "\n".join(lines))) > room:
+        lines.pop(0)
+    return note + "\n" + "\n".join(lines) if lines else ""
+
+
+def chat_command(agent, conf, generation, token=None, marker=None, resume=None, recap=None, env=None):
     """A separate discussion session: no task tools, login jobs, browser or write sandbox. token: its session
     credential (owner API 1.12). For Codex: marker goes at the end of a new chat's prompt, so that the helper can find
     its conversation later; resume is the Codex thread of the same chat to continue, with the same settings and this
@@ -818,8 +848,12 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
     owner's chat event again until it has a reply, and the helper then signals the running window. A Claude chat
     always starts so, with the instructions as its appended system prompt: interactive Claude Code runs a first
     prompt before it has connected the fleet MCP server, and with no tools that turn writes tool calls as text. Its
-    first turn is the helper's first signal, after the signal throttle. env: {NAME: value} of session_env, from a file
-    that the window reads and removes, as the credential of a Codex chat."""
+    first turn is the helper's first signal, after the signal throttle. recap: the hub's own record of what was said
+    in this chat before (chat_recap), for a chat that starts without its conversation; it goes last, after the
+    profile, says in its own first line that it is the hub's record and not this session's memory, and gives way
+    where a tmux command would otherwise be too long (chat_fit). env:
+    {NAME: value} of session_env, from a file that the window reads and removes, as the credential of a Codex
+    chat."""
     if conf.get("runtime") == "grok":
         raise Refused("a Grok agent has no direct chat yet: its tools cannot be limited to discussion")
     with open(os.path.join(KIT, "profiles", agent + ".md"), encoding="utf-8") as file:
@@ -839,6 +873,9 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
               'A terminal answer alone does not reach the app. Reply once per request, then read_messages once more '
               'and wait for a signal. No polling. A correction is new context, never automatic replay of earlier work. '
               'Never read or reveal credentials. Pass only login names. Your profile follows:\n' + profile)
+    fitted = chat_fit(recap, CHAT_PROMPT_MAX - len(shlex.quote(prompt))) if recap else ""
+    if fitted:
+        prompt += "\n\n" + fitted
     url = f"{HUB}/mcp/{agent}/{generation}/owner-chat/1"
     if conf.get("runtime") == "codex":
         if resume is not None and not THREAD_ID.fullmatch(str(resume)):
@@ -2119,15 +2156,21 @@ class Helper:
                 resume = self.chat_resume(extra["generation"])      # first: a chat that cannot continue gets no credential
                 token = session_credential(self.agent, "chat", extra["generation"])
                 marker = None if resume or runtime not in ("codex", "claude") else str(uuid.uuid4())
+                # No conversation to continue here: a first chat, or the first after a runtime switch, because the
+                # record is this runtime's own. The hub's record of what was said takes the place of the session's
+                # own memory, so the chat does not start blind. A chat that resumes keeps its own context instead.
+                recap = "" if resume else chat_recap(self.agent)
                 self.start(window, chat_command(self.agent, self.conf, extra["generation"], token=token, marker=marker,
-                                                resume=resume, env=session_env(self.agent, self.conf, "chat")),
+                                                resume=resume, recap=recap,
+                                                env=session_env(self.agent, self.conf, "chat")),
                            1, extra["generation"])
                 if marker:      # Codex finds its thread by the marker later; Claude starts with the marker as session id
                     save_chat_record(self.agent, {"generation": extra["generation"],
                                                   "marker": marker if runtime == "codex" else None,
                                                   "session": None if runtime == "codex" else marker,
                                                   "started": time.time()}, runtime)
-                self.say(f"owner-chat: {'conversation ' + resume + ' continued' if resume else 'session started'}; "
+                self.say(f"owner-chat: {'conversation ' + resume + ' continued' if resume else 'session started'}"
+                         f"{' with the hub\'s recap of this chat' if recap else ''}; "
                          f"agent read and reply are still pending")
             else:
                 self.signal(window)

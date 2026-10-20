@@ -123,7 +123,7 @@ CREATE TABLE IF NOT EXISTS cases(id TEXT PRIMARY KEY, test INTEGER, created REAL
 CREATE TABLE IF NOT EXISTS evidence(id INTEGER PRIMARY KEY, case_id TEXT, kind TEXT, ts REAL, data TEXT);
 CREATE TABLE IF NOT EXISTS ui_requests(request_id TEXT PRIMARY KEY, kind TEXT, need_id INTEGER,
   text TEXT, event_id INTEGER NOT NULL, created REAL NOT NULL, client TEXT NOT NULL,
-  recipient TEXT NOT NULL DEFAULT 'manager', replaces_request_id TEXT);
+  recipient TEXT NOT NULL DEFAULT 'manager', replaces_request_id TEXT, edits TEXT);
 CREATE TABLE IF NOT EXISTS attachments(id INTEGER PRIMARY KEY, request_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
   mime TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL, created REAL NOT NULL, client TEXT NOT NULL,
   message TEXT);
@@ -566,7 +566,7 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "server_prepare",
                "mobile", "attachments", "resource_grants", "machine_signin",
                "releases", "entitlement", "agent_signin", "github_app", "need_options", "restore",
-               "manager_start", "agent_notes"]
+               "manager_start", "agent_notes", "edit_in_place", "machine_access"]
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 
 
@@ -810,7 +810,7 @@ def mobile_chat(agent, since):
         for f in q(f"SELECT * FROM attachments WHERE message IN ({marks}) ORDER BY id", [r["request_id"] for r in said]):
             files.setdefault(f["message"], []).append(attachment_view(f))
     items = [{"kind": "message", "ts": r["created"], "id": r["request_id"], "text": r["text"], "client": r["client"],
-              "read_at": r["read_at"], "replaces": r["replaces_request_id"],
+              "read_at": r["read_at"], "replaces": r["replaces_request_id"], "edited": message_edited(r),
               "attachments": files.get(r["request_id"], [])}
              for r in said]
     items += [{"kind": "report", "ts": r["created"], "id": r["id"], "text": r["text"], "about": r["about"],
@@ -1136,7 +1136,8 @@ def migrate():
                  "headers": "TEXT",                                                  # and the agent's own headers
                  "status": "INTEGER", "response": "TEXT"},                           # and the service's answer
         "ui_requests": {"recipient": "TEXT NOT NULL DEFAULT 'manager'", "replaces_request_id": "TEXT",
-                        "origin": "TEXT"},          # owner feature chat_apps: the chat app message, as JSON
+                        "origin": "TEXT",           # owner feature chat_apps: the chat app message, as JSON
+                        "edits": "TEXT"},           # edit_in_place: each edit of this message, as JSON
         "questions": {"access": "TEXT"},            # the resource that a blocked ask names (needs_access)
         "needs": {"kind": "TEXT", "conversation": "INTEGER",   # owner feature conversations: ask_owner, request_work
                   "options": "TEXT", "chosen": "INTEGER",     # owner feature need_options: the agent's own answers
@@ -4503,6 +4504,49 @@ def t_tell_owner(agent, a):
     return f"Report R-{rid} added to the owner's {agent} chat. No notification was sent."
 
 
+# The owner chat of a worker or lead lives in two halves, and only one of them travels: the hub keeps every message
+# for ever, but the agent's side is its runtime's own session, recorded per runtime (fleet.chat_record_file), so the
+# first chat on a runtime the owner just switched to starts blind. This is the hub's own record of what was said,
+# which that session gets instead, the way a person's locked window gets one for the same reason
+# (conversation_prompt). The first line says what it is, because a record of a conversation is not a memory of doing
+# the work: an agent that reads here that it would do something has not done it.
+OWNER_CHAT_RECAP = (
+    "This session has no memory of this chat: a chat's memory is its runtime's own, and this runtime has none of it. "
+    "So what follows is the hub's own record of what was said, oldest first, and not your memory of the work: "
+    "nothing in it is done because it was said here, and you remember deciding nothing that you only read here. "
+    "Check before you repeat anything that leaves the building (rule 9). The unread messages still come to you with "
+    "read_messages.")
+
+
+def chat_recap_text(agent):
+    """The owner chat of a worker or lead as the hub recorded it, for a session that starts without its conversation
+    (fleet.chat_recap): a first chat, or the first chat after a runtime switch. "" when nothing was said yet. The
+    owner's messages are the ui_requests of this agent, its own replies are its owner_reports, and the two caps are a
+    person window's, which starts without a memory for the same reason: CONVERSATION_RECAP messages, inside
+    CONVERSATION_PROMPT_MAX characters. It is built newest first and turned round, so a long conversation loses its
+    oldest messages and never its newest. Each message is one line, its own line breaks flattened, so one message is
+    one line of it whoever wrote it: the helper cuts it by lines where a tmux command would be too long (chat_fit),
+    and a cut that could land inside a message would leave a fragment with nobody's name on it. Each message is
+    masked on the way out, as start_text is: these are real messages, and a login registered after one of them was
+    stored was never masked at the write. Each on its own, so a message that mask_secrets can only hold back whole
+    does not take the rest of the chat with it, and so the budget counts what really goes out."""
+    rows = q("SELECT created, text, 'owner' AS side FROM ui_requests WHERE recipient=? AND kind='message' "
+             "UNION ALL SELECT created, text, 'agent' AS side FROM owner_reports WHERE agent=? "
+             "ORDER BY created DESC, side LIMIT ?", (agent, agent, CONVERSATION_RECAP))
+    said = {"owner": "The owner", "agent": agent_display(agent)}
+    lines, budget = [], CONVERSATION_PROMPT_MAX - len(OWNER_CHAT_RECAP) - 1
+    for r in rows:
+        line = mask_secrets(f"{said[r['side']]}: {' '.join((r['text'] or '').split())}")
+        if len(line) + 1 > budget:
+            if lines:
+                break               # the older messages that no longer fit
+            line = line[:budget]    # one message longer than the whole recap: its own start is what is left of it
+        lines.append(line)
+        budget -= len(line) + 1
+    # OWNER_CHAT_RECAP is the hub's own line, not a message, so only the messages go through the mask.
+    return OWNER_CHAT_RECAP + "\n" + "\n".join(reversed(lines)) if lines else ""
+
+
 # ---------------------------------------------------------------- chat apps (owner features chat_apps and people)
 
 CHAT_ACCOUNT = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
@@ -4583,19 +4627,63 @@ def chat_reply(account, chat, text, t0):
     return chat_queue("message", account, t0, chat=chat, text=text, reply_to=None)
 
 
+def owner_message_text(request_id, value, recipient, origin, replaces, files):
+    """The words of one owner chat message, as its reader gets them: the owner's text under the header that says who
+    wrote it, and for a worker or a lead the request id that its reply names. A correction says what it corrects; a
+    message that the owner edited before anything read it says nothing, because it is the same message with other
+    words. One builder for both, so a new message and an edited one cannot drift."""
+    via = CHAT_APP_NAMES[origin["app"]] if origin else None
+    if agents()[recipient].get("role") in ("worker", "lead"):
+        text = f"[owner chat request_id={request_id}" + (f" via={via}" if via else "") + f"] {value}"
+    else:
+        text = f"[owner via {via}] {value}" if via else f"[owner] {value}"
+    if replaces:
+        text += f"\n[Correction to request {replaces}. This is a new message, not cancellation or replay of earlier work.]"
+    return text.rstrip() + attachment_words(files)
+
+
+def message_edited(row):
+    """When the owner last changed the words of this message where it stands, or None (edit_in_place). The app shows
+    one bubble either way, so this is the only sign that its words are not the first ones."""
+    said = json.loads(row["edits"] or "[]")
+    return said[-1]["at"] if said else None
+
+
+def message_unread(previous):
+    """True when nothing has seen this owner message yet: its event has no read time and no agent answered it. Then
+    the owner's edit is that message with other words, and not a correction under it. DB.execute only, so the write
+    asks again inside its own transaction and a read_messages of the same moment wins."""
+    row = DB.execute("SELECT read_at FROM events WHERE id=?", (previous["event_id"],)).fetchone()
+    return bool(row) and row["read_at"] is None and DB.execute(
+        "SELECT 1 FROM owner_reports WHERE in_reply_to=?", (previous["request_id"],)).fetchone() is None
+
+
+def owner_message_replace(previous, value, request_id, t0):
+    """Inside a transaction: the owner edited a message that nothing had read, so the message itself changes. Its
+    ui_requests row and its event keep their id and their time, which is why the bubble changes where it stands;
+    their text becomes the new words with nothing appended, and the words they replace go into the log, so the
+    record still holds what he first said. The files it carries stay with it: an edit brings none."""
+    files = DB.execute("SELECT * FROM attachments WHERE message=? ORDER BY id", (previous["request_id"],)).fetchall()
+    origin = json.loads(previous["origin"]) if previous["origin"] else None
+    text = owner_message_text(previous["request_id"], value, previous["recipient"], origin, None, files)
+    edits = json.loads(previous["edits"] or "[]") + [{"request_id": request_id, "text": value, "at": t0}]
+    DB.execute("UPDATE events SET text=? WHERE id=?", (text, previous["event_id"]))
+    DB.execute("UPDATE ui_requests SET text=?,edits=? WHERE request_id=?",
+               (value, json.dumps(edits), previous["request_id"]))
+    DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, "owner", f"UI message {request_id} replaced the "
+               f"words of {previous['request_id']} (M-{previous['event_id']} for {previous['recipient']}), which "
+               f"nothing had read. It said: {previous['text']}"))
+
+
 def owner_message_rows(request_id, kind, need, value, client, recipient, replaces, t0, origin=None, files=(),
                        chosen=None):
     """Inside a transaction: one owner message or answer, from the app (POST /ui/messages, /ui/needs/<id>) or from a
     chat app (origin): the answer of the need, one event and one ui_requests row. The caller checked everything.
     Returns the event ID."""
     worker_chat = need is None and agents()[recipient].get("role") in ("worker", "lead")
-    via = CHAT_APP_NAMES[origin["app"]] if origin else None
-    text = f"[owner via {via}] {value}" if via else f"[owner] {value}"
-    if worker_chat:
-        text = f"[owner chat request_id={request_id}" + (f" via={via}" if via else "") + f"] {value}"
-    if replaces:
-        text += f"\n[Correction to request {replaces}. This is a new message, not cancellation or replay of earlier work.]"
-    if need is not None:
+    if need is None:
+        text = owner_message_text(request_id, value, recipient, origin, replaces, files)
+    else:
         text = f"[owner] Answer to Needs-you N-{need['id']} ({need['title']}): {value}"
         DB.execute("UPDATE needs SET answer=?,answered=?,chosen=? WHERE id=?", (value, t0, chosen, need["id"]))
         if need["conversation"] and DB.execute("SELECT 1 FROM conversations WHERE id=?",
@@ -4608,7 +4696,7 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
             DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, "owner", f"UI {kind} {request_id} "
                        f"accepted as the answer of N-{need['id']} in C-{need['conversation']}"))
             return event_id
-    text = text.rstrip() + attachment_words(files)
+        text = text.rstrip() + attachment_words(files)
     generation = DB.execute("SELECT v FROM kv WHERE k='db_id'").fetchone()
     extra = json.dumps({"generation": generation["v"] if generation else None}) if worker_chat else "{}"
     event_id = DB.execute("INSERT INTO events(agent,kind,text,created,extra) VALUES(?,?,?,?,?)",
@@ -15868,6 +15956,80 @@ def machine_readiness(team):
     return out
 
 
+def save_access(body):
+    """How the fleet reaches one machine, on record (owner feature machine_access): the SSH user, the SSH port and
+    whether that machine answers Screen Sharing, in the `access` map of team.json, for a machine that is already in
+    the fleet. `{"delete": true}` takes the record out again.
+
+    Until this route every writer of that map wrote at creation time and never again: `hubsetup.template` for the
+    hub's own machine, with the user the hub installer was given; the join of a server, which writes `root` because
+    the join line ran as root, and only when that line reported a Linux SSH port; and `onboard.register_in_kit` on
+    the owner's Mac. So a machine that already existed could not be corrected, a Mac that joined got no entry at
+    all, and nothing could take an entry out. The Studio, which the owner reaches as `fab` every day, stood in the
+    fleet's own record with `ssh: null` and `no_ssh` against it: reachable in fact and unreachable on paper. The
+    owner, 19 October 2026:
+    "ssh works for the studio from here, so please make sure you fix it -- make sure we get this right for future
+    updates, we can't lose access to the fleet and its servers!"
+
+    Removal is half of that: a machine whose connection is gone must be recordable as gone, because an entry left
+    standing says something false, and a false record is what loses the access.
+
+    A user that the fleet may not use is refused instead of written. The rule is `machine_readiness`'s own
+    `ssh_user_not_allowed`, and it is asked of `machine_readiness` itself on the team this write would make, so the
+    route and the readiness it would produce can never drift apart. Writing it anyway would leave the machine
+    marked broken on every screen that reads that line, which is worse than the gap it was meant to close."""
+    machine, deleting = body["machine"], body.get("delete") is True
+    rev = kit_revision(fresh=True)
+    team, current, _ = team_view(rev)
+    if body["base_sha256"] != current:
+        raise Conflict("team.json changed meanwhile; reload it", sha256=current)
+    addresses = team.get("addresses") or {}
+    if machine not in addresses:
+        known = ", ".join(sorted(m for m in addresses if m != "owner"))
+        raise Refusal(404, f"this fleet has no machine {machine}" + (f" (it has {known})" if known else ""))
+    if machine == "owner":
+        raise Refusal(409, "the owner's own computer is the one that connects; the fleet does not reach it")
+    ways = dict(team.get("access") or {})
+    old = ways.get(machine)
+    entry = None if deleting else {"ssh_user": body["ssh_user"], "ssh_port": body["ssh_port"],
+                                   "screen_sharing": body["screen_sharing"]}
+    if deleting and old is None:
+        raise Refusal(404, f"the fleet has no connection to {machine} on record")
+    if entry == old:
+        return {"machine": machine, "revision": rev, "sha256": current, "changed": False, "deleted": False,
+                "access": old}
+    if entry is not None:
+        candidate = json.loads(json.dumps(team))
+        candidate.setdefault("access", {})[machine] = entry
+        reading = machine_readiness(candidate).get(machine) or {}
+        if "ssh_user_not_allowed" in ((reading.get("add_agent") or {}).get("missing") or []):
+            worker = reading.get("worker_user")
+            raise Conflict(f"the agents of {machine} run as {worker}, so the fleet can reach it as root or as "
+                           f"{worker} and not as {body['ssh_user']}: that record would leave {machine} marked "
+                           f"ssh_user_not_allowed, which is worse than no record at all",
+                           machine=machine, worker_user=worker)
+    if deleting:
+        del ways[machine]
+    else:
+        ways[machine] = entry
+    if ways:
+        team["access"] = ways
+    else:
+        team.pop("access", None)
+    try:
+        validate_team(team)
+    except ValueError as e:
+        raise Refusal(400, str(e)) from None
+    data = (json.dumps(team, indent=2) + "\n").encode()
+    done = "forgot how the fleet reaches" if deleting else \
+        "changed how the fleet reaches" if old else "recorded how the fleet reaches"
+    commit = commit_kit_file("team.json", data, f"Owner {done} {machine}")
+    apply_team(team)
+    log("owner", f"{done} {machine} in {commit[:12]}")
+    return {"machine": machine, "revision": commit, "sha256": hashlib.sha256(data).hexdigest(), "changed": True,
+            "deleted": deleting, "access": entry}
+
+
 # ---------------------------------------------------------------- servers (owner feature servers)
 #
 # A server is a machine of team.json "addresses", except the owner's own computer ("owner"), and it can have no agent.
@@ -18691,6 +18853,9 @@ class Handler(BaseHTTPRequestHandler):
                 o = json.loads(m["origin"]) if m.get("origin") else None
                 m["origin"] = {"app": o["app"], "account": o["account"],
                                "label": (conf.get(o["account"]) or {}).get("label", o["account"])} if o else None
+                # edit_in_place: when he last changed its words, and not every text it has had
+                m["edited"] = message_edited(m)
+                m.pop("edits", None)
             files = {}                          # owner feature attachments: the files of each message
             for r in q("SELECT * FROM attachments WHERE message IS NOT NULL ORDER BY id"):
                 files.setdefault(r["message"], []).append(attachment_view(r))
@@ -19570,6 +19735,36 @@ class Handler(BaseHTTPRequestHandler):
                                  f"{service} of this account from every agent")
             return {"base_sha256": base, "account": account, "service": service, "access": dict(sorted(access.items()))}
         return self.ui_command("team/google", read, save_google)
+
+    def ui_team_access(self):
+        """POST /ui/team/access (owner feature machine_access): how the fleet reaches one machine -- its SSH user,
+        its SSH port and whether Screen Sharing answers there -- or {"delete": true} to take that record out.
+
+        It is a command of team.json like every other owner change (`save_access`), and it is the only writer of
+        the `access` map besides a server's own join. The port and Screen Sharing have their defaults here, so the
+        one thing the owner must say is the user, which is the one thing nothing can derive."""
+        def read(data):
+            base = self.integration_base(data, ("machine", "ssh_user", "ssh_port", "screen_sharing", "delete"))
+            machine = data.get("machine")
+            if not isinstance(machine, str) or not SERVER_NAME.fullmatch(machine):
+                raise ValueError("machine must be the name of a machine of this fleet")
+            if data.get("delete") is not None:
+                if data["delete"] is not True or set(data) & {"ssh_user", "ssh_port", "screen_sharing"}:
+                    raise ValueError("delete must be true, without ssh_user, ssh_port or screen_sharing")
+                return {"base_sha256": base, "machine": machine, "delete": True}
+            user = data.get("ssh_user")
+            if not isinstance(user, str) or not SSH_USER.fullmatch(user.strip()):
+                raise ValueError("ssh_user must be the user this machine is reached as: 1 to 32 characters, a "
+                                 "letter or _ first, then letters, digits, . _ or -")
+            port = data.get("ssh_port", 22)
+            if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+                raise ValueError("ssh_port must be a port from 1 to 65535")
+            sharing = data.get("screen_sharing", False)
+            if not isinstance(sharing, bool):
+                raise ValueError("screen_sharing must be true or false")
+            return {"base_sha256": base, "machine": machine, "ssh_user": user.strip(), "ssh_port": port,
+                    "screen_sharing": sharing}
+        return self.ui_command("team/access", read, save_access)
 
     def ui_team_mcp(self):
         """POST /ui/team/mcp (owner feature mcp): one of the owner's own MCP servers, new, changed or deleted. The
@@ -20554,15 +20749,28 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json(409, {"error": "request_id was already used for different content or recipient"})
                 read_at = DB.execute("SELECT read_at FROM events WHERE id=?", (old["event_id"],)).fetchone()[0]
                 return self.json(200, dict(ok=True, request_id=request_id, event_id=old["event_id"],
-                    created=old["created"], read_at=read_at, replayed=True, client=client,
+                    created=old["created"], read_at=read_at, replayed=True, client=client, edited=False,
+                    message_request_id=request_id,
                     recipient=recipient, replaces_request_id=replaces, attachments=had,
                     chosen=need["chosen"] if need is not None else None))
             if need is not None and need["answer"] is not None:
                 return self.json(409, {"error": "owner request is already answered"})
+            previous = None
             if replaces is not None:
                 previous = DB.execute("SELECT * FROM ui_requests WHERE request_id=?", (replaces,)).fetchone()
                 if not previous or previous["kind"] != "message" or previous["recipient"] != recipient or previous["client"] != client:
                     return self.json(409, {"error": "correction must refer to this client's message in the same agent chat"})
+                # The same edit again (edit_in_place). It left no row of its own, so the message it changed carries
+                # it: the answer is the same one and nothing is written a second time.
+                said = next((e for e in json.loads(previous["edits"] or "[]") if e["request_id"] == request_id), None)
+                if said is not None:
+                    if said["text"] != value or files:
+                        return self.json(409, {"error": "request_id was already used for different content or recipient"})
+                    read_at = DB.execute("SELECT read_at FROM events WHERE id=?", (previous["event_id"],)).fetchone()[0]
+                    return self.json(200, dict(ok=True, request_id=request_id, event_id=previous["event_id"],
+                        created=previous["created"], read_at=read_at, replayed=True, client=client, edited=True,
+                        message_request_id=previous["request_id"],
+                        recipient=recipient, replaces_request_id=replaces, attachments=[], chosen=None))
             worker_chat = need_id is None and agents()[recipient].get("role") in ("worker", "lead")
             if worker_chat and agents()[recipient].get("runtime") == "grok":
                 return self.json(409, {"error": "direct chat with a Grok agent is not available yet"})
@@ -20577,10 +20785,19 @@ class Handler(BaseHTTPRequestHandler):
             # The event, receipt, optional answer and the links of the files commit together. No helper ack claims
             # delivery.
             with DB:
-                event_id = owner_message_rows(request_id, kind, need, value, client, recipient, replaces, created,
-                                              files=rows, chosen=choice)
+                # edit_in_place: an edit of a message that nothing has read is that message with other words, and
+                # not a correction under it. The question is asked here, inside the write, so a read_messages of
+                # the same moment wins and this edit falls back to a correction.
+                edited = previous is not None and not files and message_unread(previous)
+                if edited:
+                    owner_message_replace(previous, value, request_id, created)
+                    event_id, created = previous["event_id"], previous["created"]
+                else:
+                    event_id = owner_message_rows(request_id, kind, need, value, client, recipient, replaces, created,
+                                                  files=rows, chosen=choice)
             return self.json(200, dict(ok=True, request_id=request_id, event_id=event_id,
-                created=created, read_at=None, replayed=False, client=client,
+                created=created, read_at=None, replayed=False, client=client, edited=edited,
+                message_request_id=previous["request_id"] if edited else request_id,
                 recipient=recipient, replaces_request_id=replaces, attachments=[r["id"] for r in rows],
                 chosen=choice))
 
@@ -21606,9 +21823,13 @@ class Handler(BaseHTTPRequestHandler):
         if after < 0:
             # The helper asks this before it starts the standing session, for the DB generation its credential and
             # its conversation record are bound to. The resume brief rides with it, so the first prompt of that
-            # session says where the fleet stood instead of starting cold with see_team.
+            # session says where the fleet stood instead of starting cold with see_team. An owner chat that starts
+            # without its conversation asks the same question (fleet.chat_recap), and chat_recap rides with it for
+            # the same reason: the chat's record is per runtime, so the first chat after a switch has none.
             return self.json(200, {"events": [], "last": newest, "db": kv_get("db_id"),
-                                   "resume": manager_resume_text() if role_of(agent) == "manager" else None})
+                                   "resume": manager_resume_text() if role_of(agent) == "manager" else None,
+                                   "chat_recap": chat_recap_text(agent)
+                                   if role_of(agent) in ("worker", "lead") else None})
         if query.get("delivery") == "1" and agent != "owner":
             deadline = now() + wait
             while True:
@@ -21820,6 +22041,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_team_google()
         if parts == ["ui", "team", "mcp"]:
             return self.ui_team_mcp()
+        if parts == ["ui", "team", "access"]:            # owner feature machine_access
+            return self.ui_team_access()
         if parts == ["ui", "resources"]:
             return self.ui_resource()
         if parts == ["ui", "resources", "take"]:
@@ -22918,7 +23141,7 @@ def leak_scan():
               # a job: also the texts of create_login and save_key, and the request and the answer of call_api
               "jobs": ("login", "result", "label", "username", "url", "selector", "source_url", "path", "body", "auth",
                        "headers", "response"),
-              "sealed": ("label", "task"), "ui_requests": ("text",), "owner_reports": ("text", "about"),
+              "sealed": ("label", "task"), "ui_requests": ("text", "edits"), "owner_reports": ("text", "about"),
               "agent_messages": ("text",), "thread_events": ("data",), "holds": ("note", "detail"),
               "outcomes": ("title", "note"),
               "ui_controls": ("body", "result"), "chat_out": ("text", "error"), "chat_ignored": ("name", "preview")}
