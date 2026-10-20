@@ -50,6 +50,7 @@ import wakeups
 from desktop import Frames
 import google
 import mcp
+import push
 import releases
 from lifecycle import (APP_SERVER, APP_SERVER_RUNTIME, GITHUB_TOKEN, MCP_LIMIT, MCP_NAME, REPO_ACCESS,
                        REPO_NAME, RUNTIMES, SWITCH_RUNTIMES, TOOL_CATALOG, app_server_task, mcp_server,
@@ -276,6 +277,14 @@ CREATE TABLE IF NOT EXISTS owner_device_codes(id INTEGER PRIMARY KEY, device TEX
   created REAL NOT NULL, expires REAL NOT NULL, used REAL);
 CREATE TABLE IF NOT EXISTS owner_device_tries(id INTEGER PRIMARY KEY, device TEXT NOT NULL, ts REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS owner_device_contacts(device TEXT PRIMARY KEY, ts REAL NOT NULL, auth TEXT);
+-- Pings to the owner's devices (MOBILE-APP.md 9, owner feature push): the push token that each device gave, and one
+-- row for each ping. A ping row holds no text, and it is sent once: queued, sending, then sent, failed, skipped or
+-- unknown.
+CREATE TABLE IF NOT EXISTS owner_device_push(device TEXT PRIMARY KEY, token TEXT NOT NULL, environment TEXT NOT NULL,
+  updated REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS pings(id INTEGER PRIMARY KEY, device TEXT NOT NULL, kind TEXT NOT NULL,
+  item INTEGER NOT NULL, db TEXT NOT NULL, state TEXT NOT NULL, created REAL NOT NULL, sent REAL, status INTEGER,
+  error TEXT);
 CREATE TABLE IF NOT EXISTS resource_grants(id INTEGER PRIMARY KEY, ts REAL NOT NULL, resource TEXT NOT NULL,
   agent TEXT NOT NULL, level TEXT, by TEXT NOT NULL, revision TEXT);
 CREATE INDEX IF NOT EXISTS resource_grant_of ON resource_grants(resource, id);
@@ -586,7 +595,7 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "server_prepare",
                "mobile", "attachments", "resource_grants", "machine_signin",
                "releases", "entitlement", "agent_signin", "github_app", "need_options", "restore",
-               "manager_start", "agent_notes", "edit_in_place", "machine_access"]
+               "manager_start", "agent_notes", "edit_in_place", "machine_access", "push"]
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 
 
@@ -601,6 +610,7 @@ MOBILE_HEAD = ("id", "title", "state", "owner", "requester", "goal", "needs", "a
 DEVICE_PATHS = (("/ui/mobile", ("GET",)), ("/ui/state", ("GET",)), ("/ui/knowledge", ("GET",)),
                 ("/ui/owner/devices", ("GET",)), ("/ui/messages", ("POST",)), ("/ui/needs", ("POST",)),
                 ("/ui/tasks", ("GET", "POST")))
+DEVICE_PUSH = re.compile(r"/ui/owner/devices/[a-z][a-z0-9-]{1,30}/push")    # a device's own push token (push)
 
 
 def owner_devices():
@@ -638,6 +648,8 @@ def device_may(path, method):
     stay on the owner's Mac, and so does every write of the owner's knowledge."""
     path = path.split("?", 1)[0].rstrip("/") or "/"
     method = "GET" if method == "HEAD" else method
+    if method == "POST" and DEVICE_PUSH.fullmatch(path):      # the one device write under /ui/owner/devices
+        return True
     return any(method in methods and (path == p or path.startswith(p + "/")) for p, methods in DEVICE_PATHS)
 
 
@@ -709,7 +721,8 @@ def save_owner_device(body):
     result = save_integration(body["base_sha256"], change, f"Owner {word} the device {device}")
     if body.get("delete"):
         with transaction():
-            for table in ("owner_devices", "owner_device_codes", "owner_device_tries", "owner_device_contacts"):
+            for table in ("owner_devices", "owner_device_codes", "owner_device_tries", "owner_device_contacts",
+                          "owner_device_push"):
                 DB.execute(f"DELETE FROM {table} WHERE device=?", (device,))
     return dict(result, device=device, deleted=bool(body.get("delete")))
 
@@ -723,11 +736,131 @@ def device_rows(source):
                   "ORDER BY id DESC LIMIT 1", (name, t0))
         row = q1("SELECT last_seen FROM owner_devices WHERE device=?", (name,))
         seen = q1("SELECT ts, auth FROM owner_device_contacts WHERE device=?", (name,))
+        pings = q1("SELECT 1 FROM owner_device_push WHERE device=?", (name,))
         out.append({"device": name, "label": d["label"], "address": d["address"], "key": key is not None,
                     "since": key["created"] if key else None, "last_seen": row["last_seen"] if row else None,
                     "last_contact": seen["ts"] if seen else None, "last_answer": seen["auth"] if seen else None,
-                    "code_expires": code["expires"] if code else None, "this_device": d["address"] == source})
+                    "code_expires": code["expires"] if code else None, "this_device": d["address"] == source,
+                    "push": pings is not None})
     return out
+
+
+# ---------------------------------------------------------------- Pings to the owner's phone (owner feature push)
+
+PUSH_ENVIRONMENTS = tuple(push.HOSTS)   # the app's own build: production from TestFlight, development from Xcode
+PUSH_TEXT = 178         # characters of an item's title in a ping: about four lines of a notification
+# Characters that an answer button shows whole; an item with a longer option opens the app. iOS 27 draws a button
+# title on three lines at most and cuts the rest: on an iPhone 18 Pro, about 70 characters at the default text size
+# and about 60 at extra-extra-large (measured in the simulator, 20 October 2026).
+PUSH_BUTTON = 50
+PUSH_KEEP = 86400       # seconds that Apple keeps a ping for a phone that is switched off
+PING_EVERY = 30         # seconds between two looks at the queue when nothing woke the sender
+PING_WAKE = threading.Event()
+
+
+def push_folder():
+    """The folder of the APNs key that the owner copied (MOBILE-APP.md 6.2): push/ next to the records, which is
+    ~/.fleet/push with the default --db, so a test hub with its own --db never finds the owner's key."""
+    if CFG.get("push_dir"):
+        return CFG["push_dir"]
+    return os.path.join(os.path.dirname(CFG["db_path"]), "push") if CFG.get("db_path") else None
+
+
+def save_push_token(device, token, environment):
+    """POST /ui/owner/devices/<device>/push: the token that Apple gave this phone, which the app sends at each start.
+    A new token replaces the old one, and removing the device removes it."""
+    q("INSERT INTO owner_device_push(device,token,environment,updated) VALUES(?,?,?,?) ON CONFLICT(device) DO UPDATE "
+      "SET token=excluded.token, environment=excluded.environment, updated=excluded.updated",
+      (device, token, environment, now()))
+    log("owner", f"the owner device {device} gave its push token ({environment})")      # never the token itself
+    return {"device": device, "push": True, "environment": environment}
+
+
+def ping_need(nid):
+    """A Needs-you item that the owner is told about: one ping for each owner device that gave a push token. The row
+    holds no text: the sender reads the item when it sends, and an item that was answered by then gets no ping."""
+    devices = [r["device"] for r in q("SELECT device FROM owner_device_push ORDER BY device")
+               if r["device"] in owner_devices()]
+    if not devices:
+        return
+    t0, generation = now(), kv_get("db_id")
+    with transaction():
+        for device in devices:
+            DB.execute("INSERT INTO pings(device,kind,item,db,state,created) VALUES(?,'needs',?,?,'queued',?)",
+                       (device, nid, generation, t0))
+    PING_WAKE.set()
+
+
+def ping_payload(need, generation):
+    """What Apple carries to the phone for one Needs-you item: its number, its title and its options, and nothing
+    else of it. The options go only when each one fits a button whole, because a label that is cut can be pressed
+    for the wrong answer: an item without them opens the app. The text passes the screening of /ui/state."""
+    title = scrub(need["title"] or "")
+    if len(title) > PUSH_TEXT:
+        title = title[:PUSH_TEXT - 1].rstrip() + "…"
+    aps = {"alert": {"title": "Needs you", "body": title}, "sound": "default", "thread-id": "needs"}
+    payload = {"need": need["id"], "db": generation}
+    options = need_options(need)
+    if 2 <= len(options) <= NEED_OPTIONS_MAX and all(len(o) <= PUSH_BUTTON for o in options) \
+            and scrub(options) == options:
+        aps["category"] = "need"          # the phone's notification content extension draws one button for each
+        payload["options"] = options
+    return dict(payload, aps=aps)
+
+
+def settle_pings():
+    """At the start of the hub: Apple may have taken a ping that was sending when the hub stopped, so that ping is
+    unknown and is never sent a second time."""
+    q("UPDATE pings SET state='unknown', error='the hub stopped while it was sending' WHERE state='sending'")
+
+
+def ping_sender():
+    """The one thread that sends pings: in order, and each one once."""
+    while True:
+        try:
+            while send_ping():
+                pass
+        except Exception:
+            traceback.print_exc()
+        PING_WAKE.wait(PING_EVERY)
+        PING_WAKE.clear()
+
+
+def send_ping():
+    """Sends the oldest queued ping. False when none waits. Apple's answer decides its state, and a token that Apple
+    calls gone is dropped, so that phone gets no ping until the app gives a new one at its next start."""
+    with LOCK:
+        row = q1("SELECT * FROM pings WHERE state='queued' ORDER BY id LIMIT 1")
+        if not row:
+            return False
+        q("UPDATE pings SET state='sending' WHERE id=?", (row["id"],))
+        need = q1("SELECT * FROM needs WHERE id=?", (row["item"],))
+        device = q1("SELECT * FROM owner_device_push WHERE device=?", (row["device"],))
+        generation = kv_get("db_id")
+    state, status, error = "skipped", None, None
+    if not device or row["device"] not in owner_devices():
+        error = "the device has no push token now"
+    elif not need or row["db"] != generation:
+        error = "the item is not in these records"
+    elif need["answer"] is not None:
+        error = "the item was answered before the ping went"
+    else:
+        try:
+            found = push.key(push_folder())
+            if not found:
+                raise push.PushError(f"no APNs key on the hub machine: the owner copies it to {push_folder()}")
+            status, reason = push.send(device["token"], ping_payload(need, generation), device["environment"],
+                                       *found, collapse=f"need-{need['id']}", expires=now() + PUSH_KEEP,
+                                       base=CFG.get("push_url"))
+            state, error = ("sent" if status == 200 else "unknown" if status == 0 else "failed"), reason or None
+        except push.PushError as e:
+            state, error = "failed", str(e)
+    with LOCK:
+        q("UPDATE pings SET state=?, sent=?, status=?, error=? WHERE id=?", (state, now(), status, error, row["id"]))
+        if status == 410 or (status == 400 and error in ("BadDeviceToken", "DeviceTokenNotForTopic")):
+            q("DELETE FROM owner_device_push WHERE device=? AND token=?", (row["device"], device["token"]))
+    log("hub", f"ping {row['id']} to {row['device']} for N-{row['item']}: {state}" + (f" ({error})" if error else ""))
+    return True
 
 
 # ---------------------------------------------------------------- Needs you (owner feature need_options)
@@ -4480,6 +4613,7 @@ def t_raise_needs_you(agent, a):
     nid = ins("INSERT INTO needs(title,why,todo,raised,by,options) VALUES(?,?,?,?,?,?)",
               (title, why, todo, now(), agent, options))
     emit("owner", "notify", f"Needs you N-{nid}: {title}")
+    ping_need(nid)                                      # owner feature push: the phone rings, also when it is closed
     picks = (" The owner sees your options and presses one: " + ", ".join(json.loads(options)) +
              ". His answer is the words of the one he presses, or anything else he writes instead.") if options else ""
     return f"Raised N-{nid}. The owner's answer will arrive as a message in this session.{picks}"
@@ -5672,6 +5806,7 @@ def conversation_need(agent, conv, person, kind, title, text, todo, t0):
                     t0, nid))
     if not decides:
         emit("owner", "notify", f"Needs you N-{nid}: {title}")
+        ping_need(nid)                                  # owner feature push
     return nid, False
 
 
@@ -17421,6 +17556,20 @@ def expire_handovers(t0):
 # `store_list` gives names and never a value, by design. So a machine whose broker is lost loses the logins that
 # broker made — including the passwords of accounts that `create_login` opened, which the owner never saw. The
 # manifest names every machine that holds a store, and RESTORE.md says it in plain words.
+#
+# And what the copy *will* not carry, which is a decision and not a limit: four things in `~/.fleet` on the hub
+# machine. Three of them are the hub's own sign-ins — the Google refresh tokens with their client secret, the
+# GitHub App private key that mints every agent's token, and the credentials of the connected MCP servers. The
+# hub holds no credential in the clear anywhere else: every key in the records is a salt and a SHA-256, and
+# `team.json` holds names, which open nothing. That is what makes this copy a thing the owner can keep where he
+# keeps his own files, and a zip carrying a live private key would be a different object with a different home.
+# The owner decided it on 20 October 2026, on being shown the gap. The fourth is the attachments folder — his own
+# files, no credential in it — and it stays out for its own reasons (`hub_only_files`).
+#
+# So the copy says what it has not got, and says it about *this* hub: `hub_only_files` records whether each one
+# is there and how much of it there is, in counts only, and RESTORE.md turns those counts into the paragraph that
+# names what stops working and the step that puts it back. A list of things that may not apply would be weaker
+# than the truth, and the day somebody reads this file is the wrong day to go looking for it.
 
 BACKUP_FORMAT = 1                   # the shape of fleet.json inside the copy; a restore refuses another number
 BACKUP_DB = "fleet.sqlite3"         # the members of the copy, by name
@@ -17461,10 +17610,163 @@ def vault_holders():
     return holders
 
 
+def bytes_in_words(n):
+    """A weight the owner reads: "2.1 MiB", "840 KiB", "0 bytes". Rounded, because it is a sentence and not a
+    measurement, and never "0.0 MiB" for a folder that holds something."""
+    if n >= MIB:
+        return f"{n / MIB:.1f} MiB"
+    return f"{n / 1024:.0f} KiB" if n >= 1024 else f"{n} byte{'' if n == 1 else 's'}"
+
+
+def hub_only_files():
+    """What sits on the hub machine's own disk, outside this copy, and how much of it there is.
+
+    Counts and nothing else. Every value this returns is a number or a yes/no, because the whole reason the copy
+    is safe to keep beside the owner's own files is that it carries no credential, and a count of accounts cannot
+    become one. The files are read where a count needs reading them — the same readers the hub uses, which also
+    refuse a file whose mode is wrong — and nothing of what they hold is kept. A file the reader refuses is
+    recorded as there and not counted, which is the truth and is still worth saying.
+
+    It is here so that RESTORE.md can say "your hub had a GitHub App key and two connected Google accounts" and
+    be right about this hub, instead of listing four things of which three may not apply."""
+    found = {}
+    path = CFG.get("google_file") or GOOGLE_FILE
+    if not os.path.exists(path):
+        found["google"] = {"present": False}
+    else:
+        saved, problem = google_saved()
+        found["google"] = {"present": True} if problem else {
+            "present": True, "accounts": len(saved.get("accounts") or {}), "client": bool(saved.get("client_id"))}
+    found["github_app"] = {"present": os.path.exists(CFG.get("github_app") or GITHUB_APP)}
+    path = CFG.get("mcp_file") or MCP_FILE
+    if not os.path.exists(path):
+        found["mcp"] = {"present": False}
+    else:
+        saved, problem = mcp_saved()
+        found["mcp"] = {"present": True} if problem else {"present": True,
+                                                          "servers": len(saved.get("servers") or {})}
+    files = size = 0
+    try:
+        with os.scandir(CFG.get("attachment_dir") or ATTACH_DIR) as there:
+            for one in there:
+                try:
+                    if one.is_file(follow_symlinks=False):
+                        files, size = files + 1, size + one.stat(follow_symlinks=False).st_size
+                except OSError:
+                    continue            # a file that went in this moment's sweep is one this copy never had
+    except OSError:
+        pass                            # no folder, or none the hub user may read: nothing to count
+    found["attachments"] = {"present": bool(files), "files": files, "bytes": size}
+    return found
+
+
+def hub_only_notes(found):
+    """(what this hub had and this copy has not, what to do about each) for RESTORE.md, from `hub_only_files`.
+
+    Both halves are written from this hub's own counts: the paragraph says what stops working, and the step says
+    where to go and what to bring back. What this hub did not have is one closing line, because the owner reading
+    this has enough to do without four paragraphs of which three are about somebody else's fleet.
+
+    The attachments are the one of the four that is not a credential, and they are not in the copy either. They
+    are his own files, sent from his own machine, so the hub's copy is the derived one; the hub itself throws
+    them away after ninety days (ATTACH_KEEP), so a copy that carried them would keep what the product has
+    decided to forget; and the copy is made in memory and refused over 256 MiB (BACKUP_MAX), so a folder that
+    grew would cost him the records, which are the part nothing else holds. What it costs him is said plainly
+    below, with the count, because he is the one who gets to think it too small a price or not."""
+    import textwrap
+    github, google = found.get("github_app") or {}, found.get("google") or {}
+    servers, files = found.get("mcp") or {}, found.get("attachments") or {}
+    said, steps, had_none = [], [], []
+    # The GitHub key first in both halves, because it is one file and it unblocks every task that touches code.
+    if github.get("present"):
+        said.append(
+            "**Your GitHub App key.** `~/.fleet/github-app.pem` on the hub machine is the private key of your "
+            "GitHub App, and that key is what makes each agent's one-hour token. Without it no agent reads or "
+            "writes any repository: every task that touches code stops at its first git step. The App itself, "
+            "and its installation on your repositories, are on GitHub's side and are not lost — only the key is.")
+        steps.append(
+            "**Put a GitHub App key back.** This one first: it is a single file and it unblocks every task that "
+            "touches code. GitHub never gives a key out twice, so make a new one — github.com/settings/apps, "
+            "your App, Private keys, Generate a private key — and paste it with the App ID into the app, which "
+            "writes the file. Then delete the old key on that same page. `config/team.json` in this copy names "
+            "your repositories, so the App you want is the one installed on them.")
+    else:
+        had_none.append("GitHub App")
+    n = google.get("accounts")
+    # `n` is None when the hub could not read the file, and 0 on a file that holds a client and no account yet:
+    # "the 0 Google accounts you connected" is the kind of sentence that stops a man reading.
+    if google.get("present") and (n is None or n or google.get("client")):
+        client = " and the Desktop client they sign in with" if google.get("client") else ""
+        lost = (" Without it every Drive and Gmail tool of every agent stops, and the agent is told that Google "
+                "refused the saved access. Your files and your mail are untouched: this is a sign-in and not a "
+                "copy of anything.")
+        if n is None:
+            holds = "the Google accounts you connected." + lost
+        elif not n:
+            holds = ("the Desktop client your Google accounts sign in with, and no connected account yet. "
+                     "Without it, connecting one means finding that client file first.")
+        elif n == 1:
+            holds = f"the one Google account you connected{client}." + lost
+        else:
+            holds = f"the {n} Google accounts you connected{client}." + lost
+        said.append("**Your Google sign-in.** `~/.fleet/google.json` on the hub machine holds " + holds)
+        steps.append(
+            "**Connect Google again**, one account at a time, in the app under Resources. You need the client "
+            "file of the Desktop client from your Google Cloud project — Credentials, download the JSON again — "
+            "and to be signed in to each account in the browser that opens. `config/team.json` in this copy "
+            "names the accounts and which agent had which level, so nothing has to be remembered.")
+    else:
+        had_none.append("Google account connected")
+    n = servers.get("servers")
+    if servers.get("present") and n != 0:
+        many = "the MCP servers you connected" if n is None else (
+            "the one MCP server you connected" if n == 1 else f"the {n} MCP servers you connected")
+        said.append(
+            f"**Your MCP sign-ins.** `~/.fleet/mcp.json` on the hub machine holds {many}. Without it the agents "
+            "that had those tools are told the server is not connected, and the tools do not load.")
+        steps.append(
+            "**Connect each MCP server again**, in the app under Resources. A server that signs you in through "
+            "your browser needs nothing but that; one with a key of its own needs that key, from wherever you "
+            "keep it. `config/team.json` in this copy names the servers and their addresses.")
+    else:
+        had_none.append("MCP server connected")
+    if files.get("present"):
+        n, weight = files.get("files") or 0, bytes_in_words(files.get("bytes") or 0)
+        said.append(
+            f"**The files you attached to messages.** `~/.fleet/attachments` on the hub machine held {n} "
+            f"file{'' if n == 1 else 's'}, {weight} in all, when this copy was made. These are your own files "
+            "and no credential of anybody's, and they are left out on purpose: you sent them from your own "
+            "machine, so you hold the originals, and the hub throws them away itself after ninety days. What it "
+            "costs you is that the records in this copy still name every one of them — what it was called, how "
+            "big it was, which message carried it — and the file itself will not open. If that is the wrong "
+            f"trade for you, that folder is an ordinary folder: copy it off the hub machine whenever you like, "
+            f"and it is {weight}.")
+        steps.append(
+            "**Put the attachments back**, if you took a copy of that folder: write it to `~/.fleet/attachments` "
+            "on the new hub machine, owned by the hub user, mode 700. Nothing breaks if you do not. The messages "
+            "keep their text, and an attachment that will not open is the whole of the loss.")
+    if not said:
+        said.append(
+            "**Nothing else.** When this copy was made your hub had no GitHub App, no Google account, no "
+            "connected MCP server and no attached file, so the vault keys above are the whole of what is "
+            "missing from it.")
+    elif had_none:
+        said.append("Your hub had no " + " and no ".join(had_none) + ", so there is nothing of those to put back.")
+    said = "\n\n".join(textwrap.fill(one, 110) for one in said)
+    steps = "".join(f"{n}. {textwrap.fill(one, 110, subsequent_indent='   ')}\n"
+                    for n, one in enumerate(steps, 5))
+    if steps:
+        steps += "\n" + textwrap.fill(
+            "Until each of those is done, an agent that reaches for what is missing is told so and stops. "
+            "Nothing quietly half-works, and none of it is urgent at three in the morning.", 110) + "\n"
+    return said, steps
+
+
 def restore_notes(manifest):
     """RESTORE.md, written into the copy itself, because the day somebody reads it is the day the hub is gone."""
     holders = "".join(f"- {name} on {one['machine']} ({one['mode']}): {one['recipient'] or 'no recipient recorded'}\n"
                       for name, one in sorted(manifest["vault"].items())) or "- none\n"
+    elsewhere, reconnect = hub_only_notes(manifest.get("hub_only") or {})
     return f"""# This is one copy of your fleet
 
 Made {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(manifest['made_at']))} by your own hub,
@@ -17478,7 +17780,10 @@ fleet {manifest['fleet_id']}, at revision {(manifest['revision'] or 'unknown')[:
   live only in the hub machine's checkout, so they go with that disk.
 - `{BACKUP_MANIFEST}`: what is in this copy, with the SHA-256 of each file.
 
-## What is NOT in it, and cannot be
+## What is NOT in it
+
+Two kinds of thing: what no copy can carry, and what this one leaves out on purpose. Both are below, and both
+are about **your** hub as it stood when this copy was made, not a list of what a fleet might have.
 
 **The vault store keys.** Each machine that holds logins has its own key, in a folder only that machine's vault
 user can open. Fleet cannot read it and cannot copy it, and a new key would leave every saved value unreadable.
@@ -17488,6 +17793,13 @@ which nobody ever saw. The machines that hold one:
 {holders}
 Keep anything you cannot afford to lose in your own password manager as well.
 
+{elsewhere}
+
+**There is no password, no token and no key anywhere in this copy**, and that is what makes it a thing you can
+keep where you keep your own files. Every secret in the records is a salt and a hash; `team.json` holds names —
+a repository, an account, a server — and a name opens nothing. A copy carrying a live GitHub key would be a
+different object, and it would need somewhere to hide.
+
 ## Putting it back when the hub machine is gone
 
 1. Install a hub on the new machine the usual way, and let the app claim it. You now have an empty fleet.
@@ -17495,7 +17807,7 @@ Keep anything you cannot afford to lose in your own password manager as well.
 3. The hub checks the copy, writes your configuration back onto its configuration ref, puts the records in place
    and restarts itself. It keeps the new machine's own addresses, so the app stays connected.
 4. Each agent machine joins again as it did the first time, and each vault store is made again.
-
+{reconnect}
 Without the app, on the new hub machine: `python3 hub.py --restore <this file>`, then restart the hub service.
 
 ## Read the open tasks before you let them run
@@ -17521,6 +17833,9 @@ def backup_bundle():
     manifest = {"format": BACKUP_FORMAT, "made_at": now(), "fleet_id": fleet, "db_id": kv_get("db_id"),
                 "revision": kit_revision(), "hub": TEAM.get("hub"), "agents": sorted(agents()),
                 "vault": vault_holders(),
+                # What this hub had on its own disk and this copy has not, in counts only: RESTORE.md turns it
+                # into the paragraph that names what stops working. Never a value (hub_only_files).
+                "hub_only": hub_only_files(),
                 # What the last six-hourly check said about these records. A copy of a corrupt database is worth
                 # taking and is not worth trusting, and a restore refuses one, so the copy says which it is.
                 "integrity": kv_get("integrity"),
@@ -18679,6 +18994,22 @@ class Handler(BaseHTTPRequestHandler):
             return {"device": device}
         return self.ui_command(f"owner/devices/{device}/code", read, lambda body: new_device_code(device),
                                keep=hide_device_code)
+
+    def ui_owner_device_push(self, device):
+        """POST /ui/owner/devices/<device>/push (owner feature push): the phone's push token, from that phone itself.
+        The owner's Mac has no push token, and one device never sets another's."""
+        def read(data):
+            self.only(data, ("token", "environment"))
+            if owner_device_at(self.client_address[0]) != device:
+                raise Refusal(403, "a device gives its own push token, from its own address")
+            token, environment = data.get("token"), data.get("environment")
+            if not isinstance(token, str) or not push.DEVICE_TOKEN.fullmatch(token):
+                raise ValueError("token must be the device token that Apple gave the app, in lowercase hexadecimal")
+            if environment not in PUSH_ENVIRONMENTS:
+                raise ValueError("environment must be production or development")
+            return {"device": device, "token": token, "environment": environment}
+        return self.ui_command(f"owner/devices/{device}/push", read,
+                               lambda body: save_push_token(device, body["token"], body["environment"]))
 
     def ui_owner_enroll(self):
         """POST /ui/owner/enroll: the device takes its key with the one-time code that the owner read on the Mac. It
@@ -21993,6 +22324,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_owner_device()
         if len(parts) == 5 and parts[:3] == ["ui", "owner", "devices"] and parts[4] == "code":
             return self.ui_owner_device_code(parts[3])
+        if len(parts) == 5 and parts[:3] == ["ui", "owner", "devices"] and parts[4] == "push":
+            return self.ui_owner_device_push(parts[3])
         if parts == ["ui", "owner", "enroll"]:
             return self.ui_owner_enroll()
         if parts == ["bridge", "inbound"]:
@@ -23244,8 +23577,10 @@ def main():
     q("UPDATE questions SET waiting=0")
     q("UPDATE prompts SET decision='expired', decided=? WHERE decision IS NULL", (now(),))
     q("UPDATE jobs SET ok=0, result='the hub restarted', finished=? WHERE finished IS NULL", (now(),))
+    settle_pings()
     threading.Thread(target=timers, daemon=True).start()
     threading.Thread(target=knowledge_refresher, name="knowledge-pages", daemon=True).start()
+    threading.Thread(target=ping_sender, name="pings", daemon=True).start()
     server = ThreadingHTTPServer((host, port), Handler)
     server.daemon_threads = True
     print(f"Founderizer hub on http://{host}:{port}  board: http://{host}:{port}/board")
