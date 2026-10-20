@@ -1278,7 +1278,13 @@ def migrate():
                   "stalled_since": "REAL", "stalled_reason": "TEXT", "stall_told": "INTEGER DEFAULT 0",
                   "goal_id": "INTEGER", "parent": "INTEGER", "trigger_id": "INTEGER", "trigger_run": "INTEGER",
                   "why": "TEXT",
+                  # manager_as_lead: the step of a goal's plan that this task is one part of. A lead's children hang
+                  # on parent; the manager's hang on a step of the plan, which is the piece of work it splits.
+                  "step": "INTEGER",
                   "responsibility": "INTEGER", "duty_case": "INTEGER"},      # owner API 1.13: the duties
+        # manager_as_lead: which step of the plan next_step came from, so a split step whose parts have all ended
+        # counts as no next step, exactly as a single ended task does.
+        "goals": {"next_step_id": "INTEGER"},
         "events": {"read_at": "REAL", "helper_ack": "REAL"},
         "prompts": {"kind": "TEXT NOT NULL DEFAULT 'tool'", "subject": "TEXT", "used": "REAL"},
         "sealed": {"bound_task": "INTEGER", "expired": "REAL", "login": "TEXT", "job": "INTEGER"},
@@ -1583,7 +1589,10 @@ def start_text(agent, task_id, resume=False):
             # What this agent worked out for itself, the way its profile is here: its own notes on how it works, and
             # the lessons it wrote about the things it works on. agent_notes_text is the reader the notes left for
             # this shelf; both are carried AS the agent's own words, never as rules, so a later session weighs them.
-            + notes_start_text(agent) + memory_start_text(agent, task_id))
+            + notes_start_text(agent) + memory_start_text(agent, task_id)
+            # manager_as_lead: and, when this task is one part of a split piece of work, which piece and who holds
+            # the other parts -- a part that does not know it is a part does the whole piece.
+            + part_start_text(task_id))
     # Masked on the way out, not only where each part was written: this text carries the agent's own notes, its
     # lessons and its holdings, and a login registered after any of them was stored was never masked at the write.
     if role_of(agent) == "lead":
@@ -1591,7 +1600,10 @@ def start_text(agent, task_id, resume=False):
         head += (f'You lead {team}. Give parts of {tref(task_id)} to them with create_task: each becomes a subtask of '
                  f'{tref(task_id)}. Their results, questions and permission prompts arrive in this session: check each '
                  f'result with check_result, answer with answer, and decide prompts with decide_permission. Deliver '
-                 f'{tref(task_id)} only when its subtasks are finished. ')
+                 f'{tref(task_id)} only when its subtasks are finished. Standing work of your team is yours to write '
+                 f'as a duty, with set_duty and change_duty: your team and nobody else, and never your own duty. '
+                 f'{manager_name()} stays the authority over every duty of the fleet, so it reads what you write and '
+                 f'it writes a duty outside your team. ')
     if resume:
         return mask_secrets(head + (
             f'You are RESUMING task {tref(task_id)} after your earlier session stopped. '
@@ -1602,6 +1614,27 @@ def start_text(agent, task_id, resume=False):
         f'Your task is {tref(task_id)}. Call the fleet tool list_my_tasks with task_id '
         f'"{tref(task_id)}", do the task, report progress as you go, and finish with deliver_result.'
         + RULE_FOUR))
+
+
+def part_start_text(task_id):
+    """One line for a task that is one part of a split piece of work, with the agents that hold the other parts.
+    A part that does not know it is a part does the whole piece, or waits for somebody to tell it not to.
+
+    read_row and not q1: admit_task calls start_text inside the transaction that writes the task."""
+    t = read_row("SELECT step FROM tasks WHERE id=?", (task_id,))
+    if not t or not t["step"]:
+        return ""
+    s = read_row("SELECT goal, n, text FROM goal_steps WHERE id=?", (t["step"],))
+    if not s:
+        return ""
+    others = [r for r in read_rows("SELECT id, owner, title FROM tasks WHERE step=? AND id<>? ORDER BY id",
+                                   (t["step"], task_id))]
+    return (f'This task is ONE PART of step {s["n"]} of {gref(s["goal"])}: "{clip(s["text"], 200)}". '
+            + (("The other parts: " + "; ".join(f"{tref(r['id'])} with {r['owner']} ({clip(r['title'], 60)})"
+                                                for r in others) + ". Do your part only, and leave theirs alone: "
+                "write to them with message_agent when your part needs something of theirs. ")
+               if others else "No other part has been given out yet. ")
+            + f"{manager_name()} holds the whole piece together and checks each part. ")
 
 
 def get_task(task_id, owner=None, requester=None):
@@ -2924,16 +2957,19 @@ def t_deliver_result(agent, a):
     emit(t["requester"], "say",
          f"[hub] Result for {tref(tid)} ({t['title']}) from {agent}: {outcome}. Done: {what.rstrip('.')}. "
          f"Output: {(where or '-').rstrip('.')}. Checked: {(how or '-').rstrip('.')}. "
+         + step_stands_text(t["step"]) +
          f"-- Check it, then call check_result(task_id=\"{tref(tid)}\", accepted=true or false).", task=tid)
     return f"Delivered. {tref(tid)} is {outcome}.{said} You are done with it: stop now."
 
 
-# set_duty and change_duty are not here: duty_write_allowed refuses every actor but the manager (owner decision
-# D1), so a lead that held them held two tools that could only answer with a refusal, in every one of its sessions.
-# A lead that thinks a duty is wrong proposes it, as a worker does. decide_report is here because a subtask's report
-# reaches its lead, and a report that nobody can decide is the loop that tool is there to end.
+# set_duty and change_duty are here again by the owner's decision of 20 October 2026 ("manager should also act as a
+# lead, and leads can also set duties, yes, that is fine"). They were taken out in cd0b3cd for a good reason that no
+# longer holds: duty_write_allowed refused every actor but the manager, so a lead held two tools that could only
+# answer with a refusal. It now allows a lead the duties of its own team, and nothing else -- so the two tools can
+# do something, and what they reach is the team the lead already gives tasks to. decide_report is here because a
+# subtask's report reaches its lead, and a report that nobody can decide is the loop that tool is there to end.
 LEAD_TEAM_TOOLS = ("create_task", "cancel_task", "restart_task", "answer", "check_result", "decide_permission",
-                   "see_team", "see_capacity", "decide_report")
+                   "see_team", "see_capacity", "decide_report", "set_duty", "change_duty")
 
 
 def role_of(name):
@@ -3026,8 +3062,10 @@ def lead_overview(agent, parent):
     for name in team:
         row = q1("SELECT last_seen FROM agents WHERE name=?", (name,))
         a = agents()[name]
-        # Its duties, as markers only: a duty outlives this task, and a lead's authority does not, so a lead reads
-        # them and writes nothing to them. The manager is the authority over every duty.
+        # Its duties, as markers only, which is what choosing an agent needs: what it already answers for, and
+        # whether that is in order. A lead writes the duties of its own team (owner, 20 October 2026), so these are
+        # not read-only to it any more -- see_responsibilities gives one in full and set_duty writes it. The manager
+        # stays the authority over every duty of the fleet, this team's included.
         duties = q("SELECT id, text, marker_kind FROM responsibilities WHERE agent=? AND state='active' ORDER BY id",
                    (name,))
         out.append(f"  {name}: {a.get('role')}" + (f" ({a['title']})" if a.get("title") else "") +
@@ -3121,6 +3159,7 @@ def check_task(agent, a):
     parent = lead_task(agent)               # a lead's subtask belongs to the task of the calling session
     goal_id = q1("SELECT goal_id FROM tasks WHERE id=?", (parent,))["goal_id"] if parent else task_goal(goal)
     follows = parse_task(a["follows"]) if a.get("follows") not in (None, "", 0, "0") else None
+    step = split_step(agent, a.get("step"), goal_id, parent)
     allowed, reason = authority(agent, owner, "task")
     if not allowed:
         raise ToolError(reason)
@@ -3143,7 +3182,37 @@ def check_task(agent, a):
     if case_id and not q1("SELECT id FROM cases WHERE id=?", (case_id,)):
         raise ToolError("Unknown case_id. Use the case named by the owner.")
     return {"owner": owner, "title": title, "details": details, "done_when": done_when, "needs": needs, "goal": goal,
-            "goal_id": goal_id, "parent": parent, "follows": follows, "case_id": case_id, "why": why or None}
+            "goal_id": goal_id, "parent": parent, "step": step, "follows": follows, "case_id": case_id,
+            "why": why or None}
+
+
+def split_step(agent, value, goal_id, parent):
+    """create_task's `step`: the step of a goal's plan that this task is one part of, or None.
+
+    This is what makes the manager a lead without making it a worker. A lead's children hang on the task of its own
+    session, which is why a lead can never forget to bind one. The manager holds no task, and its unit of work is a
+    goal, so its children hang on one step of that goal's plan: the goal is the parent that already persists, has a
+    history, pauses its tasks together and refuses to close while one of them is open, and the step is the one piece
+    of work that was too much for a single agent. The hub takes the goal from the step, so the binding is not the
+    manager's to repeat for each part."""
+    if value in (None, "", 0):
+        return None
+    if parent is not None:
+        raise ToolError("A subtask belongs to the task of this session, not to a step of a plan. Leave step out.")
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise ToolError("step is the number of a step of the goal's plan, for example 4.") from None
+    if goal_id is None:
+        raise ToolError("step needs goal set to the G-<id> whose plan has that step. see_goals gives the plan.")
+    s = q1("SELECT * FROM goal_steps WHERE goal=? AND n=?", (goal_id, n))
+    if not s:
+        raise ToolError(f"{gref(goal_id)} has no step {n}. see_goals with goal=\"{gref(goal_id)}\" gives its plan; "
+                        f"write the step first with update_goal.")
+    if s["state"] in ("done", "failed"):
+        raise ToolError(f"Step {n} of {gref(goal_id)} is {s['state']}. Give the part to the step it belongs to, or "
+                        f"write a new step with update_goal.")
+    return s["id"]
 
 
 def admit_task(requester, f, trigger_id=None, trigger_run=None):
@@ -3151,12 +3220,12 @@ def admit_task(requester, f, trigger_id=None, trigger_run=None):
     Returns the task ID."""
     generation = DB.execute("SELECT v FROM kv WHERE k='db_id'").fetchone()
     t0 = now()
-    tid = DB.execute("INSERT INTO tasks(title,details,done_when,needs,goal,goal_id,parent,owner,requester,state,follows,"
-                     "created,last_activity,case_id,trigger_id,trigger_run,why) "
-                     "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    tid = DB.execute("INSERT INTO tasks(title,details,done_when,needs,goal,goal_id,parent,step,owner,requester,state,"
+                     "follows,created,last_activity,case_id,trigger_id,trigger_run,why) "
+                     "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                      (f["title"], f["details"], f["done_when"], f["needs"], f["goal"], f["goal_id"], f["parent"],
-                      f["owner"], requester, "submitted", f["follows"], t0, t0, f["case_id"], trigger_id,
-                      trigger_run, f.get("why"))).lastrowid
+                      f.get("step"), f["owner"], requester, "submitted", f["follows"], t0, t0, f["case_id"],
+                      trigger_id, trigger_run, f.get("why"))).lastrowid
     DB.execute("INSERT INTO attempts(task,attempt,created,reason) VALUES(?,1,?,'created')", (tid, t0))
     DB.execute("INSERT INTO events(agent,kind,task,text,created,extra) VALUES(?,?,?,?,?,?)",     # emit's row
                (f["owner"], "task", tid,
@@ -3176,7 +3245,23 @@ def t_create_task(agent, a):
     lim = active_limit(owner)
     if lim:
         late += f" Note: {owner} is at its usage limit until {clock(lim['until'])}; the task waits until then."
-    return f"Created {tref(tid)} for {owner}.{late}"
+        # The moment the split is worth considering, said where the manager is standing. It names no alternative
+        # agent on purpose: suitability is the manager's judgement and see_capacity is where the facts are, and a
+        # list of free agents here would be an invitation to give the work to one that does not suit it.
+        if f.get("step") is None and role_of(agent) == "manager":
+            late += (" If this work divides into parts that can each be checked on their own, a part can go to "
+                     "another SUITABLE agent now: write the piece as a step of its goal's plan and give each part "
+                     "with create_task step=<n>. see_capacity says who suits it and which accounts have allowance "
+                     "left. Never place a part on an agent that does not suit it because it is free.")
+    said = f"Created {tref(tid)} for {owner}."
+    if f.get("step") is not None:
+        s = q1("SELECT goal, n FROM goal_steps WHERE id=?", (f["step"],))
+        others = [r for r in step_parts(f["step"]) if r["id"] != tid]
+        said = (f"Created {tref(tid)} for {owner}: part of step {s['n']} of {gref(s['goal'])}"
+                + (", with " + ", ".join(f"{tref(r['id'])} ({r['owner']})" for r in others) if others else
+                   ", its first part") + ". The step is done when every part is, and the goal will not close while "
+                "one of them is open.")
+    return said + late
 
 
 def t_cancel_task(agent, a):
@@ -6172,17 +6257,61 @@ def plan_steps(goal_id):
     return q("SELECT * FROM goal_steps WHERE goal=? ORDER BY n", (goal_id,))
 
 
+def step_parts(step_id):
+    """The tasks that a step of a plan is split across, in the order they were given out. One piece of work that was
+    too much for one agent: each part is a task of its own, on the agent that suits that part."""
+    return q("SELECT id, owner, state, title FROM tasks WHERE step=? ORDER BY id", (step_id,))
+
+
+def open_step_parts(step_id):
+    return q(f"SELECT id, owner FROM tasks WHERE step=? AND {OPEN_TASK} ORDER BY id", (step_id,))
+
+
+def step_where(step_id):
+    """"; part of step 4 of G-3" for a task that is one part of a split piece of work, and "" for every other task."""
+    s = q1("SELECT goal, n FROM goal_steps WHERE id=?", (step_id,)) if step_id else None
+    return f"; part of step {s['n']} of {gref(s['goal'])}" if s else ""
+
+
+def step_stands_text(step_id):
+    """Where the split piece of work stands, for the message that carries one part's result to the manager. A lead
+    reads its subtasks' news in the session of the parent task (filed_under); the manager has one session for every
+    goal, so the news itself has to say which piece it belongs to and what that piece still waits on."""
+    if not step_id:
+        return ""
+    s = q1("SELECT goal, n FROM goal_steps WHERE id=?", (step_id,))
+    if not s:
+        return ""
+    where = f"It is one part of step {s['n']} of {gref(s['goal'])}. "
+    left = open_step_parts(step_id)
+    if left:
+        return where + ("That step still waits on " +
+                        ", ".join(f"{tref(r['id'])} ({r['owner']})" for r in left) + ". ")
+    return where + (f"It was the LAST open part: check every part, then say what step {s['n']} is with "
+                    f"update_goal step_id={s['n']} step_state=done (or failed, or blocked with what it waits for). ")
+
+
 def step_view(s):
+    parts = step_parts(s["id"])
     return {"n": s["n"], "text": s["text"], "task": s["task"], "state": s["state"],
+            # manager_as_lead: a step split across several agents. Empty for a step one task carries, which is still
+            # read from task above, so nothing that read this object before reads anything new.
+            "parts": [{"task": p["id"], "agent": p["owner"], "state": p["state"], "title": p["title"]} for p in parts],
             "created": s["created"], "updated": s["updated"]}
 
 
 def step_line(s):
-    """One step of a plan: its number, its words, its state, and the task that carries it with where that task
-    stands, so a step that still says "doing" over a task that ended is seen at once."""
+    """One step of a plan: its number, its words, its state, the task that carries it with where that task stands,
+    and the parts it is split across, so a step that still says "doing" over work that ended is seen at once."""
     t = q1("SELECT state FROM tasks WHERE id=?", (s["task"],)) if s["task"] else None
     carried = f" ({tref(s['task'])}{' ' + t['state'] if t else ''})" if s["task"] else ""
-    return f"{s['n']}. {s['text']} [{s['state']}]" + carried
+    parts = step_parts(s["id"])
+    split = ""
+    if parts:
+        split = "; split across " + ", ".join(f"{tref(p['id'])} {p['owner']} {p['state']}" for p in parts)
+        if not open_step_parts(s["id"]) and s["state"] not in ("done", "failed"):
+            split += ". EVERY PART HAS ENDED: check them, then say what the step is with update_goal step_state"
+    return f"{s['n']}. {s['text']} [{s['state']}]" + carried + split
 
 
 def plan_lines(goal_id):
@@ -6207,13 +6336,17 @@ def plan_blocked_step(goal_id):
 
 
 def live_next_step(g):
-    """The goal's next step; a step whose task has ended counts as none."""
+    """The goal's next step; a step whose work has ended counts as none, so the goal looks idle and the manager is
+    asked for the next one. The work is the one task that carries the step, or, for a step split across several
+    agents, every part of it: one part still open keeps the step alive."""
     if not g["next_step"]:
         return None
     t = q1("SELECT state FROM tasks WHERE id=?", (g["next_task"],)) if g["next_task"] else None
     if t and t["state"] in TERMINAL:
         return None
-    return {"text": g["next_step"], "task": g["next_task"], "set_at": g["next_set"]}
+    if g["next_step_id"] and step_parts(g["next_step_id"]) and not open_step_parts(g["next_step_id"]):
+        return None
+    return {"text": g["next_step"], "task": g["next_task"], "step": g["next_step_id"], "set_at": g["next_set"]}
 
 
 def record_session_tokens(agent, rows):
@@ -6530,6 +6663,13 @@ def plan_write(agent, g, a, t0):
         if not (words or task is not None or state):
             raise ToolError("To change step " + str(which) + ", give its new words in step, the task that carries it "
                             "in step_task, or its state in step_state.")
+        # manager_as_lead: a step split across several agents is one piece of work, so it ends when every part has.
+        # This is deliver_result's refusal for a lead's subtasks, one level up, and for the same reason.
+        if state == "done" and (left := open_step_parts(s["id"])):
+            raise ToolError(f"Step {which} of {gref(g['id'])} is split and still has open parts: "
+                            + ", ".join(f"{tref(r['id'])} ({r['owner']})" for r in left)
+                            + ". Check or cancel each part first; a part that failed makes the step failed or "
+                              "blocked, not done.")
         sets, args = ["updated=?"], [t0]
         for column, value in (("text", words or None), ("task", task), ("state", state)):
             if value is not None:
@@ -6552,7 +6692,7 @@ def plan_write(agent, g, a, t0):
         said += f" It is the next step of {gref(g['id'])} now."
     else:
         said += f" Step {on['n']} is the next step."
-    return said, (on["text"], on["task"]) if on else (None, None)
+    return said, (on["text"], on["task"], on["id"]) if on else (None, None, None)
 
 
 def t_update_goal(agent, a):
@@ -6590,10 +6730,12 @@ def t_update_goal(agent, a):
     said, derived = plan_write(agent, g, a, t0) if plan else ("", None)
     sets, args = ["reviewed_at=?"], [t0]
     if step:
-        sets += ["next_step=?", "next_task=?", "next_set=?"]
-        args += [step, task, t0]
-    elif derived:                       # the plan decided it, (None, None) included: the step it was on ended
-        sets += ["next_step=?", "next_task=?", "next_set=?"]
+        # Words of its own, tied to no step of the plan: next_step_id goes back to none, so live_next_step judges
+        # this one by next_task alone.
+        sets += ["next_step=?", "next_task=?", "next_step_id=?", "next_set=?"]
+        args += [step, task, None, t0]
+    elif derived:                       # the plan decided it, (None, None, None) included: the step it was on ended
+        sets += ["next_step=?", "next_task=?", "next_step_id=?", "next_set=?"]
         args += [*derived, t0]
     if wake:
         sets.append("wake_at=?")
@@ -8336,16 +8478,22 @@ def duty_watch_body(body, watch, request_id=None):
 
 
 def duty_target(body, old=None):
-    """What a duty needs from the current team, before anything is written: its holder exists, is active, and is a
-    worker or a lead that reports to the manager."""
+    """What a duty needs from the current team, before anything is written: its holder exists, is active, and a case
+    of the duty can actually be started on it with somebody who can read the result.
+
+    That last one used to be spelled "a worker or a lead that reports to the manager", which refused every duty a
+    lead could write for its own team -- the reason cd0b3cd took both duty tools off a lead. The rule it was
+    standing in for is wake_route's, and that one already handles a lead's worker: the case task becomes the lead's
+    subtask, under a parent task the manager requests, so the lead reads its team's case results in a session the
+    hub starts for it. One rule, in the place that already had it."""
     agent = body["agent"]
     if agent not in agents():
         raise Refusal(400, f"there is no agent {agent} in the team")
     if not agent_active(agent):
         raise Refusal(400, f"{agent} is in setup; activate it before you give it a duty")
-    if agent != manager_name() and (role_of(agent) not in ("worker", "lead")
-                                    or reports_to(agent) != manager_name()):
-        raise Refusal(400, f"{agent} does not report to the manager; a duty gives it tasks, so it must")
+    route, why = wakeups.wake_route(wake_org(), agent)
+    if not route:
+        raise Refusal(400, f"a case of this duty could not be started on {agent}: {why}")
     if old is None and q1("SELECT COUNT(*) n FROM responsibilities WHERE agent=? AND state!='retired'",
                           (agent,))["n"] >= DUTY_MAX:
         raise Refusal(409, f"{agent} already has {DUTY_MAX} duties; retire one first")
@@ -8608,21 +8756,42 @@ def duty_state_change(r, action, by, note="", command=None, receipt=None):
 
 
 def duty_read_allowed(actor, r):
-    """Who sees a duty: its holder and the fleet manager."""
-    return actor in (r["agent"], manager_name())
+    """Who sees a duty: its holder, the fleet manager, and the lead of the agent that holds it. Reading follows
+    writing: a lead writes the duties of its own team (duty_write_allowed), and a duty it may write but not read
+    would be a duty it could only overwrite blind."""
+    return actor in (r["agent"], manager_name()) or duty_write_allowed(actor, r["agent"])[0]
 
 
 def duty_write_allowed(actor, target):
-    """(allowed, reason): who writes a duty of `target` — the fleet manager (owner decision D1). An agent does not
-    write its own duty: it proposes one."""
+    """(allowed, reason): who writes a duty of `target`.
+
+    The manager writes the duty of any agent, because it is the authority over every duty of the fleet: it knows
+    them all, it moves one to a better agent and it retires one. A lead writes the duties of its own team and of
+    nobody else (the owner, 20 October 2026: "manager should also act as a lead, and leads can also set duties,
+    yes, that is fine"). The two are not the same reach, and this function is where the difference lives: a lead
+    answers for the agents it already gives tasks to, and the manager answers for the fleet.
+
+    A worker and a lead do not write their own duty: they propose one. A duty is what somebody else answers for
+    giving you, so an agent that wrote its own would be the only reader of its own words. The manager is the one
+    exception, and it is not an exception to that reasoning: it writes its own duties because it already is the
+    agent that answers for every duty of the fleet, and there is nobody above it but the owner."""
     if actor == "owner":
         return True, None
-    allowed, reason = authority(actor, target, "rule")
-    if not allowed:
-        return False, reason
-    if actor == manager_name():
-        return True, None
-    return False, (f"Only {manager_name()} writes a duty of {target}. "
+    if actor not in agents():
+        return False, f"{actor} is not an agent of this team."
+    if target not in agents():
+        return False, f"There is no agent {target} in the team."
+    manager = manager_name()
+    if actor == manager:
+        return authority(actor, target, "rule")
+    if role_of(actor) == "lead" and target != actor:
+        if authority(actor, target, "task")[0]:                  # its own team, by the one authority rule
+            return True, None
+        team = ", ".join(n for n, x in agents().items()
+                         if x.get("role") in ("worker", "lead") and reports_to(n) == actor) or "nobody"
+        return False, (f"{target} does not report to you, so its duty is not yours to write. Your team: {team}. "
+                       f"{manager} writes the duties of every other agent: ask it with message_agent.")
+    return False, (f"Only {manager} writes a duty of {target}. "
                    f"Propose it with message_agent or ask_my_requester; the owner and the manager decide.")
 
 
@@ -9207,15 +9376,19 @@ def t_attach_watch(agent, a):
 
 
 def t_set_duty(agent, a):
-    """The manager writes a duty: a new one, or a change of one that exists."""
+    """A new duty, or a change of one that exists: the manager for any agent, a lead for its own team."""
     duty_id = None
     if a.get("responsibility") not in (None, ""):
         duty_id = duty_ref(a["responsibility"])["id"]
     data = {k: a[k] for k in DUTY_FIELDS if k in a and a[k] is not None}
-    target = data.get("agent") or (duty_row(duty_id)["agent"] if duty_id else "")
-    allowed, reason = duty_write_allowed(agent, target)
-    if not allowed:
-        raise ToolError(reason)
+    held = duty_row(duty_id)["agent"] if duty_id else ""
+    target = data.get("agent") or held
+    # Moving a duty takes authority over both agents, which matters only for a lead: taking a duty off an agent
+    # outside its team would be writing that agent's duty by another route.
+    for name in {target, held} - {""}:
+        allowed, reason = duty_write_allowed(agent, name)
+        if not allowed:
+            raise ToolError(reason)
     try:
         body = duty_fields(data, duty_id is None)
     except ValueError as e:
@@ -9236,7 +9409,7 @@ def t_set_duty(agent, a):
 
 
 def t_change_duty(agent, a):
-    """The manager pauses, resumes, retires or reopens a duty."""
+    """Pause, resume, retire or reopen a duty: the manager for any agent, a lead for its own team."""
     r = duty_ref(a.get("responsibility"))
     allowed, reason = duty_write_allowed(agent, r["agent"])
     if not allowed:
@@ -11709,10 +11882,21 @@ TOOLS = [
      "Give one worker a task. needs is none, browser or screen; the hub refuses a worker that lacks it. "
      "Use follows to point at an earlier task whose result this one builds on or fixes. "
      "Set goal to G-<id> to link the task to an owner goal; the hub refuses a goal that is not active. "
-     "Say in why, in one line, why this agent suits the task.",
+     "Say in why, in one line, why this agent suits the task. "
+     "WORK TOO MUCH FOR ONE AGENT: write that piece as one step of the goal's plan (update_goal), then give each "
+     "part with goal=G-<id> and step=<n>. Every part is then one piece of work: the hub takes the goal from the "
+     "step, the step will not go done while a part is open, the goal will not close while a part is open, each "
+     "part's session is told which piece it belongs to and who holds the others, and each part's result tells you "
+     "what the step still waits on. Split only when the work really divides into parts a stranger could check on "
+     "their own, and give every part to an agent that SUITS it (see_capacity). Suitability first, availability "
+     "second: never put a part on an unsuitable agent because it is free or has more allowance -- a part with no "
+     "suitable agent waits for its agent instead. Splitting buys time only across different runtime accounts, "
+     "because agents that share one account share one allowance (see_capacity, ACCOUNTS).",
      S({"owner": STR, "title": STR, "done_when": STR, "details": STR,
         "needs": {"type": "string", "enum": ["none", "browser", "screen"]}, "goal": STR, "case_id": STR,
         "follows": {"type": "string", "description": "Earlier task id, for example T-3"},
+        "step": {"type": "integer", "description": "The number of the step of goal's plan that this task is one "
+                                                   "part of, when one piece of work is split across agents"},
         "why": {"type": "string", "description": "One line, at most 300 characters: why this agent suits the task "
                                                  "(expertise, access, availability)"}},
        ["owner", "title", "done_when"])),
@@ -11809,7 +11993,8 @@ TOOLS = [
      "short review note, or close it with result when its work is done and checked.\n"
      "The plan is how the goal keeps what you worked out, so that nothing of it lives only in your session: write "
      "each step you decided on with step, in your own words and in the order you will do them. One call writes or "
-     "changes one step. Give step_id to change one that is there: step_task when a task carries it, step_state as "
+     "changes one step. A step too big for one agent is split: give its parts with create_task step=<n>, and the "
+     "step cannot go done while one of them is open. Give step_id to change one that is there: step_task when a task carries it, step_state as "
      "the work moves (todo, doing, blocked, done, failed), and step again to reword it — say in those words what a "
      "blocked step waits for, and what a failed step tried, so the next read does not try it again. The step you "
      "mark doing becomes the goal's next step, so write it in one place only. see_goals with goal gives the plan "
@@ -12022,13 +12207,16 @@ TOOLS = [
     ("manager", "set_duty", t_set_duty,
      "Write a duty of an agent: a new one, or a change of one that exists (give responsibility). Give the same "
      "responsibility with another agent to move the duty to that agent, or with other words to change what it "
-     "says. You write duties that the owner asks for, and you write the ones you work out for yourself from the "
-     "conversation: work that keeps coming back, a goal that needs looking after and not one task, something you "
-     "keep doing by hand. A duty for yourself is one of those. Choose the holder by suitability first "
-     "(see_capacity): a worker or a lead of your team, or yourself when no agent suits it or the duty is about the "
-     "fleet. A duty is two things: the agent, and the words. Say in text what the agent answers for, what it does "
-     "itself and what it brings to you first, because nothing else carries that: there is no other field. A watch "
-     "becomes a wake-up rule, so you write no schedule, and the agent builds the mechanism that finds the event.",
+     "says. Whose duties you may write: the manager writes the duty of any agent of the fleet, because it is the "
+     "authority over them all; a lead writes the duties of its own team and of nobody else, and asks the manager "
+     "for a duty outside it. An agent does not write its own duty, a lead included: propose it instead, and the "
+     "manager decides. You write duties that the owner asks for, and the ones you work out for yourself: work that "
+     "keeps coming back, a goal that needs looking after and not one task, something you keep doing by hand. "
+     "Choose the holder by suitability first (see_capacity). The manager can hold a duty itself when no agent "
+     "suits it or it is about the fleet. A duty is two things: the agent, and the words. Say in text what the "
+     "agent answers for, what it does itself and what it brings to you first, because nothing else carries that: "
+     "there is no other field. A watch becomes a wake-up rule, so you write no schedule, and the agent builds the "
+     "mechanism that finds the event.",
      S({"request_id": {"type": "string", "description": "A new UUID for each write"},
         "responsibility": {"type": "string", "description": "The duty to change, for example R-1. Leave it out for a "
                                                             "new duty."},
@@ -12059,7 +12247,8 @@ TOOLS = [
     ("manager", "change_duty", t_change_duty,
      "Pause, resume, retire or reopen a duty. Retire is how a duty is removed: it stops, its watches stop, and "
      "its cases stay as history, so a duty that nothing needs any more is yours to retire without asking. "
-     "see_responsibilities names every retired duty, so reopen brings one back.",
+     "see_responsibilities names every retired duty, so reopen brings one back. The reach is the one set_duty "
+     "has: the manager any agent of the fleet, a lead its own team.",
      S({"request_id": {"type": "string", "description": "A new UUID for each write"},
         "responsibility": {"type": "string", "description": "Responsibility id, for example R-1"},
         "action": {"type": "string", "description": "pause, resume, retire or reopen"}, "note": {"type": "string"},
@@ -12332,6 +12521,7 @@ def overview_text():
                    # why this agent got this task: the requester's own reasoning, asked for by create_task and
                    # stored since, and until now printed nowhere an agent could read it
                    + (f"; given to {t['owner']} because: {t['why']}" if t["why"] else "")
+                   + step_where(t["step"])          # manager_as_lead: which split piece of work this is a part of
                    + (f"; last note: {note['text']}" if note else ""))
     if not rows:
         out.append("  none")
