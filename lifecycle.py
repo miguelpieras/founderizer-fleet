@@ -599,6 +599,7 @@ class Lifecycle:
         self.lock = threading.Lock()
         self.report_lock = threading.Lock()     # one report at a time, so that the hub gets them in the order read
         self.gate = threading.Lock()    # held while a session starts, and from the idle check to the restart
+        self.tools_changed = False      # the hub says the standing session's tool list is not the current one
         self.restarting = None          # when this process asked for its own restart
         self.loaded = self.revision()   # the revision this process runs; the checkout can move ahead of it
 
@@ -982,8 +983,13 @@ class Lifecycle:
                 code, data = self.post(status)
             except Exception:
                 return False
-        if code == 200 and isinstance(data, dict) and data.get("update_requested"):
-            self.arm(data.get("desired_revision"))
+        if code == 200 and isinstance(data, dict):
+            # The standing manager session is running on a tool list this hub would no longer serve: its helper
+            # starts it again (Helper.restart_for_tools). It stays true in every answer until that session has
+            # asked for the list again, so a helper that cannot act now acts at its next round.
+            self.tools_changed = bool(data.get("manager_tools_changed"))
+            if data.get("update_requested"):
+                self.arm(data.get("desired_revision"))
         return code == 200
 
     # ---- updates

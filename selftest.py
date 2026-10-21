@@ -265,6 +265,97 @@ def later(fn, delay):
 def board():
     return raw("GET", "/board")[2]
 
+# 0 the owner's own MCP server against the owner API it wraps (OWNER-MCP.md, OWNER-MCP-BOUNDARY.md)
+# owner_mcp.py is the owner's admin server: every tool is one route of the hub's owner API. It runs on his Mac with
+# the standard library alone, so it cannot import a single name from here -- it repeats the routes, the fields and
+# the enums as text. These checks are the whole of the upkeep, and they are here and not only in test_owner_mcp.py
+# because selftest.py is what a release runs: a lane that adds an owner route, a field or a value fails the release
+# until it has decided whether the owner's own agent can reach it. Source only: no hub, no network, nothing started.
+
+def constants(path, name):
+    """One tuple, list or dict constant of a module, as the source has it (its keys, for a dict)."""
+    for node in ast.parse(open(path).read()).body:
+        if isinstance(node, ast.Assign) and any(getattr(x, "id", "") == name for x in node.targets):
+            value = node.value
+            if isinstance(value, ast.Dict):
+                return tuple(k.value for k in value.keys if isinstance(k, ast.Constant))
+            if isinstance(value, (ast.Tuple, ast.List)):
+                return tuple(e.value for e in value.elts if isinstance(e, ast.Constant))
+    return None
+
+def owner_api_routes():
+    """Every owner command route of hub.py, by the label its own ui_command call gives, with the fields it takes."""
+    src, found = open(os.path.join(KIT, "hub.py")).read(), {}
+    for m in re.finditer(r"\n    def (ui_\w+)\(self[^)]*\):(.*?)(?=\n    def |\Z)", src, re.S):
+        name, body = m.group(1), m.group(2)
+        label = re.search(r'ui_command\(\s*f?"([^"]+)"', body)
+        if not label:
+            continue
+        fields = set()
+        for pattern in (r"self\.only\(data,\s*\(([^)]*)\)", r"self\.integration_base\(data,\s*\(([^)]*)\)",
+                        r"set\(data\)\s*-\s*\{([^}]*)\}"):
+            for got in re.finditer(pattern, body):
+                fields |= {x.strip().strip("\"'") for x in got.group(1).split(",") if x.strip()}
+        route = re.sub(r"\{[^}]*\}", "{}", "/ui/" + label.group(1)).rstrip("/")
+        route = {"/ui/attachment_keep": "/ui/attachments/{}/keep"}.get(route, route)
+        found[route] = (name, {f for f in fields - {"request_id", "db", "base_sha256"} if f and " " not in f})
+    return found
+
+try:
+    import lifecycle, owner_mcp
+    OWNER_MCP = open(os.path.join(KIT, "owner_mcp.py")).read()
+    API = owner_api_routes()
+    check("the owner API has routes to compare at all", len(API) > 50, f"{len(API)} found")
+
+    named = {re.sub(r"\{[^}]*\}", "{}", m.group(1)).rstrip("/") for m in re.finditer(r'"(/ui/[^"]*)"', OWNER_MCP)}
+    loose = sorted(set(API) - named - set(owner_mcp.NOT_TOOLS))
+    check("every owner command route is a tool of the owner's MCP server, or in its NOT_TOOLS with a reason",
+          not loose, f"neither a tool nor excluded: {loose}")
+    gone = sorted(r for r in owner_mcp.NOT_TOOLS if r not in API and not re.search(
+        r"parts(?:\[:\d\])?\s*==\s*\[" + re.escape(", ".join(f'"{s}"' for s in r.strip("/").split("/")
+                                                                  if s != "{}")) + r"\]",
+        open(os.path.join(KIT, "hub.py")).read()))
+    check("every route the owner's MCP server leaves out is still a route of the owner API", not gone,
+          f"NOT_TOOLS names routes the hub no longer has: {gone}")
+
+    sends = {}
+    for m in re.finditer(r'(?:plain|with_base)\(\s*"(/ui/[^"]*)",\s*\(([^)]*)\)', OWNER_MCP):
+        route = re.sub(r"\{[^}]*\}", "{}", m.group(1)).rstrip("/")
+        sends.setdefault(route, set()).update({x.strip().strip("\"'") for x in m.group(2).split(",") if x.strip()})
+        sends[route] |= set(re.findall(r"\{(\w+)\}", m.group(1)))      # a path variable rides in the path
+    dropped = {}
+    for route, (name, fields) in sorted(API.items()):
+        if route in owner_mcp.NOT_TOOLS:
+            continue
+        missing = (fields - sends[route]) if route in sends else {f for f in fields if f'"{f}"' not in OWNER_MCP}
+        if missing:
+            dropped[route] = sorted(missing)
+    check("every field an owner route takes can be sent by one of its tools",
+          not dropped, f"a tool would drop these in silence: {dropped}")
+
+    stale = []
+    for name, repeated in owner_mcp.FROM_THE_HUB.items():
+        module, _, attribute = name.partition(".")
+        real = getattr(lifecycle, attribute, None) if module == "lifecycle" else \
+            constants(os.path.join(KIT, "hub.py"), attribute)
+        if real is None or tuple(real) != tuple(repeated):
+            stale.append(f"{name}: it says {tuple(repeated)}, the hub says {real and tuple(real)}")
+    check("what the owner's MCP server repeats from the hub is what the hub says", not stale, "; ".join(stale))
+
+    # And the document the owner reads: a tool nobody wrote down is a tool he will not know he has.
+    owner_mcp.TOOLS.update({x["name"]: x for x in owner_mcp.tools()})
+    written = open(os.path.join(KIT, "OWNER-MCP.md")).read()
+    unwritten = sorted(n for n in owner_mcp.TOOLS if f"`{n}`" not in written)
+    check("every tool of the owner's MCP server is named in OWNER-MCP.md", not unwritten,
+          f"not in the document: {unwritten}")
+    table = {m for m in re.findall(r"^\| `(\w+)`", written, re.M)} | \
+        {w for line in written.splitlines() if line.startswith("| `")
+         for w in re.findall(r"`(\w+)`", line.split("|")[1])}
+    check("every tool OWNER-MCP.md's table names is a tool the server has", not (table - set(owner_mcp.TOOLS)),
+          f"the document names tools that are gone: {sorted(table - set(owner_mcp.TOOLS))}")
+except Exception as owner_mcp_problem:       # a missing file or a changed shape is a failure, never a silent pass
+    check("the owner's MCP server can be checked against the owner API", False, repr(owner_mcp_problem))
+
 # 1 handshake and roles
 code, headers, resp = rpc("manager", "initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "sim-cli", "version": "9.9"}})
 check("initialize answers with the requested version", code == 200 and resp["result"]["protocolVersion"] == "2025-06-18")

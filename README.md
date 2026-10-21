@@ -12,7 +12,7 @@ everything here is public and everything here is in the clone of every machine o
 | `join.sh`, `install-worker.sh` | A second server, and a Mac, joining a fleet that exists. |
 | `selftest.py` | Checks the hub on its own in about a minute. A release is not applied until it passes. |
 | `RULES.md` | The rules every agent reads at every start. |
-| `profiles/` | One profile for each agent. The owner's own, and a release never touches them. |
+| `profiles/` | One profile for each agent: what it is for, and what its owner lets it do. The owner's own, and a release never touches them, so a profile never says how to call a tool. |
 | `team.json` | The machines, the agents and how each session starts. The installer writes this fleet's own; the one here is a placeholder. |
 | `knowledge/` | What the fleet knows. `knowledge/owner/` is the owner's and a release never touches it. |
 | `release-key.pub`, `entitlement-key.pub` | The public keys a release and an entitlement are checked against. The private halves are only on our website. |

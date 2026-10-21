@@ -68,6 +68,39 @@ LOG = "/root/fleet-install.log"         # INSTALL-PROMPT.md A5
 AUTHKEY = "/root/fleet-authkey"         # INSTALL-PROMPT.md A4: the key on the server, mode 600, removed at the end
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
+# Every owner command route of hub.py that is deliberately NOT a tool here, with the reason (OWNER-MCP-BOUNDARY.md
+# section 6). The owner asked for an admin server that is "super powerful and flexible" (20 October 2026), so the
+# rule is the other way round from a list of features: every owner route is a tool unless it is named here. Ten of
+# these would make this server the thing that carried a credential, which "No secret through a tool" forbids; two
+# are not the Mac's calls at all. `selftest.py` and `test_owner_mcp.py` both read this, so a new owner route in the
+# hub fails a release until somebody decides which side of this list it is on. That is the whole of the upkeep.
+NOT_TOOLS = {
+    "/ui/releases/entitlement": "the subscription token of this fleet",
+    "/ui/github-app": "the GitHub App's private key",
+    "/ui/chat-apps/{}/token": "a Discord bot token",
+    "/ui/google/connect": "Google's client secret, and a browser flow of the owner's own",
+    "/ui/google/finish": "the authorization code of that flow",
+    "/ui/mcp/connect": "an MCP server's OAuth client, and a browser flow of the owner's own",
+    "/ui/mcp/finish": "the authorization code of that flow",
+    "/ui/secrets/add": "the value of a login",
+    "/ui/secrets/fingerprints": "the owner's own secret catalog",
+    "/ui/restore": "a whole fleet restored over this one, from a file this server would have to carry",
+    "/ui/owner/devices/{}/push": "the phone's own push token, which the route takes from the phone only",
+    "/ui/owner/enroll": "the phone's own call, before it has a key",
+}
+
+# What this file repeats from the hub because it cannot import it: this server runs on the owner's Mac with the
+# standard library alone, and the hub is on another machine. Each name is a constant of `hub.py` or `lifecycle.py`,
+# and the checks of both files hold these to it, so a value the hub gains reaches the owner's agent instead of
+# being refused in its session hours later.
+FROM_THE_HUB = {
+    "hub.CAPABILITIES": ("shell", "web", "browser", "screen"),
+    "lifecycle.SWITCH_RUNTIMES": ("codex", "claude"),
+    "lifecycle.MCP_AUTH": ("none", "oauth", "key"),
+    "lifecycle.REPO_ACCESS": ("read", "write", "deploy"),
+    "hub.PERSON_ROLES": ("customer", "employee", "supervisor", "deputy"),
+}
+
 
 class Refused(Exception):
     """Something the agent must be told instead of a result. Its text is the whole answer and holds no secret."""
@@ -788,7 +821,7 @@ MCP_ENTRY = {
     "properties": {"title": {"type": "string"}, "url": {"type": "string"}, "command": {"type": "string"},
                    "args": {"type": "array", "items": {"type": "string"}},
                    "env": {"type": "object", "additionalProperties": {"type": "string"}},
-                   "auth": {"type": "string", "enum": ["none", "oauth", "key"]},
+                   "auth": {"type": "string", "enum": list(FROM_THE_HUB["lifecycle.MCP_AUTH"])},
                    "key": {"type": "string", "description": "The name of an API key the agent reads, never a key."},
                    "runtimes": {"type": "array", "items": {"type": "string"}}},
     "additionalProperties": False,
@@ -850,17 +883,42 @@ def tools():
         tool("activate_agent", "Turn one agent on or off. An agent in setup takes no work and no message.",
              {"agent": S["text"], "active": S["bool"], **rid}, ("agent", "active"),
              with_base("/ui/team/agents/{agent}", ("active",), "the activation of this agent")),
-        tool("agent_settings", "One agent's model, effort, capabilities, title, expertise or account. Each of "
-                               "vault, runtime and vault_create is a command of its own.",
+        tool("agent_settings", "One agent's model, effort, capabilities, title, expertise, account or screen model. "
+                               "Each of vault, runtime and vault_create is a command of its own, and has a tool of "
+                               "its own here: vault_access, switch_runtime and login_creation.",
              {"agent": S["text"], "model": {"type": ["string", "null"]}, "effort": {"type": ["string", "null"]},
               "can": {"type": "array", "items": {"type": "string",
-                                                 "enum": ["shell", "web", "browser", "screen"]}},
+                                                 "enum": list(FROM_THE_HUB["hub.CAPABILITIES"])}},
               "title": {"type": ["string", "null"]},
               "expertise": {"type": "array", "items": {"type": "string"}},
-              "account": {"type": ["string", "null"]}, **rid},
+              "account": {"type": ["string", "null"]},
+              "screen": {"type": "object", "description": "The model of this agent's screen work: both keys, and "
+                                                           "null in either for the screen runtime's own default.",
+                         "properties": {"model": {"type": ["string", "null"]},
+                                        "effort": {"type": ["string", "null"]}},
+                         "required": ["model", "effort"], "additionalProperties": False},
+              **rid},
              ("agent",),
-             with_base("/ui/team/agents/{agent}", ("model", "effort", "can", "title", "expertise", "account"),
+             with_base("/ui/team/agents/{agent}",
+                       ("model", "effort", "can", "title", "expertise", "account", "screen"),
                        "these agent settings")),
+        tool("switch_runtime", "Switch one agent to its other runtime, codex or claude. It is a command of its own: "
+                               "send nothing else with it. The agent's own start command for that runtime comes "
+                               "from its runtime_policies, and prepare_runtime readies the machine first.",
+             {"agent": S["text"], "runtime": {"type": "string", "enum": list(FROM_THE_HUB["lifecycle.SWITCH_RUNTIMES"])}, **rid},
+             ("agent", "runtime"),
+             with_base("/ui/team/agents/{agent}", ("runtime",), "this agent's runtime")),
+        tool("vault_access", "Give one agent its machine's vault broker, or take it away: broker or none. A command "
+                             "of its own. The broker opens the logins the agent is granted; it never gives it a "
+                             "value, and this changes no grant.",
+             {"agent": S["text"], "vault": {"type": "string", "enum": ["broker", "none"]}, **rid},
+             ("agent", "vault"),
+             with_base("/ui/team/agents/{agent}", ("vault",), "this agent's vault access")),
+        tool("login_creation", "Let one agent make new logins in the vault with create_login, or stop it. A command "
+                               "of its own. true is taken only once the hub says that agent is ready for it, and "
+                               "false stops new calls at once.",
+             {"agent": S["text"], "vault_create": S["bool"], **rid}, ("agent", "vault_create"),
+             with_base("/ui/team/agents/{agent}", ("vault_create",), "whether this agent may make logins")),
         tool("sign_in_machine", "Start one machine's own runtime sign-in. The provider's flow runs on that machine "
                                 "in the agent's own home; the hub passes the link along and nothing of it is "
                                 "written down. Read machines for the link, give the owner the link, and send the "
@@ -908,7 +966,8 @@ def tools():
              {"name": S["text"], "server": MCP_ENTRY, "delete": S["bool"], **rid}, ("name",),
              with_base("/ui/team/mcp", ("name", "server", "delete"), "this MCP server")),
         tool("grant_access", "Give one agent a resource the fleet already holds, or end that hold with level null: "
-                             "repo:<owner/name> read|write, secret:bws://<uuid> use|read, drive:<email> "
+                             "repo:<owner/name> read|write|deploy (deploy also runs its workflows), "
+                             "secret:bws://<uuid> use|read, drive:<email> "
                              "read|write|write_shared, gmail:<email> read|write|send, tool:<name> use. The grant is "
                              "the authorization: the agent then does what that access allows, and the hub records "
                              "who gave what to whom.",
@@ -1011,7 +1070,7 @@ def tools():
              {"outbound": S["int"], **rid}, ("outbound",),
              plain("/ui/outbound/{outbound}/again", (), "this message again")),
         tool("prepare_runtime", "Prepare the other runtime of one agent on its server, before its switch.",
-             {"server": S["text"], "agent": S["text"], "runtime": {"type": "string", "enum": ["codex", "claude"]},
+             {"server": S["text"], "agent": S["text"], "runtime": {"type": "string", "enum": list(FROM_THE_HUB["lifecycle.SWITCH_RUNTIMES"])},
               **rid}, ("server", "agent", "runtime"),
              plain("/ui/servers/{server}/prepare", ("agent", "runtime"), "the prepared runtime")),
         tool("start_manager_session", "Ask the manager's machine to start the standing manager session. It only "

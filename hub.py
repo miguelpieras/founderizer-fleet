@@ -12572,7 +12572,17 @@ def manager_resume_text():
 
 
 def S(props, required=()):
-    return {"type": "object", "properties": props, "required": list(required), "additionalProperties": False}
+    """One tool's input schema. It takes exactly these fields, and `call_tool` is what refuses the rest.
+
+    The schema used to say `additionalProperties: False` and leave the refusing to the caller's runtime. That hid
+    the one failure this fleet cannot see coming: a tool's contract changes, a fleet's seeded profile still names
+    the field that went, and the agent's first call dies inside its own runtime with a validation error that names
+    the field and nothing else -- no hub log, no `calls` row, nothing the owner or the manager can read, and no
+    hint that the instructions the agent is following are older than the tool. A field this schema does not list
+    is refused here instead (`unknown_fields`), in the hub's own words and on the hub's own record. Both halves
+    matter: the seeded files name no field of any tool (test_publish.ProfilesNameNoContract), and when one drifts
+    anyway the agent is told what to read instead of guessing."""
+    return {"type": "object", "properties": props, "required": list(required)}
 
 
 STR = {"type": "string"}
@@ -12782,7 +12792,12 @@ TOOLS = [
      "suitable agent waits for its agent instead. Splitting buys time only across different runtime accounts, "
      "because agents that share one account share one allowance (see_capacity, ACCOUNTS).",
      S({"owner": STR, "title": STR, "done_when": STR, "details": STR,
-        "needs": {"type": "string", "enum": ["none", "browser", "screen"]}, "goal": STR, "case_id": STR,
+        "needs": {"type": "string", "enum": ["none", "browser", "screen"]},
+        "goal": {"type": "string", "description": "G-<id> of the goal this task belongs to. Write the goal down "
+                                                  "with update_goal first: any other text is a plain label, and "
+                                                  "the task's session is then told nothing about the goal"},
+        "case_id": {"type": "string", "description": "The duty case this task is work of, when the owner or a "
+                                                     "duty names one. Use that exact value on every task of it"},
         "follows": {"type": "string", "description": "Earlier task id, for example T-3"},
         "step": {"type": "integer", "description": "The number of the step of goal's plan that this task is one "
                                                    "part of, when one piece of work is split across agents"},
@@ -13159,7 +13174,11 @@ TOOLS = [
     ("all", "tell_owner", t_tell_owner,
      "Send a concise reply to this agent's owner chat. Worker chat replies require in_reply_to from read_messages. "
      "Task workers still report through their task tools; managers may also post checked results. No notification.",
-     S({"text": STR, "about": STR, "in_reply_to": STR}, ["text"])),
+     S({"text": STR,
+        "about": {"type": "string", "description": "What this reply is about, for the owner's own record: the "
+                                                   "message you are answering (M-<id>), the goal (G-<id>) and the "
+                                                   "tasks it came from"},
+        "in_reply_to": STR}, ["text"])),
     ("all", "message_owner", t_message_owner,
      "Write to the owner first, for example a result or a question about the owner's own request. Keep it short and "
      "rare: at most 30 a day. It goes to the chat app where the owner last wrote to you, else to your own WhatsApp "
@@ -13276,6 +13295,19 @@ TOOLS = [
 CHAT_TOOLS = ("read_messages", "tell_owner", "message_owner", "message_agent", "see_responsibilities", "recall")
 
 
+def tool_contract(agent, context=None):
+    """**A short hash of the tool contract a session of this agent would get now**: every tool's name and its input
+    schema, and nothing else.
+
+    A tool's description changes with what the fleet holds — who an agent may write to and what each of them looks
+    after, which knowledge files it reads — and those words are built at each `tools/list`, so they reach a session
+    the next time it asks. A tool that is new, gone, or that takes other fields does not: the list is served once,
+    at `initialize`, and this hub announces no change of it (`listChanged: false`). So this is the part of the list
+    that only a new session can learn."""
+    shape = sorted((t["name"], json.dumps(t["inputSchema"], sort_keys=True)) for t in tools_for(agent, context))
+    return hashlib.sha256(json.dumps(shape).encode()).hexdigest()[:12]
+
+
 def tools_for(agent, context=None):
     role = agents()[agent].get("role")
     read_only = ("list_my_tasks", "see_team", "see_goals", "see_capacity", "see_triggers", "search_knowledge",
@@ -13333,9 +13365,43 @@ def gate(task_id, name, args):
                             "; ".join(f"O-{r['id']} {r['title']}" for r in left) + ". Record each finding with resolve_outcome.")
 
 
+# A field a tool does not take and answers for itself, in words better than the general refusal below:
+# see_notes(agent=...) is how one agent tries to read another's notes, and what it has to read back is why it
+# cannot, not that the field does not exist.
+ANSWERED_FIELDS = {("see_notes", "agent")}
+
+
+def unknown_fields(name, sent):
+    """The fields of this call that the tool does not take, or none. `sent` is what the caller wrote: the fence
+    adds a task_id of its own to tools whose schema has no such field, and that one is not the caller's."""
+    for _r, tname, _fn, _desc, schema in TOOLS:
+        if tname == name:
+            return sorted(set(sent) - set(schema.get("properties") or {})
+                          - {f for n, f in ANSWERED_FIELDS if n == name})
+    return []
+
+
+def stale_instructions(name, extra):
+    """What an agent reads when it called a tool with a field the tool does not take.
+
+    Almost always the agent is not inventing: it is following words that were written when the tool took that
+    field -- its profile, a knowledge file, a task, its own notes. Those words are seeded or the owner's, so no
+    release ever corrects them, and the agent has no way to know they are older than the tool. So the refusal
+    says which field, where the current contract is, and that what sent it there may be out of date."""
+    fields = ", ".join(extra)
+    return (f"{name} does not take {fields}. "
+            f"{'These fields are' if len(extra) > 1 else 'This field is'} not part of it: the call was refused and "
+            f"nothing happened. If you were told to pass {'them' if len(extra) > 1 else 'it'}, those instructions "
+            f"are out of date -- a tool's contract changes with the hub, and a profile, a knowledge file or a note "
+            f"that restates it does not. This tool's own description is the current contract, and RULES.md says "
+            f"what the tool is for. Read the description, call it again with the fields it lists, and report that "
+            f"the instructions you followed name a field that is gone.")
+
+
 def call_tool(agent, name, args, context=None):
     role = agents()[agent].get("role")
     args = dict(args) if isinstance(args, dict) else {}
+    sent = dict(args)                   # what the caller wrote, before the fence adds its task_id
     tid, attempt = None, None
     CALL.context = context
     try:
@@ -13355,6 +13421,15 @@ def call_tool(agent, name, args, context=None):
             if not team:
                 args["task_id"] = tref(tid)
             gate(tid, name, args)
+            # task_id is the session's field and not the tool's: every call of a task session is fenced by it,
+            # whether or not the tool's own schema lists it (message_agent does not). So it is never the caller's
+            # mistake here, and the check below must not read it as one.
+            sent.pop("task_id", None)
+        # After the fence and the gate, so a held task still reads STOP first, and before anything is done: a call
+        # with a field the tool does not take is refused whole, never half-applied with the field dropped.
+        extra = unknown_fields(name, sent)
+        if extra:
+            raise ToolError(stale_instructions(name, extra))
         for r, tname, fn, desc, schema in TOOLS:
             if tname == name and (r in (role, "all") or (role == "lead" and (r == "worker" or name in LEAD_TEAM_TOOLS))):
                 # These wait for an answer, a helper or Google, or read many files (search_knowledge): not under LOCK.
@@ -18796,6 +18871,12 @@ def record_status(agent, data):
     # settings and the owner's own button all reach it the same way.
     requested = bool(up and up["state"] in ("requested", "waiting_idle"))
     answer = {"desired_revision": (up["desired"] if requested and up["desired"] else desired), "update_requested": requested}
+    # **The standing session cannot be told that a tool is new**, so its helper starts it again (restart_for_tools).
+    # Only when this hub served that session its list: before that there is nothing to compare, and a session that
+    # has not asked yet will get the current one anyway.
+    if agents()[agent].get("role") == "manager":
+        served = kv_get("tools:" + agent)
+        answer["manager_tools_changed"] = bool(served) and served != tool_contract(agent)
     if data.get("manager_handover"):
         # The helper forgets its hand-over when nothing needs it any more: this report ended the switch with it, or no
         # switch of this manager is open, so that no end of a switch would use it.
@@ -25082,6 +25163,10 @@ def rpc(agent, m, headers, context=None):
             result = {}
         elif method == "tools/list":
             result = {"tools": tools_for(agent, context)}
+            # **What the standing session is running with.** The manager's session stands for days, so this is the
+            # only record of which contract it got; a worker's session is one task long and asks again with it.
+            if context is None and agents().get(agent, {}).get("role") == "manager":
+                kv_set("tools:" + agent, tool_contract(agent))
         elif method == "tools/call":
             q("UPDATE agents SET client_seen=? WHERE name=? AND client IS NOT NULL", (now(), agent))
             text, is_error = call_tool(agent, params.get("name"), params.get("arguments") or {}, context)

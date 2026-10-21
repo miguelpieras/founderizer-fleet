@@ -2417,6 +2417,30 @@ class Helper:
         finally:
             tmux("kill-session", "-t", session)
 
+    def restart_for_tools(self):
+        """**A new team tool reaches the standing session only when it starts.** The hub hands a session its tool
+        list once, at `initialize`, and announces no change of it, so a worker gets a new tool with its next task
+        and the manager — whose session always stands — would keep the list it started with for as long as it runs.
+        The owner asked how an agent gets an update of its tools by itself (21 October 2026).
+
+        So when the hub says that list is no longer the one it would serve, this closes that session and its own
+        watch starts it again within ten seconds, on the same conversation (`--resume`): the manager is away for
+        the seconds of one restart, and only when there is something new for it to pick up. It waits while a turn
+        is running and while a switch is closing or starting that session, and the hub keeps saying it until the
+        new session has asked for the list."""
+        if self.conf.get("role") != "manager" or not self.lifecycle.tools_changed:
+            return
+        if self.manager_due or self.manager_left or self.manager_retiring is not None or self.outdated():
+            return                      # a start or a switch is already going to give it the current list
+        target = f"{self.session}:=manager"
+        if self.window_runtime("manager") is None or self.working(target):
+            return                      # nothing to close, or a turn runs: at the next round
+        with contextlib.suppress(subprocess.CalledProcessError, Refused):
+            tmux("kill-window", "-t", target)
+        self.lifecycle.tools_changed = False
+        self.manager_due = True
+        self.say("manager: its team tools changed, so its session starts again on the same conversation")
+
     def restart_after_login(self):
         """A session that started before this machine had a credential is sitting at the provider's own sign-in
         screen, and no credential reaches a window that already runs. So the standing manager session is closed
@@ -3051,6 +3075,7 @@ class Helper:
         previous runtime's session after a switch, or when the owner pressed the control that the hub's manager_down
         warning carries (owner feature manager_start); it is tried at most each 10 seconds, and it stays due until a
         start succeeds, also when a later step of the round fails."""
+        self.restart_for_tools()
         if self.conf.get("role") == "manager" and not self.manager_due and self.manager_gone():
             self.manager_due = True
             self.say_manager("manager: its session is not running; the helper starts it again")

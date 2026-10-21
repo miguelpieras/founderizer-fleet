@@ -123,6 +123,9 @@ would read as an empty fleet instead of as a mistake.
 | `remove_machine` | `/ui/servers/<s>/remove` | A server with no agent leaves. |
 | `activate_agent` / `agent_settings` | `/ui/team/agents/<a>` | Turn an agent on or off; its model, effort, capabilities. |
 | `agent_key` | `/ui/team/agents/<a>/key` | Register, replace or remove an agent's key, by its SHA-256. Never a key. |
+| `switch_runtime` | `/ui/team/agents/<a>` | Switch one agent to its other runtime. A command of its own. |
+| `vault_access` | `/ui/team/agents/<a>` | Give one agent its machine's vault broker, or take it away. |
+| `login_creation` | `/ui/team/agents/<a>` | Let one agent make new logins in the vault, or stop it. |
 | `set_reporting_lines` | `/ui/team/lines` | The whole shape of the team: each agent's role and who it reports to. |
 | `save_profile` | `/ui/profiles/<a>` | Write one agent's profile — the owner's own words, which the agent cannot change. |
 | `prepare_runtime` | `/ui/servers/<s>/prepare` | Prepare an agent's other runtime before its switch. |
@@ -188,9 +191,41 @@ Two smaller ones worth knowing: a server has to exist and be paid for before `in
 reach it, and turning a new agent on waits for that machine's own setup check — the hub refuses
 `activate_agent` until then and says exactly what is missing, which the agent can read and act on.
 
+## Keeping it in step with the hub
+
+This server is a client of the owner API, and the hub is built by several threads at once. So the one thing that
+can go wrong is **drift**: the hub grows a route, a field or a value, and this file does not. It cannot be caught by
+reading the file, because the failure is silent in three different ways, and each has a check of its own.
+
+`owner_mcp.py` runs on the owner's Mac with the standard library alone, and the hub is on another machine, so it
+**cannot import one name from the hub**. It repeats the routes, the fields and the enums as text. Two constants in
+the file are where that repetition lives — `NOT_TOOLS` (the routes left out, each with its reason) and
+`FROM_THE_HUB` (every value copied from `hub.py` or `lifecycle.py`) — and the checks below hold both to the hub.
+
+| What drifts | How it fails if nothing checks | The check |
+| --- | --- | --- |
+| A **new owner route** | The owner asks for it, the agent has no tool, and nobody knows the route exists | Every `ui_command` route of `hub.py` must be a tool here or named in `NOT_TOOLS` |
+| A **new field** on a route that is already a tool | The worst one: `plain` and `with_base` send exactly the fields their own tuple names, so the call still succeeds and the setting is simply **not there** | Every field a route takes must be sendable by one of its tools |
+| A **new value** of an enum | The agent is told the old values and refuses a good one, or sends a stale one | Every entry of `FROM_THE_HUB` must equal the hub's own constant |
+| A **tool nobody wrote down** | The owner never learns he has it, and the table below goes stale both ways | Every tool must be named in this file, and every tool the table names must exist |
+
+**All of them run in `selftest.py`**, section 0, from the source alone — no hub, no network, nothing started. That is
+the point: `selftest.py` is what a release runs, and nothing excuses a failure in it (COORDINATION.md rule 5). So a
+thread that adds an owner route or a field **fails the release** until it has decided whether the owner's own agent
+can reach it. `test_owner_mcp.py` has the same drift checks with their reasoning. Neither keeps a list by hand: both read
+`hub.py`.
+
+The second check is not hypothetical. It found four powers on `POST /ui/team/agents/<a>` that `agent_settings`
+**named in its own description** and could not send — `screen`, `runtime`, `vault` and `vault_create` — which are
+now `agent_settings`'s `screen` field and the tools `switch_runtime`, `vault_access` and `login_creation`. The third
+found `repo: read|write` after the hub had gained a third level, `deploy`.
+
+Each check is proved to fail: a route, a field and an enum value were each added to a copy of `hub.py`,
+and a tool was taken out of this file's own table, and every check failed naming exactly what drifted.
+
 ## Checks
 
-`test_owner_mcp.py`, 41 checks, against a fixture hub and never against a real fleet:
+`test_owner_mcp.py`, 43 checks, against a fixture hub and never against a real fleet:
 
 - **`Boundary`** — OWNER-MCP-BOUNDARY.md, held to the code that enforces it: no agent can be put on
   the owner's address, no owner device can take a machine's address, the owner's own computer cannot
@@ -222,11 +257,12 @@ reach it, and turning a new agent on waits for that machine's own setup check �
   `team.json` (an account, a login's title, how a machine is reached) and one of the owner's own knowledge files
   added and removed; a person added with a handle, blocked and removed; a file sent to the hub, read back whole and
   kept; and the small switches — Pause all, the manager session, and a reload the hub refuses.
-- **`Shape`** — an MCP client lists the tools, every page is a `GET` route `hub.py` really serves,
-  and without a hub every tool says how to get one. And **the one check that answers "does it have all the admin
-  actions"**: every `ui_command` route of `hub.py` is either a tool here or named in `NOT_TOOLS` with its reason, so
-  a new owner route fails this check until somebody decides whether it belongs here. The list is read from `hub.py`
-  and not kept by hand, which is the only way that answer stays true.
+- **`Shape`** — an MCP client lists the tools, every page is a `GET` route `hub.py` really serves, and without a hub
+  every tool says how to get one. And the three drift checks of "Keeping it in step with the hub" above, which are
+  what answers "does it have all the admin actions" and keeps answering it: every owner route is a tool or is in
+  `NOT_TOOLS` with its reason, every field of a route can be sent, and every value in `FROM_THE_HUB` is the hub's
+  own. All three read `hub.py` and keep no list by hand, and all three also run in `selftest.py`, which a release
+  runs.
 
 **Live, 20 October 2026,** against a real fleet's own hub from its owner's Mac, with a real MCP client over standard input and output. `which_hub` said
 `reads_owner_api: true`. Every read answered with his own fleet: four machines, each agent's

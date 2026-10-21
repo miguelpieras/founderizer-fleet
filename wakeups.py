@@ -807,7 +807,10 @@ def describe_detail(rule, runs, history, source, when):
 
 
 def obj(props, required=()):
-    return {"type": "object", "properties": props, "required": list(required), "additionalProperties": False}
+    """A wake-up tool's input schema, the same shape `hub.S` gives every other tool and for the same reason: the
+    field a tool does not take is refused by `hub.call_tool`, in the hub's own words and on the hub's own record,
+    and not inside the caller's runtime where nobody can read it."""
+    return {"type": "object", "properties": props, "required": list(required)}
 
 
 TASK_ID = {"type": "string", "description": "In a task session: your task, for example T-7. You can leave it out."}
