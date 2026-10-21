@@ -5422,6 +5422,15 @@ def t_raise_needs_you(agent, a):
     return f"Raised N-{nid}. The owner's answer will arrive as a message in this session.{picks}"
 
 
+def unanswered_owner_message(agent):
+    """The oldest chat message of the owner's to this agent that it has read and nothing has answered, or None."""
+    row = q1("SELECT u.request_id FROM ui_requests u JOIN events e ON e.id=u.event_id "
+             "WHERE u.recipient=? AND u.kind='message' AND u.need_id IS NULL AND e.read_at IS NOT NULL "
+             "AND NOT EXISTS (SELECT 1 FROM owner_reports r WHERE r.agent=u.recipient AND r.in_reply_to=u.request_id) "
+             "ORDER BY u.created LIMIT 1", (agent,))
+    return row["request_id"] if row else None
+
+
 def t_tell_owner(agent, a):
     text = str(a.get("text") or "").strip()
     about = str(a.get("about") or "").strip()
@@ -5436,6 +5445,15 @@ def t_tell_owner(agent, a):
             # what message_owner is for. Nothing else an agent reads named it.
             raise ToolError("Reply with in_reply_to set to the owner request UUID from read_messages. To write to "
                             "the owner first, with no message of his to answer, use message_owner: short and rare.")
+    # **A manager's answer is linked to the message it answers.** Its own owner messages carry no request id — a
+    # worker's do, and that is what a worker names — so the manager cannot name one however it tries, and every
+    # reply of its own landed beside the owner's message instead of under it. The hub reads the chat the way the
+    # owner does: a report posted while a message of his stands read and unanswered is the answer to it. The app
+    # could otherwise only say "a later report has no link to your message", about a conversation he was reading,
+    # answered, in front of him (21 October 2026). A report with nothing of his waiting answers nothing, which is
+    # what a routine post of the manager's is.
+    if reply is None and agents()[agent].get("role") == "manager":
+        reply = unanswered_owner_message(agent)
     if reply is not None:
         try:
             reply = str(uuid.UUID(reply))
