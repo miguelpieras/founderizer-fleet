@@ -19556,12 +19556,20 @@ def login_view(row, live=True):
 
 def expire_logins(t0=None):
     """Give up a sign-in that nobody finished, and forget its live part. Also drops a code that the machine never
-    came for."""
+    came for, and a sign-in whose link this hub no longer has."""
     t0 = t0 or now()
     for row in q(f"SELECT * FROM signin_jobs WHERE {LOGIN_OPEN} AND updated<?", (t0 - LOGIN_LIFE,)):
         q("UPDATE signin_jobs SET state='failed', detail=?, updated=? WHERE id=?",
           (f"The sign-in was not finished in {LOGIN_LIFE // 60} minutes. Start it again.", t0, row["id"]))
         LIVE_LOGINS.pop(row["id"], None)
+    # **A hub that restarted kept no link.** `needs_owner` is written with the link in the same breath, so a row in
+    # that state with nothing live is a sign-in this hub cannot finish and the owner cannot open: the window on its
+    # machine went with the restart. Left alone it stands for a quarter of an hour, showing a step with no link and
+    # refusing the next sign-in, which is what the owner met on 21 October 2026.
+    for row in q("SELECT * FROM signin_jobs WHERE state='needs_owner'"):
+        if row["id"] not in LIVE_LOGINS:
+            q("UPDATE signin_jobs SET state='failed', detail=?, updated=? WHERE id=?",
+              ("The hub restarted while this sign-in waited. Start it again.", t0, row["id"]))
     for one, live in list(LIVE_LOGINS.items()):
         if live.get("code") and t0 - live.get("code_at", t0) > LOGIN_CODE_LIFE:
             live.pop("code", None)              # the machine never came for it: forget it rather than keep it
