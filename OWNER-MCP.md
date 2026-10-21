@@ -3,12 +3,16 @@
 `owner_mcp.py` is the third face of Founderizer. The first is the Mac app. The second is
 `INSTALL-PROMPT.md`, a prompt the customer pastes into the agent they already run. This is the
 one that works unattended: **an MCP server that an agent connects to, and then sets a fleet up
-and runs it** — it installs a hub, claims it, adds machines and agents, hands out access from the
-pool, says a goal, reads every check, takes releases and backups, and answers a Needs-you item.
+and runs it** — it installs a hub, claims it, adds machines and agents, adds MCP servers, hands out
+access from the pool, says a goal, reads every check, takes releases and backups, and answers a
+Needs-you item.
 No person clicks anything.
 
 It is for the owner's own agent: his Claude, or any MCP client. It is not for the fleet's agents —
 they have their own server, the `fleet` tools of `hub.py` (RULES.md). This one is the owner's side.
+**OWNER-MCP-BOUNDARY.md** is why that sentence holds in the code and not only here: what stops this
+server becoming a tool the manager can grant, why nothing refuses it by name, and where the
+confirmation of a destructive call goes when there is no window to put it in.
 
 ## Give it to an agent
 
@@ -118,10 +122,32 @@ would read as an empty fleet instead of as a mistake.
 | `add_agent` | `/ui/servers/<s>/agents` | An agent on an available server, with its install job. |
 | `remove_machine` | `/ui/servers/<s>/remove` | A server with no agent leaves. |
 | `activate_agent` / `agent_settings` | `/ui/team/agents/<a>` | Turn an agent on or off; its model, effort, capabilities. |
+| `agent_key` | `/ui/team/agents/<a>/key` | Register, replace or remove an agent's key, by its SHA-256. Never a key. |
+| `set_reporting_lines` | `/ui/team/lines` | The whole shape of the team: each agent's role and who it reports to. |
+| `save_profile` | `/ui/profiles/<a>` | Write one agent's profile — the owner's own words, which the agent cannot change. |
+| `prepare_runtime` | `/ui/servers/<s>/prepare` | Prepare an agent's other runtime before its switch. |
+| `start_manager_session` | `/ui/machines/<a>/manager` | Ask the manager's machine to start the standing session. |
 | `sign_in_machine` / `sign_in_code` | `/ui/machines/<a>/signin[/code]` | Start a machine's own provider sign-in, and carry the code back. |
 | `check_machine` / `update_machine` | `/ui/machines/<a>/check`, `/update` | Take a reading now; update Fleet when idle. |
+| `check_mcp_server` | `/ui/mcp/check` | Does this MCP server answer? Asked before it is saved, and of a machine for a `command` server. Writes nothing. |
+| `save_mcp_server` | `/ui/team/mcp` | Add one of the owner's own MCP servers, change it, or remove it. An agent loads it only once it also holds `tool:<name>`. |
 | `grant_access` | `/ui/team/repos`, `/ui/team/tools`, `/ui/team/google`, `/ui/secrets/grant` | One agent's hold of one resource, as `<kind>:<what>` and a level. |
 | `share_resource` / `take_resource` | `/ui/resources`, `/ui/resources/take` | The pool's standing; and end one hold. |
+| `save_account` | `/ui/team/accounts` | One runtime account: its provider and the owner's title for it. |
+| `save_login` | `/ui/team/logins` | The owner's title for one vault login, by its `bws://` reference. The label only. |
+| `machine_access` | `/ui/team/access` | How the fleet reaches a machine: its SSH user, port, Screen Sharing. |
+| `save_knowledge` | `/ui/knowledge` | The owner's own knowledge files: text, a page the hub fetches, a kept file, a delete. |
+| `save_person` / `person_handle` | `/ui/people`, `/ui/people/<id>/handles` | The people who may write to an agent, and their chat handles. |
+| `person_code` / `remove_owner_handle` | `/ui/people/codes`, `/ui/people/handles` | Link the owner's own chat account; remove one of his handles. |
+| `control_conversation` | `/ui/conversations/<id>` | Pause one conversation with a person, or let it run again. |
+| `save_chat_account` | `/ui/team/chat-apps` | One chat app account. The account, never its bot token. |
+| `pause_chat_apps` | `/ui/chat-apps/pause` | Pause all: every inbound message and every outbound item at once. |
+| `link_chat_app` | `/ui/chat-apps/<id>/link`, `/unlink` | Link or unlink a WhatsApp account. The QR is a read. |
+| `send_again` | `/ui/outbound/<id>/again` | Send one chat message again, for an unknown or failed one. |
+| `disconnect_google` / `disconnect_mcp_server` | `/ui/google/disconnect`, `/ui/mcp/disconnect` | End a saved connection. The grants stay. |
+| `attach_file` / `read_attachment` / `keep_attachment` | `/ui/attachments*` | A file to the hub, a file back to this Mac, and keeping one. |
+| `owner_device` / `device_code` | `/ui/owner/devices[/<d>/code]` | The owner's phones, and one enrollment code. Its key is the phone's. |
+| `reload_team` | `/ui/team/reload` | Apply `team.json` from a pushed revision without restarting the hub. |
 | `send_message` | `/ui/messages` | Say something to an agent. **This is how a goal or a duty is set.** |
 | `answer_needs_you` | `/ui/needs/<id>` | Answer a Needs-you item, in words or by choosing an option. |
 | `control_task` / `steer_task` | `/ui/tasks/<id>/control`, `/steer` | Pause, stop, resume; steer an open task. |
@@ -164,8 +190,17 @@ reach it, and turning a new agent on waits for that machine's own setup check �
 
 ## Checks
 
-`test_owner_mcp.py`, 26 checks, against a fixture hub and never against a real fleet:
+`test_owner_mcp.py`, 41 checks, against a fixture hub and never against a real fleet:
 
+- **`Boundary`** — OWNER-MCP-BOUNDARY.md, held to the code that enforces it: no agent can be put on
+  the owner's address, no owner device can take a machine's address, the owner's own computer cannot
+  join as a machine, `grant_access` does **not** refuse this server by name (asserted on purpose, so
+  the address gate cannot be quietly replaced by a blocklist of one file name), and the grant it
+  makes is inert — the dangerous tools, called from an address that names no owner, all refuse.
+- **`McpServers`** — the owner's own MCP servers through this server: a `command` server checked
+  against a machine before anything is saved, then saved, renamed and removed; an entry the hub
+  refuses given back in the hub's own words with nothing saved; and an entry that moved under the
+  command as the hub's own 409 instead of an overwrite.
 - **`FromNothing`** — the whole claim, end to end, with a real MCP client over standard input and
   output, the real claim listener of `hubsetup.py`, the real owner API of `hub.py` in process and
   the real `POST /join` for the machine that joins: claim a hub, read the fleet, add a machine,
@@ -182,8 +217,26 @@ reach it, and turning a new agent on waits for that machine's own setup check �
 - **`NoSecret`** — no tool takes a secret, the credential-carrying routes are not tools here, a
   registered login in a message is refused and stored nowhere, and the sign-in code is in no row
   and no log line.
+- **`Admin`** — the admin actions beside the ones `FromNothing` walks: a profile written as the owner and the
+  agent's own notes read but never written; the reporting lines, so a worker reports to a lead; the entries of
+  `team.json` (an account, a login's title, how a machine is reached) and one of the owner's own knowledge files
+  added and removed; a person added with a handle, blocked and removed; a file sent to the hub, read back whole and
+  kept; and the small switches — Pause all, the manager session, and a reload the hub refuses.
 - **`Shape`** — an MCP client lists the tools, every page is a `GET` route `hub.py` really serves,
-  and without a hub every tool says how to get one.
+  and without a hub every tool says how to get one. And **the one check that answers "does it have all the admin
+  actions"**: every `ui_command` route of `hub.py` is either a tool here or named in `NOT_TOOLS` with its reason, so
+  a new owner route fails this check until somebody decides whether it belongs here. The list is read from `hub.py`
+  and not kept by hand, which is the only way that answer stays true.
+
+**Live, 20 October 2026,** against a real fleet's own hub from its owner's Mac, with a real MCP client over standard input and output. `which_hub` said
+`reads_owner_api: true`. Every read answered with his own fleet: four machines, each agent's
+repositories, the people, the chat apps, capacity, health (`ok: true`), the checks, the duties, his
+phone and the four profiles. `check_mcp_server` asked `mac-studio` about a program and **his Studio
+answered for itself** (`missing`, "no notes-mcp on its PATH or in ~/.local/bin"), so the machine half
+of that check is live on his fleet, which UI-API.md still calls not deployed. Three writes were made
+and each was undone: an MCP server added (`f053582`) and removed (`bb07f77`); Pause all on and off
+again; and a knowledge file added (`b2f3e8b`) and removed (`fb208c7`). His catalog, his Pause all and
+his knowledge files are exactly as they were, and nothing else on his fleet was changed.
 
 **Not proved:** no Linux server was provisioned and no provider was signed in to, so the install's
 `apt`, `git clone`, `hub.sh` and `verify` steps are proved as the commands the server sends and

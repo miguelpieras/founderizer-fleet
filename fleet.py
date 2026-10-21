@@ -2330,6 +2330,27 @@ class Helper:
             except Refused as e:
                 return report("failed", detail=str(e))
             ready_runtime_config()                       # the runtime's first screen, not the provider's
+            # **The first half of a different account.** No provider starts a second sign-in while one is live, so
+            # the owner's "Use another account" signs this runtime out first, in the same job and the same window
+            # session. Nothing of the old credential is read here: the runtime's own sign-out removes it, and this
+            # only waits for the runtime to say it is gone.
+            if extra.get("replace") and self.signed_in(runtime):
+                label = LOGIN_LABELS.get(runtime, runtime)
+                try:
+                    out_command = runtime_logout_command(runtime, program)
+                except Refused as e:
+                    return report("failed", detail=str(e))
+                tmux("kill-session", "-t", session)
+                ensure_session(session)
+                start_window(session, "logout", out_command)
+                deadline = time.monotonic() + LOGOUT_WAIT
+                while time.monotonic() < deadline and self.signed_in(runtime):
+                    time.sleep(3)
+                tmux("kill-session", "-t", session)
+                if self.signed_in(runtime):
+                    return report("failed", detail=f"{label} did not sign out on this machine, so its account was "
+                                                   f"not changed. Sign out there yourself, then sign in.")
+                report("starting", detail=f"{label} is signed out. The sign-in starts now.")
             tmux("kill-session", "-t", session)          # a sign-in that was given up leaves no window behind
             ensure_session(session)
             start_window(session, "login", command)
@@ -4201,6 +4222,7 @@ PROVIDER_REFUSAL = ("Fleet signs in to no model provider: " + ", ".join(PROVIDER
 LOGIN_SESSION = "fleet-login-%s"            # a tmux session of its own: the agent's own session keeps its windows
 LOGIN_URL_WAIT = 90                         # seconds for the provider's link to appear on the screen
 LOGIN_CODE_WAIT = 840                       # seconds for the owner's code to come back through the hub
+LOGOUT_WAIT = 120                           # seconds for the runtime to report that it is signed out again
 LOGIN_DONE_WAIT = 900                       # seconds for the runtime to report that it is signed in: as long
                                             # as the hub keeps the sign-in open (hub.LOGIN_LIFE), because the
                                             # owner is in a browser and three minutes called a real sign-in
@@ -4271,6 +4293,16 @@ def runtime_login_command(runtime, exe):
     flow = runtime_fact(runtime, "sign_in")
     if not flow:
         raise Refused(f"Fleet drives no sign-in for {runtime}")
+    return "exec " + shlex.join([exe, *flow["args"]])
+
+
+def runtime_logout_command(runtime, exe):
+    """The provider's own sign-out, as one window command, from that runtime's own entry (lifecycle.RUNTIMES
+    "sign_out"). It exists for one reason: a provider will not start a second sign-in while one is live, so an
+    owner who wants a different account of the same provider needs this half first."""
+    flow = runtime_fact(runtime, "sign_out")
+    if not flow:
+        raise Refused(f"Fleet drives no sign-out for {runtime}")
     return "exec " + shlex.join([exe, *flow["args"]])
 
 

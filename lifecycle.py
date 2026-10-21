@@ -82,6 +82,9 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
 #   sign_in           the sign-in the fleet drives for it, or None: {args, after the executable; url, the provider's
 #                     own link as it is read from the screen; shows_code, the code the provider prints, or None;
 #                     wants_code, it waits for a code the owner pastes}
+#   sign_out          the sign-out the fleet drives for it, or None: {args, after the executable}. It exists for one
+#                     reason: a provider will not start a second sign-in while one is live, so an owner who wants a
+#                     DIFFERENT account of the same provider needs this half first (hub.start_machine_login, replace)
 #   no_sign_in        why the fleet drives none, in the words the owner reads ({where}: this machine or that one);
 #                     None when it drives one
 #   sandbox           how its start command says what it may touch, as the owner reads it; None when Fleet cannot
@@ -121,6 +124,7 @@ RUNTIMES = {
         "sign_in": {"args": ["login", "--device-auth"],
                     "url": re.compile(r"https://auth\.openai\.com/[A-Za-z0-9/_?=&.%-]{0,400}"),
                     "shows_code": re.compile(r"\b[A-Z0-9]{4}-[A-Z0-9]{4,6}\b"), "wants_code": False},
+        "sign_out": {"args": ["logout"]},
         "no_sign_in": None,
         "sandbox": {"name": "Codex", "flag": "--sandbox", "value": "[a-z-]+", "unset": "the default",
                     "words": {"danger-full-access": "the runtime does not limit file or network access",
@@ -156,6 +160,7 @@ RUNTIMES = {
         "sign_in": {"args": ["/login"],
                     "url": re.compile(r"https://(?:claude\.ai|console\.anthropic\.com)/[A-Za-z0-9/_?=&.%#+-]{0,400}"),
                     "shows_code": None, "wants_code": True},
+        "sign_out": {"args": ["/logout"]},
         "no_sign_in": None,
         "sandbox": {"name": "Claude", "flag": "--permission-mode", "value": "[A-Za-z]+", "unset": "default",
                     "words": {},
@@ -182,6 +187,7 @@ RUNTIMES = {
         "model_flags": None,
         "local_model": None,
         "sign_in": None,
+        "sign_out": None,
         "no_sign_in": ("Fleet drives no Grok sign-in: xAI's terms do not let a third party run it this way. "
                        "Sign in to Grok yourself on {where} machine."),
         "sandbox": None,
@@ -190,8 +196,8 @@ RUNTIMES = {
 # Every fact above in one list, so that a new entry cannot quietly leave one out (test_runtime_table).
 RUNTIME_FACTS = ("label", "driver", "acp_command", "can", "full_access", "manager_access", "first_worker", "manager",
                  "owner_chat", "agent_messages", "conversation", "conversation_why", "mcp_servers", "app_server",
-                 "switch", "session_settings", "token_in_env", "model_flags", "local_model", "sign_in", "no_sign_in",
-                 "sandbox")
+                 "switch", "session_settings", "token_in_env", "model_flags", "local_model", "sign_in", "sign_out",
+                 "no_sign_in", "sandbox")
 
 
 def runtime_fact(runtime, fact, otherwise=None):

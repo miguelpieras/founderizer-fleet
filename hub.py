@@ -82,7 +82,8 @@ CREATE INDEX IF NOT EXISTS task_owner_state ON tasks(owner, state, id);
 CREATE INDEX IF NOT EXISTS task_follows ON tasks(follows) WHERE follows IS NOT NULL;
 CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, task INTEGER, agent TEXT, ts REAL, text TEXT);
 CREATE TABLE IF NOT EXISTS questions(id INTEGER PRIMARY KEY, task INTEGER, asker TEXT, requester TEXT,
-  text TEXT, asked REAL, answer TEXT, answered REAL, waiting INTEGER DEFAULT 0, nudged INTEGER DEFAULT 0);
+  text TEXT, asked REAL, answer TEXT, answered REAL, waiting INTEGER DEFAULT 0, nudged INTEGER DEFAULT 0,
+  assumed TEXT);
 CREATE INDEX IF NOT EXISTS question_asker ON questions(asker, asked);
 -- What an agent says upward without stopping its task (report_up), and what its requester decided about it
 -- (decide_report). severity is what the sender asked for; delivered is what the hub priced it at. collapsed_into
@@ -103,7 +104,10 @@ CREATE TABLE IF NOT EXISTS needs(id INTEGER PRIMARY KEY, title TEXT, why TEXT, t
   by TEXT, answer TEXT, answered REAL);
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, agent TEXT, kind TEXT, task INTEGER, text TEXT,
   created REAL, extra TEXT, read_at REAL, helper_ack REAL);
-CREATE TABLE IF NOT EXISTS reminders(id INTEGER PRIMARY KEY, due REAL, note TEXT, done INTEGER DEFAULT 0);
+-- "Come back to this at this time", for any agent. agent is who set it and who the hub brings it back to;
+-- task is the work it brings back, and while it waits that task is parked: no nudge and no new session.
+CREATE TABLE IF NOT EXISTS reminders(id INTEGER PRIMARY KEY, due REAL, note TEXT, done INTEGER DEFAULT 0,
+  agent TEXT, task INTEGER, created REAL, fired REAL);
 CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY, key TEXT, text TEXT, ts REAL, ua TEXT);
 CREATE TABLE IF NOT EXISTS sealed(id INTEGER PRIMARY KEY, sender TEXT, recipient TEXT, task TEXT, label TEXT,
   ciphertext TEXT, created REAL, fetched INTEGER DEFAULT 0);
@@ -370,7 +374,7 @@ def in_transaction(what):
     caller written outside one reads this exception instead of getting a row that is sometimes there.
 
     Guarded: keep_command, event_rows, dispatch_check, resource_record, log_row, duty_new_case,
-    memory_from_work, and the row writers of the six crash windows — record_outcome_rows, stop_request_rows,
+    memory_from_work, came_back, and the row writers of the six crash windows — record_outcome_rows, stop_request_rows,
     request_unknown_rows, duty_history_row, duty_watch_rows, duty_review_rows, trigger_create_rows,
     trigger_edit_rows and trigger_state_rows. Each of those has a committing twin for the callers that have no
     transaction of their own, so the guard never stands between a caller and the write it meant to make.
@@ -596,7 +600,7 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "mobile", "attachments", "resource_grants", "machine_signin",
                "releases", "entitlement", "agent_signin", "github_app", "need_options", "restore",
                "manager_start", "agent_notes", "edit_in_place", "machine_access", "push",
-               "attachment_knowledge"]
+               "attachment_knowledge", "asking_and_waiting"]
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 
 
@@ -1281,7 +1285,10 @@ def migrate():
                   # manager_as_lead: the step of a goal's plan that this task is one part of. A lead's children hang
                   # on parent; the manager's hang on a step of the plan, which is the piece of work it splits.
                   "step": "INTEGER",
-                  "responsibility": "INTEGER", "duty_case": "INTEGER"},      # owner API 1.13: the duties
+                  "responsibility": "INTEGER", "duty_case": "INTEGER",      # owner API 1.13: the duties
+                  # asking_and_waiting: when the first silence nudge went, so the second rung is measured from it
+                  # and not from the same quiet time, which fired both of them five seconds apart after an outage
+                  "nudged_at": "REAL"},
         # manager_as_lead: which step of the plan next_step came from, so a split step whose parts have all ended
         # counts as no next step, exactly as a single ended task does.
         "goals": {"next_step_id": "INTEGER"},
@@ -1300,7 +1307,10 @@ def migrate():
         "ui_requests": {"recipient": "TEXT NOT NULL DEFAULT 'manager'", "replaces_request_id": "TEXT",
                         "origin": "TEXT",           # owner feature chat_apps: the chat app message, as JSON
                         "edits": "TEXT"},           # edit_in_place: each edit of this message, as JSON
-        "questions": {"access": "TEXT"},            # the resource that a blocked ask names (needs_access)
+        # the resource that a blocked ask names (needs_access), and what the asker said it would go on with when
+        # it asked without stopping (asking_and_waiting): the record of what was decided by default
+        "questions": {"access": "TEXT", "assumed": "TEXT"},
+        "reminders": {"agent": "TEXT", "task": "INTEGER", "created": "REAL", "fired": "REAL"},
         "needs": {"kind": "TEXT", "conversation": "INTEGER",   # owner feature conversations: ask_owner, request_work
                   "options": "TEXT", "chosen": "INTEGER",     # owner feature need_options: the agent's own answers
                   "answered_by": "TEXT"},     # null is the owner; "P-<id> <name>" is the deputy of that conversation
@@ -1357,6 +1367,9 @@ def migrate():
         "CREATE UNIQUE INDEX IF NOT EXISTS sealed_job ON sealed(job) WHERE job IS NOT NULL",
         "CREATE UNIQUE INDEX IF NOT EXISTS jobs_request ON jobs(agent, request_id) WHERE request_id IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS event_task ON events(task, kind)",          # owner API 1.12: desktop_busy
+        # asking_and_waiting: parked() asks it of one task on every pass of the silence loop and of liveness. Here
+        # and not in SCHEMA, because SCHEMA runs first and an existing database has no reminders.task yet.
+        "CREATE INDEX IF NOT EXISTS reminder_task ON reminders(task, done) WHERE task IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS chat_out_report ON chat_out(report) WHERE report IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS chat_out_state ON chat_out(state, kind)",
         "CREATE INDEX IF NOT EXISTS conversation_message_of ON conversation_messages(conversation, id)",
@@ -1539,6 +1552,79 @@ def holdings_start_text(agent):
     return "\n" + clip(said, max(120, HOLDINGS_CHARS - len(closing))) + closing + "\n"
 
 
+# No prompt named a colleague. A worker's start text said what it holds and then, for anything it does not hold,
+# "ask_my_requester with needs_access" -- with no way of knowing who holds it. Its only roster was the description of
+# one tool, message_agent, which no worker start text named at all; and that roster is built from the owner's
+# "Responsible for" line, which on a fleet whose profiles keep the text they were installed with is the same sentence
+# for every worker. So the agents were strangers with one dispatcher, and the facts that do tell them apart -- the
+# repositories, the services, the machine each one can reach -- were shown to the manager alone.
+# What a colleague holds is a fact about the team. Its allowance, its workload, its accounts, its logins and its
+# helper are not: those are how the manager chooses who works, and an agent that read them would be routing.
+TEAM_CHARS = 700                # the most that the team block adds to a session's opening text
+TEAM_ITEMS = 4                  # named things of one kind about a colleague, before the rest become a count
+
+
+def colleague_facts(name):
+    """What one other agent can do, from team.json and nothing else: the same clauses holdings_parts gives an agent
+    about itself, minus the two that are a power rather than a fact -- the saved logins its vault opens, and the API
+    keys of its sessions. No account label and no Google address either: the first is the owner's spending identity
+    and the second is his data."""
+    a = agents().get(name) or {}
+    out = []
+    if a.get("expertise"):
+        out.append("expertise " + named_few(sorted(a["expertise"]), TEAM_ITEMS))
+    reach = sorted(set(a.get("can") or []) - {"shell", "web"})
+    if reach:
+        out.append("can use " + named_few(reach, TEAM_ITEMS))
+    if a.get("repos"):
+        out.append("GitHub " + named_few((f"{r} ({v})" for r, v in sorted(a["repos"].items())), TEAM_ITEMS))
+    google = a.get("google") or {}
+    for service in ("gmail", "drive"):
+        if google.get(service):
+            out.append(f"{GOOGLE_NAMES[service]} at the level {google[service]['level']}")
+    if a.get("tools"):
+        out.append("MCP servers " + named_few(sorted(a["tools"]), TEAM_ITEMS))
+    return out
+
+
+def colleague_line(name, who=""):
+    """One other agent in one line: who it is, how it stands to the reader, and what it holds. The two readers of it
+    are a session's opening text and message_agent's own directory, so the fact that tells two agents apart is in
+    both."""
+    a = agents().get(name) or {}
+    facts = colleague_facts(name)
+    return (f"{name}" + (f" ({a['title']})" if a.get("title") else "")
+            + f" [{a.get('role')}" + (f", {runtime_label(a['runtime'])}" if a.get("runtime") else "") + "]" + who
+            + ": " + ("; ".join(facts) or "no repository, service or server of its own"))
+
+
+def team_start_text(agent):
+    """The rest of the fleet as the session that has to work with it reads it, and the two routes to a colleague by
+    use. team.json only: start_text runs inside admit_task's transaction, so no q, no q1 and no git show -- which is
+    also why the duties and the owner's own sentence are not here, and see_responsibilities and message_agent's
+    directory still carry those."""
+    requester, mine = reports_to(agent), \
+        [n for n in agents() if reports_to(n) == agent] if role_of(agent) == "lead" else []
+    kept, left = [], 0
+    for name in agents():
+        if name == agent or not agent_active(name):
+            continue
+        line = colleague_line(name, " -- it gives you your tasks" if name == requester else
+                              " -- you give it tasks" if name in mine else "")
+        if sum(len(x) + 3 for x in kept) + len(line) <= TEAM_CHARS:
+            kept.append(line)
+        else:
+            left += 1
+    if not kept:
+        return ""
+    return ("\nYOUR TEAM, from the fleet's own record and not from profiles: " + " | ".join(kept)
+            + (f" | and {left} more, which {manager_name()} knows." if left else "")
+            + ". Work that needs a colleague's access or machine: name the thing in ask_my_requester's needs_access "
+              "and say who you think holds it; your requester reads the holder itself. A question for one of them: "
+              "message_agent, which it answers from a session that can talk and not act. None of this gives you "
+              "their access.\n")
+
+
 def allowance_start_text(agent, task_id):
     """One line on the agent's own allowance, as a verdict and not a number, and only when it changes what the
     session should do. Below ALLOWANCE_LOUD it says nothing: a percentage in every start text is noise. The fleet
@@ -1571,21 +1657,29 @@ def allowance_start_text(agent, task_id):
             "mid-task, one report_progress is worth more than anything else you do with that turn.\n")
 
 
-# Rule 4, both halves, in the words a session reads before it does anything. The blocking half was always here; the
-# other one was in RULES.md alone, which an agent reads once, at the start, before it has found anything -- so
-# report_up was named nowhere an agent reads at the moment it would reach for it.
-RULE_FOUR = (" Never contact the owner: if you are blocked, use ask_my_requester. If you are not blocked but found "
-             "something this task does not cover -- an event that belongs to another agent's duty, a fact the other "
-             "agents need, something the fleet does not have, a risk -- say it with report_up, which pauses nothing.")
+# Rule 4, all three halves, in the words a session reads before it does anything. The blocking half was always here;
+# report_up's was in RULES.md alone, which an agent reads once, at the start, before it has found anything -- so it
+# was named nowhere an agent reads at the moment it would reach for it. The third is the one that was missing
+# altogether (asking_and_waiting): an agent that is merely unsure had to choose between stopping its work and
+# guessing, and rule 4 forbids the guess, so the cheapest thing it could do was the forbidden one.
+RULE_FOUR = (" Never contact the owner: if you are blocked, use ask_my_requester. If you are only UNSURE and not "
+             "blocked, ask anyway and say in default what you will go on with: the task does not pause, your "
+             "requester can still change it, and the record says this was decided by your reading and not by it. "
+             "Never a default for access, money or anything that leaves the building. If you are not blocked but "
+             "found something this task does not cover -- an event that belongs to another agent's duty, a fact the "
+             "other agents need, something the fleet does not have, a risk -- say it with report_up, which pauses "
+             "nothing.")
 
 
 def start_text(agent, task_id, resume=False):
     head = (f'You are agent "{agent}" in Founderizer. Read RULES.md and '
             f'profiles/{agent}.md in this folder first. Your helper brought this folder up to date just before this '
             f'session; do not pull at the start. Call read_messages with task_id \"{tref(task_id)}\" now and whenever signalled. '
-            # What the fleet's own record says this agent holds, and what is left of its allowance: the two facts
-            # that change its first action, so they are here and not behind a tool.
-            + holdings_start_text(agent) + allowance_start_text(agent, task_id)
+            # What the fleet's own record says this agent holds, who else is on the fleet and what each of them
+            # holds, and what is left of its allowance: the facts that change its first action, so they are here
+            # and not behind a tool. The team comes straight after the holdings because the two read as one thing:
+            # what you hold, what the others hold, and how to name the one you lack.
+            + holdings_start_text(agent) + team_start_text(agent) + allowance_start_text(agent, task_id)
             # What this agent worked out for itself, the way its profile is here: its own notes on how it works, and
             # the lessons it wrote about the things it works on. agent_notes_text is the reader the notes left for
             # this shelf; both are carried AS the agent's own words, never as rules, so a later session weighs them.
@@ -1675,6 +1769,54 @@ def active_limit(agent):
 def limit_ended(agent):
     """When the agent's last usage limit ended (0 if never). Silence is measured from after it."""
     return q1("SELECT MAX(ended) m FROM agent_limits WHERE agent=?", (agent,))["m"] or 0
+
+
+def parked(task_id):
+    """The open reminder that this task waits for, or None (asking_and_waiting). A task is parked because its own
+    agent said when to come back to it, so it is quiet on purpose: the third kind of deliberate quiet beside a hold
+    and a usage limit, and the clocks leave all three alone. read_row and not q1: describe_task is reached from
+    start_text, which admit_task runs inside the transaction that writes the task."""
+    return read_row("SELECT * FROM reminders WHERE task=? AND done=0 AND due>? ORDER BY id DESC LIMIT 1",
+                    (task_id, now())) if task_id else None
+
+
+# The patience a single long call buys (asking_and_waiting). "Activity" was measured at the boundaries of tool
+# calls, so a session inside one call that runs for minutes read exactly like a wedged one: `gh run watch`, a build
+# or a deploy wait is the cheapest way for an agent to wait and the clock charged it a worker turn at three minutes
+# and a manager turn at six. The hub already stores every call and every status change of it (thread_events), so
+# nothing new has to be stored and nobody has to remember to set a field. needs is the wrong lever and was not
+# used: one browser task is busy and idle in turns, and a shell task can hold one call open for an hour.
+CALL_PATIENCE = 1800            # seconds one unfinished tool call may run before the silence clock speaks
+CALL_LOOK = 500                 # the newest call records of the attempt that open_call reads
+
+
+def open_call(task_id, attempt):
+    """The longest-running tool call of this attempt that the session has not finished, or None: (title, started).
+    Bounded, so a long task costs the same: with more than CALL_LOOK call records the oldest open call can be older
+    than the window, which only makes the hub less patient, never more."""
+    status, started, title = {}, {}, {}
+    for r in reversed(q("SELECT data, created FROM thread_events WHERE task=? AND attempt=? AND "
+                        "type IN ('tool_call','tool_call_update') ORDER BY id DESC LIMIT ?",
+                        (task_id, attempt, CALL_LOOK))):
+        d = json.loads(r["data"])
+        call = d["tool_call_id"]
+        status[call] = d["status"]
+        started.setdefault(call, r["created"])
+        if d.get("title"):
+            title.setdefault(call, d["title"])
+    live = [c for c, state in status.items() if state in ("pending", "in_progress")]
+    if not live:
+        return None
+    call = min(live, key=lambda c: started[c])
+    return title.get(call, "a tool call"), started[call]
+
+
+def busy_in_a_call(t, t0):
+    """What the session of task row `t` has been inside for too long, or None: (title, how long). The clocks use it
+    twice -- it buys the patience, and when the patience is gone it is the one fact that changes the requester's
+    decision, so the message says it."""
+    call = open_call(t["id"], t["attempt"])
+    return (call[0], t0 - call[1]) if call else None
 
 
 def held_word(hold):
@@ -2262,6 +2404,58 @@ def end_limits(t0):
         log("hub", f"{lim['agent']}'s usage limit ended; resumed {len(done)} task(s)")
 
 
+# A task carried a pointer to its own reason that its owner could not follow. "Goal: G-1" is an id; no worker and no
+# lead tool opens a goal, and `details` has no description and no prompt that asks the manager to copy the owner's
+# words into it. So whatever the owner said, and whatever the manager understood of it, stopped at the task's title
+# and its done-when line, and the one route left was ask_my_requester, which pauses the task.
+# That bites hardest under the owner's own rule that the grant is the authorization: an agent that holds a
+# repository or a mailbox does what the access allows, and the goal's words are the only limit that belongs to this
+# piece of work. Nothing new is stored for this. The goal is already one row, written by the manager at the moment
+# the owner spoke; the hub reads it back in the answer of the call that every start text orders in the first minute.
+GOAL_WHY_CHARS = 1200   # the goal's own words in a task's description: about 300 tokens, the warm start's own cap
+GOAL_STEP_CHARS = 300   # the step of the plan that this task carries
+
+
+def goal_why_lines(t):
+    """Why this task exists, in the words the manager wrote down: the goal, the step of its plan that this task
+    carries, and the limits the goal itself sets. Empty for a task with no goal.
+
+    The framing is part of it, and it comes before the words: the goal says why the work exists, and the done-when
+    line is still the work. A worker that reads a whole goal and takes it for its task does more than it was given.
+    """
+    g = goal_row(t["goal_id"]) if t["goal_id"] else None
+    if not g:
+        return []
+    said = " ".join((g["text"] or "").split())
+    cut = len(said) > GOAL_WHY_CHARS
+    out = [f'  Why this task exists: it belongs to {gref(g["id"])} "{g["title"]}". That goal is not your task -- '
+           f'your task is what Done when says -- and these are the owner\'s words as the manager wrote them down: '
+           + (said[:GOAL_WHY_CHARS].rstrip() + "..." if cut else said or "nothing was written.")]
+    if cut:
+        out.append("    The goal says more than this. Ask your requester for the rest if your work turns on it.")
+    s = q1("SELECT n, text FROM goal_steps WHERE id=?", (t["step"],)) if t["step"] else \
+        q1("SELECT n, text FROM goal_steps WHERE goal=? AND task=?", (g["id"], t["id"]))
+    if s:
+        out.append(f'    Step {s["n"]} of its plan, which this task is for: {clip(s["text"], GOAL_STEP_CHARS)}')
+    # The goal's own limits, which hold for every task of it. Money is named because a "never" about money is a
+    # limit like any other; it is not an allowance, because record_spend is the manager's tool and not yours.
+    out.append("    " + limits_text(json.loads(g["limits"])) + " These are the goal's limits and they hold for your "
+               "task too. Spending is recorded by your requester, so ask it before anything is spent.")
+    return out
+
+
+def went_on_with(task_id):
+    """The questions of this task that its agent asked without stopping and that nobody answered, or "". That is the
+    record of what was decided by the agent's own reading rather than by its requester, and it is the thing the owner
+    must be able to see afterwards -- so it goes in the result the requester checks, not only in a table."""
+    rows = read_rows("SELECT id, assumed FROM questions WHERE task=? AND assumed IS NOT NULL AND answer IS NULL "
+                     "ORDER BY id", (task_id,))
+    if not rows:
+        return ""
+    return ("DECIDED BY ITS OWN READING, with no answer from you: "
+            + "; ".join(f"Q-{r['id']} \"{clip(r['assumed'], 200)}\"" for r in rows) + ". ")
+
+
 def describe_task(t):
     lines = [f"{tref(t['id'])} [{t['state']}] {t['title']}",
              f"  Requester: {t['requester']}",
@@ -2269,6 +2463,7 @@ def describe_task(t):
              f"  Done when: {t['done_when']}"]
     if t["goal"]:
         lines.append(f"  Goal: {t['goal']}")
+    lines += goal_why_lines(t)
     if t["details"]:
         lines.append(f"  Details: {t['details']}")
     if t["follows"]:
@@ -2281,7 +2476,12 @@ def describe_task(t):
             lines.append(f'  Read {tref(p["id"])} in full with see_earlier_work(task="{tref(p["id"])}").')
     for qu in q("SELECT * FROM questions WHERE task=? ORDER BY id", (t["id"],)):
         ans = f'answered: "{qu["answer"]}"' if qu["answer"] is not None else "not answered yet"
-        lines.append(f'  Question Q-{qu["id"]}: "{qu["text"]}" -> {ans}')
+        lines.append(f'  Question Q-{qu["id"]}: "{qu["text"]}" -> {ans}'
+                     + (f' (you went on with: "{qu["assumed"]}")' if qu["assumed"] else ""))
+    park = parked(t["id"])
+    if park:
+        lines.append(f"  WAITING until {clock(park['due'])} (R-{park['id']}: {park['note']}). Nothing nudges this "
+                     f"task until then, and the hub brings it back to you itself.")
     hold = active_hold(t["id"])
     if hold:
         lines.append(f"  HELD: {held_word(hold)}. Do not work on it until a message says that it resumes.")
@@ -2827,13 +3027,24 @@ def access_route(asker, rid, requester):
     return " ".join(out)
 
 
+ASSUMED_TEXT = 400              # characters of what an agent says it will go on with
+
+
 def t_ask_my_requester(agent, a):
     tid = parse_task(a.get("task_id"))
     question = str(a.get("question") or "").strip()
     if not question:
         raise ToolError("Ask one clear question.")
     rid = access_needed(a.get("needs_access"))
-    guard(agent, question)
+    assumed = str(a.get("default") or "").strip()
+    if assumed and rid:
+        # An ask for access cannot be answered by a default at all: the agent does not hold the thing, so there is
+        # no reading of its own to go on with, and the grant reaches its next session and not this one.
+        raise ToolError("An ask for access is never answered by a default: you do not hold the access, so there is "
+                        "nothing to go on with. Leave default out, and this task waits for the grant.")
+    if len(assumed) > ASSUMED_TEXT:
+        raise ToolError(f"Say in default, in {ASSUMED_TEXT} characters, the one thing you will go on with.")
+    guard(agent, question, assumed)
     try:
         wait = int(a.get("wait_seconds", CFG["ask_wait"]))
     except (TypeError, ValueError):
@@ -2842,6 +3053,25 @@ def t_ask_my_requester(agent, a):
     t = get_task(tid, owner=agent)
     if t["state"] in TERMINAL:
         raise ToolError(f"{tref(tid)} is already {t['state']}.")
+    if assumed:
+        # The whole point of a default is that the asker does not stop, so this one neither sets input-required nor
+        # waits inside the call. The task keeps its state, the question is on the record with the reading it went
+        # on with, and the answer -- if one comes -- arrives as a message, the path t_answer already has for an
+        # asker whose call has ended.
+        with LOCK:
+            fence(agent, tid)
+            qid = ins("INSERT INTO questions(task,asker,requester,text,asked,waiting,assumed) VALUES(?,?,?,?,?,0,?)",
+                      (tid, agent, t["requester"], question, now(), assumed))
+            activity(tid, "ask_my_requester")
+            emit(t["requester"], "say",
+                 f"[hub] Question Q-{qid} from {agent} on {tref(tid)} ({t['title']}): {question} "
+                 f"-- {tref(tid)} is NOT paused: {agent} goes on with: {assumed} "
+                 f"Answer with the fleet tool answer(question_id=\"Q-{qid}\", text=...) only if that is wrong. "
+                 f"Its result will say that this was decided by its own reading and not by you.", task=tid)
+        return (f"Q-{qid} is with {t['requester']} and {tref(tid)} is NOT paused: go on with: {assumed} "
+                f"If {t['requester']} answers differently, the answer arrives as a message in this session; check "
+                f"what you already did on this reading before you continue (rule 9). Never a default for access, "
+                f"money or anything that leaves the building: for those, ask without one and wait.")
     with LOCK:
         fence(agent, tid)
         qid = ins("INSERT INTO questions(task,asker,requester,text,asked,waiting,access) VALUES(?,?,?,?,?,1,?)",
@@ -2957,7 +3187,7 @@ def t_deliver_result(agent, a):
     emit(t["requester"], "say",
          f"[hub] Result for {tref(tid)} ({t['title']}) from {agent}: {outcome}. Done: {what.rstrip('.')}. "
          f"Output: {(where or '-').rstrip('.')}. Checked: {(how or '-').rstrip('.')}. "
-         + step_stands_text(t["step"]) +
+         + went_on_with(tid) + step_stands_text(t["step"]) +
          f"-- Check it, then call check_result(task_id=\"{tref(tid)}\", accepted=true or false).", task=tid)
     return f"Delivered. {tref(tid)} is {outcome}.{said} You are done with it: stop now."
 
@@ -3107,6 +3337,8 @@ def lead_overview(agent, parent):
     ids = [t["id"] for t in rows] or [0]
     marks = ",".join("?" * len(ids))
     out += ["", "OPEN QUESTIONS"] + [f"  Q-{r['id']} from {r['asker']} on {tref(r['task'])}: {r['text']}" +
+                                     (f" NOT WAITING: it goes on with \"{r['assumed']}\". Answer only if that is "
+                                      f"wrong." if r["assumed"] else "") +
                                      (f" {access_route(r['asker'], r['access'], agent)}" if r["access"] else "")
                                      for r in
                                      q(f"SELECT * FROM questions WHERE answer IS NULL AND task IN ({marks})", ids)]
@@ -3324,13 +3556,22 @@ def t_answer(agent, a):
         got = next((h["level"] for h in resource_holders(kind, what) if h["agent"] == qu["asker"]), None) if kind else None
         q("UPDATE questions SET answer=?, answered=? WHERE id=?", (text, now(), qid))
         t = q1("SELECT * FROM tasks WHERE id=?", (qu["task"],))
-        if t and t["state"] == "input-required":
+        # Only the question the task actually waits on releases it. Answering one of two open questions used to set
+        # the task working whichever one it was, so answering a question it was not waiting on let a paused session
+        # be told to continue -- and a question asked with a default is never the one a task waits on at all.
+        if t and t["state"] == "input-required" and t["waiting_on"] == f"Q-{qid}":
             q("UPDATE tasks SET state='working', waiting_on=NULL WHERE id=?", (t["id"],))
         activity(qu["task"])
         if not qu["waiting"]:
             emit(qu["asker"], "say",
-                 f"[hub] Answer to your question Q-{qid} on {tref(qu['task'])}: {text} -- Continue the task.",
+                 f"[hub] Answer to your question Q-{qid} on {tref(qu['task'])}: {text} -- " +
+                 (f"You went on with: {qu['assumed']} If this answer says otherwise, check what you already did on "
+                  f"that reading before you continue (rule 9)." if qu["assumed"] else "Continue the task."),
                  task=qu["task"])
+    if qu["assumed"]:
+        return (f"Answered Q-{qid}. {qu['asker']} did not wait for you: it went on with \"{qu['assumed']}\", so your "
+                f"answer may be correcting work already done. It reads the answer in the session of "
+                f"{tref(qu['task'])} and checks that work itself (rule 9).")
     if got:
         return (f"Answered Q-{qid}. {qu['asker']} holds {resource_phrase(kind, what)} at {got} now, but the session of "
                 f"{tref(qu['task'])} cannot use it: a running session keeps what it started with. Your answer does not "
@@ -3417,15 +3658,59 @@ def remembered(agent, tool, key):
     return None
 
 
+REMINDER_MAX = 366 * 86400      # a reminder is a time, so it has the bound a time has: within one year
+
+
 def t_set_reminder(agent, a):
-    try:
-        minutes = float(a.get("minutes"))
-    except (TypeError, ValueError):
-        raise ToolError("minutes must be a number.")
-    note = str(a.get("note") or "").strip() or "reminder"
+    """"Come back to this at this time", for any agent, for a task as well as for a duty's case, which is a task.
+
+    It was the manager's alone, it took a count of minutes, and it delivered to the manager whoever set it -- while
+    the wake-up rules took a schedule, belonged to every agent, and started a NEW task with no memory of this one.
+    Two tools, two owners, two vocabularies, for one idea, and nothing at all for the agent that must wait four
+    hours for a build. This is the one idea; the wake-up rules keep what this does not do, which is recurring work
+    and a saved code check that costs no model turn."""
+    minutes, at = a.get("minutes"), a.get("at")
+    if (minutes in (None, "")) == (at in (None, "")):
+        raise ToolError("Give either minutes (a count from now) or at (a time), and not both.")
+    if at not in (None, ""):
+        due = parse_wake(at, "at")
+    else:
+        try:
+            minutes = float(minutes)
+        except (TypeError, ValueError):
+            raise ToolError("minutes must be a number.") from None
+        if not 0 <= minutes * 60 <= REMINDER_MAX:
+            raise ToolError("minutes must be from now and within one year.")
+        due = now() + minutes * 60
+    note = str(a.get("note") or "").strip()
+    if not note:
+        raise ToolError("Say in note what you are coming back to, in your own words.")
     guard(agent, note)
-    rid = ins("INSERT INTO reminders(due,note) VALUES(?,?)", (now() + minutes * 60, note))
-    return f"Reminder R-{rid} set for {minutes:g} minutes from now."
+    tid = parse_task(a["task_id"]) if a.get("task_id") else None
+    context = getattr(CALL, "context", None)
+    if tid is None and context and len(context) == 3 and context[1] != "owner-chat":
+        tid = parse_task(context[1])            # the task of this session, which is what "come back to this" means
+    t = None
+    if tid is not None:
+        t = get_task(tid, owner=agent)
+        if t["state"] in TERMINAL:
+            raise ToolError(f"{tref(tid)} is already {t['state']}; there is nothing to come back to.")
+    with LOCK:
+        if tid is not None:
+            fence(agent, tid)
+            # One task comes back once: a second call moves the time instead of making a second reminder, which is
+            # also what makes a retry of the same call harmless.
+            q("UPDATE reminders SET done=1 WHERE task=? AND done=0", (tid,))
+        rid = ins("INSERT INTO reminders(due,note,agent,task,created) VALUES(?,?,?,?,?)",
+                  (due, note, agent, tid, now()))
+    if tid is None:
+        return f"Reminder R-{rid}: the hub messages you at {goal_time(due)}."
+    desk = (" Its window stays open, so this machine's desktop is busy until then."
+            if t["needs"] in ("browser", "screen") else "")
+    return (f"Reminder R-{rid}: the hub brings you back to {tref(tid)} at {goal_time(due)}. Until then {tref(tid)} "
+            f"waits: nothing nudges it and no session is started for it, and it is marked as waiting until then for "
+            f"{t['requester']}.{desk} Stop working on it now; the hub puts your note in front of you in this "
+            f"session if it still runs, and in a new one if it does not.")
 
 
 def t_see_team(agent, a):
@@ -3508,6 +3793,103 @@ def account_state(reading, holds, t0):
     return availability("available")
 
 
+# An allowance was seen only after it was spent. The readings are already in the hub -- used_percent and resets_at
+# for each window of each provider account, refreshed every five minutes -- and nothing read them until a session
+# had been held. The manager's is the one that matters most: every question, every result and every permission
+# prompt of the fleet waits for it, and the hub's own flag after the limit cannot reach the owner's phone.
+# The measure is not the percentage. 92% of a weekly window with 42 hours still to run is a fleet that stops before
+# Thursday; 92% with one hour to run is a window that is almost reset. So what is read is the share of the allowance
+# that is gone against the share of the window that is gone.
+ALLOWANCE_PACE = 70             # percent used: below this a fast morning still recovers, and saying it is noise
+ALLOWANCE_LAST = 95             # percent used: this says it on its own, whatever the reset time says
+ALLOWANCE_WINDOW = 86400        # seconds: a shorter window resets itself before advice about it is worth a turn
+
+
+def window_pace(w, t0):
+    """What share of this window's allowance will be gone by its reset if it goes on being spent at the pace of the
+    window so far: 100 is exactly used up, 150 runs out two thirds of the way through. None when the reading does
+    not say how long the window is or when it resets, because the fleet invents no reading."""
+    if not w.get("window_minutes") or not w.get("resets_at"):
+        return None
+    gone = 1 - (w["resets_at"] - t0) / (w["window_minutes"] * 60)
+    return w["used_percent"] / gone if 0 < gone <= 1 else None
+
+
+def allowance_worth_saying(reading, t0):
+    """(window, pace, why) of the one window of this reading that is worth acting on now, or None. `why` is "pace"
+    for a window that runs out before its reset at the pace so far, and "last" for one with almost nothing left,
+    which needs no projection. A missing, stale or errored reading says nothing at all."""
+    if not reading or reading.get("error") or not reading.get("collected_at") or \
+            t0 - reading["collected_at"] > USAGE_STALE:
+        return None
+    found = []
+    for w in reading.get("windows") or []:
+        if (w.get("window_minutes") or 0) * 60 < ALLOWANCE_WINDOW or w["used_percent"] >= 100:
+            continue        # a used-up window is a hold, which the owner's banner and the agent's own line carry
+        pace = window_pace(w, t0)
+        if w["used_percent"] >= ALLOWANCE_LAST:
+            found.append((w, pace, "last"))
+        elif w["used_percent"] >= ALLOWANCE_PACE and pace is not None and pace >= 100:
+            found.append((w, pace, "pace"))
+    return max(found, key=lambda x: x[0]["used_percent"], default=None)
+
+
+def account_groups(t0=None):
+    """{account key: the account} over every route of every agent in one pass: the agents on it, the newest reading
+    of it, the hub's usage-limit holds that a session on it caused, and its allowance. A route with no account
+    identity, and a local model, belong to no account.
+
+    capacity_view builds the same grouping for the manager's choice of who works, with the display that choice
+    needs. This is the grouping alone, for the places that say something about an allowance before it is spent."""
+    t0, out = t0 or now(), {}
+    for name in agents():
+        lim, local = active_limit(name), local_model(agents().get(name) or {})
+        for route, runtime, reading in usage_routes(name):
+            key = (reading or {}).get("account_key")
+            if not key or (route == "primary" and local):
+                continue
+            g = out.setdefault(key, {"key": key, "runtime": runtime, "reading": None, "agents": set(), "holds": []})
+            g["agents"].add(name)
+            if (reading.get("collected_at") or 0) > ((g["reading"] or {}).get("collected_at") or -1):
+                g["reading"] = reading
+            if lim and limit_route(lim) == route:
+                g["holds"].append(lim)
+    for g in out.values():
+        g["agents"] = sorted(g["agents"])
+        g["state"] = account_state(g["reading"], g["holds"], t0)
+    return out
+
+
+def account_group(agent, route="primary", groups=None):
+    """The provider account that one route of one agent spends from, with the other agents that share it. None for
+    a route with no account identity -- a local model, or a reading that has not named one yet."""
+    want = next((r for r in usage_routes(agent) if r[0] == route), None)
+    key = (want[2] or {}).get("account_key") if want else None
+    g = (groups if groups is not None else account_groups()).get(key) if key else None
+    return dict(g, runtime=want[1], sharers=[n for n in g["agents"] if n != agent]) if g else None
+
+
+def allowance_ahead(agent, route="primary"):
+    """(the line to say, the window, why) about this agent's own allowance while there is still something to do
+    about it, or ("", None, None). One reader of the numbers, so the manager's message, its see_capacity, its
+    resume brief and the owner's health screen cannot disagree about what is left."""
+    t0 = now()
+    group = account_group(agent, route)
+    if not group or group["state"]["state"] != "available":
+        return "", None, None      # an account that is already used up is a hold, and the hub says that elsewhere
+    found = allowance_worth_saying(group["reading"], t0)
+    if not found:
+        return "", None, None
+    w, pace, why = found
+    said = (f'the {group["runtime"]} window "{clip(w["label"], 40)}" of your account is {w["used_percent"]:g}% used'
+            + (f" and resets at {clock(w['resets_at'])}" if w["resets_at"] else ", with no given reset")
+            + (f". At the pace of this window so far it is gone before then ({pace:.0f}% of it by the reset)"
+               if why == "pace" else ". Almost nothing is left of it")
+            + (f". {', '.join(group['sharers'])} spend the same allowance" if group["sharers"] else "")
+            + f". The reading is {span(t0 - group['reading']['collected_at'])} old.")
+    return said, w, why
+
+
 LOOKS_AFTER_MAX = 200           # characters of one agent's own words: enough to recognise it, short enough to list
 DIRECTORY_MAX = 2000            # characters of the whole directory in message_agent's description
 _responsible = {}               # (revision, agent) -> that profile's line, which only a commit of the ref changes
@@ -3544,15 +3926,22 @@ def looks_after(agent, rev, duties=None):
 
 def agent_directory(agent):
     """The fleet as one agent reads it in message_agent: every other active agent, with the sentence that says what
-    it looks after. So an agent that is blocked finds the one that looks after the machines, the shop or the mail by
-    what it looks after, instead of having to know a name by chance."""
+    it looks after and what the fleet's own record says it holds. So an agent that is blocked finds the one that
+    looks after the machines, the shop or the mail by what it looks after, instead of having to know a name by
+    chance.
+
+    The holdings are here as well as in a task session's start text, and the duplication is deliberate: a chat
+    window has no start text of the hub's, so this description is the only roster it ever gets, and the sentence
+    alone cannot tell two agents apart while their profiles keep the line they were installed with."""
     rev, duties, kept, left = kit_revision(), {}, [], 0
     for r in q("SELECT agent, text FROM responsibilities WHERE state!='retired' ORDER BY id"):
         duties.setdefault(r["agent"], []).append(duty_name(r["text"]))
     for name, a in agents().items():
         if name == agent or not agent_active(name):
             continue
-        line = f"{name} ({a.get('role')}) looks after: {looks_after(name, rev, duties.get(name, []))}."
+        facts = colleague_facts(name)
+        line = (f"{name} ({a.get('role')}) looks after: {looks_after(name, rev, duties.get(name, []))}."
+                + (" It holds: " + "; ".join(facts) + "." if facts else ""))
         if sum(len(x) + 3 for x in kept) + len(line) <= DIRECTORY_MAX:
             kept.append(line)
         else:
@@ -3691,7 +4080,7 @@ def capacity_view(names=None, expertise=None, needs=None, login=None):
             "resources": grant_pool([a["agent"] for a in out])}
 
 
-def capacity_text(view, filters, needs, restricted=False, parent=None):
+def capacity_text(view, filters, needs, restricted=False, parent=None, caller=None):
     """see_capacity as text. restricted (a lead): only the task IDs of its own scope appear, in every line - its
     session's task and that task's subtasks; the agent's other open work is a count."""
     t0 = view["time"]
@@ -3803,13 +4192,23 @@ def capacity_text(view, filters, needs, restricted=False, parent=None):
         if not pool:
             out.append("  none. Every resource is the owner's to give until it makes one grantable: ask with "
                        "raise_needs_you, and say what the work needs it for.")
+    # The caller's own account is in none of the blocks above: it reads the capacity of the agents it may give work
+    # to, and it is not one of them. Its own allowance is what every one of those placements costs a turn of, so it
+    # belongs in the tool it calls before each one -- said as its own spending and not as a fact about an agent.
+    mine = allowance_ahead(caller)[0] if caller else ""
+    if mine:
+        out.append(f"YOUR OWN ALLOWANCE: {mine} Fewer and bigger turns until the reset"
+                   + (", and raise_needs_you so that the owner knows before it stops you."
+                      if role_of(caller) == "manager" else ", and tell your requester what will not get done.")
+                   + " It is no reason to pass work to an agent that does not suit it.")
     advice = ["Choose by suitability first: expertise, responsibility, knowledge and access. Then workload "
               "and availability."]
     if not restricted:          # only the manager can act on the pool
         advice.append("Access that an agent lacks can be yours to give: grant it from the pool above instead of "
                       "asking the owner, and ask the owner only for what the fleet does not hold yet.")
-    advice.append("If no eligible agent is available, wait for it -- set_reminder brings you back to this in so "
-                  "many minutes -- or tell the owner what capacity is missing. Fleet buys and provisions nothing.")
+    advice.append("If no eligible agent is available, wait for it -- set_reminder brings you back to this at a time "
+                  "you name, in so many minutes or at the reset itself -- or tell the owner what capacity is "
+                  "missing. Fleet buys and provisions nothing.")
     out.append(" ".join(advice))
     return "\n".join(out)
 
@@ -3926,7 +4325,7 @@ def t_see_capacity(agent, a):
         names = [n for n in agents() if n != agent]
     filters = ", ".join(f"{k} {v}" for k, v in (("expertise", expertise), ("needs", needs), ("login", login)) if v)
     return capacity_text(capacity_view(names, expertise, needs, login), filters, needs,
-                         restricted=parent is not None, parent=parent)
+                         restricted=parent is not None, parent=parent, caller=agent)
 
 
 SEARCH_RESULTS = (5, 20)        # search_knowledge: the files of one result, by default and at most
@@ -6468,8 +6867,9 @@ def task_goal(value):
     return g["id"]
 
 
-def parse_wake(value):
-    """An ISO date or date and time in the goals time zone. A date alone means the review hour of that day."""
+def parse_wake(value, field="wake_at"):
+    """An ISO date or date and time in the fleet's own time zone. A date alone means the review hour of that day.
+    One parser for every "at this time" the fleet takes: a goal's wake_at and a reminder's at (asking_and_waiting)."""
     import datetime
     _, hour, zone = goal_settings()
     text = str(value).strip()
@@ -6480,10 +6880,11 @@ def parse_wake(value):
             at = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
             at = at if at.tzinfo else at.replace(tzinfo=zone)
     except ValueError:
-        raise ToolError("wake_at must be an ISO date or date and time, for example 2026-10-14 or 2026-10-14T09:00.")
+        raise ToolError(f"{field} must be an ISO date or date and time, for example 2026-10-14 or 2026-10-14T09:00. "
+                        f"A time with no zone is read in the fleet's own time zone.")
     ts = at.timestamp()
     if not now() < ts <= now() + 366 * 86400:
-        raise ToolError("wake_at must be in the future and within one year.")
+        raise ToolError(f"{field} must be in the future and within one year.")
     return ts
 
 
@@ -11618,6 +12019,33 @@ def circle_sweep(t0):
          "see_history tells you what moved and what did not.")
 
 
+def allowance_sweep(t0):
+    """From the hub tick: the manager's own allowance, to the manager, while it can still do something about it.
+
+    It is the one allowance the whole fleet passes through, and the manager cannot see it: see_capacity lists every
+    agent but itself, so the number was in the hub and in front of nobody. The message names raise_needs_you,
+    because that is the manager's own call and the one path that reaches the owner's phone -- the hub's flags fire
+    after the limit, when nothing can be done about it. Once per window instance, and once more when it is nearly
+    gone: the signature is what was last said, so a new reset time or a worse stage says it again and an unchanged
+    one says nothing."""
+    if t0 - float(kv_get("allowance_sweep_at") or 0) < goal_settings()[0] * 60:
+        return
+    kv_set("allowance_sweep_at", t0)
+    mgr = manager_name()
+    said, w, why = allowance_ahead(mgr)
+    sig = f"{w['id']}|{w['resets_at']}|{why}" if said else ""
+    if sig == (kv_get("allowance_sweep_sig") or ""):
+        return
+    kv_set("allowance_sweep_sig", sig or None)
+    if not sig:
+        return
+    emit(mgr, "say", f"[hub] YOUR OWN ALLOWANCE: {said} Every question, every result and every permission prompt of "
+         f"this fleet waits for you, so when it is gone the fleet stops with you. Do now what you cannot do then: "
+         f"raise_needs_you, saying what you will stop doing and what the owner can change. Until the reset, work in "
+         f"fewer and bigger steps. This is your own allowance and not a reason to move work to an agent with more "
+         f"left: suitability comes first, as it always does.")
+
+
 # ---------------------------------------------------------------- the manager's resume brief
 #
 # The standing session is the fleet's single point of forgetting: when it dies, everything it worked out goes except
@@ -11685,6 +12113,12 @@ def resume_lines(t0):
     if decided:
         out.append("What you did last: " + "; ".join(f"{clip(r['what'], 70)} ({ago(r['ts'])} ago)"
                                                      for r in decided))
+    # Its own allowance, as allowance_start_text already gives a worker its own: the first text of every manager
+    # session, so a session that starts cold does not plan a week of work it cannot pay for.
+    mine = allowance_ahead(manager_name())[0]
+    if mine:
+        out.append(f"YOUR OWN ALLOWANCE: {mine} Fewer and bigger turns until the reset, and raise_needs_you so that "
+                   f"the owner knows before it stops you.")
     return out
 
 
@@ -11723,15 +12157,23 @@ TOOLS = [
      S({"task_id": TASK_ID, "attachment_id": {"type": "string", "description": "The attachment, for example A-3"}},
        ["task_id", "attachment_id"])),
     ("worker", "ask_my_requester", t_ask_my_requester,
-     "Ask the one who gave you the task a question when you are blocked. Only this task pauses. "
-     "Waits briefly for the answer; if none comes, stop working on the task and the answer will arrive later. "
-     "When what you lack is access, name the thing itself in needs_access: the hub reads who holds it and what the "
-     "owner made grantable, and tells your requester whether it can give it, ask the agent that holds it, or take "
-     "it to the owner.",
+     "Ask the one who gave you the task a question. Blocked: ask with no default, and only this task pauses -- it "
+     "waits briefly for the answer, and if none comes you stop and the answer arrives later. Only UNSURE and not "
+     "blocked: say in default what you will go on with, and the task does NOT pause. The call returns at once, your "
+     "requester is told that you are not waiting and answers only if your reading is wrong, and your result says "
+     "this was decided by your reading and not by it. So asking costs you nothing and guessing in silence has no "
+     "excuse. Never a default for access, money or anything that leaves the building -- a send, a post, a payment, "
+     "a deployment: ask without one and wait. When what you lack is access, name the thing itself in needs_access: "
+     "the hub reads who holds it and what the owner made grantable, and tells your requester whether it can give "
+     "it, ask the agent that holds it, or take it to the owner.",
      S({"task_id": TASK_ID, "question": STR,
+        "default": {"type": "string", "description": "What you will go on with if nobody answers. With it the task "
+                    "does not pause and the call returns at once. Leave it out when you are blocked, and never give "
+                    "one for access, money or anything that leaves the building."},
         "needs_access": {"type": "string", "description": "The access that the task needs, as <kind>:<what>: "
                          "repo:acme/web, secret:bws://<uuid>, gmail:a@b.com, drive:a@b.com or tool:<MCP server>"},
-        "wait_seconds": {"type": "integer", "description": "How long to wait for the answer. Default 45, at most 55."}},
+        "wait_seconds": {"type": "integer", "description": "How long to wait for the answer. Default 45, at most 55. "
+                         "Nothing waits when you give a default."}},
        ["task_id", "question"])),
     ("worker", "deliver_result", t_deliver_result,
      "Finish a task. outcome is completed, failed or rejected. Say what was done, where the output is, "
@@ -11882,6 +12324,10 @@ TOOLS = [
      "Give one worker a task. needs is none, browser or screen; the hub refuses a worker that lacks it. "
      "Use follows to point at an earlier task whose result this one builds on or fixes. "
      "Set goal to G-<id> to link the task to an owner goal; the hub refuses a goal that is not active. "
+     "WHAT ITS AGENT SEES: title, done_when, details, what the task it follows did, and -- only when goal is a "
+     "G-<id> -- that goal's own words, its plan step and its limits, in the answer of list_my_tasks. It does not "
+     "see this conversation, so link the goal, and put in details anything else the owner said that limits this "
+     "work. "
      "Say in why, in one line, why this agent suits the task. "
      "WORK TOO MUCH FOR ONE AGENT: write that piece as one step of the goal's plan (update_goal), then give each "
      "part with goal=G-<id> and step=<n>. Every part is then one piece of work: the hub takes the goal from the "
@@ -11930,9 +12376,6 @@ TOOLS = [
      S({"prompt_id": {"type": "string", "description": "Prompt id, for example P-2"},
         "decision": {"type": "string", "enum": ["allow", "deny"]}, "always": {"type": "boolean"}, "reason": STR},
        ["prompt_id", "decision"])),
-    ("manager", "set_reminder", t_set_reminder,
-     "Have the hub message you after some minutes.",
-     S({"minutes": {"type": "number"}, "note": STR}, ["minutes", "note"])),
     ("manager", "see_team", t_see_team,
      "See every agent, every open task, open questions, pending permission prompts and Needs-you items.",
      S({})),
@@ -12253,6 +12696,20 @@ TOOLS = [
         "responsibility": {"type": "string", "description": "Responsibility id, for example R-1"},
         "action": {"type": "string", "description": "pause, resume, retire or reopen"}, "note": {"type": "string"},
         "task_id": TASK_ID}, ["request_id", "responsibility", "action"])),
+    ("all", "set_reminder", t_set_reminder,
+     "Come back to this at a time you name. In a task session it parks that task: nothing nudges it and no session "
+     "is started for it until then, and at the time you named the hub puts your note in front of you in this "
+     "session if it still runs, or in a new one if it does not. So a wait of hours -- a build, a deploy, somebody "
+     "else's answer, nine tomorrow -- costs no open tool call and no turn. Give either minutes or at. Calling it "
+     "again for the same task moves the time instead of making a second reminder. For work that repeats, or a check "
+     "that must cost no turn at all, use save_trigger instead: that is a rule, this is one time.",
+     S({"note": {"type": "string", "description": "What you are coming back to, in your own words"},
+        "minutes": {"type": "number", "description": "A count of minutes from now"},
+        "at": {"type": "string", "description": "A time instead: an ISO date or date and time, for example "
+               "2026-10-21T09:00. With no zone it is read in the fleet's own time zone."},
+        "task_id": {"type": "string", "description": "The task to come back to, which must be your own. Default: "
+                    "the task of this session. A session that holds no task of its own only gets a message."}},
+       ["note"])),
     *[("all", name, {"see_triggers": t_see_triggers, "save_trigger": t_save_trigger,
                      "change_trigger": t_change_trigger}[name], desc, schema) for name, desc, schema in wakeups.TOOL_SPECS],
     ("all", "tell_owner", t_tell_owner,
@@ -12516,6 +12973,8 @@ def overview_text():
         out.append(f"  {tref(t['id'])} [{t['state']}] {t['title']} -- owner {t['owner']}, last activity "
                    f"{ago(t['last_activity'])} ago" + (f", waiting on {t['waiting_on']}" if t["waiting_on"] else "")
                    + (f"; HELD: {held_word(hold)} ({hold['state']})" if hold else "")
+                   + (f"; WAITING until {clock(park['due'])}, as {t['owner']} asked (R-{park['id']}: {park['note']})"
+                      if (park := parked(t["id"])) else "")
                    + (f"; {unknown} unknown outcome(s)" if unknown else "")
                    + (f"; NO LIVE PATH: {t['stalled_reason']}" if t["stalled_since"] else "")
                    # why this agent got this task: the requester's own reasoning, asked for by create_task and
@@ -12540,6 +12999,8 @@ def overview_text():
     rows = q("SELECT * FROM questions WHERE answer IS NULL ORDER BY id")
     for r in rows:
         out.append(f"  Q-{r['id']} from {r['asker']} on {tref(r['task'])}, waiting {ago(r['asked'])}: {r['text']}" +
+                   (f" NOT WAITING: it goes on with \"{r['assumed']}\". Answer only if that is wrong."
+                    if r["assumed"] else "") +
                    (f" {access_route(r['asker'], r['access'], r['requester'])}" if r["access"] else ""))
     if not rows:
         out.append("  none")
@@ -14561,21 +15022,72 @@ def timers():
             traceback.print_exc()
 
 
+def reminder_sweep(t0):
+    """What an agent asked to come back to, put in front of it at the time it named (asking_and_waiting).
+
+    The mark and the delivery land in one transaction, or neither does: the old loop set done=1 and then wrote the
+    message, so a stop between the two lost the reminder for good. A reminder for a task goes to the session of
+    that task -- a message while it runs, a new session when it does not, the shape end_limits already uses for a
+    usage limit that resets -- and the new session is NOT counted as a restart, because coming back at nine is not
+    a crash loop and the three restarts are there for crash loops."""
+    for r in q("SELECT * FROM reminders WHERE done=0 AND due<=?", (t0,)):
+        # agent is null on a reminder written before this version, and every one of those was the manager's.
+        agent = r["agent"] or manager_name()
+        t = q1("SELECT * FROM tasks WHERE id=?", (r["task"],)) if r["task"] else None
+        if r["task"] and (not t or t["state"] in TERMINAL):
+            q("UPDATE reminders SET done=1 WHERE id=?", (r["id"],))     # the task ended; nothing to come back to
+            continue
+        if t and (active_hold(t["id"]) or active_limit(t["owner"])):
+            continue            # held work and an agent at its usage limit wait; the reminder waits with them
+        note = (f"Reminder R-{r['id']}: {r['note']}"
+                + (f" -- carry on with {tref(t['id'])} now. First check what was already done (rule 9): never "
+                   f"repeat an outside action that already happened." if t else ""))
+        if t and not session_alive(agent, t["id"]):
+            event = attempt_event(t, note)      # outside the transaction: the start text reads, and a read commits
+            with transaction():
+                DB.execute("UPDATE reminders SET done=1, fired=? WHERE id=?", (t0, r["id"]))
+                came_back(t["id"], t0)
+                attempt_rows(t, "reminder", event, t0, counted=False)
+            log("hub", f"reminder R-{r['id']} brought {agent} back to {tref(t['id'])} in a new session")
+            continue
+        filed = filed_under(agent, "say", r["task"])
+        with transaction():
+            DB.execute("UPDATE reminders SET done=1, fired=? WHERE id=?", (t0, r["id"]))
+            if t:
+                came_back(t["id"], t0)
+            event_rows([(agent, "say", filed, "[hub] " + note, None)], t0)
+        log("hub", f"reminder R-{r['id']} delivered to {agent}")
+
+
+def came_back(task_id, t0):
+    """Inside the caller's transaction: the silence clock of a task the hub has just brought back starts now. The
+    work was quiet because its own agent said when to come back to it, so the quiet before this moment is not
+    silence -- without this the task is nudged on the same tick that ends its wait."""
+    in_transaction("came_back")
+    DB.execute("UPDATE tasks SET last_activity=?, nudge_level=0, nudged_at=NULL WHERE id=?", (t0, task_id))
+
+
 def liveness(t0):
-    """Every open task needs a live path: a live session, an open question, a hold or a usage-limit wait.
-    A task with none is recovered with a new session (at most three times) or reported to its requester once."""
+    """Every open task needs a live path: a live session, an open question, a hold, a usage-limit wait, or a time its
+    own agent named to come back to it. A task with none is recovered with a new session (at most three times) or
+    reported to its requester once."""
     for t in q("SELECT * FROM tasks WHERE state IN ('submitted','working','input-required','auth-required')"):
         tid, owner = t["id"], t["owner"]
         row = q1("SELECT * FROM agents WHERE name=?", (owner,))
         online = bool(row and row["last_seen"] and t0 - row["last_seen"] < CFG.get("offline_after", 90))
         listed = bool(row and row["alive_ts"] and t0 - row["alive_ts"] <= 60)       # the helper sends its window list
         alive = listed and tref(tid) in set(filter(None, (row["alive"] or "").split(",")))
-        hold, lim = active_hold(tid), active_limit(owner)
-        question = q1("SELECT id FROM questions WHERE task=? AND answer IS NULL ORDER BY id", (tid,))
+        hold, lim, park = active_hold(tid), active_limit(owner), parked(tid)
+        # Only a question the task is actually waiting on is a live path. One asked with a default is not: its task
+        # works on, so a session that then dies has no path of its own and must be restarted like any other -- and
+        # without this filter it would never be, because an open question looked like a reason to wait for ever.
+        question = q1("SELECT id FROM questions WHERE task=? AND answer IS NULL AND assumed IS NULL ORDER BY id", (tid,))
         if hold:
             path = held_word(hold)
         elif lim:
             path = f"waiting for {owner}'s usage limit to reset at {clock(lim['until'])}"
+        elif park:
+            path = f"waiting until {clock(park['due'])}, as {owner} asked (R-{park['id']})"
         elif t["state"] == "submitted":
             path = ((f"waiting for {owner} to load its new settings" if settings_pending(owner) else
                      "waiting for its session to start") if online else None)
@@ -14653,21 +15165,42 @@ def tick():
     mgr = manager_name()
     with LOCK:
         end_limits(t0)
+        # Before the clocks, and for the same reason end_limits is: both bring work back, and a task whose park has
+        # just ended is not a silent task. Run after the silence loop it was nudged at the very tick it came back.
+        reminder_sweep(t0)      # what an agent asked to come back to, at the time it named
         chat_sweep(t0)          # owner feature chat_apps: a message item without a report for 120 seconds
-        # silence on working tasks: nudge the owner, then the requester. Held tasks are quiet on purpose.
+        # Silence on working tasks: nudge the owner, then the requester. Four kinds of task are quiet on purpose and
+        # none of them is nudged -- a held one, one whose agent is at its usage limit, one that is parked until the
+        # time its own agent named, and one whose session is inside a single call that has not run too long yet.
+        # STARTED is in the measure because the hub's own restart is not a task's silence: without it one outage
+        # made every healthy task look silent at the first tick (both rungs, five seconds apart).
         for t in q("SELECT * FROM tasks WHERE state='working'"):
-            if active_hold(t["id"]) or active_limit(t["owner"]):
+            if active_hold(t["id"]) or active_limit(t["owner"]) or parked(t["id"]):
                 continue
-            quiet = t0 - max(t["last_activity"] or t["created"], limit_ended(t["owner"]))
+            quiet = t0 - max(t["last_activity"] or t["created"], limit_ended(t["owner"]), STARTED)
+            # The second rung is measured from the first nudge and not from the same quiet time: after a hub outage
+            # the whole silence was already there at the first tick, so both rungs fired five seconds apart and the
+            # worker never had a chance to answer the first one.
             if t["nudge_level"] == 0 and quiet > CFG["silence"]:
-                q("UPDATE tasks SET nudge_level=1 WHERE id=?", (t["id"],))
-                emit(t["owner"], "say", f"[hub] No activity on {tref(t['id'])} for {span(quiet)}. "
-                     f"Report progress, ask your requester, or deliver.", task=t["id"])
+                rung = 1
+            elif t["nudge_level"] == 1 and quiet > 2 * CFG["silence"] and t0 - (t["nudged_at"] or 0) > CFG["silence"]:
+                rung = 2
+            else:
+                continue
+            busy = busy_in_a_call(t, t0)
+            if busy and busy[1] < CALL_PATIENCE:
+                continue        # it is inside one call and has been for less than the patience: busy, not silent
+            inside = f" It has been inside one call, \"{busy[0]}\", for {span(busy[1])}." if busy else ""
+            if rung == 1:
+                q("UPDATE tasks SET nudge_level=1, nudged_at=? WHERE id=?", (t0, t["id"]))
+                emit(t["owner"], "say", f"[hub] No activity on {tref(t['id'])} for {span(quiet)}.{inside} "
+                     f"Report progress, deliver, or ask your requester -- and if you are only unsure, ask with a "
+                     f"default and go on.", task=t["id"])
                 log("hub", f"nudged {t['owner']} about silent {tref(t['id'])}")
-            elif t["nudge_level"] == 1 and quiet > 2 * CFG["silence"]:
+            else:
                 q("UPDATE tasks SET nudge_level=2 WHERE id=?", (t["id"],))
                 emit(t["requester"], "say", f"[hub] {tref(t['id'])} ({t['title']}, owner {t['owner']}) has been silent "
-                     f"for {span(quiet)}. Decide what to do: wait, cancel it and reassign, or ask.", task=t["id"])
+                     f"for {span(quiet)}.{inside} Decide what to do: wait, cancel it and reassign, or ask.", task=t["id"])
                 log("hub", f"told {t['requester']} that {tref(t['id'])} is silent")
         # tasks that never started: the owner's machine may be offline
         for t in q("SELECT * FROM tasks WHERE state='submitted' AND nudge_level=0"):
@@ -14678,8 +15211,10 @@ def tick():
                 emit(t["requester"], "say", f"[hub] {tref(t['id'])} has not started after {span(t0 - t['created'])}. "
                      f"{t['owner']}'s machine or helper may be offline. Consider cancel_task and another worker.", task=t["id"])
                 log("hub", f"told {t['requester']} that {tref(t['id'])} never started")
-        # unanswered questions: nudge the requester
-        for r in q("SELECT * FROM questions WHERE answer IS NULL AND nudged=0"):
+        # Unanswered questions: nudge the requester. A question asked with a default is not chased: its task is not
+        # waiting, its message already said "answer only if that is wrong", and chasing it would turn the cheap way
+        # of asking into the noisy one.
+        for r in q("SELECT * FROM questions WHERE answer IS NULL AND nudged=0 AND assumed IS NULL"):
             if t0 - r["asked"] > CFG["question_wait"]:
                 q("UPDATE questions SET nudged=1 WHERE id=?", (r["id"],))
                 emit(r["requester"], "say", f"[hub] Question Q-{r['id']} from {r['asker']} has waited "
@@ -14692,6 +15227,7 @@ def tick():
             memory_sweep(t0)            # a lifetime memory: what leaves the shelf, keeping every word
             report_sweep(t0)            # the reports that wait for a decision
             circle_sweep(t0)            # what looks like running in circles
+            allowance_sweep(t0)         # the manager's own allowance, while it can still act on it
             integrity_check(t0)
             expire_handovers(t0)
             settle_checks(t0)
@@ -14710,10 +15246,6 @@ def tick():
             trigger_sweep(t0)
         except Exception:
             traceback.print_exc()           # a broken trigger must not stop the reminders and manager checks below
-        # reminders
-        for r in q("SELECT * FROM reminders WHERE done=0 AND due<=?", (t0,)):
-            q("UPDATE reminders SET done=1 WHERE id=?", (r["id"],))
-            emit(mgr, "say", f"[hub] Reminder R-{r['id']}: {r['note']}")
         # the one exception: the hub tells the owner itself when the manager is gone
         kind, flag = None, None
         pending = q1("SELECT MIN(created) ts FROM events WHERE agent=? AND kind='say' AND read_at IS NULL", (mgr,))["ts"]
@@ -18479,6 +19011,29 @@ def health_view():
         warn("manager_" + flag["kind"], kv_get("mgr_flag"),
              f"Start the session of {manager_name().capitalize()} again." if flag["kind"] == "down" else
              f"Open {manager_name().capitalize()}, where its session and its machine are.", agent=manager_name())
+    # An allowance that will be gone before it resets, while there is still time to do something about it. One line
+    # per provider account and not per agent, because the allowance belongs to the account and several agents can
+    # share one. An account that is already used up is not here: that is a hold, and the lines above carry it.
+    for g in sorted(account_groups(t0).values(), key=lambda x: x["key"]):
+        if g["state"]["state"] != "available":
+            continue
+        found = allowance_worth_saying(g["reading"], t0)
+        if not found:
+            continue
+        w, pace, why = found
+        stops = manager_name() in g["agents"]
+        warn("allowance_pace",
+             f"The {g['runtime']} account of {', '.join(a.capitalize() for a in g['agents'])} has used "
+             f"{w['used_percent']:g}% of its \"{clip(w['label'], 40)}\" window"
+             + (f", which resets at {clock(w['resets_at'])}" if w["resets_at"] else ", for which it gave no reset time")
+             + (f". At the pace of the window so far it is gone before then ({pace:.0f}% of it by the reset)."
+                if why == "pace" else ". Almost nothing is left of it."),
+             (f"Keep your own sessions off this login until the reset, or sign {manager_name().capitalize()} in to an "
+              f"account with allowance left. While the manager is held, nothing on this fleet is answered, checked "
+              f"or decided." if stops else
+              f"Open {g['agents'][0].capitalize()} and tell {manager_name().capitalize()} what must not wait for the "
+              f"reset. Fleet buys no allowance."),
+             agent=manager_name() if stops else (g["agents"][0] if len(g["agents"]) == 1 else None))
     # The two findings of the fleet's own sweeps, on the owner's screen (his rule, 19 October 2026: a screen that
     # reports something wrong must carry the way to put it right). He is told only what the manager has already had
     # and not settled: a circle the hub noticed a minute ago is the manager's to decide, and interrupting the owner
@@ -18537,7 +19092,11 @@ def health_view():
 #   - a runtime whose entry carries no `sign_in` has no sign-in path here: Grok's terms do not let a third party
 #     run it this way, and the entry says so in the words the owner reads (lifecycle.no_sign_in).
 LOGIN_RUNTIMES = tuple(sorted(runtimes_with("sign_in")))        # the runtimes a sign-in can be driven for
-LOGIN_STATES = ("starting", "needs_owner", "signing_in")        # a sign-in that is still going on
+# A sign-in that is still going on. `signing_out` is its first half and only for a replace: the owner wants a
+# DIFFERENT account of this provider, and no provider starts a second sign-in while one is live.
+LOGIN_STATES = ("signing_out", "starting", "needs_owner", "signing_in")
+LOGIN_OPEN = "state IN (%s)" % ",".join("'%s'" % s for s in LOGIN_STATES)
+LOGIN_OUT_RUNTIMES = tuple(sorted(runtimes_with("sign_out")))   # the runtimes a sign-out can be driven for
 LOGIN_LIFE = 900                # seconds a sign-in may take before the hub gives it up
 LOGIN_CODE_LIFE = 180           # seconds the owner's code waits in memory for the machine to take it
 LOGIN_URLS = {name: RUNTIMES[name]["sign_in"]["url"] for name in LOGIN_RUNTIMES}      # the provider's own link
@@ -18566,8 +19125,7 @@ def expire_logins(t0=None):
     """Give up a sign-in that nobody finished, and forget its live part. Also drops a code that the machine never
     came for."""
     t0 = t0 or now()
-    for row in q("SELECT * FROM signin_jobs WHERE state IN ('starting','needs_owner','signing_in') AND updated<?",
-                 (t0 - LOGIN_LIFE,)):
+    for row in q(f"SELECT * FROM signin_jobs WHERE {LOGIN_OPEN} AND updated<?", (t0 - LOGIN_LIFE,)):
         q("UPDATE signin_jobs SET state='failed', detail=?, updated=? WHERE id=?",
           (f"The sign-in was not finished in {LOGIN_LIFE // 60} minutes. Start it again.", t0, row["id"]))
         LIVE_LOGINS.pop(row["id"], None)
@@ -18575,14 +19133,13 @@ def expire_logins(t0=None):
         if live.get("code") and t0 - live.get("code_at", t0) > LOGIN_CODE_LIFE:
             live.pop("code", None)              # the machine never came for it: forget it rather than keep it
             live.pop("code_at", None)
-        if not q1("SELECT id FROM signin_jobs WHERE id=? AND state IN ('starting','needs_owner','signing_in')", (one,)):
+        if not q1(f"SELECT id FROM signin_jobs WHERE id=? AND {LOGIN_OPEN}", (one,)):
             LIVE_LOGINS.pop(one, None)
 
 
 def open_login(agent):
     expire_logins()
-    return q1("SELECT * FROM signin_jobs WHERE agent=? AND state IN ('starting','needs_owner','signing_in') "
-              "ORDER BY id DESC LIMIT 1", (agent,))
+    return q1(f"SELECT * FROM signin_jobs WHERE agent=? AND {LOGIN_OPEN} ORDER BY id DESC LIMIT 1", (agent,))
 
 
 def last_login(agent):
@@ -18600,14 +19157,24 @@ def signed_in_now(agent, runtime):
     "Claude Code is signed in on this machine. Its own sign-out comes first.", which is a dead end with the wrong
     reason on it. Unknown is the honest answer, and then the route refuses for the reason that is true or starts
     the sign-in."""
+    return machine_said(agent, runtime)[0]
+
+
+def machine_said(agent, runtime):
+    """The same answer with the time of the reading it came from: (True/False/None, reported or None).
+
+    **The time is what keeps a replace alive.** A sign-in that begins while the runtime is signed in — the owner
+    wants another account of the same provider — must not be closed by a reading taken before its sign-out, which
+    still says "signed in" about the account he is leaving. So `end_signed_in_waits` asks when the machine said it,
+    and a reading older than the job's own last step decides nothing."""
     row = q1("SELECT data, reported FROM machine_status WHERE agent=?", (agent,))
     if not row or now() - row["reported"] > MACHINE_STALE:
-        return None
+        return None, None
     data = json.loads(row["data"])
     for where in (data.get("runtimes") or {}, {(data.get("runtime") or {}).get("name"): data.get("runtime") or {}}):
         if runtime in where and isinstance(where[runtime], dict):
-            return where[runtime].get("signed_in")
-    return None
+            return where[runtime].get("signed_in"), row["reported"]
+    return None, row["reported"]
 
 
 def end_signed_in_waits(agent, t0=None):
@@ -18625,9 +19192,17 @@ def end_signed_in_waits(agent, t0=None):
     nothing read the one thing that knew. The screen follows the machine now, and never a clock.
     """
     t0 = t0 or now()
-    for row in q("SELECT * FROM signin_jobs WHERE agent=? AND state IN ('starting','needs_owner','signing_in')",
-                 (agent,)):
-        if signed_in_now(agent, row["runtime"]) is not True:
+    for row in q(f"SELECT * FROM signin_jobs WHERE agent=? AND {LOGIN_OPEN}", (agent,)):
+        # **A replace is not over because the machine still says what it said.** Its first half signs the runtime
+        # out of the account the owner is leaving, so while that runs the machine goes on reporting "signed in"
+        # about that very account — and the news this function waits for is about the next one. So a job that has
+        # not signed out yet ends here on nothing, and after it has, only a reading taken since its last step
+        # counts. Without the two of them the owner's Use another account would be marked done before its link
+        # ever reached him.
+        if row["state"] == "signing_out":
+            continue
+        said, when = machine_said(agent, row["runtime"])
+        if said is not True or (when or 0) <= row["updated"]:
             continue
         q("UPDATE signin_jobs SET state='done', detail=NULL, updated=? WHERE id=?", (t0, row["id"]))
         LIVE_LOGINS.pop(row["id"], None)        # the link and any code go, as on any other end of a sign-in
@@ -18635,7 +19210,8 @@ def end_signed_in_waits(agent, t0=None):
     # The sign-in is the last step of both an install and a preparation, so a job that waits there is finished when
     # the machine is signed in. Its words go with its prompt: the app says what a finished job of that kind did.
     for row in q("SELECT * FROM server_jobs WHERE agent=? AND state='needs_owner' AND step='sign_in'", (agent,)):
-        if signed_in_now(agent, row["runtime"]) is not True:
+        said, when = machine_said(agent, row["runtime"])
+        if said is not True or (when or 0) <= row["updated"]:
             continue
         q("UPDATE server_jobs SET state='done', step='sign_in', detail=NULL, prompt=NULL, updated=? WHERE id=?",
           (t0, row["id"]))
@@ -18643,8 +19219,34 @@ def end_signed_in_waits(agent, t0=None):
                    f"{runtime_label(row['runtime'])} signed in")
 
 
-def start_machine_login(agent, runtime):
-    """POST /ui/machines/<agent>/signin: ask this machine to start its runtime's own sign-in. One at a time."""
+def busy_words(busy):
+    """What keeps an agent occupied, in the owner's own words. The same facts `switch_busy` gives a switch, because
+    a sign-out stops the agent exactly as a switch does."""
+    parts = []
+    if busy.get("open_tasks"):
+        parts.append(", ".join(busy["open_tasks"]))
+    if busy.get("chats_waiting"):
+        parts.append("%d chat waiting" % busy["chats_waiting"])
+    if busy.get("desktop"):
+        parts.append("desktop %s open" % busy["desktop"])
+    if busy.get("checks"):
+        parts.append("%d check running" % len(busy["checks"]))
+    if busy.get("jobs"):
+        parts.append("%d credential job open" % len(busy["jobs"]))
+    return ", ".join(parts) or "work open"
+
+
+def start_machine_login(agent, runtime, replace=False):
+    """POST /ui/machines/<agent>/signin: ask this machine to start its runtime's own sign-in. One at a time.
+
+    **`replace` is how an owner uses a DIFFERENT account of the same provider**, and it is the whole reason this
+    route has a second half. No provider starts a second sign-in while one is live, so without it the answer was
+    "its own sign-out comes first" — a step Founderizer had nowhere, which made the app's own button inert. The
+    owner, 20 October 2026, had a manager at 92% of its weekly allowance and an idle account beside it.
+
+    A replace signs the runtime out first and then signs it in, as one job (state `signing_out`, then the ordinary
+    sign-in). It **stops that agent** until the sign-in is finished, so it is refused while the agent has work
+    open, in the same words a switch is: nothing is signed out from under a running task."""
     a = agents().get(agent)
     if a is None:
         raise Refusal(404, "no such agent")
@@ -18656,15 +19258,26 @@ def start_machine_login(agent, runtime):
     open_one = open_login(agent)
     if open_one:
         return {"agent": agent, "login": login_view(open_one, live=False), "changed": False}
-    if signed_in_now(agent, runtime) is True:
-        raise Refusal(409, f"{runtime_label(runtime)} is signed in on this machine. Its own sign-out comes first.")
+    signed_in = signed_in_now(agent, runtime) is True
+    if signed_in and not replace:
+        raise Refusal(409, f"{runtime_label(runtime)} is signed in on this machine. Use another account signs it "
+                           f"out first.")
+    if signed_in and runtime not in LOGIN_OUT_RUNTIMES:
+        raise Refusal(409, f"Founderizer drives no {runtime_label(runtime)} sign-out, so it cannot change the "
+                           f"account on this machine. Sign out there yourself, then sign in.")
     if not q1("SELECT last_seen FROM agents WHERE name=? AND last_seen>?", (agent, now() - MACHINE_STALE)):
         raise Refusal(409, f"{agent}'s helper is not reporting, so nothing can start the sign-in on that machine.")
-    t0 = now()
-    lid = ins("INSERT INTO signin_jobs(agent,runtime,state,created,updated) VALUES(?,?,'starting',?,?)",
-              (agent, runtime, t0, t0))
-    emit(agent, "login", f"Sign in to {runtime_label(runtime)}", extra={"login": lid, "runtime": runtime})
-    log("owner", f"asked {agent} to sign in to {runtime_label(runtime)} (L-{lid})")      # never a code and never a link
+    busy = switch_busy(agent) if signed_in else None
+    if busy:
+        raise Refusal(409, f"{agent.capitalize()} has {busy_words(busy)}. A sign-out stops it, so finish or stop "
+                           f"that first.")
+    t0, state = now(), "signing_out" if signed_in else "starting"
+    lid = ins("INSERT INTO signin_jobs(agent,runtime,state,created,updated) VALUES(?,?,?,?,?)",
+              (agent, runtime, state, t0, t0))
+    emit(agent, "login", f"Sign in to {runtime_label(runtime)}",
+         extra={"login": lid, "runtime": runtime, "replace": signed_in})
+    log("owner", f"asked {agent} to sign in to {runtime_label(runtime)}"      # never a code and never a link
+                 + (" with another account" if signed_in else "") + f" (L-{lid})")
     return {"agent": agent, "changed": True,
             "login": login_view(q1("SELECT * FROM signin_jobs WHERE id=?", (lid,)), live=False)}
 
@@ -18702,6 +19315,10 @@ def login_report(agent, lid, update):
             return {"ok": True, "state": row["state"]}
         raise Refusal(409, f"this sign-in is {row['state']}")
     state, detail = update["state"], update["detail"]
+    # `starting` is the end of a replace's first half and nothing else: a machine must not be able to send a
+    # sign-in that is waiting for the owner back to the beginning and drop its link.
+    if state == "starting" and row["state"] != "signing_out":
+        raise Refusal(409, f"this sign-in is {row['state']}")
     if state == "needs_owner":
         url, shown = update["url"], update["shows_code"]
         if not LOGIN_URLS[row["runtime"]].fullmatch(url or ""):
@@ -18721,8 +19338,8 @@ def login_report(agent, lid, update):
 def login_input(data):
     """The body of POST /helper/login/<agent>/<id>."""
     state = data.get("state")
-    if state not in ("needs_owner", "signing_in", "done", "failed"):
-        raise ValueError("state must be needs_owner, signing_in, done or failed")
+    if state not in ("starting", "needs_owner", "signing_in", "done", "failed"):
+        raise ValueError("state must be starting, needs_owner, signing_in, done or failed")
     detail = data.get("detail")
     if detail is not None and not (isinstance(detail, str) and len(detail) <= 500):
         raise ValueError("detail is at most 500 characters")
@@ -19634,10 +20251,15 @@ class Handler(BaseHTTPRequestHandler):
             runtime = data.get("runtime")
             if not (isinstance(runtime, str) and runtime):
                 raise ValueError("runtime must be claude or codex")
-            return {"agent": agent, "runtime": runtime}
+            if not isinstance(data.get("replace", False), bool):
+                raise ValueError("replace is true or false")
+            # `replace` is the owner asking for a DIFFERENT account of this provider: the runtime is signed out
+            # first and signed in again, as one job. It is part of the command's body, so a repeat of the same
+            # request_id is the same request and a change of mind is a new one.
+            return {"agent": agent, "runtime": runtime, "replace": bool(data.get("replace", False))}
 
         return self.ui_command(f"machines/{agent}/signin", read,
-                               lambda body: start_machine_login(agent, body["runtime"]))
+                               lambda body: start_machine_login(agent, body["runtime"], replace=body["replace"]))
 
     def ui_machine_signin_code(self, agent):
         """POST /ui/machines/<agent>/signin/code: the code the provider gave the owner, for the machine to type into

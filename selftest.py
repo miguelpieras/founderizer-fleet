@@ -65,14 +65,17 @@ def start_hub(name, addresses, *flags, agents=None):
     sys.exit(1)
 
 
-# The tools of each role, by name, in RULES.md's own groups: the ones every agent has, then the manager's fifteen with
-# its two duty writes, or the nine of a worker's task. A count says only that something moved; a set says which tool
-# moved, and RULES.md names every one of these. The tools a grant adds are not here: start_hub drops the grants.
+# The tools of each role, by name, in RULES.md's own groups: the ones every agent has, then the manager's own with
+# its two duty writes, or the ones of a worker's task. set_reminder is in the first group since asking_and_waiting,
+# because "come back to this at this time" was the manager's alone and belongs to every agent that has to wait.
+# A count says only that something moved; a set says which tool moved, and RULES.md names every one of these.
+# The tools a grant adds are not here: start_hub drops the grants.
 EVERY_AGENT = ["read_messages", "search_knowledge", "write_knowledge", "see_responsibilities", "open_case",
                "record_step", "close_case", "attach_watch", "see_notes", "write_notes", "remember", "recall",
-               "forget", "see_triggers", "save_trigger", "change_trigger", "message_owner", "message_agent"]
+               "forget", "see_triggers", "save_trigger", "change_trigger", "set_reminder", "message_owner",
+               "message_agent"]
 MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "answer", "check_result",
-                               "decide_permission", "set_reminder", "see_team", "see_capacity", "see_goals",
+                               "decide_permission", "see_team", "see_capacity", "see_goals",
                                "update_goal", "record_spend", "raise_needs_you", "tell_owner", "grant_access",
                                "set_duty", "change_duty", "see_history", "decide_report"]
 WORKER_TOOLS = EVERY_AGENT + ["list_my_tasks", "report_progress", "read_attachment", "ask_my_requester",
@@ -300,6 +303,11 @@ opening = "\n".join(e["text"] for e in told)
 check("a session is told the tools its Google levels give, by name and not by the name of the level",
       all(t in opening for t in ("drive_search", "drive_write", "drive_move", "gmail_read", "gmail_send")),
       opening[:500])
+# The check below reads one audience's own text, because the corpus of the next one is audience-blind: every prose
+# string of hub.py, whoever reads it. message_agent passed that check on seven strings and was named in no worker's
+# start text -- the one text read at the moment a worker needs a colleague.
+check("a worker's own start text names the other agents and the tool that reaches them",
+      "YOUR TEAM" in opening and "message_agent" in opening and "pa [lead" in opening, opening[:800])
 procL.terminate()
 
 # The universe this check reads: the tool tables as the source has them. Tied to the three tool lists above, so a
