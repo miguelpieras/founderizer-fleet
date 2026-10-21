@@ -2329,13 +2329,12 @@ class Helper:
                 command = runtime_login_command(runtime, program)
             except Refused as e:
                 return report("failed", detail=str(e))
-            ready_runtime_config()                       # the runtime's first screen, not the provider's
+            label = LOGIN_LABELS.get(runtime, runtime)
             # **The first half of a different account.** No provider starts a second sign-in while one is live, so
             # the owner's "Use another account" signs this runtime out first, in the same job and the same window
             # session. Nothing of the old credential is read here: the runtime's own sign-out removes it, and this
             # only waits for the runtime to say it is gone.
             if extra.get("replace") and self.signed_in(runtime):
-                label = LOGIN_LABELS.get(runtime, runtime)
                 try:
                     out_command = runtime_logout_command(runtime, program)
                 except Refused as e:
@@ -2351,22 +2350,48 @@ class Helper:
                     return report("failed", detail=f"{label} did not sign out on this machine, so its account was "
                                                    f"not changed. Sign out there yourself, then sign in.")
                 report("starting", detail=f"{label} is signed out. The sign-in starts now.")
+            # **The runtime's own first screen, and after the sign-out, not before it.** Signing Claude Code out
+            # does not leave it signed out and ready: it puts its whole first run back, so the answers written
+            # before the sign-out go with the account and the sign-in opens behind a theme picker. This call is
+            # here, once, for both halves; it says so when it had to write them again.
+            if ready_runtime_config():
+                self.say(f"sign-in L-{lid}: wrote {label}'s own first-run answers again")
             tmux("kill-session", "-t", session)          # a sign-in that was given up leaves no window behind
             ensure_session(session)
             start_window(session, "login", command)
             url = shown = None
+            asked, answered, seen = LOGIN_SETUP_CURSOR.get(runtime), [], None
             deadline = time.monotonic() + LOGIN_URL_WAIT
             while time.monotonic() < deadline and not url:
                 time.sleep(2)
                 screen = login_screen(session)
                 found = LOGIN_URLS[runtime].search(screen)
                 url = found.group(0) if found else None
-                if url and runtime in LOGIN_SHOWN_CODE:
-                    code = LOGIN_SHOWN_CODE[runtime].search(screen)
-                    shown = code.group(0) if code else None
+                if url:
+                    if runtime in LOGIN_SHOWN_CODE:
+                        code = LOGIN_SHOWN_CODE[runtime].search(screen)
+                        shown = code.group(0) if code else None
+                    break
+                # **A first-run question of the runtime's own, standing in front of the provider's link.** Fleet
+                # takes the option the runtime itself has selected, which is what a person pressing through its
+                # first run would get, and it does so only while a question is really waiting: a window showing
+                # its selection cursor and no link yet. It is bounded, and it presses again only once the screen
+                # has changed, so a key that changes nothing stops it instead of being sent for ninety seconds.
+                here = " ".join(screen.split())
+                if asked and len(answered) < LOGIN_SETUP_ANSWERS and asked.search(screen) and here != seen:
+                    seen, asking = here, login_prompt_line(screen)
+                    answered.append(asking)
+                    self.say(f"sign-in L-{lid}: answering {label}'s own first-run question")
+                    tmux("send-keys", "-t", f"{session}:=login", "Enter")
             if not url:
-                return report("failed", detail=f"{LOGIN_LABELS.get(runtime, runtime)} printed no sign-in link in "
-                                               f"{LOGIN_URL_WAIT} seconds. Try again.")
+                # Which screen, and not "printed no link": the one thing the owner could act on.
+                waiting = login_prompt_line(login_screen(session))
+                detail = f"{label} printed no sign-in link in {LOGIN_URL_WAIT} seconds. "
+                detail += f'Its window is waiting at "{waiting}".' if waiting else \
+                    "Its window showed nothing Founderizer could read."
+                if answered:
+                    detail += f" Founderizer answered {len(answered)} of its own first-run questions first."
+                return report("failed", detail=detail + " Try again.")
             wants = runtime in LOGIN_WANTS_CODE
             report("needs_owner", url=url, shows_code=shown, wants_code=wants)
             if wants and not self.await_login_code(lid, session):
@@ -2375,9 +2400,9 @@ class Helper:
             while time.monotonic() < deadline:
                 if self.signed_in(runtime):
                     self.restart_after_login()
-                    return report("done", detail=f"{LOGIN_LABELS.get(runtime, runtime)} is signed in on this machine.")
+                    return report("done", detail=f"{label} is signed in on this machine.")
                 time.sleep(5)
-            report("failed", detail=f"{LOGIN_LABELS.get(runtime, runtime)} did not report itself signed in. Try again.")
+            report("failed", detail=f"{label} did not report itself signed in. Try again.")
         except Refused as e:
             self.say(f"sign-in L-{lid}: {e}")
         except Exception as e:          # never pass the detail on: the screen of that window could hold the code
@@ -4222,6 +4247,7 @@ PROVIDER_REFUSAL = ("Fleet signs in to no model provider: " + ", ".join(PROVIDER
 LOGIN_SESSION = "fleet-login-%s"            # a tmux session of its own: the agent's own session keeps its windows
 LOGIN_URL_WAIT = 90                         # seconds for the provider's link to appear on the screen
 LOGIN_CODE_WAIT = 840                       # seconds for the owner's code to come back through the hub
+LOGIN_SETUP_ANSWERS = 5                     # first-run questions of its own that a sign-in may be asked past
 LOGOUT_WAIT = 120                           # seconds for the runtime to report that it is signed out again
 LOGIN_DONE_WAIT = 900                       # seconds for the runtime to report that it is signed in: as long
                                             # as the hub keeps the sign-in open (hub.LOGIN_LIFE), because the
@@ -4233,6 +4259,9 @@ LOGIN_URLS = {name: e["sign_in"]["url"] for name, e in RUNTIMES.items() if e["si
 LOGIN_SHOWN_CODE = {name: e["sign_in"]["shows_code"] for name, e in RUNTIMES.items()
                     if e["sign_in"] and e["sign_in"]["shows_code"]}
 LOGIN_WANTS_CODE = tuple(name for name, e in RUNTIMES.items() if (e["sign_in"] or {}).get("wants_code"))
+# How each runtime's own first-run question shows that it waits on a choice; absent for one that asks none.
+LOGIN_SETUP_CURSOR = {name: e["sign_in"]["setup_cursor"] for name, e in RUNTIMES.items()
+                      if e["sign_in"] and e["sign_in"]["setup_cursor"]}
 # What may be typed into a sign-in window, and nothing else: letters, digits, dashes, and the `#` and the
 # second half that Claude's own code carries (`<code>#<state>`, about 94 characters). No space, no control
 # character and no shell or tmux metacharacter, because this text reaches a terminal as keys.
@@ -4304,6 +4333,29 @@ def runtime_logout_command(runtime, exe):
     if not flow:
         raise Refused(f"Fleet drives no sign-out for {runtime}")
     return "exec " + shlex.join([exe, *flow["args"]])
+
+
+# A link, a code, or anything long enough to be one. `login_prompt_line` takes these out before a word of a
+# sign-in window leaves the machine.
+LOGIN_SECRETISH = re.compile(r"https?://\S+|[A-Za-z0-9][A-Za-z0-9_.#-]{15,}")
+
+
+def login_prompt_line(screen):
+    """One safe line saying what the sign-in window is waiting at, so a sign-in that gave up says which screen it
+    was stuck on instead of "printed no link".
+
+    **The screen itself never leaves this machine.** It can hold the provider's link, the code it printed or the
+    code the owner pasted, so anything that could be one of those is taken out first and what is left is one short
+    line of ordinary words — the question, where there is one, else the first line that reads as a sentence."""
+    lines = []
+    for raw in (screen or "").splitlines():
+        line = LOGIN_SECRETISH.sub("", raw).strip(" \t\u2502\u2503|*\u2500\u2501-=_\u276f\u203a>")
+        if len(re.findall("[A-Za-z]", line)) >= 4:
+            lines.append(line[:80])
+    for line in lines:
+        if line.endswith((":", "?")):
+            return line
+    return lines[0] if lines else ""
 
 
 def login_screen(session):

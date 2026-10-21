@@ -1758,6 +1758,15 @@ def clock(ts):
     return time.strftime("%H:%M UTC", time.gmtime(ts)) if ts else "an unknown time"
 
 
+def until_clock(ts, t0=None):
+    """A time to come that cannot be read a day early: how far off it is, and then the clock. clock() carries no
+    date, so "resets at 14:00 UTC" for a reset 31 hours away reads as this afternoon -- and when the question is
+    whether to wait for the reset or sign the agent in to another account, that day is the whole answer."""
+    left = max(0, ts - (t0 if t0 is not None else now()))
+    return (f"in {int(left // 3600)} hours, at {clock(ts)}" if left >= 5400 else
+            f"in {int(left // 60)} minutes, at {clock(ts)}")
+
+
 def active_hold(task_id):
     return q1("SELECT * FROM holds WHERE task=? AND state<>'released' ORDER BY id DESC LIMIT 1", (task_id,)) if task_id else None
 
@@ -3598,6 +3607,54 @@ def t_check_result(agent, a):
             f"create_task(..., follows=\"{tref(tid)}\") that says what to fix.")
 
 
+def expiry_forward(tid, key):
+    """What an agent is told when its permission prompt expired (1.36). Nobody decided, so nothing is forbidden and
+    the same command may be run again, which asks the requester once more -- the hub used to say only "no for now,
+    ask your requester", and an agent that asks has to ask about a prompt that can no longer be decided.
+
+    The second expiry of the same request in the same task is not a third try: two silent windows are a loop, and a
+    loop is what telling an agent to run it again could otherwise build."""
+    if q1("SELECT COUNT(*) n FROM prompts WHERE task=? AND key=? AND decision='expired'", (tid, key))["n"] > 1:
+        return "This request already expired once: do not run it again, and ask your requester what to do instead."
+    return ("Nothing was decided, so nothing is forbidden: run the same thing again when the work needs it, and your "
+            "requester is asked once more. Do not reach it another way; ask your requester if you cannot wait.")
+
+
+def late_permission_word(by, p, decision, reason):
+    """Inside the lock: a decide_permission that arrives after its prompt expired (1.36). It decides nothing -- the
+    prompt stays expired, the command did not run, and a denial is never reversed after the fact -- but the decider's
+    word stops being a dead end. Its only road into the work was a message, and a message lands in the agent's
+    owner-chat window, which has no task tools; so the hub puts the word in the session that holds the work. Returns
+    the refusal, which says what was passed on. The word is passed once: a second call reads back the first.
+
+    A closed task has no session to tell, and a code approval is for one exact revision, so both keep the plain
+    refusal."""
+    pid = p["id"]
+    plain = (f"P-{pid} expired: no decision came in time, so {p['agent']} was told no and the command did not run. "
+             f"Nothing can be decided on it now.")
+    t = q1("SELECT * FROM tasks WHERE id=?", (p["task"],))
+    if p["kind"] == "code":
+        return plain + f" A code approval is for one exact revision: {p['agent']} saves it again to be asked afresh."
+    if not t or t["state"] in TERMINAL:
+        return plain + (f" {tref(p['task'])} is {t['state'] if t else 'gone'}, so it has no session to tell. "
+                        f"A fix is a new task that follows it.")
+    if p["reason"]:
+        return plain + f" {p['reason']}"
+    said = (f"[hub] {by} says {decision} on P-{pid}, which had already expired, so the command did not run. " +
+            (f"Run the same thing again when the work needs it; it asks {by} once more."
+             if decision == "allow" else
+             f"Do not run it, and do not reach it another way.") + (f" {by}: {reason}" if reason else ""))
+    note = f"{by} said {decision} after it expired, and {p['agent']} was told so in its session"
+    filed = filed_under(p["agent"], "say", p["task"])
+    with transaction():
+        DB.execute("UPDATE prompts SET reason=? WHERE id=?", (note, pid))
+        event_rows([(p["agent"], "say", filed, said, None)], now())
+    log(by, f"passed a late {decision} of P-{pid} to {p['agent']} on {tref(p['task'])}")
+    return plain + (f" {p['agent']} has been told in its own task session that you say {decision}" +
+                    (f", so its next attempt reaches you as a new prompt: answer that one with always=true if it "
+                     f"should never ask again." if decision == "allow" else ", so it will not run it."))
+
+
 def t_decide_permission(agent, a):
     pid = parse_id(a.get("prompt_id"), "permission prompt")
     decision = str(a.get("decision") or "").strip().lower()
@@ -3620,8 +3677,7 @@ def t_decide_permission(agent, a):
         if t:
             in_scope(agent, t)
         if p["decision"] == "expired":
-            raise ToolError(f"P-{pid} expired: no decision came in time, so {p['agent']} was told no. "
-                            f"If it should go ahead, tell {p['agent']} to try again.")
+            raise ToolError(late_permission_word(agent, p, decision, reason))
         if p["decision"]:
             raise ToolError(f"P-{pid} was already decided: {p['decision']}.")
         code = p["kind"] == "code"
@@ -3817,17 +3873,32 @@ def window_pace(w, t0):
 
 def allowance_worth_saying(reading, t0):
     """(window, pace, why) of the one window of this reading that is worth acting on now, or None. `why` is "pace"
-    for a window that runs out before its reset at the pace so far, and "last" for one with almost nothing left,
-    which needs no projection. A missing, stale or errored reading says nothing at all."""
+    for a window that runs out before its reset at the pace so far, "last" for one with almost nothing left, which
+    needs no projection, and "spent" for one the account itself reports as used up.
+
+    "spent" is not a hold. The reading says 100% the moment the provider does; the hold is written only when a
+    session is actually refused and its helper reports it. This said nothing at 100% because it took the two to
+    arrive together, and they do not: between them nothing held, nothing warned, and the fleet read as healthy with
+    its week already gone. Whether a hold exists is not in a reading, so the caller gates on that (health_view);
+    this says only what the numbers say.
+
+    A missing, stale or errored reading says nothing at all, and neither does a window whose reset has passed: that
+    window has reset and this reading is simply behind it (account_state calls the same thing "passed"). The fleet
+    invents no reading, and a window the account does not report is not a window at zero: only the windows it does
+    report are read here, so an account that reports no week says nothing about its week."""
     if not reading or reading.get("error") or not reading.get("collected_at") or \
             t0 - reading["collected_at"] > USAGE_STALE:
         return None
     found = []
     for w in reading.get("windows") or []:
-        if (w.get("window_minutes") or 0) * 60 < ALLOWANCE_WINDOW or w["used_percent"] >= 100:
-            continue        # a used-up window is a hold, which the owner's banner and the agent's own line carry
+        if (w.get("window_minutes") or 0) * 60 < ALLOWANCE_WINDOW:
+            continue        # a shorter window resets itself before advice about it is worth a turn
+        if w["resets_at"] is not None and w["resets_at"] <= t0:
+            continue        # it has reset; this reading is behind it, and awaiting a new one says nothing
         pace = window_pace(w, t0)
-        if w["used_percent"] >= ALLOWANCE_LAST:
+        if w["used_percent"] >= 100:
+            found.append((w, pace, "spent"))
+        elif w["used_percent"] >= ALLOWANCE_LAST:
             found.append((w, pace, "last"))
         elif w["used_percent"] >= ALLOWANCE_PACE and pace is not None and pace >= 100:
             found.append((w, pace, "pace"))
@@ -3876,7 +3947,10 @@ def allowance_ahead(agent, route="primary"):
     t0 = now()
     group = account_group(agent, route)
     if not group or group["state"]["state"] != "available":
-        return "", None, None      # an account that is already used up is a hold, and the hub says that elsewhere
+        # A window at 100% makes the state "limited", so "spent" never reaches the text below: what to do about an
+        # allowance that is already gone is not this agent's own pacing but the owner's, and allowance_spent on his
+        # health screen carries it.
+        return "", None, None
     found = allowance_worth_saying(group["reading"], t0)
     if not found:
         return "", None, None
@@ -5816,8 +5890,14 @@ def agent_message_view(m):
 def agent_delivery(m, parent, t0):
     """Inside a transaction: the event of one agent message (16.2). The manager gets a say event. A worker or a lead
     gets it in the task session that sent the message that this one answers, while that task is open; else in its chat
-    window, as a chat event (the helper starts the window as for an owner chat). Returns the event ID."""
-    text = f"[message from {m['sender']} id=AM-{m['id']}] {m['text']}"
+    window, as a chat event (the helper starts the window as for an owner chat). Returns the event ID.
+
+    The header names the sender's own task when the message came from a task session (1.36). The hub stored it from
+    the start and said it to nobody, so a peer with two tasks open could not tell which one was being asked about.
+    A message from a chat window belongs to no task and names none. It is the sender's task and never the reader's
+    authority: the header says who is asking about what, and nothing more."""
+    on = f" on {tref(m['sender_task'])}" if m["sender_task"] else ""
+    text = f"[message from {m['sender']}{on} id=AM-{m['id']}] {m['text']}"
     to = m["recipient"]
     if role_of(to) == "manager":
         return DB.execute(EVENT, (to, "say", None, text, t0, "{}")).lastrowid
@@ -11996,6 +12076,59 @@ def reports_waiting(t0):
     return [r for r in open_reports(kinds=False) if t0 - r["created"] > REPORT_OWNER_WAIT]
 
 
+# A task that nothing is moving (tasks_stuck). Every alarm the hub raises about one task is sent once: the worker is
+# nudged, the requester is told, and after that the hub is silent for ever -- a wedged session, a session that
+# finished without deliver_result, a task that never started and a task with no session left after its three
+# restarts all read alike, and `see_team` says "quiet 24h00" while the owner's screen says nothing at all. These
+# three measures are the owner's own rung, and they add no message to any agent: the hub still changes nothing by
+# itself about a stuck task, because cancelling or reassigning it is the manager's decision.
+STUCK_NO_PATH = 3600        # seconds an open task may have no live path at all (liveness has given up on it)
+STUCK_SUBMITTED = 1200      # seconds a task may sit submitted while its own agent's helper keeps checking in
+STUCK_SILENT = 7200         # seconds a working task may be silent while no call of its session is open
+
+
+def tasks_stuck(t0):
+    """[(since, one line)] of the open tasks that nothing is moving and that the requester was already told about,
+    oldest first.
+
+    The rule `circles_waiting` sets holds here: the owner is told only what the manager (or a lead) already had in
+    front of it and did not settle, so every line here has had its own message upward -- `nudge_level` 2 is the
+    silence rung, the never-started nudge and the no-live-path report, and a `restarts` over the bound is the "no
+    running session after 3 restarts" message. Without that gate this would be a third rung aimed at the owner,
+    which is the drowning the fleet's own rule about his attention forbids.
+
+    **Deliberate quiet is not stuckness**, and that is the case that must not regress. A held task, a task whose
+    agent is at its usage limit and a parked task are left out whole, exactly as the clocks of `tick` leave them
+    out; and a session inside one unfinished call is left out of the silence measure however long that call has
+    run, because it is visibly inside that call, the requester's own message named the call and its age, and this
+    rung exists for work that nothing is doing."""
+    out, updating = [], release_applying()      # an update run holds every start on purpose, as the nudge knows
+    for t in q(f"SELECT * FROM tasks WHERE {OPEN_TASK} ORDER BY id"):
+        if active_hold(t["id"]) or active_limit(t["owner"]) or parked(t["id"]):
+            continue        # the three kinds of quiet on purpose, as in tick's own silence loop
+        if t["nudge_level"] < 2 and t["restarts"] <= SESSION_RESTARTS:
+            continue        # nobody upward has been told yet: it is not the owner's to see
+        if not t["live_path"] and t0 - (t["stalled_since"] or t0) > STUCK_NO_PATH:
+            since = t["stalled_since"]
+            says = (f"has had no live path for {ago(since)} and is still {t['state']}: "
+                    f"{t['stalled_reason'] or 'no reason recorded'}")
+        elif (t["state"] == "submitted" and not updating and t0 - t["created"] > STUCK_SUBMITTED
+                and helper_online(t["owner"], t0)):
+            since = t["created"]
+            says = (f"has not started in {ago(since)}, though {t['owner']}'s helper keeps checking in: its runtime "
+                    f"may be signed out, or its session may be failing to start")
+        elif t["state"] == "working":
+            quiet = t0 - max(t["last_activity"] or t["created"], limit_ended(t["owner"]), STARTED)
+            if quiet <= STUCK_SILENT or busy_in_a_call(t, t0):
+                continue        # the fourth kind of quiet on purpose: one call of its own that has not finished
+            since = t0 - quiet
+            says = f"has been silent for {ago(since)} with no call of its session open"
+        else:
+            continue
+        out.append((since, f"{tref(t['id'])} ({clip(t['title'], 60)}, owner {t['owner']}) {says}"))
+    return sorted(out)
+
+
 def circle_sweep(t0):
     """From the hub tick: the circles the fleet is running in, to the manager, when the set changes. The hub reports;
     the decision stays the manager's."""
@@ -13137,6 +13270,7 @@ def board_html():
         took = f" by {r['by']} after {int(r['decided'] - r['created'])}s" if r["decided"] else ""
         if r["decision"] == "expired":
             took = " (nobody decided in time; the answer given was no)"
+            took += f"; {r['reason']}" if r["reason"] else ""
         dec = esc(r["decision"]) + esc(took) if r["decision"] else f"<i>waiting {esc(ago(r['created']))}</i>"
         p.append(f"<tr><td>P-{r['id']} {esc(r['tool'])} <span class='muted'>{esc(r['input'])}</span></td>"
                  f"<td>{esc(r['agent'])}</td><td>{tref(r['task'])}</td><td>{dec}</td></tr>")
@@ -15160,6 +15294,12 @@ def offline_sweep(t0):
         log("hub", f"{name} went offline (last check-in {clock(seen)}); the manager was told")
 
 
+# How long the hub's own timers may be silent before the owner's screen asks about them (tick_heartbeat). A pass
+# takes milliseconds and runs every CFG["tick"] (5) seconds, so this is twelve missed passes: late enough that a
+# long sweep of its own cannot raise it, early enough that the fleet has not been unattended for a working day.
+TICK_WARN = 60
+
+
 def tick():
     t0 = now()
     mgr = manager_name()
@@ -15295,6 +15435,13 @@ def tick():
             kv_set("mgr_flag", flag)        # keep the minutes current
             if not kv_get("mgr_flag_since"):
                 kv_set("mgr_flag_since", t0)
+        # The last line of the pass, and the only thing that says the pass reached it (tick_heartbeat). The first
+        # half of this function is deliberately unguarded -- reminder_sweep must run before the clocks, and a tick
+        # that half-runs and says nothing is the thing being fixed, not a reason to wrap each section in a try. So
+        # one raising callee still ends the whole pass, and now the record of it is not only the journal: this key
+        # stops moving, and health_view says so. t0 and not now(), because what the owner needs is when the last
+        # complete pass began: a pass that takes longer than TICK_WARN to finish is also a pass to look at.
+        kv_set("tick_ok", t0)
 
 
 # ---------------------------------------------------------------- practice site
@@ -18963,6 +19110,22 @@ def health_view():
         warn("schema", f"This database refused {len(schema)} schema step(s) at the last start, and the hub runs "
                        f"without them: " + " | ".join(schema[:3]),
              "Tell us, with the step above. This hub answers without it until a release your records accept.")
+    # The sweeper's own sweeper (tick_heartbeat). The hub answers every request while its timers are stopped, so
+    # without this line the fleet looks well on every screen and nothing is nudged, restarted or reported. The key
+    # is written at the hub's start and then at the end of each complete pass, so this reads as a question only
+    # when a pass is genuinely overdue, and a hub with no timers thread at all (every test) is asked nothing.
+    try:
+        beat = float(kv_get("tick_ok"))
+    except (TypeError, ValueError):
+        beat = None
+    if beat and t0 - beat > TICK_WARN:
+        warn("timers_stalled",
+             f"The hub's timers last completed a full pass {ago(beat)} ago, at {clock(beat)}. They run every "
+             f"{CFG.get('tick', 5):g} seconds: while they are stopped, no silent task is nudged, no lost session is "
+             f"started again, no work held by a usage limit is resumed, and no goal, duty or report is swept.",
+             "Tell us. The hub's own log holds the error that stopped the pass (on the hub machine: journalctl "
+             "--user -u fleet-hub -n 200). Restarting fleet-hub frees a pass that is stuck; a pass that fails on a "
+             "record fails again after the restart.", agent=on_the_hub)
     helpers = []
     for name in agents():
         row = q1("SELECT last_seen FROM agents WHERE name=?", (name,))
@@ -19011,28 +19174,53 @@ def health_view():
         warn("manager_" + flag["kind"], kv_get("mgr_flag"),
              f"Start the session of {manager_name().capitalize()} again." if flag["kind"] == "down" else
              f"Open {manager_name().capitalize()}, where its session and its machine are.", agent=manager_name())
-    # An allowance that will be gone before it resets, while there is still time to do something about it. One line
-    # per provider account and not per agent, because the allowance belongs to the account and several agents can
-    # share one. An account that is already used up is not here: that is a hold, and the lines above carry it.
+    # An allowance that is gone, or will be gone before it resets. One line per provider account and not per agent,
+    # because the allowance belongs to the account and several agents can share one.
+    #
+    # The gate is the hold and not the state. account_state calls an account "limited" the moment its reading says
+    # 100%, but the owner's banner is built from active_limit, and that hold is written only when a session is
+    # actually refused and its helper reports it. The two do not arrive together, and this said nothing at 100%
+    # because it assumed they did: between the reading and the first refusal nothing held and nothing warned, so a
+    # fleet whose week was gone answered ok with no warnings at all (his own words, 21 October 2026: "manager is
+    # NOT at 97% - not updated! it is concerning"). That span is what allowance_spent is for. Once a hold exists
+    # this falls silent again: the manager banner above and the agent's own start text carry it, and a third voice
+    # saying the same thing is noise.
     for g in sorted(account_groups(t0).values(), key=lambda x: x["key"]):
-        if g["state"]["state"] != "available":
-            continue
+        if g["holds"] or g["state"]["state"] == "unknown":
+            continue        # a reading the hub cannot trust says nothing of its own; the fleet invents no reading
         found = allowance_worth_saying(g["reading"], t0)
         if not found:
             continue
         w, pace, why = found
-        stops = manager_name() in g["agents"]
-        warn("allowance_pace",
-             f"The {g['runtime']} account of {', '.join(a.capitalize() for a in g['agents'])} has used "
-             f"{w['used_percent']:g}% of its \"{clip(w['label'], 40)}\" window"
-             + (f", which resets at {clock(w['resets_at'])}" if w["resets_at"] else ", for which it gave no reset time")
-             + (f". At the pace of the window so far it is gone before then ({pace:.0f}% of it by the reset)."
-                if why == "pace" else ". Almost nothing is left of it."),
-             (f"Keep your own sessions off this login until the reset, or sign {manager_name().capitalize()} in to an "
-              f"account with allowance left. While the manager is held, nothing on this fleet is answered, checked "
-              f"or decided." if stops else
-              f"Open {g['agents'][0].capitalize()} and tell {manager_name().capitalize()} what must not wait for the "
-              f"reset. Fleet buys no allowance."),
+        stops, spent = manager_name() in g["agents"], why == "spent"
+        # Spent says what is true and what it costs: the window is gone, and the reason no other line here says so
+        # is that nothing has failed yet. It carries no projection -- there is nothing left to project. Its reset
+        # says how far off it is, because here the reset is the decision: waiting out seven hours and waiting out
+        # thirty-one are not the same answer, and the clock alone does not tell them apart.
+        said = ((f"has used all of its \"{clip(w['label'], 40)}\" window"
+                 + (f", which resets {until_clock(w['resets_at'], t0)}" if w["resets_at"]
+                    else ", for which it gave no reset time")
+                 + ". No session has been refused yet, so nothing holds it and no other line here says so: the next "
+                   "session on this account is the one that stops.") if spent else
+                (f"has used {w['used_percent']:g}% of its \"{clip(w['label'], 40)}\" window"
+                 + (f", which resets at {clock(w['resets_at'])}" if w["resets_at"]
+                    else ", for which it gave no reset time")
+                 + (f". At the pace of the window so far it is gone before then ({pace:.0f}% of it by the reset)."
+                    if why == "pace" else ". Almost nothing is left of it.")))
+        # The manager's fix keeps the words it already had, minus the one that no longer helps: keeping sessions off
+        # the login saves what is left of a window, and a spent one has nothing left to save.
+        if stops and spent:
+            fix = (f"Sign {manager_name().capitalize()} in to an account with allowance left. While the manager is "
+                   f"held, nothing on this fleet is answered, checked or decided.")
+        elif stops:
+            fix = (f"Keep your own sessions off this login until the reset, or sign "
+                   f"{manager_name().capitalize()} in to an account with allowance left. While the manager is held, "
+                   f"nothing on this fleet is answered, checked or decided.")
+        else:
+            fix = (f"Open {g['agents'][0].capitalize()} and tell {manager_name().capitalize()} what must not wait "
+                   f"for the reset. Fleet buys no allowance.")
+        warn("allowance_spent" if spent else "allowance_pace",
+             f"The {g['runtime']} account of {', '.join(a.capitalize() for a in g['agents'])} " + said, fix,
              agent=manager_name() if stops else (g["agents"][0] if len(g["agents"]) == 1 else None))
     # The two findings of the fleet's own sweeps, on the owner's screen (his rule, 19 October 2026: a screen that
     # reports something wrong must carry the way to put it right). He is told only what the manager has already had
@@ -19047,6 +19235,17 @@ def health_view():
              + (f" | and {len(stuck) - 2} more." if len(stuck) > 2 else ""),
              f"Open {manager_name().capitalize()} and tell it what to do about them. The hub reports a circle and "
              f"changes nothing by itself, because the third attempt is sometimes the right one.",
+             agent=manager_name())
+    wedged = tasks_stuck(t0)
+    if wedged:
+        warn("tasks_stuck",
+             f"{len(wedged)} open task(s) are stuck and nothing is moving them. "
+             f"{manager_name().capitalize()} was told about each and has settled none: "
+             + " | ".join(line for _, line in wedged[:2])
+             + (f" | and {len(wedged) - 2} more." if len(wedged) > 2 else ""),
+             f"Open {manager_name().capitalize()} and tell it what to do about them: wait, cancel each and give the "
+             f"work to another worker, or raise a Needs-you item. The hub starts a lost session again three times "
+             f"and then changes nothing by itself, because cancelling work is a decision, not a timer.",
              agent=manager_name())
     waiting = reports_waiting(t0)
     if waiting:
@@ -24429,10 +24628,16 @@ class Handler(BaseHTTPRequestHandler):
                 activity(tid)
         if not row["decision"]:
             log("hub", f"P-{pid} got no decision in {int(CFG['hook_wait'])}s; {agent} was told no")
+            forward = expiry_forward(tid, key)
             emit(requester, "say", f"[hub] P-{pid} from {agent} on {tref(tid)} expired without a decision. "
-                                   f"{agent} was told no for now and may ask you what to do.", task=tid or None)
+                                   f"{agent} was told no for now, and that it may run the same thing again, which "
+                                   f"asks you once more. decide_permission on P-{pid} decides nothing now: it passes "
+                                   f"your word to that session, because a message of yours would not reach it.",
+                 task=tid or None)
+            emit(agent, "say", f"[hub] P-{pid} expired: nobody decided in {int(CFG['hook_wait'])}s, so {tool} was "
+                               f"refused for now and did not run. {forward}", task=tid)
             return reply("deny", f"No decision arrived in {int(CFG['hook_wait'])} seconds, so the answer is no for now. "
-                                 f"Do not work around it: ask your requester what to do.")
+                                 f"{forward}")
         try:
             fence(agent, tid, (data.get("generation"), task, data.get("attempt")))
         except ToolError as e:
@@ -24620,6 +24825,11 @@ def main():
     q("UPDATE prompts SET decision='expired', decided=? WHERE decision IS NULL", (now(),))
     q("UPDATE jobs SET ok=0, result='the hub restarted', finished=? WHERE finished IS NULL", (now(),))
     settle_pings()
+    # The heartbeat starts here and not at the first complete pass (tick_heartbeat), so that a hub whose very first
+    # pass raises -- a bad row is there before the timers are -- is visible on the owner's screen after TICK_WARN
+    # instead of for ever reading as a hub that has not ticked yet. A process with no timers thread (every test)
+    # writes this key nowhere and is asked nothing.
+    kv_set("tick_ok", now())
     threading.Thread(target=timers, daemon=True).start()
     threading.Thread(target=knowledge_refresher, name="knowledge-pages", daemon=True).start()
     threading.Thread(target=ping_sender, name="pings", daemon=True).start()

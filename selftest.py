@@ -425,11 +425,18 @@ check("a long command that differs only at its end is a new question", d["behavi
 check("permission messages contain the full command", any(long_b in e["text"] for e in events("manager")))
 check("a denial comes back with the reason", "never" in d.get("message", ""), text)
 before = events("manager")[-1]["id"]
+mine = events("studio")[-1]["id"]
 t0 = time.time(); code, _, text = raw("POST", "/hook/permission/studio/T-2", dict(hook_body, tool_input={"command": "sudo reboot"}))
 d = json.loads(text)["hookSpecificOutput"]["decision"]
-check("no decision in time: the answer is no, with the way forward", d["behavior"] == "deny" and "ask your requester" in d["message"] and 3.5 < time.time() - t0 < 7, text)
+check("no decision in time: the answer is no, with the way forward", d["behavior"] == "deny" and "ask your requester" in d["message"] and "run the same thing again" in d["message"] and 3.5 < time.time() - t0 < 7, text)
+check("the worker's own session is told that an expiry forbids nothing",
+      any("P-4 expired" in e["text"] and "run the same thing again" in e["text"] for e in events("studio", after=mine)))
+mine = events("studio")[-1]["id"]
 text, err = tool("manager", "decide_permission", prompt_id="P-4", decision="allow")
 check("a decision that comes too late is refused, not lost", err and "expired" in text, text)
+check("a late word reaches the session that holds the work and decides nothing",
+      "told in its own task session" in text and
+      any("manager says allow on P-4" in e["text"] for e in events("studio", after=mine)), text)
 check("the requester is told the prompt expired", any("P-4" in e["text"] and "expired" in e["text"] for e in events("manager", after=before)))
 check("the task is working again after the prompt", "T-2 [working]" in tool("manager", "see_team")[0])
 before = events("manager")[-1]["id"]

@@ -81,7 +81,8 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
 #   local_model       the start-command flag by which it runs a model on the machine itself; None when it has none
 #   sign_in           the sign-in the fleet drives for it, or None: {args, after the executable; url, the provider's
 #                     own link as it is read from the screen; shows_code, the code the provider prints, or None;
-#                     wants_code, it waits for a code the owner pastes}
+#                     wants_code, it waits for a code the owner pastes; setup_cursor, how a first-run question of
+#                     its own shows that it is waiting on a choice, or None for a runtime that asks none}
 #   sign_out          the sign-out the fleet drives for it, or None: {args, after the executable}. It exists for one
 #                     reason: a provider will not start a second sign-in while one is live, so an owner who wants a
 #                     DIFFERENT account of the same provider needs this half first (hub.start_machine_login, replace)
@@ -123,7 +124,8 @@ RUNTIMES = {
         # Codex shows the owner a code to type into the browser; Claude gives the owner a code to type in here.
         "sign_in": {"args": ["login", "--device-auth"],
                     "url": re.compile(r"https://auth\.openai\.com/[A-Za-z0-9/_?=&.%-]{0,400}"),
-                    "shows_code": re.compile(r"\b[A-Z0-9]{4}-[A-Z0-9]{4,6}\b"), "wants_code": False},
+                    "shows_code": re.compile(r"\b[A-Z0-9]{4}-[A-Z0-9]{4,6}\b"), "wants_code": False,
+                    "setup_cursor": None},
         "sign_out": {"args": ["logout"]},
         "no_sign_in": None,
         "sandbox": {"name": "Codex", "flag": "--sandbox", "value": "[a-z-]+", "unset": "the default",
@@ -157,9 +159,13 @@ RUNTIMES = {
         "token_in_env": False,
         "model_flags": {"model": ["--model", "{}"], "effort": ["--effort", "{}"]},
         "local_model": None,
+        # Signing Claude Code out puts its own first run back, so its sign-in can open behind a theme picker and a
+        # "Select login method". `ready_runtime_config` answers those in the runtime's own file; this is what the
+        # helper watches for when a question stands there anyway (a new one, or a version that asks it again).
         "sign_in": {"args": ["/login"],
-                    "url": re.compile(r"https://(?:claude\.ai|console\.anthropic\.com)/[A-Za-z0-9/_?=&.%#+-]{0,400}"),
-                    "shows_code": None, "wants_code": True},
+                    "url": re.compile(r"https://(?:claude\.ai|claude\.com|console\.anthropic\.com)/[A-Za-z0-9/_?=&.%#+-]{0,400}"),
+                    "shows_code": None, "wants_code": True,
+                    "setup_cursor": re.compile(r"(?m)^[^\S\n]*[\u276f\u203a>]\s+\S")},
         "sign_out": {"args": ["/logout"]},
         "no_sign_in": None,
         "sandbox": {"name": "Claude", "flag": "--permission-mode", "value": "[A-Za-z]+", "unset": "default",
