@@ -542,7 +542,7 @@ def integration_env(agent, conf, keys=None):
     groups = [{"token": t["token"], "repos": [r for r in t["repos"] if isinstance(r, str) and r in repos]}
               for t in data.get("tokens") or [] if isinstance(t, dict) and isinstance(t.get("token"), str)
               and GITHUB_TOKEN.fullmatch(t["token"]) and isinstance(t.get("repos"), list)]
-    groups = [g for g in groups if g["repos"]]          # the first one is GH_TOKEN's: the hub sends write first
+    groups = [g for g in groups if g["repos"]]      # the first is GH_TOKEN's: the hub sends the highest access first
     tokens = {r: g["token"] for g in groups for r in g["repos"]}
     values, notes = {}, [f"No GitHub token for {', '.join(map(str, e.get('repos') or []))}: {e.get('error')}."
                          for e in data.get("errors") or [] if isinstance(e, dict)]
@@ -637,6 +637,9 @@ def github_text(values, tools):
                  "repository, work on a new branch from the latest origin default branch and push only that branch. "
                  "For a change, open a pull request (gh pr create) and give its link in your result. Never push to the "
                  "default branch and never merge. ")
+    if any(access == "deploy" for _, access in repos):
+        text += ("deploy is write and the repository's own deployment: its .github/workflows files, which a write "
+                 "token may not push at all, and its GitHub Actions runs (gh workflow, gh run). ")
     if "GH_TOKEN" in values:
         text += ("GH_TOKEN and git's credentials for these repositories stop working one hour after this start. Never "
                  "show them or put them in a note, a file, a command or a commit. ")

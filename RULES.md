@@ -98,7 +98,7 @@ A manager session that starts cold opens with where the fleet stood — each goa
 
 The manager chooses in this order:
 
-1. **Suitability.** The goal, the agent's expertise and title, what its profile makes it responsible for, the duties that it already holds and whether they are in order, its knowledge files, and its access: capabilities (browser, screen), the secrets it may use (logins and API keys, by name, and which API keys it reads in its sessions), its GitHub repositories (read or write) and its Gmail and Drive levels. `see_capacity` shows these facts and why an agent is not eligible, and it shows you your own allowance when that is far enough gone to change how you work. For the manager it also shows the grantable pool and, on each agent's line, the access that it does not have yet and the manager may give it: an agent that suits the work but lacks the access is still a choice, because the grant is one call away.
+1. **Suitability.** The goal, the agent's expertise and title, what its profile makes it responsible for, the duties that it already holds and whether they are in order, its knowledge files, and its access: capabilities (browser, screen), the secrets it may use (logins and API keys, by name, and which API keys it reads in its sessions), its GitHub repositories (read, write or deploy) and its Gmail and Drive levels. `see_capacity` shows these facts and why an agent is not eligible, and it shows you your own allowance when that is far enough gone to change how you work. For the manager it also shows the grantable pool and, on each agent's line, the access that it does not have yet and the manager may give it: an agent that suits the work but lacks the access is still a choice, because the grant is one call away.
 2. **Then workload and availability.** Open tasks, and for each runtime account: available, limited until a reset, offline, in setup, or unknown (no current reading). Agents that share one paid account share one allowance; it counts once.
 
 Never give work to an agent that is not suitable because it has more allowance or is free now. If no suitable agent is available: wait for it (`see_capacity` says until when, when the provider gave a time), or tell the owner what capacity is missing (more workers, or more account capacity) with `tell_owner` or `raise_needs_you`. Fleet buys and provisions nothing. Say in `create_task`'s `why`, in one line, why this agent suits the task.
@@ -203,7 +203,9 @@ like a refund tool that checks the amount itself — and never for a wider key.
   is visible without the owner having to look for it.
 - **A blocked task names what it needs.** A worker or a lead that cannot go on for want of access calls
   `ask_my_requester` with the thing itself in `needs_access`: `repo:acme/web`, `secret:bws://<uuid>`, `gmail:a@b.com`,
-  `drive:a@b.com` or `tool:<MCP server>`, the same name that `grant_access` takes. The hub reads the pool and the
+  `drive:a@b.com` or `tool:<MCP server>`, the same name that `grant_access` takes. A thing you hold at a **lower
+  level** than the work needs is access you do not have, so name that level in `needs_level`: a repository at `write`
+  when the work must change a workflow file is an ask for the same repository at `deploy`. The hub reads the pool and the
   holders at that moment and tells your requester which of the three routes it is, in the words of its own tools: the
   grant that settles it, the agent that already holds it and can do this part, or new access, which the manager takes
   to the owner with `raise_needs_you`. A lead has no `grant_access`, so it passes such a question to the manager with
@@ -313,7 +315,7 @@ If your browser tools say that the browser extension is not connected, stop. Do 
 
 ## GitHub repositories
 
-The owner can give you GitHub repositories, each with read or write access, and tools such as `github` (the GitHub MCP server). They reach your task sessions only.
+The owner can give you GitHub repositories, each with read, write or deploy access, and tools such as `github` (the GitHub MCP server). They reach your task sessions only. `deploy` is `write` and the repository's own deployment: its workflow files, which a `write` token may not push at all, and its GitHub Actions runs.
 
 - Your start text names your repositories. Your helper fetches each one into `~/fleet-work/<owner>/<name>` just before the session starts, or clones it there.
 - `GH_TOKEN` (for `gh` and the `github` tool) and git's credentials for github.com work only for your repositories, with the access that the owner gave. They stop one hour after the session starts; a new session gets new ones. Never use another GitHub credential that you find on the machine.

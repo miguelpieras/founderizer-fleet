@@ -253,9 +253,17 @@ MODEL_NAME = re.compile(r"[A-Za-z0-9._:/\[\]-]{1,120}")
 EFFORT_NAME = re.compile(r"[a-z]{1,20}")
 LOGIN_REASONS = ("ok", "not_found", "no_access", "bad_format", "no_token", "timeout", "error")
 APP_SERVER = "app-server"       # the start policy of a worker or lead of APP_SERVER_RUNTIME: screen_runner.py
-# GitHub repositories (owner feature integrations): owner/name in lower case, and the access that the owner gives.
+# GitHub repositories (owner feature integrations): owner/name in lower case, and the access that the owner gives,
+# from the lowest to the highest. deploy is write and the repository's own deployment: its workflow files, which a
+# token without the App's workflows permission may not push at all, and its GitHub Actions runs.
 REPO_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,38}/(?!\.\.?$)[a-z0-9._-]{1,100}")
-REPO_ACCESS = ("read", "write")
+REPO_ACCESS = ("read", "write", "deploy")
+# What the owner alone can do for deploy, in one sentence: GitHub refuses the token until the App carries those two
+# permissions and the installation has accepted them. The hub says it where a deploy token is refused, where an agent
+# asks for deploy and where the manager grants it, so nobody reads a bare GitHub error.
+DEPLOY_APP_NOTE = ("deploy needs the Workflows and Actions permissions on the hub's GitHub App, and the owner must "
+                   "accept them on the App's installation page (GitHub Settings, Applications, the hub's App); "
+                   "GitHub refuses a deploy token until then")
 # A GitHub App installation token, as the hub gets it and a session uses it: GitHub's current ones have about 400
 # characters, with - and . in them.
 GITHUB_TOKEN = re.compile(r"[A-Za-z0-9_.-]{20,4096}")

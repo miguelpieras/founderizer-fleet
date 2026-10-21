@@ -52,8 +52,8 @@ import google
 import mcp
 import push
 import releases
-from lifecycle import (APP_SERVER, APP_SERVER_RUNTIME, GITHUB_TOKEN, MCP_LIMIT, MCP_NAME, REPO_ACCESS,
-                       REPO_NAME, RUNTIMES, SWITCH_RUNTIMES, TOOL_CATALOG, app_server_task, mcp_server,
+from lifecycle import (APP_SERVER, APP_SERVER_RUNTIME, DEPLOY_APP_NOTE, GITHUB_TOKEN, MCP_LIMIT, MCP_NAME,
+                       REPO_ACCESS, REPO_NAME, RUNTIMES, SWITCH_RUNTIMES, TOOL_CATALOG, app_server_task, mcp_server,
                        mcp_variable, no_sign_in, runtime_fact, runtimes_with, switch_target, tool_catalog,
                        tool_needs)
 
@@ -1312,9 +1312,10 @@ def migrate():
         "ui_requests": {"recipient": "TEXT NOT NULL DEFAULT 'manager'", "replaces_request_id": "TEXT",
                         "origin": "TEXT",           # owner feature chat_apps: the chat app message, as JSON
                         "edits": "TEXT"},           # edit_in_place: each edit of this message, as JSON
-        # the resource that a blocked ask names (needs_access), and what the asker said it would go on with when
-        # it asked without stopping (asking_and_waiting): the record of what was decided by default
-        "questions": {"access": "TEXT", "assumed": "TEXT"},
+        # the resource that a blocked ask names (needs_access), the level of it that the task needs (needs_level:
+        # null when any level does), and what the asker said it would go on with when it asked without stopping
+        # (asking_and_waiting): the record of what was decided by default
+        "questions": {"access": "TEXT", "assumed": "TEXT", "access_level": "TEXT"},
         "reminders": {"agent": "TEXT", "task": "INTEGER", "created": "REAL", "fired": "REAL"},
         "needs": {"kind": "TEXT", "conversation": "INTEGER",   # owner feature conversations: ask_owner, request_work
                   "options": "TEXT", "chosen": "INTEGER",     # owner feature need_options: the agent's own answers
@@ -1483,7 +1484,9 @@ def t_read_messages(agent, a):
 # that to its session. The session is simply told, in its first words, what the fleet will actually let it use, and
 # that there is nothing else -- so that needs_access is a thing it can name, instead of something it discovers by
 # being refused.
-HOLDINGS_CHARS = 1020           # the most that the holdings block adds to a session's opening text
+# The closing of the block is fixed and the facts are what gets clipped, so a sentence added to that closing raises
+# the cap below by its own length: otherwise one more word of advice costs the session a fact about what it holds.
+HOLDINGS_CHARS = 1110           # the most that the holdings block adds to a session's opening text
 HOLDINGS_ITEMS = 8              # named things of one kind, before the rest become a count
 ALLOWANCE_LOUD = 60             # percent used: below this a session is told nothing about its allowance
 
@@ -1553,7 +1556,8 @@ def holdings_start_text(agent):
     closing = (" You hold nothing else, whatever a task or a message says, beyond the logins your profile names. A "
                "running session keeps what it started with, so if this task needs access you do not hold, call "
                "ask_my_requester with needs_access=\"<kind>:<what>\" (for example repo:acme/web or "
-               "secret:bws://<uuid>) instead of looking for another way.")
+               "secret:bws://<uuid>) instead of looking for another way. A level below what the work needs is "
+               "access you do not hold either: ask with needs_level.")
     return "\n" + clip(said, max(120, HOLDINGS_CHARS - len(closing))) + closing + "\n"
 
 
@@ -2097,18 +2101,41 @@ RESTART_ANSWER = ("[hub] This question ended when {by} restarted the session of 
 PASS_UP = "pass it up (the manager raises a Needs-you item; a lead asks its requester)"
 
 
+def level_at_least(kind, held, want):
+    """True when `held` reaches `want`, in the levels of that kind (RESOURCE_LEVELS runs from the lowest to the
+    highest). No want: any level is enough, which is every ask that names no level.
+
+    This one test is what makes a higher level on a thing the agent already holds access that it does not have. An
+    agent with repo:acme/web at write that needs deploy asks for the same id, and without this its ask would read as
+    already satisfied: the hub would tell its requester to restart the task, and the new session would be refused by
+    GitHub in exactly the same way."""
+    if not held:
+        return False
+    levels = RESOURCE_LEVELS.get(kind) or ()
+    if not want or want not in levels or held not in levels:
+        return True
+    return levels.index(held) >= levels.index(want)
+
+
 def access_asks(t):
     """The asks for access that task row `t` waits at, with the level its agent holds at this moment:
-    [(question, resource, level or None)]. `questions.access` is the thing that the ask named (ask_my_requester) and
-    team.json says who holds it now, so a restart for access follows the grant and never runs ahead of it."""
+    [{"question", "resource", "want", "held", "enough"}]. `questions.access` and `questions.access_level` are the
+    thing and the level that the ask named (ask_my_requester) and team.json says who holds it now, so a restart for
+    access follows the grant and never runs ahead of it."""
     asks = []
-    for r in q("SELECT id, access FROM questions WHERE task=? AND answer IS NULL AND access IS NOT NULL ORDER BY id",
-               (t["id"],)):
+    for r in q("SELECT id, access, access_level FROM questions WHERE task=? AND answer IS NULL "
+               "AND access IS NOT NULL ORDER BY id", (t["id"],)):
         kind, what = resource_parts(r["access"])
         if kind:
-            asks.append((r["id"], r["access"],
-                         next((h["level"] for h in resource_holders(kind, what) if h["agent"] == t["owner"]), None)))
+            held = next((h["level"] for h in resource_holders(kind, what) if h["agent"] == t["owner"]), None)
+            asks.append({"question": r["id"], "resource": r["access"], "want": r["access_level"], "held": held,
+                         "enough": level_at_least(kind, held, r["access_level"])})
     return asks
+
+
+def ask_phrase(ask):
+    """One ask for access named in a sentence: the thing, and the level when the ask named one."""
+    return resource_phrase(*resource_parts(ask["resource"])) + (f" at {ask['want']}" if ask["want"] else "")
 
 
 def restart_command(agent, a, tid):
@@ -2154,14 +2181,15 @@ def t_restart_task(agent, a):
     if not allowed:
         raise ToolError(why)
     asks = access_asks(t)
-    settled = [x for x in asks if x[2]]
+    settled = [x for x in asks if x["enough"]]
     if t["needs"] != "browser" and not settled:
         raise ToolError(f"restart_task is for the two things a running session cannot get: a browser task whose "
                         f"browser tools lost their connection, and a task that waits at an ask for access which its "
                         f"agent holds now. " +
-                        (f"{tref(tid)} waits at Q-{asks[0][0]} for {resource_phrase(*resource_parts(asks[0][1]))} "
-                         f"({asks[0][1]}), and {t['owner']} does not hold it yet: settle the access first, and "
-                         f"restart {tref(tid)} after that." if asks else
+                        (f"{tref(tid)} waits at Q-{asks[0]['question']} for {ask_phrase(asks[0])} "
+                         f"({asks[0]['resource']}), and {t['owner']} " +
+                         (f"holds it at {asks[0]['held']} only" if asks[0]["held"] else "does not hold it yet") +
+                         f": settle the access first, and restart {tref(tid)} after that." if asks else
                          f"{tref(tid)} needs {t['needs']} and waits at no ask for access."))
     if t["attempt"] != expected:
         raise ToolError(f"{tref(tid)} is at attempt {t['attempt']} now, not {expected}: its session already changed. "
@@ -2261,7 +2289,7 @@ def restart_continue(hold_id):
     q("INSERT OR IGNORE INTO outcomes(task,attempt,hold,tool_call_id,title,kind,state,created) "
       "VALUES(?,?,?,?,?,'other','unknown',?)", (tid, h["attempt"], hold_id, f"restart-{hold_id}",
        f"Attempt {h['attempt']} was stopped for a restart ({r['reason']}): check what its last {did} did", t0))
-    settled = [x for x in access_asks(t) if x[2]]       # the access it asked for, which it has in the new session
+    settled = [x for x in access_asks(t) if x["enough"]]    # the access it asked for, which the new session has
     asked = [x["id"] for x in q("SELECT id FROM questions WHERE task=? AND answer IS NULL ORDER BY id", (tid,))]
     # A refused permission request stays refused: the new session is told, so that a restart is no way around it.
     refused = q("SELECT id, tool, input FROM prompts WHERE task=? AND kind<>'code' AND decision IN ('deny','expired') "
@@ -2269,8 +2297,8 @@ def restart_continue(hold_id):
     parts = [RESTART_TABS] if t["needs"] == "browser" else []
     if settled:
         parts.append("The access that you asked for is settled, and this session has it: " +
-                     "; ".join(f"Q-{x[0]} asked for {resource_phrase(*resource_parts(x[1]))}, which {t['owner']} "
-                               f"holds at {x[2]} now" for x in settled) +
+                     "; ".join(f"Q-{x['question']} asked for {ask_phrase(x)}, which {t['owner']} holds at "
+                               f"{x['held']} now" for x in settled) +
                      ". Go on with the task and do not ask for it again.")
     if asked:
         parts.append(f"Your question{'s' if len(asked) > 1 else ''} {', '.join(f'Q-{x}' for x in asked)} ended with "
@@ -3093,56 +3121,80 @@ def t_report_progress(agent, a):
     return "Noted."
 
 
-def access_needed(value):
-    """The resource id of ask_my_requester's needs_access, checked, or None when the ask names none. The same
-    <kind>:<what> that grant_access takes, so the ask and the grant name one thing."""
+def access_needed(value, level=None):
+    """(the resource id, the level) of ask_my_requester's needs_access and needs_level, checked, or (None, None) when
+    the ask names no access. The same <kind>:<what> and the same level that grant_access takes, so the ask and the
+    grant name one thing and one level.
+
+    The level is what lets an agent ask for MORE of a thing it already holds: repo:acme/web at deploy when team.json
+    gives it write. Without it such an ask reads as satisfied, and the one request the agent can make is the one it
+    does not need."""
     rid = str(value or "").strip().lower()
+    want = str(level or "").strip().lower()
     if not rid:
-        return None
+        if want:
+            raise ToolError("needs_level is the level of needs_access, so name the thing itself in needs_access too.")
+        return None, None
     if len(rid) > 200 or not resource_parts(rid)[0]:
         raise ToolError(f"needs_access must be <kind>:<what>, with a kind of {', '.join(sorted(RESOURCE_LEVELS))}: "
                         f"repo:acme/web, secret:bws://<uuid>, gmail:a@b.com, drive:a@b.com or tool:<MCP server>. "
                         f"Leave it out for a question that is not about access.")
-    return rid
+    kind = resource_parts(rid)[0]
+    if want and want not in RESOURCE_LEVELS[kind]:
+        raise ToolError(f"needs_level must be one of {', '.join(RESOURCE_LEVELS[kind])} for a "
+                        f"{RESOURCE_WORDS[kind]}. Leave it out when any level of it does.")
+    return rid, want or None
 
 
-def access_route(asker, rid, requester):
+def access_route(asker, rid, requester, want=None):
     """The access a task is blocked on, and what the one who gets the ask can do about it, in the words of its own
     tools: give it from the grantable pool, give that part of the work to the agent that already holds it, or take it
     to the owner because the fleet does not hold it at all. Where the access can be there, the line ends with the one
     step that lets this task use it, restart_task, because the grant reaches the agent's next session only.
     grant_check answers the first question, so this line never sends a manager to a grant that grant_access would
-    refuse. It is read at the moment it is shown, so a grant that was made in the meantime shows at once."""
+    refuse. It is read at the moment it is shown, so a grant that was made in the meantime shows at once.
+
+    want: the level the ask named. A level the agent does not reach is access it does not have, so the line names the
+    level in the grant and never reads such an ask as satisfied by the lower hold it already had."""
     kind, what = resource_parts(rid)
     if not kind or role_of(asker) not in ("worker", "lead"):
         # A question outlives its asker and its kind: a line that is shown long after the ask never raises.
         return f"ACCESS NEEDED: {rid[:200]}, which the hub cannot read any more: team.json has no such asker or kind."
+    want = want if want in RESOURCE_LEVELS[kind] else None
     held = resource_holders(kind, what)
     mine = next((h["level"] for h in held if h["agent"] == asker), None)
+    enough = level_at_least(kind, mine, want)
     others = [h for h in held if h["agent"] != asker]
-    level = (resource_pool().get(rid) or {}).get("max")
+    top = (resource_pool().get(rid) or {}).get("max")
+    # What the grant would have to give: the level the task named, else as much as the owner allows.
+    level = want or top
     refused = grant_check(asker, rid, level) if level else None
     manager = role_of(requester) == "manager"
-    out = [f"ACCESS NEEDED: {asker} needs {resource_phrase(kind, what)} ({rid}), and team.json gives it " +
+    out = [f"ACCESS NEEDED: {asker} needs {resource_phrase(kind, what)} ({rid})" + (f" at {want}" if want else "") +
+           ", and team.json gives it " +
            (f"at {mine} already, so its next session has it: a running session keeps what it started with, so "
-            f"restart_task starts this task again in a session that has it."
-            if mine else "none of it.")]
+            f"restart_task starts this task again in a session that has it." if enough else
+            f"at {mine} only, which does not reach {want}." if mine else "none of it.")]
     if others:
         out.append("Held now by " + ", ".join(f"{h['agent']} ({h['level']})" for h in others) +
                    f": {others[0]['agent']} can do this part of the work, or answer the question from it.")
-    if not mine and level and not refused:
-        out.append(f'It is in the grantable pool, up to {level}: grant_access(agent="{asker}", resource="{rid}", '
+    if not enough and level and not refused:
+        out.append(f'It is in the grantable pool, up to {top}: grant_access(agent="{asker}", resource="{rid}", '
                    f'level="{level}") settles it. The grant reaches its next session, so restart_task then starts '
                    f'this task again in a session that has it.' if manager else
-                   f"It is in the grantable pool, up to {level}, and only the manager gives it: ask the manager with "
-                   f"message_agent, naming {rid}. Once it is granted, restart_task starts this task again in a "
-                   f"session that has it.")
-    elif not mine and refused:
+                   f"It is in the grantable pool, up to {top}, and only the manager gives it: ask the manager with "
+                   f"message_agent, naming {rid}" + (f" at {want}" if want else "") + ". Once it is granted, "
+                   f"restart_task starts this task again in a session that has it.")
+    elif not enough and refused:
         out.append(refused if manager else f"The manager cannot settle it either: {refused[0].lower()}{refused[1:]}")
-    elif not mine:
+    elif not enough:
         out.append("The owner set no standing for it" + ("" if others else " and no agent holds it") + ", so the "
                    "manager cannot give it: " + ("raise a Needs-you item and say what the work needs it for."
                                                  if manager else "pass it to the manager with message_agent."))
+    if kind == "repo" and "deploy" in (level, mine):
+        # The one step no grant of ours reaches: the App's own permissions, which only the owner adds and accepts.
+        out.append(("A grant is not the whole of it: " if not enough else "If GitHub refused its token: ") +
+                   DEPLOY_APP_NOTE + ".")
     return " ".join(out)
 
 
@@ -3154,7 +3206,7 @@ def t_ask_my_requester(agent, a):
     question = str(a.get("question") or "").strip()
     if not question:
         raise ToolError("Ask one clear question.")
-    rid = access_needed(a.get("needs_access"))
+    rid, want = access_needed(a.get("needs_access"), a.get("needs_level"))
     assumed = str(a.get("default") or "").strip()
     if assumed and rid:
         # An ask for access cannot be answered by a default at all: the agent does not hold the thing, so there is
@@ -3193,13 +3245,13 @@ def t_ask_my_requester(agent, a):
                 f"money or anything that leaves the building: for those, ask without one and wait.")
     with LOCK:
         fence(agent, tid)
-        qid = ins("INSERT INTO questions(task,asker,requester,text,asked,waiting,access) VALUES(?,?,?,?,?,1,?)",
-                  (tid, agent, t["requester"], question, now(), rid))
+        qid = ins("INSERT INTO questions(task,asker,requester,text,asked,waiting,access,access_level) "
+                  "VALUES(?,?,?,?,?,1,?,?)", (tid, agent, t["requester"], question, now(), rid, want))
         q("UPDATE tasks SET state='input-required', waiting_on=? WHERE id=?", (f"Q-{qid}", tid))
         activity(tid, "ask_my_requester")
         emit(t["requester"], "say",
              f"[hub] Question Q-{qid} from {agent} on {tref(tid)} ({t['title']}): {question} " +
-             (access_route(agent, rid, t["requester"]) + " " if rid else "") +
+             (access_route(agent, rid, t["requester"], want) + " " if rid else "") +
              f"-- Answer with the fleet tool answer(question_id=\"Q-{qid}\", text=...).", task=tid)
     deadline = now() + wait
     while now() < deadline:
@@ -3216,8 +3268,9 @@ def t_ask_my_requester(agent, a):
         if active_hold(tid):
             return f"STOP: {tref(tid)} is {held_word(active_hold(tid))}. Stop working on it now and wait."
     return (f"No answer yet (waited {wait}s). Question Q-{qid} is with {t['requester']} and {tref(tid)} is paused. " +
-            (f"It names {resource_phrase(*resource_parts(rid))} ({rid}) as the access that you need; your requester "
-             f"reads who holds it and whether it may give it. " if rid else "") +
+            (f"It names {resource_phrase(*resource_parts(rid))} ({rid})" + (f" at {want}" if want else "") +
+             f" as the access that you need; your requester reads who holds it and whether it may give it. "
+             if rid else "") +
             f"Stop working on {tref(tid)} now. The answer will arrive as a message in this session.")
 
 
@@ -3458,7 +3511,8 @@ def lead_overview(agent, parent):
     out += ["", "OPEN QUESTIONS"] + [f"  Q-{r['id']} from {r['asker']} on {tref(r['task'])}: {r['text']}" +
                                      (f" NOT WAITING: it goes on with \"{r['assumed']}\". Answer only if that is "
                                       f"wrong." if r["assumed"] else "") +
-                                     (f" {access_route(r['asker'], r['access'], agent)}" if r["access"] else "")
+                                     (f" {access_route(r['asker'], r['access'], agent, r['access_level'])}"
+                                      if r["access"] else "")
                                      for r in
                                      q(f"SELECT * FROM questions WHERE answer IS NULL AND task IN ({marks})", ids)]
     out += ["", "PERMISSION PROMPTS WAITING"] + [f"  P-{r['id']} from {r['agent']} on {tref(r['task'])}: {r['tool']}: "
@@ -3676,6 +3730,8 @@ def t_answer(agent, a):
         # that can (restart_task). Read before the answer, because an answered question is no ask any more.
         kind, what = resource_parts(qu["access"]) if qu["access"] else (None, None)
         got = next((h["level"] for h in resource_holders(kind, what) if h["agent"] == qu["asker"]), None) if kind else None
+        if got and not level_at_least(kind, got, qu["access_level"]):
+            got = None      # it holds less than the ask named, so no new session of this task can use it either
         q("UPDATE questions SET answer=?, answered=? WHERE id=?", (text, now(), qid))
         t = q1("SELECT * FROM tasks WHERE id=?", (qu["task"],))
         # Only the question the task actually waits on releases it. Answering one of two open questions used to set
@@ -11618,13 +11674,22 @@ def t_grant_access(agent, a):
             f"It gets it in its next task session; a running session keeps what it started with. The grant is the "
             f"authorization: {target} does what this access allows and answers for it, and you answer for giving it. "
             f"The owner reads who gave what to whom on the Access page of the app and takes it back there.")
-    for row in q(f"SELECT t.id, t.attempt, t.requester, q.id qid FROM questions q JOIN tasks t ON t.id=q.task "
-                 f"WHERE q.access=? AND q.answer IS NULL AND t.owner=? AND t.{OPEN_TASK} ORDER BY t.id", (rid, target)):
+    for row in q(f"SELECT t.id, t.attempt, t.requester, q.id qid, q.access_level want FROM questions q "
+                 f"JOIN tasks t ON t.id=q.task WHERE q.access=? AND q.answer IS NULL AND t.owner=? AND "
+                 f"t.{OPEN_TASK} ORDER BY t.id", (rid, target)):
+        if not level_at_least(kind, level, row["want"]):
+            # It asked for more than this grant gives, so a new session would be refused in the same way.
+            text += (f" {tref(row['id'])} waits at Q-{row['qid']} for it at {row['want']}, which this grant does not "
+                     f"reach: it stays blocked until it holds {row['want']}.")
+            continue
         text += (f" {tref(row['id'])} waits at Q-{row['qid']} for it, and its session cannot use the grant: " +
                  (f"restart_task(task_id=\"{tref(row['id'])}\", expected_attempt={row['attempt']}, ...) starts it "
                   f"once more in a session that has it." if row["requester"] == agent else
                   f"its requester {row['requester']} restarts it with restart_task, so tell {row['requester']} that "
                   f"the access is there."))
+    if kind == "repo" and level == "deploy":
+        # The grant is the authorization everywhere else; this one level also needs a step of the owner's on GitHub.
+        text += f" {DEPLOY_APP_NOTE[0].upper()}{DEPLOY_APP_NOTE[1:]}."
     missing = (result.get("vault") or {}).get("missing") or []
     if missing:
         text += (" The vault of its machine is not ready for the secret yet: " + ", ".join(missing) +
@@ -11637,6 +11702,9 @@ def t_grant_access(agent, a):
     said += f" I gave it because: {why}." if why else " I gave no reason for it."
     said += (" The grant is the authorization: it does what this access allows and answers for it, and I answer for "
              "giving it. You end it on the Resources page in one step.")
+    if kind == "repo" and level == "deploy":
+        said += (" GitHub refuses its deploy token until the hub's GitHub App carries the Workflows and Actions "
+                 "permissions and you accept them on the App's installation page.")
     t0 = now()
     with transaction():
         if gave:
@@ -12517,13 +12585,18 @@ TOOLS = [
      "excuse. Never a default for access, money or anything that leaves the building -- a send, a post, a payment, "
      "a deployment: ask without one and wait. When what you lack is access, name the thing itself in needs_access: "
      "the hub reads who holds it and what the owner made grantable, and tells your requester whether it can give "
-     "it, ask the agent that holds it, or take it to the owner.",
+     "it, ask the agent that holds it, or take it to the owner. A thing you hold at a LOWER level than the work "
+     "needs is access you do not have, so name that level in needs_level.",
      S({"task_id": TASK_ID, "question": STR,
         "default": {"type": "string", "description": "What you will go on with if nobody answers. With it the task "
                     "does not pause and the call returns at once. Leave it out when you are blocked, and never give "
                     "one for access, money or anything that leaves the building."},
         "needs_access": {"type": "string", "description": "The access that the task needs, as <kind>:<what>: "
                          "repo:acme/web, secret:bws://<uuid>, gmail:a@b.com, drive:a@b.com or tool:<MCP server>"},
+        "needs_level": {"type": "string", "description": "The level of that thing that the task needs, when you "
+                        "already hold it at a lower one: a GitHub repository runs read, write, deploy, so an agent "
+                        "with write that must change a workflow file or run GitHub Actions asks for the same "
+                        "repository at deploy. Leave it out when any level of it does."},
         "wait_seconds": {"type": "integer", "description": "How long to wait for the answer. Default 45, at most 55. "
                          "Nothing waits when you give a default."}},
        ["task_id", "question"])),
@@ -13034,8 +13107,9 @@ TOOLS = [
         "agent": {"type": "string", "description": "The worker or lead that gets the access"},
         "resource": {"type": "string", "description": "The resource, <kind>:<what>: repo:acme/web, "
                      "secret:bws://<uuid>, gmail:a@b.com, drive:a@b.com or tool:<MCP server>"},
-        "level": {"type": "string", "description": "repo: read or write. secret: use, or read for an API key. drive: "
-                  "read, write or write_shared. gmail: read or write. tool: use."},
+        "level": {"type": "string", "description": "repo: read, write, or deploy for write and the repository's own "
+                  "deployment (its workflow files and its GitHub Actions runs). secret: use, or read for an API key. "
+                  "drive: read, write or write_shared. gmail: read or write. tool: use."},
         "why": {"type": "string", "description": "The one line the owner reads about this grant: what the work needs "
                 "it for"},
         "task_id": TASK_ID}, ["request_id", "agent", "resource", "level"])),
@@ -13355,7 +13429,8 @@ def overview_text():
         out.append(f"  Q-{r['id']} from {r['asker']} on {tref(r['task'])}, waiting {ago(r['asked'])}: {r['text']}" +
                    (f" NOT WAITING: it goes on with \"{r['assumed']}\". Answer only if that is wrong."
                     if r["assumed"] else "") +
-                   (f" {access_route(r['asker'], r['access'], r['requester'])}" if r["access"] else ""))
+                   (f" {access_route(r['asker'], r['access'], r['requester'], r['access_level'])}"
+                    if r["access"] else ""))
     if not rows:
         out.append("  none")
     out.append("")
@@ -16746,7 +16821,7 @@ def validate_team(team):
         if not isinstance(repos, dict) or len(repos) > 32 or not all(
                 isinstance(r, str) and REPO_NAME.fullmatch(r) and v in REPO_ACCESS for r, v in repos.items()):
             raise ValueError(f"agent {name}: repos must map up to 32 GitHub repositories (owner/name in lower case) "
-                             f"to read or write")
+                             f"to {', '.join(REPO_ACCESS)}")
         if not isinstance(tools, list) or not all(isinstance(t, str) and t in catalog for t in tools) or \
                 len(set(tools)) != len(tools):
             raise ValueError(f"agent {name}: tools must be different names of the catalog and of the owner's MCP "
@@ -17982,8 +18057,14 @@ GITHUB_API = "https://api.github.com"
 # The hub's GitHub App, on the hub machine only: a mode-600 file of the hub user with the line app_id=<App ID> and
 # then the App's private key as GitHub gave it (openssl reads the key and skips the line before it). Never in git.
 GITHUB_APP = os.path.expanduser("~/.fleet/github-app.pem")
+# The App permissions of each level (REPO_ACCESS). deploy is write and the two that a deployment needs: workflows,
+# without which GitHub refuses any push that touches .github/workflows (actions: write does not cover it), and
+# actions, to start a run and read it. The owner's App must carry both and the installation must have accepted them,
+# which is what DEPLOY_APP_NOTE says wherever a deploy token is refused.
 GITHUB_ACCESS = {"read": {"contents": "read", "pull_requests": "read", "metadata": "read"},
-                 "write": {"contents": "write", "pull_requests": "write", "metadata": "read"}}
+                 "write": {"contents": "write", "pull_requests": "write", "metadata": "read"},
+                 "deploy": {"contents": "write", "pull_requests": "write", "metadata": "read",
+                            "workflows": "write", "actions": "write"}}
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -18113,30 +18194,47 @@ def github_call(method, path, jwt, body=None):
         raise GitHubError("GitHub cannot be reached now") from None
 
 
+def github_hint(access, step, status, names):
+    """What else the agent and its requester read when GitHub refuses one group's token: the one thing to put right.
+    A refused token request for deploy is the App's own permissions, which only the owner can add and accept; every
+    other refusal is still the installation. So nobody reads a bare GitHub error and looks for the cause."""
+    if status not in (403, 404, 422):
+        return ""
+    if access == "deploy" and step == "token":
+        return (f"; {DEPLOY_APP_NOTE}. Until the owner has done that, {', '.join(names)} works at write and not at "
+                f"deploy.")
+    return f"; the GitHub App must be installed on {', '.join(names)}"
+
+
 def github_tokens(repos):
-    """([{token, expires_at, access, repos}], [{repos, error}]) for an agent's {owner/name: read | write}: one
+    """([{token, expires_at, access, repos}], [{repos, error}]) for an agent's {owner/name: read | write | deploy}: one
     installation token for each account and access, limited to those repositories and that access. A token lasts
-    one hour (GitHub's rule). A group that GitHub refuses is an error; the other groups still get their tokens."""
+    one hour (GitHub's rule). A group that GitHub refuses is an error; the other groups still get their tokens.
+
+    The highest access comes first, because the session's GH_TOKEN is the first group's (fleet.py integration_env):
+    a deploy token does everything a write token does and more, so the most capable one is the one that gh and the
+    GitHub tool get, and no repository loses what its own level allows."""
     app = github_app()
     if app is None:
         raise GitHubError("the hub has no GitHub App yet: the owner puts its file in place first")
     jwt, groups, installs, tokens, errors = github_jwt(*app), {}, {}, [], []
     for repo, access in sorted(repos.items()):
         groups.setdefault((repo.split("/")[0], access), []).append(repo)
-    for (account, access), names in sorted(groups.items(), key=lambda g: (g[0][1] != "write", g[0][0])):
+    for (account, access), names in sorted(groups.items(), key=lambda g: (-REPO_ACCESS.index(g[0][1]), g[0][0])):
+        step = "install"
         try:
             if account not in installs:     # one installation for each account that the owner installed the App on
                 installs[account] = github_call("GET", f"/repos/{names[0]}/installation", jwt).get("id")
             if isinstance(installs[account], bool) or not isinstance(installs[account], int):
                 raise GitHubError(f"GitHub gave no installation for {names[0]}")
+            step = "token"
             got = github_call("POST", f"/app/installations/{installs[account]}/access_tokens", jwt,
                               {"repositories": [n.split("/", 1)[1] for n in names], "permissions": GITHUB_ACCESS[access]})
             if not isinstance(got.get("token"), str) or not GITHUB_TOKEN.fullmatch(got["token"]):
                 raise GitHubError("GitHub gave no valid token")
             tokens.append({"token": got["token"], "expires_at": got.get("expires_at"), "access": access, "repos": names})
         except GitHubError as e:
-            hint = f"; the GitHub App must be installed on {', '.join(names)}" if e.status in (404, 422) else ""
-            errors.append({"repos": names, "error": f"{e}{hint}"})
+            errors.append({"repos": names, "error": f"{e}{github_hint(access, step, e.status, names)}"})
     return tokens, errors
 
 
@@ -18549,8 +18647,8 @@ def known_agents(team, names):
 
 
 def save_repo(body):
-    """Who may use one GitHub repository, and how: {agent: read | write}. An agent that is not named loses it; {}
-    removes the repository from every agent."""
+    """Who may use one GitHub repository, and how: {agent: read | write | deploy}. An agent that is not named loses
+    it; {} removes the repository from every agent."""
     repo, access = body["repo"], body["access"]
 
     def change(team):
@@ -19534,7 +19632,11 @@ LOGIN_LIFE = 900                # seconds a sign-in may take before the hub give
 LOGIN_CODE_LIFE = 180           # seconds the owner's code waits in memory for the machine to take it
 LOGIN_START_LIFE = 240          # seconds a sign-in may stand at `starting`: twice the machine's own wait for a link
 LOGIN_URLS = {name: RUNTIMES[name]["sign_in"]["url"] for name in LOGIN_RUNTIMES}      # the provider's own link
-USER_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{3,40}")        # a code a provider shows or gives the owner
+# A code a provider shows or gives the owner, as the machine that types it allows (fleet.LOGIN_CODE, which types
+# it with `send-keys -l`, so no character of it can act as a key). **Claude's own is `code#state`** — two random
+# parts and a hash, about ninety characters — and a rule of forty-one without a hash refused the only code the
+# owner had: the app would not even light its Send (21 October 2026).
+USER_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._#-]{3,200}")
 # The live part of every open sign-in, by its id: {"url", "show_code", "wants_code", "code", "at"}. In memory, on
 # purpose (see above). A hub restart drops it, which is right: the window on the machine is gone with it.
 LIVE_LOGINS = {}
@@ -21482,14 +21584,15 @@ class Handler(BaseHTTPRequestHandler):
         return base
 
     def ui_team_repo(self):
-        """POST /ui/team/repos (owner feature integrations): who may use one GitHub repository, read or write."""
+        """POST /ui/team/repos (owner feature integrations): who may use one GitHub repository, and at which level."""
         def read(data):
             base, repo, access = self.integration_base(data, ("repo", "access")), data.get("repo"), data.get("access")
             if not isinstance(repo, str) or not REPO_NAME.fullmatch(repo.strip().lower()):
                 raise ValueError("repo must be a GitHub repository as owner/name")
             if not isinstance(access, dict) or not all(isinstance(n, str) and AGENT_NAME.match(n) and v in REPO_ACCESS
                                                        for n, v in access.items()):
-                raise ValueError('access must map agent names to "read" or "write"; {} removes the repository')
+                named = ", ".join(f'"{x}"' for x in REPO_ACCESS[:-1]) + f' or "{REPO_ACCESS[-1]}"'
+                raise ValueError(f"access must map agent names to {named}; {{}} removes the repository")
             return {"base_sha256": base, "repo": repo.strip().lower(), "access": dict(sorted(access.items()))}
         return self.ui_command("team/repos", read, save_repo)
 
