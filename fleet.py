@@ -2365,8 +2365,7 @@ class Helper:
             while time.monotonic() < deadline and not url:
                 time.sleep(2)
                 screen = login_screen(session)
-                found = LOGIN_URLS[runtime].search(screen)
-                url = found.group(0) if found else None
+                url = whole_link(screen, LOGIN_URLS[runtime])
                 if url:
                     if runtime in LOGIN_SHOWN_CODE:
                         code = LOGIN_SHOWN_CODE[runtime].search(screen)
@@ -4364,6 +4363,35 @@ def login_prompt_line(screen):
 # question then, no first-run question was ever answered, and every sign-in gave up after ninety seconds saying
 # it was waiting at the banner, which was simply the start of that one line (the owner, 21 October 2026).
 SCREEN_CONTROL = re.compile(r"[\x00-\x09\x0b-\x1f\x7f-\x9f]")      # every control character but the newline
+
+
+# **A link the runtime drew across more than one line of its window.** Claude Code prints its sign-in link at
+# the full width of the window and breaks it itself, so no line of the capture holds the whole of it and tmux's
+# own join leaves those lines apart. The owner opened what the first line held and the provider answered "Missing
+# redirect_uri parameter" (21 October 2026). A line that runs to the edge of a real window is continued by the
+# line under it, for as long as that line is link and nothing else.
+LINK_TAIL = re.compile(r"^[A-Za-z0-9/_?=&.%#+~:@!$'()*,;-]+$")
+LINK_WIDTH = 40                             # narrower than any terminal: then no line of it reaches an edge
+
+
+def whole_link(screen, pattern):
+    """The provider's own link, put back together from the lines it was drawn on. None where the screen has none."""
+    raw = screen.splitlines()
+    width = max((len(line) for line in raw), default=0)
+    edge = [width >= LINK_WIDTH and len(line) >= width for line in raw]
+    lines = [line.strip(" \t\u2502\u2503\u2551|") for line in raw]
+    for i, line in enumerate(lines):
+        found = pattern.search(line)
+        if not found:
+            continue
+        link, goes_on = found.group(0), edge[i] and found.end() == len(line)
+        for j in range(i + 1, len(lines)):
+            if not goes_on or not lines[j] or not LINK_TAIL.fullmatch(lines[j]):
+                break
+            link += lines[j]
+            goes_on = edge[j]
+        return link
+    return None
 
 
 def login_screen(session):
