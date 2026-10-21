@@ -4358,11 +4358,19 @@ def login_prompt_line(screen):
     return lines[0] if lines else ""
 
 
+# **A sign-in window is read as lines**: which question is waiting, and whether a cursor stands on one of them.
+# `CONTROL` is for text about to be typed into a terminal, where a newline is a keypress like any other, so it
+# takes the newlines out with the rest — and the whole window came back as one long line. Nothing matched a
+# question then, no first-run question was ever answered, and every sign-in gave up after ninety seconds saying
+# it was waiting at the banner, which was simply the start of that one line (the owner, 21 October 2026).
+SCREEN_CONTROL = re.compile(r"[\x00-\x09\x0b-\x1f\x7f-\x9f]")      # every control character but the newline
+
+
 def login_screen(session):
-    """What the sign-in window shows now. `capture-pane -p` gives the text without escapes; -J joins a link that
-    the terminal wrapped over two lines."""
+    """What the sign-in window shows now, as its lines. `capture-pane -p` gives the text without escapes; -J joins
+    a link that the terminal wrapped over two lines."""
     r = tmux("capture-pane", "-p", "-J", "-t", f"{session}:=login")
-    return CONTROL.sub(" ", r.stdout) if r.returncode == 0 else ""
+    return SCREEN_CONTROL.sub(" ", r.stdout) if r.returncode == 0 else ""
 
 
 def type_login_code(session, code):
