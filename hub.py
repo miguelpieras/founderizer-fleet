@@ -600,7 +600,7 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "mobile", "attachments", "resource_grants", "machine_signin",
                "releases", "entitlement", "agent_signin", "github_app", "need_options", "restore",
                "manager_start", "agent_notes", "edit_in_place", "machine_access", "push",
-               "attachment_knowledge", "asking_and_waiting"]
+               "attachment_knowledge", "asking_and_waiting", "account_limits"]
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 
 
@@ -1292,6 +1292,11 @@ def migrate():
         # manager_as_lead: which step of the plan next_step came from, so a split step whose parts have all ended
         # counts as no next step, exactly as a single ended task does.
         "goals": {"next_step_id": "INTEGER"},
+        # account_limits: a hold belongs to one agent, an allowance to one account. `cause` is the id of the row
+        # whose session reported the limit (null when this agent reported it itself), so one episode of one account
+        # is one row for each agent it holds and one message for the manager. `route` is the route of this agent
+        # that spends from that account, which a derived row cannot read from a task of its own.
+        "agent_limits": {"cause": "INTEGER", "route": "TEXT"},
         "events": {"read_at": "REAL", "helper_ack": "REAL"},
         "prompts": {"kind": "TEXT NOT NULL DEFAULT 'tool'", "subject": "TEXT", "used": "REAL"},
         "sealed": {"bound_task": "INTEGER", "expired": "REAL", "login": "TEXT", "job": "INTEGER"},
@@ -1641,7 +1646,13 @@ def allowance_start_text(agent, task_id):
     lim = read_row("SELECT * FROM agent_limits WHERE agent=? AND ended IS NULL ORDER BY id DESC LIMIT 1", (agent,))
     state = account_state(reading, [lim] if lim and limit_route(lim) == want else [], now())
     if state["state"] == "limited":
-        return ("\nYOUR ALLOWANCE is used up: the hub holds your work until " +
+        # Where it went, when it was not this agent that spent it (account_limits): an agent held for an allowance
+        # it shares reads the same line as one that reached its own limit, and would otherwise pace against a
+        # window of its own that is nowhere near full.
+        source = limit_source(lim) if lim and limit_route(lim) == want else None
+        return ("\nYOUR ALLOWANCE is used up" +
+                (f": a session of {source}, which spends the same provider account, reached its usage limit" if source
+                 else "") + ". The hub holds your work until " +
                 (clock(state["until"]) if state["until"] else "the provider resets it, at a time nobody has given") +
                 ". Report progress now if you can; the session that resumes this task reads it.\n")
     if state["state"] != "available":
@@ -2068,7 +2079,16 @@ def release_hold(task_id, mode, by, via=None, note=""):
 # ---- restart_task: the requester's Stop and Resume with a check, in one step. It is for the two things a running
 # ---- session cannot get: its browser connection back, and access that was settled after the session started.
 
-SESSION_RESTARTS = 3        # the most new sessions that a task gets for a lost or failed session (liveness, restart_task)
+# Three is a crash-loop brake and not a lifetime cap. A session that was lost after it had lived and worked for
+# hours -- a machine rebooted, a runtime updated, a usage-limit episode that ended the session -- is recovered
+# without spending anything, because a task that worked for 60 hours and is then restarted a fourth time is not a
+# task the hub should give up on. What the budget counts is the loss that says the start itself is failing: a
+# session lost within SESSION_YOUNG of starting. Three of those and the hub stops and reports, as before. The
+# rate at which long-lived sessions are lost is not bound here at all: it is a circle the manager is told about
+# (CIRCLE_RESTART_RATE), because stopping a task that is getting work done is the manager's decision and not a
+# counter's.
+SESSION_RESTARTS = 3        # the most new sessions that a task gets for a session that was lost young, or failed
+SESSION_YOUNG = 600         # a session lost within this of its own start died young: that is the crash loop
 RESTART_TABS = ("The browser tabs of the earlier session stay open and are not yours now: do not use them, do not close "
                 "them, and do not open their pages again only to copy them. Open what you need in your own new tab, and "
                 "say in your next progress report which pages you opened again.")
@@ -2166,8 +2186,8 @@ def t_restart_task(agent, a):
         raise ToolError(f"{t['owner']} waits for its usage limit to reset at {clock(lim['until'])}. {tref(tid)} "
                         f"continues by itself then, so it is not restarted now.")
     if t["restarts"] >= SESSION_RESTARTS:
-        raise ToolError(f"{tref(tid)} already had {SESSION_RESTARTS} new sessions. Do not try again: cancel it, or "
-                        f"{PASS_UP}.")
+        raise ToolError(f"{tref(tid)} has used all {SESSION_RESTARTS} of its restarts. Do not try again: cancel it, "
+                        f"or {PASS_UP}.")
     confirmed = own and h["state"] == "stopped"         # a stop that the helper reported late: nothing more to stop
     extra, t0 = control_extra(t, 0, "stop"), now()
     with transaction():
@@ -2317,8 +2337,55 @@ def settle_outcome(outcome_id, finding, by, note="", task_id=None):
     return q1("SELECT * FROM outcomes WHERE id=?", (outcome_id,))
 
 
+# The hub's own word about a usage limit is the one `say` that reaches a limited agent. Every other message waits
+# for the reset, deliberately: nothing is typed into a session that cannot answer. This one is the message that says
+# WHY the session is about to go quiet, so held until the reset it is stale and useless -- the review of 20 October
+# called it inert. Writing it before the hold row does not help: the delivery filter reads active_limit when the
+# helper polls, not when the event is written, so by then the row is there whatever order wrote it. The filter has
+# to let this one kind through, and this flag is how it knows it.
+LIMIT_SAY = {"limit": True}
+NO_RESET = ", one hour from now, because no reset time was given"
+
+
+def spread_limit(agent, route, cause, until, known, t0):
+    """One account, one allowance: hold the other agents that spend it, with the same reset and this report as their
+    cause. Returns (the agents held, the words for why none was).
+
+    The manager is never held this way. A wrong spread onto a worker delays that worker until a reset; a wrong one
+    onto the manager stops the fleet, and the hub would be deriving it from a report it cannot attribute to a window
+    (one_allowance). The manager reads its own account in see_capacity and in allowance_sweep's message, and its own
+    session reports its own limit when it reaches it."""
+    g = account_group(agent, route)
+    if not g:
+        return [], "its runtime names no provider account, so the hub knows of no other agent on that allowance"
+    others = [(name, r) for name, r in g["routes"] if name != agent and name != manager_name()]
+    if not others:
+        return [], "no other agent spends this allowance"
+    shared, why = one_allowance(g["reading"])
+    if not shared:
+        return [], why
+    held = []
+    for name, r in others:
+        if active_limit(name):
+            continue            # already held, by its own report or by an earlier one of this account
+        ins("INSERT INTO agent_limits(agent,since,until,reset_known,cause,route) VALUES(?,?,?,?,?,?)",
+            (name, t0, until, known, cause, r))
+        held.append(name)
+        for t in q("SELECT id FROM tasks WHERE owner=? AND state='working' ORDER BY id", (name,)):
+            if not session_alive(name, t["id"]):
+                continue        # no session to tell; its next one reads allowance_start_text
+            emit(name, "say", f"[hub] A session of {agent} on the provider account you share with it reached its "
+                 f"usage limit, so the allowance you were spending is gone too. The hub holds your work on "
+                 f"{tref(t['id'])} until {clock(until)}" + ("" if known else NO_RESET) + f". The best thing you can "
+                 f"do with this turn is one report_progress on {tref(t['id'])} saying where you got to and what is "
+                 f"left: the session that resumes this task reads it. After the reset, check what was already done "
+                 f"before you repeat anything (rule 9).", task=t["id"], extra=LIMIT_SAY)
+    return held, None
+
+
 def start_limit(agent, resets_at, task_id=None):
-    """A session reported a usage limit. Hold the agent's work until the reset, or for one hour without one.
+    """A session reported a usage limit. Hold the agent's work until the reset, or for one hour without one, and with
+    it the other agents that spend the same provider allowance (spread_limit).
     The manager's own limit is shown to the owner by the manager flag, because the manager cannot act on it."""
     t0 = now()
     if resets_at is not None and resets_at <= t0:
@@ -2327,33 +2394,49 @@ def start_limit(agent, resets_at, task_id=None):
     lim = active_limit(agent)
     if lim:
         if known and (not lim["reset_known"] or until > lim["until"]):
-            q("UPDATE agent_limits SET until=?, reset_known=1 WHERE id=?", (until, lim["id"]))
+            # Every agent this episode holds waits for one reset, so a later and better reset time moves all of
+            # them: the reported row and each row derived from it, whichever of the two this report came in on.
+            root = lim["cause"] or lim["id"]
+            q("UPDATE agent_limits SET until=?, reset_known=1 WHERE ended IS NULL AND (id=? OR cause=?)",
+              (until, root, root))
         return
+    route = task_route(task_id)
     q("UPDATE agent_limits SET resumed=? WHERE agent=? AND resumed IS NULL", (t0, agent))     # a new hold replaces the old resume
-    ins("INSERT INTO agent_limits(agent,since,until,reset_known,task) VALUES(?,?,?,?,?)", (agent, t0, until, known, task_id))
+    cause = ins("INSERT INTO agent_limits(agent,since,until,reset_known,task,route) VALUES(?,?,?,?,?,?)",
+                (agent, t0, until, known, task_id, route))
     if task_id:
         # The session that reported it, while it probably still has one turn. Until now only the manager was told,
         # so an agent never learned that it had been limited: the next session was told only that the limit had
         # reset, which is why nothing paced itself and no result said where the allowance ran out. end_limits
         # already writes to the worker at the other end of the hold, so this is the same pattern.
         emit(agent, "say", f"[hub] You reached your usage limit. The hub holds your work on {tref(task_id)} until "
-             f"{clock(until)}" + ("" if known else ", one hour from now, because no reset time was given") +
+             f"{clock(until)}" + ("" if known else NO_RESET) +
              f". Your session can stop at any moment, so the best thing you can do with this turn is one "
              f"report_progress on {tref(task_id)} saying where you got to and what is left: the session that "
              f"resumes this task reads it, and whatever else you start now is lost. Say in your result where the "
              f"allowance ran out. After the reset, check what was already done before you repeat anything (rule 9).",
-             task=task_id)
+             task=task_id, extra=LIMIT_SAY)
+    also, why_not = spread_limit(agent, route, cause, until, known, t0)
     if agent == manager_name():
-        log("hub", f"the manager is limited until {clock(until)}")
+        log("hub", f"the manager is limited until {clock(until)}" +
+            (f"; so are {', '.join(also)}, on the same account" if also else ""))
         return
     held = [tref(r["id"]) for r in q("SELECT id FROM tasks WHERE owner=? AND state NOT IN "
                                     "('completed','failed','rejected','canceled') ORDER BY id", (agent,))]
     source = f"the session of {tref(task_id)}" if task_id else "its helper"
+    # One allowance, said where the manager chooses who works. Without this the manager read "vps is limited",
+    # created the next task for worker4 on the same account, and learned the rest from a session that failed on
+    # its first call. With it, the line names every agent the allowance holds -- or says why it holds only one.
+    shared = (f" {' and '.join(also)} {'spend' if len(also) > 1 else 'spends'} the same provider allowance, so the "
+              f"hub holds {'their' if len(also) > 1 else 'its'} work until then too." if also else
+              f" The hub holds no other agent for it: {why_not}." if why_not else "")
     emit(manager_name(), "say", f"[hub] {agent} reached its usage limit (reported by {source}). "
-         f"The hub holds its work until {clock(until)}" + ("" if known else ", one hour from now, because no reset time was given") +
-         f": {', '.join(held) or 'no open tasks'}. New tasks for {agent} wait too. There are no nudges or restarts until then, "
-         f"and the hub resumes the held work one time after the reset. To move an urgent task, cancel it and create it for another worker.")
-    log("hub", f"{agent} is limited until {clock(until)}")
+         f"The hub holds its work until {clock(until)}" + ("" if known else NO_RESET) +
+         f": {', '.join(held) or 'no open tasks'}.{shared} New tasks for {agent} wait too. There are no nudges or "
+         f"restarts until then, and the hub resumes the held work one time after the reset. To move an urgent task, "
+         f"cancel it and create it for another worker -- one that does not spend this allowance.")
+    log("hub", f"{agent} is limited until {clock(until)}" +
+        (f"; so are {', '.join(also)}, on the same account" if also else ""))
 
 
 def screen_failed(key, seq, error):
@@ -2385,32 +2468,59 @@ def screen_failed(key, seq, error):
     log("hub", f"{tref(t['id'])} on {t['owner']} is paused: its {session} failed ({error.get('code') or 'no error record'})")
 
 
+def resume_held(lim, t0):
+    """One held agent's working tasks, each resumed one time: a message when its session still runs, a new attempt
+    when it does not. The new attempt is not counted, so a reset never spends one of the three session restarts."""
+    done = []
+    for t in q("SELECT * FROM tasks WHERE owner=? AND state='working' ORDER BY id", (lim["agent"],)):
+        if active_hold(t["id"]) or (t["last_activity"] or 0) >= lim["until"]:
+            continue
+        text = (f"Your usage limit has reset. Continue {tref(t['id'])}. First check what was already done (rule 9): "
+                f"never repeat an outside action that already happened.")
+        if session_alive(lim["agent"], t["id"]):
+            emit(lim["agent"], "say", "[hub] " + text, task=t["id"])
+            done.append(f"{tref(t['id'])} (message)")
+        else:
+            new_attempt(t, "limit reset", text)
+            done.append(f"{tref(t['id'])} (new session)")
+    return done
+
+
 def end_limits(t0):
     """At the reset, held messages flow again. After a short grace time, each held task that did not continue
-    by itself (the vendor can resume on its own) is resumed one time."""
+    by itself (the vendor can resume on its own) is resumed one time.
+
+    One episode of one account is one reported row and a row for each other agent it holds (account_limits), and it
+    ends as one thing: every agent's work resumes exactly once, and the manager reads one message for the episode
+    and not one for each agent. The rows of an episode carry one `until`, which start_limit moves together."""
     for lim in q("SELECT * FROM agent_limits WHERE ended IS NULL AND until<=?", (t0,)):
         q("UPDATE agent_limits SET ended=? WHERE id=?", (t0, lim["id"]))
         log("hub", f"{lim['agent']}'s usage limit reset")
-    for lim in q("SELECT * FROM agent_limits WHERE ended IS NOT NULL AND resumed IS NULL AND until<=?", (t0 - LIMIT_GRACE,)):
-        if lim["agent"] == manager_name():
-            q("UPDATE agent_limits SET resumed=? WHERE id=?", (t0, lim["id"]))
-            continue
-        done = []
-        for t in q("SELECT * FROM tasks WHERE owner=? AND state='working' ORDER BY id", (lim["agent"],)):
-            if active_hold(t["id"]) or (t["last_activity"] or 0) >= lim["until"]:
-                continue
-            text = (f"Your usage limit has reset. Continue {tref(t['id'])}. First check what was already done (rule 9): "
-                    f"never repeat an outside action that already happened.")
-            if session_alive(lim["agent"], t["id"]):
-                emit(lim["agent"], "say", "[hub] " + text, task=t["id"])
-                done.append(f"{tref(t['id'])} (message)")
-            else:
-                new_attempt(t, "limit reset", text)
-                done.append(f"{tref(t['id'])} (new session)")
-        q("UPDATE agent_limits SET resumed=? WHERE id=?", (t0, lim["id"]))
-        emit(manager_name(), "say", f"[hub] {lim['agent']}'s usage limit has reset. The hub resumed its held work one time: "
-             f"{', '.join(done) or 'nothing was waiting'}.")
-        log("hub", f"{lim['agent']}'s usage limit ended; resumed {len(done)} task(s)")
+    # The reported row of each episode, and a derived row whose reported row is already resumed: a second report by
+    # the agent that caused this one closes its own rows and leaves that one behind, and the work it holds still has
+    # to resume exactly once.
+    for lim in q("SELECT l.* FROM agent_limits l LEFT JOIN agent_limits c ON c.id=l.cause "
+                 "WHERE l.ended IS NOT NULL AND l.resumed IS NULL AND l.until<=? "
+                 "AND (l.cause IS NULL OR c.resumed IS NOT NULL) ORDER BY l.id", (t0 - LIMIT_GRACE,)):
+        episode = [lim] + q("SELECT * FROM agent_limits WHERE cause=? AND resumed IS NULL AND ended IS NOT NULL "
+                            "ORDER BY id", (lim["id"],))
+        told = []
+        for r in episode:
+            if r["agent"] != manager_name():
+                told.append((r["agent"], resume_held(r, t0)))
+            q("UPDATE agent_limits SET resumed=? WHERE id=?", (t0, r["id"]))
+        if len(told) == 1 and not lim["cause"]:
+            agent, done = told[0]
+            emit(manager_name(), "say", f"[hub] {agent}'s usage limit has reset. The hub resumed its held work one "
+                 f"time: {', '.join(done) or 'nothing was waiting'}.")
+        elif told:
+            names = " and ".join(a for a, _ in told)
+            emit(manager_name(), "say", f"[hub] The usage limit of the provider account that {names} "
+                 f"{'share' if len(told) > 1 else 'shares'} has reset. The hub resumed "
+                 f"{'their' if len(told) > 1 else 'its'} held work one time -- "
+                 + "; ".join(f"{a}: {', '.join(d) or 'nothing was waiting'}" for a, d in told) + ".")
+        log("hub", f"{lim['agent']}'s usage limit ended; resumed "
+                   f"{sum(len(d) for _, d in told)} task(s) of {len(told)} agent(s)")
 
 
 # A task carried a pointer to its own reason that its owner could not follow. "Goal: G-1" is an id; no worker and no
@@ -3485,7 +3595,10 @@ def t_create_task(agent, a):
     late = "" if seen and now() - (seen["last_seen"] or 0) < 90 else f" Note: {owner}'s helper has not checked in recently."
     lim = active_limit(owner)
     if lim:
-        late += f" Note: {owner} is at its usage limit until {clock(lim['until'])}; the task waits until then."
+        source = limit_source(lim)      # account_limits: an allowance another agent spent is not this one's limit
+        late += (f" Note: {owner} is held until {clock(lim['until'])}, because a session of {source} on the account "
+                 f"they share reached its usage limit; the task waits until then." if source else
+                 f" Note: {owner} is at its usage limit until {clock(lim['until'])}; the task waits until then.")
         # The moment the split is worth considering, said where the manager is standing. It names no alternative
         # agent on purpose: suitability is the manager's judgement and see_capacity is where the facts are, and a
         # list of free agents here would be an invitation to give the work to one that does not suit it.
@@ -3786,6 +3899,19 @@ def kept_reading(key, prior):
     return dict(prior, error="Token records could not be read." if key == "tokens" else "Account limits could not be refreshed.")
 
 
+def signed_out_name(prior, reading):
+    """**An account the owner signed out of still has a name.** A machine's helper drops the address from its own
+    reading the moment the runtime says it is signed out, so that it does not stay on that machine's disk — and the
+    card is then left with the week that account spent and nothing that says whose week it was (the owner, 21 October
+    2026: "it should show the previous account that was usage limited"). The hub is the owner's own, so the hub is
+    where the last address of that same account is kept. For a sign-out and for nothing else: a reading that says the
+    identity changed is saying that this is not that account, and it carries no name forward."""
+    if reading.get("account_email") or reading.get("error") != SIGN_IN_REQUIRED:
+        return
+    if prior and prior.get("account_key") and prior.get("account_key") == reading.get("account_key"):
+        reading["account_email"] = prior.get("account_email")
+
+
 def usage_routes(name):
     """[(route, runtime, limits)] of one agent: its primary runtime, and the Codex screen runtime when it has one."""
     a = agents().get(name) or {}
@@ -3799,10 +3925,16 @@ def usage_routes(name):
     return routes
 
 
-def limit_route(lim):
-    """The route whose session reached a usage limit: screen for a screen task, else primary."""
-    t = read_row("SELECT needs FROM tasks WHERE id=?", (lim["task"],)) if lim["task"] else None
+def task_route(task_id):
+    """The route a task's session runs on: screen for a screen task, else primary."""
+    t = read_row("SELECT needs FROM tasks WHERE id=?", (task_id,)) if task_id else None
     return "screen" if t and t["needs"] == "screen" else "primary"
+
+
+def limit_route(lim):
+    """The route of this agent that spends from the limited account: screen for a screen task, else primary. A hold
+    derived from another agent's report (account_limits) has no task of its own, so it carries its route."""
+    return lim["route"] or task_route(lim["task"])
 
 
 def availability(kind, reason=None, until=None, retry_at=None):
@@ -3919,16 +4051,69 @@ def account_groups(t0=None):
             key = (reading or {}).get("account_key")
             if not key or (route == "primary" and local):
                 continue
-            g = out.setdefault(key, {"key": key, "runtime": runtime, "reading": None, "agents": set(), "holds": []})
+            g = out.setdefault(key, {"key": key, "runtime": runtime, "reading": None, "agents": set(),
+                                     "routes": [], "holds": []})
             g["agents"].add(name)
+            g["routes"].append((name, route))       # account_limits: which route of each agent spends from it
             if (reading.get("collected_at") or 0) > ((g["reading"] or {}).get("collected_at") or -1):
                 g["reading"] = reading
             if lim and limit_route(lim) == route:
                 g["holds"].append(lim)
     for g in out.values():
         g["agents"] = sorted(g["agents"])
+        g["routes"].sort()
         g["state"] = account_state(g["reading"], g["holds"], t0)
     return out
+
+
+# A hold belongs to one agent; an allowance belongs to one account. So a session that reaches a usage limit spends
+# the allowance of every agent on that account, and the hub held only the one that reported it: create_task for the
+# other was taken, its helper was handed the task, and the session failed on its first call. The hold spreads here.
+#
+# The trap is that a window can be one MODEL's share of an account and not the account's own allowance. A reported
+# limit carries nothing but a reset time -- no window, no label, no scope -- so the hub can never say which window a
+# session hit. The reading is the only thing that carries a scope at all, and it carries it in the window's LABEL
+# and in no field of its own: claude_cache appends " (<model>)" to "5 hours", "7 days" or "Account limit" when the
+# provider scoped that window to one model, and normalize_codex_limits puts the provider's own bucket name before
+# " / <period>", one bucket for each limit id (usage.py; its validator fixes a window's five keys, none of them a
+# scope). So the hub cannot ask which window was hit. It can only ask whether every window of this account is the
+# account's own -- and when it cannot say that, it holds nobody else. Reading this wrongly must cost a hold that
+# does not spread, never one that spreads too far: a limit on one model would otherwise take the fleet down.
+SHARE_OF_ONE_MODEL = re.compile(r".* \([^()]+\)")       # claude_cache's scope suffix, the only mark of a scope
+
+
+def one_allowance(reading):
+    """(whether a limit reported on this account is the whole account's allowance, the words for why it is not)."""
+    windows = (reading or {}).get("windows") or []
+    if not windows:
+        return False, "its account reading names no allowance window"
+    scoped = sorted(w["label"] for w in windows if SHARE_OF_ONE_MODEL.fullmatch(w["label"] or ""))
+    if scoped:
+        return False, (f'this account reports a window that is one model\'s share of it ("{clip(scoped[0], 40)}"), '
+                       f"and a reported limit does not say which window it was")
+    families = sorted({w["label"].split(" / ")[0] for w in windows if " / " in (w["label"] or "")})
+    if len(families) > 1:
+        return False, (f"this account reports a window for each of {', '.join(families)}, and a reported limit does "
+                       f"not say which of them it was")
+    return True, None
+
+
+def limit_source(lim):
+    """The agent whose session reported the usage limit that holds this one, or None when it reported it itself.
+
+    read_row and not q1: allowance_start_text reads this from start_text, which admit_task runs inside the
+    transaction that writes the task. A q1 there would commit the half-written task (see read_rows)."""
+    row = read_row("SELECT agent FROM agent_limits WHERE id=?", (lim["cause"],)) if lim and lim["cause"] else None
+    return row["agent"] if row else None
+
+
+def limit_reason(lim):
+    """Why this agent's work is held, for the owner's capacity screen: its own session reached the limit, or another
+    agent's session spent the allowance they share. The owner reads which, so neither line can say that an agent
+    reached a limit that another agent reported."""
+    source = limit_source(lim)
+    return (f"A session of {source} on the provider account they share reached its usage limit" if source else
+            "A session reached its usage limit") + "; the hub holds all of this agent's work until then."
 
 
 def account_group(agent, route="primary", groups=None):
@@ -4081,15 +4266,16 @@ def capacity_view(names=None, expertise=None, needs=None, login=None):
                   if own.get("error") == IDENTITY_CHANGED else
                   availability("available", "A local model has no account limit.") if group is None else groups[group]["state"])
             # account_email: what this route's own runtime reported, or null (unknown), with the time of that own
-            # reading: read_at and stale are of the group's newest reading, which another route can have given. It is
-            # for the owner's display only; the group above comes from account_key alone.
+            # reading: read_at and stale are of the group's newest reading, which another route can have given. A
+            # route that is signed out keeps the last address of that same account (`signed_out_name`). It is for
+            # the owner's display only; the group above comes from account_key alone.
             email = own.get("account_email")
             routes.append(dict({"route": route, "runtime": runtime, "group": group, "account_email": email,
                                 "account_email_read_at": own.get("collected_at") if email else None,
                                 "read_at": (reading or {}).get("collected_at"), "stale": bool(reading) and stale(reading)}, **st))
             shown.add(group)
         known = bool(lim and lim["reset_known"])
-        hold = {"reason": "A session reached its usage limit; the hub holds all of this agent's work until then.",
+        hold = {"reason": limit_reason(lim) if lim else None, "source": limit_source(lim),
                 "until": lim["until"] if known else None, "retry_at": None if known else lim["until"],
                 "task": lim["task"], "route": limit_route(lim)} if lim else None
         allowed = sorted(granted_logins(name)) if a.get("vault") != "none" else []
@@ -11811,9 +11997,12 @@ def history_agents(a, days, start, before):
                       (since, until, name))]
         mid, mid_before = median(minutes(start, now())), median(minutes(before, start))
         tries = [t["attempt"] for t in new]
-        limits = q1("SELECT COUNT(*) n FROM agent_limits WHERE agent=? AND since>=?", (name, start))["n"]
-        limits_before = q1("SELECT COUNT(*) n FROM agent_limits WHERE agent=? AND since>=? AND since<?",
-                           (name, before, start))["n"]
+        # cause IS NULL: a limit this agent's own session reported. One it was held for because another agent on
+        # its account spent the allowance (account_limits) is in history_accounts, counted apart.
+        limits = q1("SELECT COUNT(*) n FROM agent_limits WHERE agent=? AND cause IS NULL AND since>=?",
+                    (name, start))["n"]
+        limits_before = q1("SELECT COUNT(*) n FROM agent_limits WHERE agent=? AND cause IS NULL AND since>=? "
+                           "AND since<?", (name, before, start))["n"]
         tokens = q1("SELECT COALESCE(SUM(total),0) n FROM session_tokens WHERE agent=? AND reported>=?",
                     (name, start))["n"]
         out.append(f"  {name}: delivered {moved(len(new), len(old))}; "
@@ -11913,17 +12102,21 @@ def history_refusals(a, days, start, before):
 
 
 def history_accounts(a, days, start, before):
-    """The usage limits each agent ran into, and how long they held its work."""
+    """The usage limits each agent ran into, and how long they held its work. A limit another agent on the same
+    account reported (account_limits) held this agent's work too, and it is counted apart: it is not a limit this
+    agent ran into, and reading it as one would make a worker on a shared account look like the worse agent."""
     who = [a["agent"]] if a.get("agent") else list(agents())
     out = [f"WHAT THE ACCOUNTS DID, the last {days} days against the {days} before them"]
     for name in who:
         new = q("SELECT * FROM agent_limits WHERE agent=? AND since>=?", (name, start))
         old = q("SELECT * FROM agent_limits WHERE agent=? AND since>=? AND since<?", (name, before, start))
         held = sum((r["ended"] or now()) - r["since"] for r in new)
+        shared = [r for r in new if r["cause"]]
         if not new and not old:
             continue
         out.append(f"  {name} ({(agents().get(name) or {}).get('account') or 'no owner label'}): "
-                   f"limit episodes {moved(len(new), len(old))}"
+                   f"limit episodes {moved(len(new) - len(shared), len([r for r in old if not r['cause']]))}"
+                   + (f", {len(shared)} of them an allowance another agent on the account spent" if shared else "")
                    + (f", {span(held)} of held work" if held else "")
                    + (f", {len([r for r in new if not r['reset_known']])} without a reset time" if new else ""))
     if len(out) == 1:
@@ -11949,7 +12142,7 @@ def t_see_history(agent, a):
 
 # ---------------------------------------------------------------- circle_sweep: the hub sees a repetition by itself
 #
-# Five things the hub can see with SQL and no AI turn. It reports the circle and decides nothing: it never cancels,
+# Six things the hub can see with SQL and no AI turn. It reports the circle and decides nothing: it never cancels,
 # reassigns or blocks anything on a pattern match, because the one case where the third attempt was right is exactly
 # the one an automatic rule would kill. One message to the manager when the set changes, never one per circle and
 # never one per tick.
@@ -11957,6 +12150,8 @@ def t_see_history(agent, a):
 CIRCLE_QUESTION_DAYS = 14       # the same question twice inside this is a circle
 CIRCLE_CHAIN = 3                # tasks in one follows chain whose last one ended badly
 CIRCLE_RESTARTS = 3             # restarts on one task
+CIRCLE_RESTART_RATE = 6         # sessions of one open task lost and started again inside CIRCLE_RESTART_WINDOW
+CIRCLE_RESTART_WINDOW = 86400
 CIRCLE_REFUSALS = 5             # identical refusals inside one task
 CIRCLE_PAIR = 8                 # messages between two agents in a day, with no task made
 CIRCLE_SHOWN = 10
@@ -12000,11 +12195,25 @@ def circles(t0):
                           f"and ended "
                           f"{t['outcome'] or 'unaccepted'} too: "
                           f"{' <- '.join(tref(x['id']) for x in chain)}. {clip(t['title'], 100)}"))
-    # 3. one task started again and again
+    # 3. one task started again and again. `restarts` counts the sessions that died young and the ones its own
+    # requester restarted, so this is the task whose three restarts are spent or nearly spent (SESSION_RESTARTS).
     for t in q(f"SELECT * FROM tasks WHERE restarts>=? AND {OPEN_TASK} ORDER BY id", (CIRCLE_RESTARTS,)):
         found.append((f"restarts:{t['id']}:{t['restarts']}",
-                      f"{tref(t['id'])} ({t['owner']}) has been started again {t['restarts']} times and is still "
+                      f"{tref(t['id'])} ({t['owner']}) has used {t['restarts']} restarts and is still "
                       f"{t['state']}: {clip(t['title'], 100)}"))
+    # 3b. one task whose sessions keep being lost at a rate that nothing bounds. A session that lived and worked
+    # and was then lost is recovered without spending one of the three (SESSION_YOUNG), which is right for a
+    # reboot and says nothing about a task that loses its session every hour. So the rate is a circle and not a
+    # stop: the hub keeps the task alive, the manager reads how often it is being revived, and the decision to
+    # cancel work that is getting done stays its own. Counted from the attempts, which carry each one's own start.
+    for t in q(f"SELECT * FROM tasks WHERE {OPEN_TASK} ORDER BY id"):
+        n = q1("SELECT COUNT(*) n FROM attempts WHERE task=? AND reason='restart' AND created>?",
+               (t["id"], t0 - CIRCLE_RESTART_WINDOW))["n"]
+        if n >= CIRCLE_RESTART_RATE:
+            found.append((f"lost:{t['id']}:{n // CIRCLE_RESTART_RATE}",
+                          f"{tref(t['id'])} ({t['owner']}) lost its session {n} times in the last "
+                          f"{CIRCLE_RESTART_WINDOW // 3600} hours and was started again each time, and is still "
+                          f"{t['state']}: {clip(t['title'], 100)}"))
     # 4. one session asking for the same refused thing
     for r in q("SELECT task, agent, name, detail, COUNT(*) n FROM calls WHERE ok=0 AND task IS NOT NULL "
                "GROUP BY task, agent, name, SUBSTR(detail,1,?) HAVING n>=? ORDER BY task",
@@ -12096,6 +12305,16 @@ def tasks_stuck(t0):
     silence rung, the never-started nudge and the no-live-path report, and a `restarts` over the bound is the "no
     running session after 3 restarts" message. Without that gate this would be a third rung aimed at the owner,
     which is the drowning the fleet's own rule about his attention forbids.
+
+    A `restarts` over the bound still means exactly that the hub has given up: only liveness writes
+    SESSION_RESTARTS + 1, and only when it has refused to restart a session that died young. A task whose restarts
+    are no longer being spent -- its sessions live and work and are then lost -- does not fall off this screen
+    either, and through this rung's own two measures and not through a special case. A restart resets neither
+    `last_activity` nor `nudge_level`, so a session that is replaced and is silent again keeps the silence measure
+    and the nudge that opens the gate; and a replacement that never comes up is a young loss, which spends the
+    budget and ends at the no-path measure. What is left is a task whose new sessions do work each time, which is
+    not stuck: the churn of it is a circle the manager is told about (CIRCLE_RESTART_RATE), and the owner reads it
+    on the `circles_stuck` rung beside this one when it stands for a day.
 
     **Deliberate quiet is not stuckness**, and that is the case that must not regress. A held task, a task whose
     agent is at its usage limit and a parked task are left out whole, exactly as the clocks of `tick` leave them
@@ -13095,7 +13314,9 @@ def overview_text():
                    f"{', '.join(a.get('can', [])) or '-'}" + (f"; expertise: {', '.join(a['expertise'])}" if a.get("expertise") else "")
                    + f"; helper seen {when(row['last_seen'] if row else None)}; "
                    f"open tasks: {', '.join(tref(r['id']) for r in running) or 'none'}"
-                   + (f"; AT ITS USAGE LIMIT until {clock(lim['until'])}" if lim else ""))
+                   + (f"; HELD until {clock(lim['until'])}: a session of {limit_source(lim)} on the account they "
+                      f"share reached its usage limit" if lim and limit_source(lim) else
+                      f"; AT ITS USAGE LIMIT until {clock(lim['until'])}" if lim else ""))
     out.append("")
     out.append("OPEN TASKS")
     rows = q("SELECT * FROM tasks WHERE state NOT IN ('completed','failed','rejected','canceled') ORDER BY id")
@@ -15203,8 +15424,9 @@ def came_back(task_id, t0):
 
 def liveness(t0):
     """Every open task needs a live path: a live session, an open question, a hold, a usage-limit wait, or a time its
-    own agent named to come back to it. A task with none is recovered with a new session (at most three times) or
-    reported to its requester once."""
+    own agent named to come back to it. A task with none is recovered with a new session or reported to its
+    requester once. The three restarts (SESSION_RESTARTS) bound the sessions that died young, which is the crash
+    loop; a session that lived and worked and was then lost is recovered without spending one of them."""
     for t in q("SELECT * FROM tasks WHERE state IN ('submitted','working','input-required','auth-required')"):
         tid, owner = t["id"], t["owner"]
         row = q1("SELECT * FROM agents WHERE name=?", (owner,))
@@ -15219,7 +15441,10 @@ def liveness(t0):
         if hold:
             path = held_word(hold)
         elif lim:
-            path = f"waiting for {owner}'s usage limit to reset at {clock(lim['until'])}"
+            source = limit_source(lim)
+            path = (f"waiting for the usage limit of the account {owner} shares with {source} to reset at "
+                    f"{clock(lim['until'])}" if source else
+                    f"waiting for {owner}'s usage limit to reset at {clock(lim['until'])}")
         elif park:
             path = f"waiting until {clock(park['due'])}, as {owner} asked (R-{park['id']})"
         elif t["state"] == "submitted":
@@ -15243,19 +15468,28 @@ def liveness(t0):
           (t0, reason, tid))
         if t["state"] == "submitted":
             continue        # the never-started nudge reports these
-        if online:          # the session vanished: restart it, at most three times
+        if online:          # the session vanished: restart it, and only a young death spends one of the three
             if not t["started"] or t0 - t["started"] < 45:
                 continue
             if not t["missing_since"]:
                 q("UPDATE tasks SET missing_since=? WHERE id=?", (t0, tid))
             elif t0 - t["missing_since"] > 30:
-                if t["restarts"] < SESSION_RESTARTS:
-                    new_attempt(t, "restart", counted=True)
-                    log("hub", f"session for {tref(tid)} vanished; restarting it on {owner}")
+                # How long the lost session lived, measured at the moment it went and not now: missing_since is
+                # the first tick that saw it gone, and it stands still while the hub waits, so this answer does
+                # not drift as the task sits there. A long-lived session that is lost is recovered for free; if
+                # its replacement then fails to come up, that loss is young and the budget takes it, so three
+                # starts that fail still stop the task.
+                young = t["missing_since"] - t["started"] < SESSION_YOUNG
+                if not young or t["restarts"] < SESSION_RESTARTS:
+                    new_attempt(t, "restart", counted=young)
+                    log("hub", f"session for {tref(tid)} vanished after {span(t['missing_since'] - t['started'])}; "
+                               f"restarting it on {owner}" + ("" if young else " (not counted: it was not a crash loop)"))
                 elif t["restarts"] == SESSION_RESTARTS:
                     q("UPDATE tasks SET restarts=? WHERE id=?", (SESSION_RESTARTS + 1, tid))
                     emit(t["requester"], "say", f"[hub] {tref(tid)} has no running session on {owner} after "
-                         f"{SESSION_RESTARTS} restarts. "
+                         f"{SESSION_RESTARTS} restarts. This one was lost within {span(SESSION_YOUNG)} of its own "
+                         f"start, and a session that keeps dying that young says the start is failing and not the "
+                         f"work: {owner}'s runtime may be signed out, or its session may be failing to start. "
                          f"Decide what to do.", task=tid)
         elif not t["stall_told"] and t0 - (t["stalled_since"] or t0) >= CFG.get("silence", 180):
             q("UPDATE tasks SET stall_told=1, nudge_level=2 WHERE id=?", (tid,))
@@ -23432,7 +23666,9 @@ class Handler(BaseHTTPRequestHandler):
                 for r in rows:
                     t = q1("SELECT * FROM tasks WHERE id=?", (r["task"],)) if r["task"] else None
                     extra = json.loads(r["extra"] or "{}")
-                    if limited and r["kind"] in ("task", "say", "chat"):
+                    # LIMIT_SAY passes: the hub's own word about this limit is what tells the session why it is
+                    # about to go quiet, and held until the reset it arrives stale and says nothing.
+                    if limited and r["kind"] in ("task", "say", "chat") and not extra.get("limit"):
                         continue        # held until the usage limit resets; the read receipt stays open
                     if r["kind"] == "conversation" and ((limited or pending or updating) or not q1(
                             "SELECT 1 FROM conversations WHERE id=? AND state='open'",
@@ -23542,9 +23778,11 @@ class Handler(BaseHTTPRequestHandler):
                             data["screen"][key] = kept_reading(key, prior)
                 if local_model(agents()[agent]):
                     data["limits"] = None       # a local model has no vendor account windows; never keep old ones
-                for reading in (data["limits"], (data.get("screen") or {}).get("limits")):
+                for prior, reading in ((old.get("limits"), data["limits"]),
+                                       ((old.get("screen") or {}).get("limits"), (data.get("screen") or {}).get("limits"))):
                     if reading is not None:     # the account email of the signed-in runtime, or null: unknown
                         reading.setdefault("account_email", None)
+                        signed_out_name(prior, reading)
                 stored = old.get("previous")    # the hub's own reading at the switch, or an earlier report
                 if prev and prev["tokens"] and not (stored and stored["runtime"] == prev["runtime"] and stored["tokens"] and
                                                     stored["tokens"]["collected_at"] > prev["tokens"]["collected_at"]):
