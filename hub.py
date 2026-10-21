@@ -19532,6 +19532,7 @@ LOGIN_OPEN = "state IN (%s)" % ",".join("'%s'" % s for s in LOGIN_STATES)
 LOGIN_OUT_RUNTIMES = tuple(sorted(runtimes_with("sign_out")))   # the runtimes a sign-out can be driven for
 LOGIN_LIFE = 900                # seconds a sign-in may take before the hub gives it up
 LOGIN_CODE_LIFE = 180           # seconds the owner's code waits in memory for the machine to take it
+LOGIN_START_LIFE = 240          # seconds a sign-in may stand at `starting`: twice the machine's own wait for a link
 LOGIN_URLS = {name: RUNTIMES[name]["sign_in"]["url"] for name in LOGIN_RUNTIMES}      # the provider's own link
 USER_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{3,40}")        # a code a provider shows or gives the owner
 # The live part of every open sign-in, by its id: {"url", "show_code", "wants_code", "code", "at"}. In memory, on
@@ -19570,6 +19571,14 @@ def expire_logins(t0=None):
         if row["id"] not in LIVE_LOGINS:
             q("UPDATE signin_jobs SET state='failed', detail=?, updated=? WHERE id=?",
               ("The hub restarted while this sign-in waited. Start it again.", t0, row["id"]))
+    # **And a machine that restarted left no sign-in running.** A helper leaves `starting` within its own wait for
+    # the provider's link, so a row that has stood there for twice as long is one whose helper went with it — an
+    # update of that machine, most often. It is over too, instead of refusing the next sign-in for a quarter of an
+    # hour while a window nobody reads waits on that machine.
+    for row in q("SELECT * FROM signin_jobs WHERE state='starting' AND updated<?", (t0 - LOGIN_START_LIFE,)):
+        q("UPDATE signin_jobs SET state='failed', detail=?, updated=? WHERE id=?",
+          ("Its machine did not get as far as the provider's page. Start the sign-in again.", t0, row["id"]))
+        LIVE_LOGINS.pop(row["id"], None)
     for one, live in list(LIVE_LOGINS.items()):
         if live.get("code") and t0 - live.get("code_at", t0) > LOGIN_CODE_LIFE:
             live.pop("code", None)              # the machine never came for it: forget it rather than keep it
