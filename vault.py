@@ -242,7 +242,11 @@ def load_config(path):
             members = grp.getgrnam(group)
         except KeyError:
             raise SystemExit(f"there is no group {group} on this machine") from None
-        if pwd.getpwuid(os.getuid()).pw_name in members.gr_mem or members.gr_gid == os.getgid():
+        # The vault **user's** own groups, read from the passwd and group files, and never this process's gid: the
+        # service runs with Group=<this very group> so that the socket is readable by the machine's agent users, so
+        # the running gid is always it, and reading that refused every correctly installed broker.
+        me = pwd.getpwuid(os.getuid())
+        if me.pw_name in members.gr_mem or members.gr_gid == me.pw_gid:
             raise SystemExit("worker_group must be the group of the agents' users, never one the vault user is in")
     for key in ["age_key", "socket", "age"] + sorted((STORE_KEYS | BITWARDEN_KEYS - {"region"}) & given):
         if not isinstance(conf[key], str) or not os.path.isabs(conf[key]):
