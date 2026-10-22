@@ -2405,6 +2405,8 @@ class Helper:
             self.login_job(kind, task, extra)
         elif kind == "request":
             self.request_job(task, extra)
+        elif kind == "deposit":
+            self.deposit(extra)
         elif kind == "control":
             self.control(task, extra)
         elif kind == "manager_start":
@@ -3568,6 +3570,29 @@ class Helper:
             raise Refused(f"the hub did not take the {extra.get('action')} result ({code})")
         self.say(f"{task}: {extra.get('action')} {'confirmed' if confirmed else 'NOT confirmed'}: {detail}")
 
+    def deposit(self, extra):
+        """A key or a login that the owner sealed in his app for this machine's vault (owner feature
+        secret_deliveries). The helper passes only the delivery's number: the broker takes the sealed copy from the hub,
+        opens it with its own key, has the hub compare the value's fingerprints with the owner's and saves it in its
+        own store. Nothing of the copy or the value passes this process. The outcome goes back to the hub, which drops
+        the copy; if the hub cannot be told, the event stays pending and the next poll asks again, which is the same
+        save."""
+        number = extra.get("deposit")
+        if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+            raise Refused("a delivery without its number")
+        try:
+            reply = broker_job_request(self.agent, {"op": "deposit", "job": number}, timeout=60)
+            ok, text = True, "Saved in this machine's vault." if reply.get("saved") == "new" else \
+                "This machine's vault already had it."
+        except Refused as e:
+            ok, text = False, str(e)[:300]
+        except Exception as e:          # never pass details on: they could hold a value
+            ok, text = False, f"the helper hit an error ({type(e).__name__})"
+        code, _ = http("POST", f"/helper/deposit/{self.agent}/{number}", {"ok": ok, "text": text})
+        if code != 200:
+            raise Refused(f"the hub did not take the outcome of delivery {number}")
+        self.say(f"delivery {number}: {'saved' if ok else 'refused: ' + text[:120]}")
+
     def login_job(self, kind, task, extra):
         """A sign-in or a handover an agent asked for. It happens here, outside the agent's session."""
         login, to = str(extra.get("login") or ""), str(extra.get("to") or "")
@@ -3940,6 +3965,10 @@ def cmd_check(args):
                  "this broker is older than the fleet's own store")
             line(status.get("recipient") == conf.get("vault_recipient"), "vault broker key is the one pinned in team.json",
                  "set vault_recipient for this agent to the broker's public key")
+            if store == "store":            # owner feature secret_deliveries: the owner's keys reach this store so
+                line(status.get("deposits") is True or None, "vault broker takes the keys the owner delivers",
+                     "update Fleet Vault with the Founderizer app" if sys.platform == "darwin" else
+                     "install vault.py again and restart fleet-vault (WORKER-INSTALL.md, \"Vault broker\")")
             # The broker runs a root-owned copy of vault.py that no release reinstalls, so this is the one line that
             # says whether it runs the vault of this checkout. The hub says the same against the revision it serves.
             try:
@@ -4231,6 +4260,7 @@ def vault_status(agent):
               "creates": (status.get("creates") is True) if status else None,       # create_login
               "captures": (status.get("captures") is True) if status else None,     # save_key
               "requests": (status.get("requests") is True) if status else None,     # call_api
+              "deposits": (status.get("deposits") is True) if status else None,     # a delivered secret of the owner's
               "broker_recipient": recipient if isinstance(recipient, str) else None,
               "broker_source": source if isinstance(source, str) and re.fullmatch(r"[0-9a-f]{64}", source) else None,
               "broker_read_at": time.time() if status else None}

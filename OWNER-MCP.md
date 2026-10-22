@@ -152,7 +152,7 @@ would read as an empty fleet instead of as a mistake.
 | `owner_device` / `device_code` | `/ui/owner/devices[/<d>/code]` | The owner's phones, and one enrollment code. Its key is the phone's. |
 | `reload_team` | `/ui/team/reload` | Apply `team.json` from a pushed revision without restarting the hub. |
 | `send_message` | `/ui/messages` | Say something to an agent. **This is how a goal or a duty is set.** |
-| `answer_needs_you` | `/ui/needs/<id>` | Answer a Needs-you item, in words or by choosing an option. |
+| `answer_needs_you` | `/ui/needs/<id>` | Answer a Needs-you item, in words or by choosing an option. A secret request takes neither: the app's secure form answers it. |
 | `control_task` / `steer_task` | `/ui/tasks/<id>/control`, `/steer` | Pause, stop, resume; steer an open task. |
 | `goal_state` / `duty_state` / `trigger_state` | `/ui/goals/<id>/state` and the two beside it | Pause, resume, finish, drop. |
 | `settle_outcome` | `/ui/outcomes/<id>` | Record whether an unknown outcome took effect. |
@@ -172,7 +172,9 @@ server is not allowed to carry.
 
 1. **Bring a new credential into the fleet.** The subscription token the shop issues for this
    fleet (`POST /ui/releases/entitlement`), the GitHub App's private key, a chat app's bot token,
-   Google's Connect, a vault login and the Tailscale auth key itself. Each is the owner's account,
+   Google's Connect, a vault login (also the one a manager asks for with `request_secret`, whose
+   answer, `POST /ui/needs/<id>/secret`, only the app's secure form gives, once the value is in the
+   vault) and the Tailscale auth key itself. Each is the owner's account,
    the owner's money and the owner's liability (RULES.md, "Access that the fleet already holds"),
    and the value would have to pass through a tool. So the owner does these in the app, and this
    server hands out only what the fleet already holds. The Tailscale key is the one it touches,

@@ -35,7 +35,8 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "runtime_switch", "login_create", "login_capture", "api_request",
             "app_server_tasks",     # helper abilities that the hub may use; app_server_tasks: app_server_task below
             "manager_switch",       # the manager's helper closes its previous runtime's session after a switch
-            "mcp_program"]          # it resolves a command MCP server's program for POST /ui/mcp/check
+            "mcp_program",          # it resolves a command MCP server's program for POST /ui/mcp/check
+            "secret_deposits"]      # it carries a sealed copy of the owner's into this machine's vault (deposit)
 # ---------------------------------------------------------------- the runtimes
 #
 # What the fleet knows about a runtime is here, in one entry for each provider, and nowhere else. hub.py, fleet.py and

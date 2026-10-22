@@ -70,8 +70,8 @@ OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 # Every owner command route of hub.py that is deliberately NOT a tool here, with the reason (OWNER-MCP-BOUNDARY.md
 # section 6). The owner asked for an admin server that is "super powerful and flexible" (20 October 2026), so the
-# rule is the other way round from a list of features: every owner route is a tool unless it is named here. Ten of
-# these would make this server the thing that carried a credential, which "No secret through a tool" forbids; two
+# rule is the other way round from a list of features: every owner route is a tool unless it is named here. Twelve
+# of these would make this server the thing that carried a credential, which "No secret through a tool" forbids; two
 # are not the Mac's calls at all. `selftest.py` and `test_owner_mcp.py` both read this, so a new owner route in the
 # hub fails a release until somebody decides which side of this list it is on. That is the whole of the upkeep.
 NOT_TOOLS = {
@@ -84,6 +84,8 @@ NOT_TOOLS = {
     "/ui/mcp/finish": "the authorization code of that flow",
     "/ui/secrets/add": "the value of a login",
     "/ui/secrets/fingerprints": "the owner's own secret catalog",
+    "/ui/needs/{}/secret": "a secret request's answer, which the app's secure form gives once the value is in a vault",
+    "/ui/secrets/deliver": "copies of a value sealed to each machine's vault, which only the owner's own vault makes",
     "/ui/restore": "a whole fleet restored over this one, from a file this server would have to carry",
     "/ui/owner/devices/{}/push": "the phone's own push token, which the route takes from the phone only",
     "/ui/owner/enroll": "the phone's own call, before it has a key",

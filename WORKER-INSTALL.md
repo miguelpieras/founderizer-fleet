@@ -134,6 +134,17 @@ install changes only who may ask it. A broker opens one store or the other, neve
 both, so a machine with the fleet's own store cannot open a secret of a Bitwarden
 project, and the owner's existing brokers are left as they are.
 
+**The owner's keys reach that store by delivery.** A key or a login that the owner
+types into Founderizer is saved in the vault of his Mac, which no worker reads. So
+the app also seals the value to each machine's pinned vault key, the hub carries the
+sealed copy, which it cannot open, and the broker opens it, has the hub compare the
+value's fingerprints with the ones the owner's vault registered, and saves it in its
+own store under the same `bws://` reference (owner feature `secret_deliveries`). It
+takes a broker whose `vault.py` has the `deposit` operation (its status says
+`"deposits": true`) and a helper that reports the feature `secret_deposits`; the
+Secrets page says, for each machine, whether it can take one and what is missing. A
+broker that opens a Bitwarden project takes none.
+
 **The configuration is root with mode 644 and holds no secret.** Do not make it
 `root:fleet-vault` 640: the service sets `Group=`, so the vault user's own group is
 not among the service's groups, the broker fails on its own configuration, and the

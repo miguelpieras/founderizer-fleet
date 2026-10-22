@@ -40,6 +40,10 @@ Without that key the broker sends no request.
 A Linux broker also gives a session start the API keys that the owner lets the calling agent read (read): the hub
 names them, and the broker reads each value and registers its fingerprints before it gives it to the worker's user.
 
+With the fleet's own store, a Linux broker also takes a key or a login that the owner typed into Founderizer on his
+Mac (deposit): the app seals the value to this broker's pinned key, the hub carries the sealed copy, and the broker
+opens it, has the hub compare the value's fingerprints with the owner's, and saves it under the same reference.
+
 Run a copy that the worker's user cannot change (root-owned, outside the worker's checkout), with a root-owned
 configuration, Bitwarden settings and programs, because an agent can change every file in its own checkout:
     python3 /usr/local/lib/fleet-vault/vault.py serve --config /etc/fleet-vault/vault.json
@@ -98,7 +102,7 @@ STORE_KEYS = {"store", "store_key"}
 BITWARDEN_KEYS = {"region", "token_file", "bws", "bws_config"}
 AGENT_NAME = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
 CALLER_KEY = re.compile(r"[A-Za-z0-9_-]{43}")          # an agent key (owner API 1.12): 256 bits, base64url
-OPERATIONS = ("status", "signin", "handover", "probe", "create", "request", "cancel", "read")
+OPERATIONS = ("status", "signin", "handover", "probe", "create", "request", "cancel", "read", "deposit")
 ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,59}")         # read: the variable name of an API key, as the hub checks it
 READS = 32                  # read: the most values that one session gets
 # The write setup (create_login): all three keys or none. sdk: the installed library; sdk_sha256: its checksum;
@@ -630,6 +634,55 @@ def probe(conf, job):
     return {"ok": True, "v": PROTOCOL, "job": job, "results": results}
 
 
+def delivered(text, item):
+    """The value in a delivered copy, read as store-put reads the owner's own (store_item): a login needs its address,
+    and an API key keeps one when it has it. It refuses, and never exits, because the broker serves the next request."""
+    try:
+        given = json.loads(text)
+    except ValueError:
+        raise Refused("the delivered copy holds no item") from None
+    if item == "api_key" and isinstance(given, dict) and "url" not in given:
+        return check_value(text)
+    return check_login(given)
+
+
+def deposit(conf, number):
+    """deposit (owner feature secret_deliveries): save in this machine's own store one key or login that the owner's
+    vault sealed to this broker's pinned key. The helper names only the delivery. The hub gives the sealed copy, the
+    secret's reference, title and kind, and the salts of its fingerprints; the copy is opened here with the handover
+    key, and the hub compares the value's fingerprints with the ones that the owner's vault registered under that
+    reference before anything is saved. It is saved under the same reference, so `bws://<id>` names one value in every
+    vault of the fleet, and the answer holds no part of it."""
+    if backend(conf) != "store":
+        raise Refused("this machine's vault opens a Bitwarden project, so it takes no delivered secret")
+    store = LocalStore(conf)            # a store that does not open refuses before the hub gives the copy
+    read_private(conf["age_key"], "handover key")
+    code, data = hub(conf, "POST", f"/helper/vault/{conf['agent']}", {"job": number, "kind": "deposit"})
+    if code != 200 or not isinstance(data, dict) or data.get("ok") is not True or data.get("job") != number \
+            or data.get("kind") != "deposit":
+        reason = data.get("error") if isinstance(data, dict) else None
+        raise Refused("the hub did not give this delivery" + (f": {reason}" if isinstance(reason, str) else ""))
+    ref, title, item, text, salts = (data.get(k) for k in ("login", "title", "item", "ciphertext", "fingerprint_salts"))
+    m = SECRET_REF.fullmatch(ref) if isinstance(ref, str) else None
+    if not (m and plain_line(title, 200) and item in ("login", "api_key") and isinstance(text, str) and ARMOR in text
+            and isinstance(salts, dict)
+            and all(re.fullmatch(r"[0-9a-f]{32}", str(salts.get(k))) for k in ("password", "totp"))):
+        raise Refused("the hub gave no valid delivery")
+    r = run([conf["age"], "-d", "-i", conf["age_key"]], text)
+    if r is None or r.returncode != 0:
+        raise Refused("the delivered copy cannot be opened with this machine's vault key")
+    value = delivered(r.stdout, item)
+    code, data = hub(conf, "POST", f"/helper/vault/{conf['agent']}/fingerprints",
+                     {"deposit": number, "fingerprints": fingerprints(value, salts)})
+    if code != 200 or not isinstance(data, dict) or data.get("ok") is not True or data.get("deposit") != number:
+        reason = data.get("error") if isinstance(data, dict) else None
+        raise Refused("the hub did not confirm this value" + (f": {reason}" if isinstance(reason, str) else ""))
+    saved = store.put(m.group(1).lower(), title, json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                                            ensure_ascii=False), "delivered from the owner's vault")
+    log(f"deposit job={number}: {ref.lower()} {saved}")
+    return {"ok": True, "v": PROTOCOL, "deposit": number, "login": ref.lower(), "saved": saved}
+
+
 def probe_one(conf, ref, token):
     def result(state, reason):
         return {"login": ref, "state": state, "reason": reason}
@@ -790,6 +843,31 @@ class LocalStore:
         finally:
             os.close(fd)
         return sid
+
+    def put(self, sid, name, value, note=""):
+        """Save one item under the id that it has in the owner's vault (deposit): "new", or "same" when the store holds
+        that value under that id already. Another value under that id is refused, because one reference names one
+        value in every vault of the fleet: a delivery never changes what a name already means here."""
+        if canonical_id(sid) != sid or not plain_line(name, 200) or not isinstance(value, str) or \
+                not isinstance(note, str):
+            raise Refused("the vault store needs an id and a name of 1 to 200 characters for an item")
+        fd = self.locked()
+        try:
+            items = self.opened()
+            if sid in items:
+                try:
+                    same = json.loads(items[sid]["value"]) == json.loads(value)
+                except ValueError:
+                    same = items[sid]["value"] == value
+                if same:
+                    return "same"
+                raise Refused("this machine's vault store holds another value under this reference, so nothing was "
+                              "saved")
+            items[sid] = {"key": name, "value": value, "note": note, "made_at": time.time()}
+            self.keep(items)
+        finally:
+            os.close(fd)
+        return "new"
 
     def item(self, sid):
         """One item of the store: {id, key (its name), value, note}."""
@@ -1641,6 +1719,8 @@ def handle(conf, line, uid):
             status["creates"] = True
         if conf.get("_requests") is not None:       # only with a curl program: this broker can send a request
             status["requests"] = True
+        if backend(conf) == "store":                # the fleet's own store takes a secret the owner delivers
+            status["deposits"] = True
         return status
     who = caller(req)
     if who:                             # this request acts for its caller; the store does not change
@@ -1663,6 +1743,13 @@ def handle(conf, line, uid):
         if not isinstance(job, int) or isinstance(job, bool) or job < 1:
             raise Refused("a request needs a job number")
         return send(conf, job)
+    if op == "deposit":
+        job = req.get("job")
+        if not who:
+            raise Refused("a deposit needs the caller fields")
+        if not isinstance(job, int) or isinstance(job, bool) or job < 1:
+            raise Refused("a deposit needs the number of its delivery")
+        return deposit(conf, job)
     if op == "signin":
         raise Refused("signing in needs a browser: only the Mac vault helper signs in")
     if op == "read":

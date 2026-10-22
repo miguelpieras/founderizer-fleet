@@ -8,7 +8,7 @@ Needs nothing but Python. The sealed-handover checks are skipped when `age` is n
 Takes about a minute because it waits for the hub's timers. It tests hub.py only: fleet.py needs
 tmux and real sessions, which is what the pilot itself is for.
 """
-import ast, hashlib, json, os, re, shutil, socket, subprocess, sys, tempfile, threading, time
+import ast, base64, hashlib, json, os, re, shutil, socket, subprocess, sys, tempfile, threading, time, uuid
 import urllib.error, urllib.parse, urllib.request
 
 VERBOSE = "-v" in sys.argv
@@ -40,12 +40,13 @@ REFERENCE = {
 }
 
 
-def start_hub(name, addresses, *flags, agents=None):
+def start_hub(name, addresses, *flags, agents=None, extra=None):
     port = free_port()
     team = {"hub": {"machine": "hub", "port": 8765}, "addresses": addresses,
             "agents": json.loads(json.dumps(REFERENCE))}
     if agents:          # agents of the check's own
         team["agents"].update(json.loads(json.dumps(agents)))
+    team.update(json.loads(json.dumps(extra or {})))        # other entries of the check's own, a catalog of secrets
     path = os.path.join(TMP, f"{name}.json")
     json.dump(team, open(path, "w"))
     proc = subprocess.Popen([sys.executable, os.path.join(KIT, "hub.py"), "--host", "127.0.0.1", "--port", str(port),
@@ -76,7 +77,8 @@ EVERY_AGENT = ["read_messages", "search_knowledge", "write_knowledge", "see_resp
                "message_agent"]
 MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "answer", "check_result",
                                "decide_permission", "see_team", "see_capacity", "see_goals",
-                               "update_goal", "record_spend", "raise_needs_you", "tell_owner", "grant_access",
+                               "update_goal", "record_spend", "raise_needs_you", "request_secret", "tell_owner",
+                               "grant_access",
                                "set_duty", "change_duty", "see_history", "decide_report"]
 WORKER_TOOLS = EVERY_AGENT + ["list_my_tasks", "report_progress", "read_attachment", "ask_my_requester",
                               "deliver_result", "sign_in", "hand_over", "resolve_outcome", "see_earlier_work",
@@ -602,6 +604,104 @@ ev = events("manager", after=before)
 check("the owner's answer reaches the manager", ev and "Tide" in ev[0]["text"], str(ev))
 code, _, _ = raw("POST", "/say", form={"text": "Status please"})
 check("owner message reaches the manager", any("[owner] Status please" in e["text"] for e in events("manager", after=before)))
+text, err = tool("manager", "raise_needs_you", title="Stripe", why="Billing needs the key",
+                 what_to_do="Please paste the Stripe secret key here.")
+check("a Needs-you item that asks for a key in words is refused, naming request_secret",
+      err and "request_secret" in text, text)
+
+# 7b secret requests (owner feature secret_requests): the manager asks for a key, the owner's app answers with its
+# secure form, and no value passes the manager or the hub. A hub of its own, because the answer is an owner route,
+# which needs the owner's address, and the main hub has none; the catalog is in its team.json from the start, as the
+# app's own step (POST /ui/secrets/add) would have left it, because that step commits team.json through git.
+STRIPE = "bws://11111111-2222-4333-8444-555555555555"
+procS, hubS = start_hub("secrets", {"vps": "", "mac-studio": "", "owner": "127.0.0.1"}, "--tick", "1",
+                        agents={"studio": dict(REFERENCE["studio"], secrets={STRIPE: "read"})},
+                        extra={"logins": {STRIPE: {"title": "STRIPE_SECRET_KEY", "kind": "api_key",
+                                                   "env": "STRIPE_SECRET_KEY"}}})
+
+
+def owner_ui(path, body, base=None):
+    db = json.loads(raw("GET", "/ui/state", base=base)[2])["db"]
+    return raw("POST", path, dict({"request_id": str(uuid.uuid4()), "db": db}, **body),
+               {"X-Fleet-Client": "selftest"}, base=base)
+
+
+text, err = tool("manager", "request_secret", base=hubS, why="Charge customers")
+check("request_secret: an API key needs its variable name", err and "needs env" in text, text)
+text, err = tool("manager", "request_secret", base=hubS, kind="login", why="Read the payouts")
+check("request_secret: a login needs its sign-in page", err and "needs site" in text, text)
+text, err = tool("manager", "request_secret", base=hubS, kind="login", site="https://dash.example.com", why="x",
+                 give_to={"vps": "read"})
+check("request_secret: nobody reads a login", err and '"use"' in text, text)
+text, err = tool("manager", "request_secret", base=hubS, env="STRIPE_SECRET_KEY", why="Billing")
+check("request_secret: a key the catalog has is refused, with its reference", err and STRIPE in text, text)
+text, err = tool("manager", "request_secret", base=hubS, env="OPENAI_API_KEY", site="https://api.openai.com",
+                 why="studio writes the product copy", give_to={"studio": "read"})
+check("request_secret raises a Needs-you item and says the value never passes the manager",
+      not err and "N-1" in text and "never its value" in text, text)
+text, err = tool("manager", "request_secret", base=hubS, env="OPENAI_API_KEY", why="again")
+check("...and the same request again raises nothing", not err and "N-1 already asks" in text, text)
+need = json.loads(raw("GET", "/ui/state", base=hubS)[2])["needs"][0]
+check("the owner's app reads what the item asks for", need["kind"] == "secret" and need["secret"] == {
+    "kind": "api_key", "env": "OPENAI_API_KEY", "site": "https://api.openai.com", "give": {"studio": "read"}}, need)
+code, _, text = owner_ui("/ui/needs/1", {"answer": "sk-proj-abcdef0123456789"}, base=hubS)
+check("a secret request takes no answer in words", code == 409 and "no answer in words" in text, text)
+code, _, _ = raw("POST", "/needs/1", form={"answer": "sk-proj-abcdef0123456789"}, base=hubS)
+check("...not on the board either", code == 303 and "This page takes no secret" in raw("GET", "/board", base=hubS)[2]
+      and not json.loads(raw("GET", "/ui/state", base=hubS)[2])["needs"][0]["answer"])
+said = "\n".join(e["text"] for e in json.loads(raw("GET", "/events/manager?after=0&wait=0", base=hubS)[2])["events"])
+check("...and no word of it reached the manager", "sk-proj" not in said, said[-300:])
+code, _, text = owner_ui("/ui/needs/1/secret", {"login": "bws://99999999-2222-4333-8444-555555555555"}, base=hubS)
+check("the secure answer names a secret of the catalog", code == 404, text)
+code, _, text = owner_ui("/ui/needs/1/secret", {"login": STRIPE, "value": "x"}, base=hubS)
+check("the secure answer takes no value", code == 400 and "unknown field" in text, text)
+answer_id = str(uuid.uuid4())
+code, _, text = owner_ui("/ui/needs/1/secret", {"login": STRIPE, "request_id": answer_id}, base=hubS)
+check("the secure answer is accepted", code == 200 and json.loads(text)["login"] == STRIPE, text)
+said = json.loads(raw("GET", "/events/manager?after=0&wait=0", base=hubS)[2])["events"][-1]["text"]
+check("the manager reads the secret's name, its reference and who holds it, in the hub's words",
+      "Answer to Needs-you N-1" in said and STRIPE in said and "studio (reads it as $STRIPE_SECRET_KEY)" in said
+      and "Its variable is STRIPE_SECRET_KEY, not OPENAI_API_KEY" in said, said)
+code, _, text = owner_ui("/ui/needs/1/secret", {"login": STRIPE, "request_id": answer_id}, base=hubS)
+check("the same answer again is a replay", code == 200 and json.loads(text)["replayed"], text)
+code, _, text = owner_ui("/ui/needs/1/secret", {"decline": "no"}, base=hubS)
+check("an answered secret request takes no second answer", code == 409, text)
+text, err = tool("manager", "request_secret", base=hubS, kind="login", site="https://dash.example.com/login",
+                 why="vps reads the payouts", give_to={"vps": "use"})
+check("request_secret asks for a login", not err and "a login for dash.example.com" in text, text)
+code, _, text = owner_ui("/ui/needs/2/secret", {"decline": "Use the test account first"}, base=hubS)
+said = json.loads(raw("GET", "/events/manager?after=0&wait=0", base=hubS)[2])["events"][-1]["text"]
+check("a declined secret request reaches the manager in the owner's words",
+      code == 200 and "Not given: Use the test account first" in said, text + said)
+text, err = tool("manager", "raise_needs_you", base=hubS, title="Vault token", why="Fleet Vault has none",
+                 what_to_do="Paste the Bitwarden access token into Fleet Vault on your Mac.")
+check("a Needs-you item that sends the owner to his own app passes", not err and "N-3" in text, text)
+code, _, text = owner_ui("/ui/needs/3/secret", {"decline": ""}, base=hubS)
+check("an item that asks for no secret takes no secure answer", code == 409, text)
+# Owner feature secret_deliveries: the app seals a value to each machine's pinned vault key and the hub carries the
+# sealed copy to that machine's broker. The hub's side only: a broker that opens a copy needs age, a store and a vault
+# user of its own, which is what a machine is for.
+state = json.loads(raw("GET", "/ui/state", base=hubS)[2])
+check("the hub offers secret_deliveries", "secret_deliveries" in state["ui_features"], state["ui_features"])
+code, _, text = raw("GET", f"/ui/secrets/machines?db={state['db']}&login={urllib.parse.quote(STRIPE)}", base=hubS)
+got = {m["machine"]: m for m in json.loads(text)["machines"]} if code == 200 else {}
+check("a machine whose agents have no broker access is offered no key to seal to",
+      got.get("mac-studio", {}).get("missing") == ["no_broker_access"] and got["mac-studio"]["recipient"] is None
+      and got["mac-studio"]["deposit"] is None and set(got) == {"vps", "mac-studio"}, text)
+armored = base64.b64encode(b"age-encryption.org/v1\n-> X25519 " + b"A" * 43 + b"\n" + b"B" * 43 + b"\n--- " +
+                           b"C" * 43 + b"\n" + os.urandom(48)).decode()
+COPY = "-----BEGIN AGE ENCRYPTED FILE-----\n" + "".join(armored[i:i + 64] + "\n" for i in range(0, len(armored), 64)) + \
+    "-----END AGE ENCRYPTED FILE-----\n"
+KEY = "age1" + "q" * 58
+code, _, text = owner_ui("/ui/secrets/deliver", {"login": STRIPE, "copies": [
+    {"machine": "mac-studio", "recipient": KEY, "ciphertext": COPY}]}, base=hubS)
+check("a copy for a machine that takes none is refused, with why", code == 409 and "no_broker_access" in text, text)
+code, _, text = owner_ui("/ui/secrets/deliver", {"login": STRIPE, "copies": [
+    {"machine": "mac-studio", "recipient": KEY, "ciphertext": '{"password": "sk_live_0123456789abcdef"}'}]}, base=hubS)
+check("the hub takes a sealed copy and nothing else", code == 400 and "age file" in text, text)
+code, _, text = owner_ui("/ui/secrets/deliver", {"login": STRIPE, "value": "x", "copies": []}, base=hubS)
+check("...and no value beside it", code == 400 and "unknown field" in text, text)
+procS.terminate()
 
 # 8 outbox, practice site, fingerprints, seatbelt
 check("outbox starts empty", json.loads(raw("GET", "/outbox?key=launch")[2])["count"] == 0)

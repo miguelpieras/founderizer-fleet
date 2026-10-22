@@ -302,6 +302,14 @@ CREATE TABLE IF NOT EXISTS releases(id INTEGER PRIMARY KEY, seen REAL NOT NULL, 
   version TEXT, notes TEXT, minimum TEXT, hold INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL, step TEXT,
   says TEXT, pinned TEXT, reached TEXT, started REAL, finished REAL, automatic INTEGER NOT NULL DEFAULT 0);
 CREATE UNIQUE INDEX IF NOT EXISTS release_revision ON releases(revision);
+-- Owner feature secret_deliveries: one key or login of the owner's, sealed in his app to one machine's pinned vault
+-- key, on its way into that machine's own store. The hub carries the sealed copy and cannot open it; `recipient` is
+-- the pin it was sealed to, `sha256` what the owner's command named, and the copy itself is dropped when the
+-- delivery ends, as a sealed handover's is.
+CREATE TABLE IF NOT EXISTS deposits(id INTEGER PRIMARY KEY, login TEXT NOT NULL, machine TEXT NOT NULL,
+  agent TEXT NOT NULL, recipient TEXT NOT NULL, sha256 TEXT NOT NULL, ciphertext TEXT, request_id TEXT NOT NULL,
+  created REAL NOT NULL, released REAL, verified REAL, finished REAL, ok INTEGER, result TEXT);
+CREATE INDEX IF NOT EXISTS deposit_of ON deposits(login, machine, id);
 
 """
 EVENT_CAP = 5000                                    # thread records kept per task attempt
@@ -600,7 +608,8 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "mobile", "attachments", "resource_grants", "machine_signin",
                "releases", "entitlement", "agent_signin", "github_app", "need_options", "restore",
                "manager_start", "agent_notes", "edit_in_place", "machine_access", "push",
-               "attachment_knowledge", "asking_and_waiting", "account_limits"]
+               "attachment_knowledge", "asking_and_waiting", "account_limits", "secret_requests",
+               "secret_deliveries"]
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 
 
@@ -883,10 +892,24 @@ def need_options(row):
     return [str(x) for x in got] if isinstance(got, list) else []
 
 
+def need_secret(row):
+    """What a secret request asks for (owner feature secret_requests), as a dict, or None for every other item:
+    {kind, env (an API key), site, give ({agent: use | read}, the manager's proposal), saved (the reference that
+    answered it)}. It names a secret and never holds a value."""
+    if row["kind"] != "secret":
+        return None
+    try:
+        got = json.loads(row["secret"]) if row["secret"] else {}
+    except (ValueError, TypeError):
+        got = {}
+    return got if isinstance(got, dict) else {}
+
+
 def need_view(row):
     """One Needs-you item for the owner: its row, with the agent's options as a list and the option that the owner
-    pressed as its index. chosen is null for an answer that the owner typed."""
-    return dict(row, options=need_options(row))
+    pressed as its index. chosen is null for an answer that the owner typed. secret is what a secret request asks
+    for, which the app answers with its secure form, and null on every other item."""
+    return dict(row, options=need_options(row), secret=need_secret(row))
 
 
 def check_need_options(given):
@@ -1041,7 +1064,7 @@ def filed_under(agent, kind, task):
 
 def emit(agent, kind, text, task=None, extra=None):
     """Queue a message for one agent's helper. Kinds: task, say, chat, stop, control, signin, handover, create,
-    capture, request, notify, mcp_program, manager_start."""
+    capture, request, deposit, notify, mcp_program, manager_start."""
     return ins(EVENT, (agent, kind, filed_under(agent, kind, task), str(text), now(), json.dumps(extra or {})))
 
 
@@ -1350,7 +1373,8 @@ def migrate():
         "reminders": {"agent": "TEXT", "task": "INTEGER", "created": "REAL", "fired": "REAL"},
         "needs": {"kind": "TEXT", "conversation": "INTEGER",   # owner feature conversations: ask_owner, request_work
                   "options": "TEXT", "chosen": "INTEGER",     # owner feature need_options: the agent's own answers
-                  "answered_by": "TEXT"},     # null is the owner; "P-<id> <name>" is the deputy of that conversation
+                  "answered_by": "TEXT",      # null is the owner; "P-<id> <name>" is the deputy of that conversation
+                  "secret": "TEXT"},          # owner feature secret_requests: what request_secret asks for, never a value
         "owner_reports": {"agent": "TEXT NOT NULL DEFAULT 'manager'", "in_reply_to": "TEXT",
                           "pushed": "INTEGER NOT NULL DEFAULT 0"},     # chat apps round 2: message_owner
         "chat_out": {"recipient": "TEXT"},          # chat apps round 2: a Discord user ID when chat is null
@@ -3180,7 +3204,9 @@ def access_needed(value, level=None):
     if len(rid) > 200 or not resource_parts(rid)[0]:
         raise ToolError(f"needs_access must be <kind>:<what>, with a kind of {', '.join(sorted(RESOURCE_LEVELS))}: "
                         f"repo:acme/web, secret:bws://<uuid>, gmail:a@b.com, drive:a@b.com or tool:<MCP server>. "
-                        f"Leave it out for a question that is not about access.")
+                        f"Leave it out for a question that is not about access, and for a key or a login that the "
+                        f"fleet does not hold at all, which has no reference yet: say in the question which one and "
+                        f"what for, and the owner is asked for it.")
     kind = resource_parts(rid)[0]
     if want and want not in RESOURCE_LEVELS[kind]:
         raise ToolError(f"needs_level must be one of {', '.join(RESOURCE_LEVELS[kind])} for a "
@@ -4549,7 +4575,8 @@ def capacity_text(view, filters, needs, restricted=False, parent=None, caller=No
                        f". Held by {held}. You may give it to: {', '.join(p['eligible']) or 'nobody here'}.")
         if not pool:
             out.append("  none. Every resource is the owner's to give until it makes one grantable: ask with "
-                       "raise_needs_you, and say what the work needs it for.")
+                       "raise_needs_you, and say what the work needs it for. A key or a login the fleet does not "
+                       "hold at all: request_secret, and he types it into the vault.")
     # The caller's own account is in none of the blocks above: it reads the capacity of the agents it may give work
     # to, and it is not one of them. Its own allowance is what every one of those placements costs a turn of, so it
     # belongs in the tool it calls before each one -- said as its own spending and not as a fact about an agent.
@@ -5469,6 +5496,32 @@ def need_is_notice(*texts):
             f"truly must do or decide something now, raise it again saying only that.")
 
 
+# A key, a password or a token is never asked for in words (owner feature secret_requests). The hub masks only the
+# values it already knows, so a key that the owner types into a chat or into the answer of a Needs-you item is in the
+# manager's conversation, its runtime's own transcript and these records before anything can mask it. request_secret
+# asks for one instead: the owner types it into the app's secure form, which writes it into the vault, and the
+# manager gets its name and its reference. An item that sends the owner to an app of his own (Fleet Vault, the
+# Secrets page) asks for no value in words, and passes.
+ASKS_FOR_SECRET = re.compile(
+    r"\b(?:send|paste|share|provide|forward|reply with|answer with|write)\b[^.;:!?\n]{0,40}?"
+    r"\b(?:api[ -]?keys?|keys?|tokens?|passwords?|secrets?|credentials?|passcodes?)\b", re.I)
+SECRET_IN_AN_APP = re.compile(r"\b(?:fleet|founderizer) vault\b|\bsecrets page\b", re.I)
+
+
+def need_asks_secret(*texts):
+    """The refusal of a Needs-you item that asks the owner for a secret's value in words, or None."""
+    blob = " ".join(t for t in texts if t)
+    hit = ASKS_FOR_SECRET.search(blob)
+    if not hit or SECRET_IN_AN_APP.search(blob):
+        return None
+    return (f'Not raised: this item asks the owner to "{hit.group(0)}", and a key, a password or a token is never '
+            f"sent in words. The hub masks only the values it already knows, so it would be in your conversation and "
+            f"in these records before anything could mask it. Ask for it with request_secret: the owner types it "
+            f"into a secure form in Founderizer on his Mac, it goes straight into the vault, and his answer gives "
+            f"you its name and its reference, never the value. If this item is about something else, say it "
+            f"without asking for the value itself.")
+
+
 def t_raise_needs_you(agent, a):
     title = str(a.get("title") or "").strip()
     why = str(a.get("why") or "").strip()
@@ -5481,6 +5534,9 @@ def t_raise_needs_you(agent, a):
     notice = need_is_notice(title, why, todo, *(json.loads(options) if options else ()))
     if notice:
         raise ToolError(notice)
+    secret = need_asks_secret(title, why, todo)
+    if secret:
+        raise ToolError(secret)
     mine = need_is_yours(agent, title, why, todo)
     if mine:
         raise ToolError(mine)
@@ -5492,6 +5548,349 @@ def t_raise_needs_you(agent, a):
     picks = (" The owner sees your options and presses one: " + ", ".join(json.loads(options)) +
              ". His answer is the words of the one he presses, or anything else he writes instead.") if options else ""
     return f"Raised N-{nid}. The owner's answer will arrive as a message in this session.{picks}"
+
+
+# ---------------------------------------------------------------- secret requests (owner feature secret_requests)
+# The owner, 22 October 2026: "can we setup a system so that I can enter secrets/api keys in an input to the manager,
+# so he can save them into the fleet?" The manager asks with request_secret, and that is a Needs-you item of its own
+# kind. The app answers it with its secure form: the owner types the value, Fleet Vault on his Mac writes it into the
+# vault, the hub registers its fingerprints and its catalog entry (POST /ui/secrets/add) and the agents he chose
+# (POST /ui/secrets/grant), and only then does the request get its answer (POST /ui/needs/<id>/secret), whose words
+# are the hub's own, read from the catalog: the name, the reference and who holds it. No value passes the manager,
+# its runtime or this file, and an answer in words is refused, so a key cannot reach the chat by that route either.
+SECRET_REQUESTS_OPEN = 5        # requests of the manager's that may wait for the owner at once: each rings his phone
+SECRET_SITE_MAX = 200
+SECRET_WHY_MAX = 1000
+SECRET_GIVE_MAX = 12
+SECRET_DECLINE_MAX = 300
+SECRET_SITE = re.compile(r"https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?(?:[/?#][^\s]*)?")
+SECRET_TODO = ("Open this request in Founderizer on your Mac and type it into its secure form: it goes straight into "
+               "the vault, and no agent sees it, the manager included. The request takes no answer in words, so a "
+               "key cannot land in a chat by mistake.")
+SECRET_NO_WORDS = ("N-{id} asks for a secret, so it takes no answer in words: a key typed here would be in the "
+                   "manager's conversation before anything could mask it. Answer it in Founderizer on the owner's "
+                   "Mac, whose secure form puts the value into the vault.")
+
+
+def secret_site_host(site):
+    """The host of a request's address, for its title: "dashboard.stripe.com" of "https://dashboard.stripe.com/login".
+    It keeps the subdomain, because that is the page the owner will recognise."""
+    return urllib.parse.urlsplit(site).hostname or site
+
+
+def secret_asked(spec):
+    """A request's secret in a sentence: "the API key STRIPE_SECRET_KEY", "a login for stripe.com"."""
+    if spec.get("kind") == "api_key":
+        return f"the API key {spec.get('env')}"
+    return f"a login for {secret_site_host(spec['site'])}" if spec.get("site") else "a login"
+
+
+def t_request_secret(agent, a):
+    kind = str(a.get("kind") or "api_key").strip()
+    if kind not in SECRET_KINDS:
+        raise ToolError('kind is "api_key", a key that an agent reads as a variable or that its vault sends with '
+                        'call_api, or "login", a user name and a password that its vault signs in with.')
+    env = str(a.get("env") or "").strip()
+    if kind == "api_key" and not env_name(env):
+        raise ToolError("An API key needs env: the variable name an agent reads it by, A-Z, 0-9 and _, starting "
+                        "with a letter, at most 60 characters, for example STRIPE_SECRET_KEY. The names a session "
+                        "sets itself (FLEET_*, ANTHROPIC_*, PATH and their like) are not available.")
+    if kind == "login" and env:
+        raise ToolError("A login has no env: no agent ever reads a password, its vault signs in with it. Leave env "
+                        "out, or ask for an API key instead.")
+    site = str(a.get("site") or "").strip()
+    if site and (len(site) > SECRET_SITE_MAX or not SECRET_SITE.fullmatch(site)):
+        raise ToolError(f"site is the address where the secret is used, with https://, at most {SECRET_SITE_MAX} "
+                        f"characters: a login's sign-in page, or the API an agent calls with the key.")
+    if kind == "login" and not site:
+        raise ToolError("A login needs site: the address of its sign-in page, with https://, so the owner knows "
+                        "which account you mean and the vault knows where to sign in.")
+    why = str(a.get("why") or "").strip()
+    if not why or len(why) > SECRET_WHY_MAX:
+        raise ToolError(f"why is what the work needs it for, in 1 to {SECRET_WHY_MAX} characters: the owner reads "
+                        f"it before he types the value.")
+    give = a.get("give_to") or {}
+    if not isinstance(give, dict) or len(give) > SECRET_GIVE_MAX:
+        raise ToolError(f'give_to maps up to {SECRET_GIVE_MAX} agents to "use" or "read", for example '
+                        f'{{"studio": "read"}}.')
+    for name, level in give.items():
+        if role_of(name) not in ("worker", "lead"):
+            raise ToolError(f"give_to names workers and leads, because a secret reaches task sessions: {name} is "
+                            f"not one. Agents: {', '.join(n for n in agents() if role_of(n) in ('worker', 'lead'))}.")
+        if level not in RESOURCE_LEVELS["secret"] or (level == "read" and kind != "api_key"):
+            raise ToolError(f'{name} gets "use", which lets its vault use the secret for it without it ever seeing '
+                            f'it, or for an API key "read", which puts the key into its sessions as the variable.')
+    spec = {"kind": kind, **({"env": env} if env else {}), **({"site": site} if site else {}),
+            **({"give": dict(sorted(give.items()))} if give else {})}
+    if kind == "api_key":
+        have = next((ref for ref, e in sorted(logins().items())
+                     if e.get("kind") == "api_key" and e.get("env") == env), None)
+        if have:
+            rid = f"secret:{have}"
+            top = (resource_pool().get(rid) or {}).get("max")
+            route = (f'grant_access(agent=..., resource="{rid}", level="{top}") gives it to an agent' if top else
+                     f"it is not in the grantable pool, so the owner gives it to an agent on the Secrets page: "
+                     f"raise_needs_you, naming {have} and the agent")
+            raise ToolError(f"The fleet already holds the API key {env}, as {have}, so there is nothing to type: "
+                            f"{route}. If its value is wrong or was revoked, tell the owner with raise_needs_you that "
+                            f"{have} must be removed on the Secrets page; then request_secret asks for the new one.")
+    waiting = q("SELECT * FROM needs WHERE kind='secret' AND answer IS NULL ORDER BY id")
+    for r in waiting:
+        old = need_secret(r)
+        if old.get("kind") == kind and old.get("env" if kind == "api_key" else "site") == spec.get(
+                "env" if kind == "api_key" else "site"):
+            return (f"N-{r['id']} already asks the owner for {secret_asked(old)}, so nothing was raised again. His "
+                    f"answer arrives as a message in this session.")
+    if len(waiting) >= SECRET_REQUESTS_OPEN:
+        raise ToolError(f"{len(waiting)} secret requests already wait for the owner: "
+                        + ", ".join(f"N-{r['id']}" for r in waiting) + ". Wait for his answers before you ask for more.")
+    guard(agent, why, site)
+    title = ("Enter the API key " + env) if kind == "api_key" else f"Enter a login for {secret_site_host(site)}"
+    nid = ins("INSERT INTO needs(title,why,todo,raised,by,kind,secret) VALUES(?,?,?,?,?,?,?)",
+              (title, why, SECRET_TODO, now(), agent, "secret", json.dumps(spec)))
+    emit("owner", "notify", f"Needs you N-{nid}: {title}")
+    ping_need(nid)
+    return (f"Asked the owner for {secret_asked(spec)} as N-{nid}. He types it into the secure form of N-{nid} in "
+            f"Founderizer on his Mac: it goes straight into the vault, and neither you nor any other agent ever sees "
+            f"it. His answer arrives as a message in this session with its name, its reference and who holds it, "
+            f"never its value. Never ask him for it in words in the meantime.")
+
+
+def secret_answer_text(ref, entry, spec):
+    """The words that answer a secret request, read from the catalog and team.json at the moment of the answer: the
+    secret's name, its reference and who holds it. Never a value: the hub has none."""
+    api = entry.get("kind") == "api_key"
+    name = entry.get("env") or entry.get("title") or ref
+    held = resource_holders("secret", ref)
+    top = (resource_pool().get(f"secret:{ref}") or {}).get("max")
+    words = [f"Saved {'the API key' if api else 'the login'} {name} in the vault, as {ref}."]
+    if api and spec.get("env") and entry.get("env") != spec["env"]:
+        words.append(f"Its variable is {entry.get('env')}, not {spec['env']}.")
+    words.append(("Held now by " + ", ".join(
+        f"{h['agent']} ({'reads it as $' + name if h['level'] == 'read' else 'uses it through its vault'})"
+        for h in held) + ": each has it in a task session that starts once the vault of its machine has it.")
+                 if held else "No agent holds it yet.")
+    words += delivery_words(ref, [h["agent"] for h in held])
+    words.append(f'You may give it with grant_access(resource="secret:{ref}"), up to {top}.' if top else
+                 "Only the owner gives it to an agent: it is not in the grantable pool.")
+    words.append("Its value is in the vault: neither this message nor you have it.")
+    return " ".join(words)
+
+
+def answer_secret(body, request_id, client):
+    """POST /ui/needs/<id>/secret: the answer of one secret request, with a secret of the catalog or with a decline.
+    The value was saved, registered and granted by the app's own steps before this one; this one says so to the
+    agent that asked, in the hub's words, through the same rows as every owner answer (owner_message_rows)."""
+    need = q1("SELECT * FROM needs WHERE id=?", (body["need"],))
+    if not need:
+        raise Refusal(404, "owner request does not exist")
+    if need["kind"] != "secret":
+        raise Refusal(409, "this owner request asks for no secret: answer it in words (POST /ui/needs/<id>)")
+    if need["answer"] is not None:
+        raise Refusal(409, "owner request is already answered")
+    if q1("SELECT 1 FROM ui_requests WHERE request_id=?", (request_id,)):
+        raise Refusal(409, "request_id was already used for an owner message; send the answer with a new one")
+    spec, ref = need_secret(need), body["login"]
+    if ref is not None:
+        entry = logins().get(ref)
+        if entry is None:
+            raise Refusal(404, "no such secret: its hub step (POST /ui/secrets/add) comes first")
+        if (entry.get("kind") or "login") != spec.get("kind", "api_key"):
+            raise Refusal(409, f"this request asks for {secret_asked(spec)}, and {ref} is "
+                               f"{'an API key' if entry.get('kind') == 'api_key' else 'a login'}")
+        text = secret_answer_text(ref, entry, spec)
+    else:
+        text = "Not given" + (f": {body['decline']}" if body["decline"] else ".") + \
+            " Do not ask for it in words instead."
+    t0 = now()
+    with transaction():
+        event_id = owner_message_rows(request_id, "answer", need, text, client, need["by"], None, t0)
+        if ref is not None:
+            DB.execute("UPDATE needs SET secret=? WHERE id=?", (json.dumps(dict(spec, saved=ref)), need["id"]))
+    return {"need": need["id"], "login": ref, "answer": text, "event_id": event_id}
+
+
+# ---------------------------------------------------------------- a key into each machine's own vault
+#
+# Owner feature secret_deliveries. The app saves a value in the vault of the owner's Mac, and a machine whose broker
+# keeps the fleet's own store cannot read that vault. So the app also seals the value to each such machine's pinned
+# vault key (store_key: the key a sealed handover is locked to, which only the owner's own command pins) and the hub
+# carries the sealed copies, which it cannot open. That machine's broker opens its copy, has the hub compare the
+# value's fingerprints with the ones the owner's vault registered under that reference, and saves it in its own store
+# under the same reference. The copy is dropped when the delivery ends. No value reaches the hub, a helper, an agent
+# or a log, and the owner's command names only checksums of the copies, which is all the hub keeps of it.
+DEPOSIT_WAIT = 7 * 86400        # seconds a sealed copy waits for its machine before it is dropped
+DEPOSIT_COPIES = 32             # machines in one command
+DEPOSIT_COPY_MAX = 16384        # characters of one sealed copy: a key or a login is far less
+DEPOSIT_RESULT_MAX = 300
+AGE_FILE = re.compile(r"-----BEGIN AGE ENCRYPTED FILE-----\n((?:[A-Za-z0-9+/=]{1,64}\n){1,400})"
+                      r"-----END AGE ENCRYPTED FILE-----\n?")
+DEPOSIT_STATES = {None: "waiting", 1: "delivered", 0: "failed"}
+
+
+def sealed_copy(text):
+    """An age file in ASCII armor sealed to an X25519 key, as the app seals it, with LF line ends, or None. The hub
+    cannot open it and does not try: this only refuses what is plainly not a sealed copy, before a broker reads it."""
+    if not isinstance(text, str) or len(text) > DEPOSIT_COPY_MAX:
+        return None
+    text = text.replace("\r\n", "\n")
+    m = AGE_FILE.fullmatch(text)
+    try:
+        head = base64.b64decode(m.group(1).replace("\n", ""), validate=True) if m else b""
+    except ValueError:
+        return None
+    return text if head.startswith(b"age-encryption.org/v1\n-> X25519 ") and b"\n--- " in head else None
+
+
+def deposit_machines(team=None, t0=None):
+    """{machine: entry} for each machine with a worker or a lead (the owner's Mac has neither, so the vault the app
+    saves into is never one of these): its agents, and either the agent whose helper carries a copy there and the
+    pinned key to seal it to, or what is missing, in vault_grant's codes."""
+    team, t0 = team or TEAM, t0 or now()
+    groups = {}         # one address is one machine name (validate_team), so this is by name
+    for name, a in sorted(team["agents"].items()):
+        if a.get("role") in ("worker", "lead") and a.get("machine"):
+            groups.setdefault(a["machine"], []).append(name)
+    out = {}
+    for machine, names in sorted(groups.items()):
+        key, brokers = store_key(team, machine), [n for n in names if team["agents"][n].get("vault") == "broker"]
+        carrier, fresh, missing = None, -1, ["no_broker_access"] if not brokers else [] if key else ["no_vault_store"]
+        for n in brokers if key else []:
+            r, lack = broker_report(n, t0), [] if agent_key(n) else ["agent_without_key"]
+            if not r or r.get("broker_recipient") is None:
+                lack.append("broker_status_unknown")
+            elif r["broker_recipient"] != key:
+                lack.append("vault_store_mismatch")
+            else:
+                lack += [code for code, good in (("broker_without_callers", r.get("callers") is True),
+                                                 ("helper_without_deposits", "secret_deposits" in r["features"]),
+                                                 ("broker_without_deposits", r.get("deposits") is True)) if not good]
+            if not lack and (r.get("broker_read_at") or 0) > fresh:
+                carrier, fresh = n, r.get("broker_read_at") or 0
+            elif lack and (not missing or len(lack) < len(missing)):
+                missing = lack
+        out[machine] = {"machine": machine, "agents": names, "carrier": carrier, "recipient": key if carrier else None,
+                        "missing": [] if carrier else missing}
+    return out
+
+
+def deposit_view(row):
+    """One delivery, for the owner: never its copy."""
+    return {"id": row["id"], "state": DEPOSIT_STATES[row["ok"]] if row["finished"] else "waiting",
+            "agent": row["agent"], "created": row["created"], "taken": row["released"], "finished": row["finished"],
+            "result": row["result"]}
+
+
+def latest_deposits(ref):
+    """{machine: the newest delivery of this secret to that machine}."""
+    return {r["machine"]: r for r in q("SELECT * FROM deposits WHERE id IN (SELECT MAX(id) FROM deposits WHERE login=? "
+                                       "GROUP BY machine)", (ref,))}
+
+
+def delivery_words(ref, holders):
+    """What the hub knows of this secret in the vaults of these agents' machines, in sentences: its deliveries there,
+    and a machine that could take one and got none. A machine that takes no delivery is left out, because what its
+    vault holds is not the hub's to say: one that reads the owner's Bitwarden project can have it already."""
+    machines, done, by = deposit_machines(), latest_deposits(ref), {}
+    for m in sorted({agents()[a]["machine"] for a in holders if a in agents()}):
+        state = deposit_view(done[m])["state"] if m in done else "none" if machines.get(m, {}).get("carrier") else None
+        if state:
+            by.setdefault(state, []).append(m)
+
+    def vaults(names):
+        return ("the vault of " if len(names) == 1 else "the vaults of ") + \
+            (names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1])
+    said = {"delivered": lambda v: f"{v[0].upper()}{v[1:]} {'has' if v.startswith('the vault ') else 'have'} it.",
+            "waiting": lambda v: f"It is on its way to {v}: the hub tells you when it is there.",
+            "failed": lambda v: f"It did not reach {v}: the owner delivers it again from the app.",
+            "none": lambda v: f"The owner has not delivered it to {v}."}
+    return [said[state](vaults(by[state])) for state in ("delivered", "waiting", "failed", "none") if state in by]
+
+
+def secret_machines(ref, t0=None):
+    """GET /ui/secrets/machines: each machine, whether a sealed copy can go to it now (and the key to seal it to), and
+    with a secret, its newest delivery there."""
+    done = latest_deposits(ref) if ref else {}
+    return [dict(m, deposit=deposit_view(done[name]) if name in done else None)
+            for name, m in sorted(deposit_machines(None, t0).items())]
+
+
+def deliver_secret(body, copies):
+    """POST /ui/secrets/deliver: one delivery for each sealed copy, to its machine. body is what the hub keeps of the
+    command (the checksums); copies are the sealed copies themselves, by machine. A machine that has this secret
+    already, or whose delivery still waits, gets no second one. Every named machine must take a copy now, sealed to its
+    key as pinned now, or nothing is delivered. The fingerprints that the app registered with the secret are what each
+    vault's copy is compared with (helper_deposit_check). Called with LOCK held."""
+    ref = body["login"]
+    entry = logins().get(ref)
+    if entry is None:
+        raise Refusal(404, "no such secret: its hub step (POST /ui/secrets/add) comes first")
+    t0 = now()
+    machines, done = deposit_machines(None, t0), latest_deposits(ref)
+    wrong = {c["machine"]: (["no_such_machine"] if c["machine"] not in machines else
+                            machines[c["machine"]]["missing"] or ["vault_key_changed"])
+             for c in body["copies"] if c["machine"] not in machines or not machines[c["machine"]]["carrier"]
+             or machines[c["machine"]]["recipient"] != c["recipient"]}
+    if wrong:
+        raise Conflict("these machines cannot take a copy now: " + ", ".join(sorted(wrong)), machines=wrong)
+    out, rows, events = [], [], []
+    for c in body["copies"]:
+        old = done.get(c["machine"])
+        if old is not None and (not old["finished"] or old["ok"]):
+            out.append({"machine": c["machine"], "id": old["id"], "state": "waiting" if not old["finished"] else
+                        "delivered", "new": False})
+            continue
+        rows.append((ref, c["machine"], machines[c["machine"]]["carrier"], c["recipient"], c["sha256"],
+                     copies[c["machine"]], body["request_id"], t0))
+    with transaction():
+        for row in rows:
+            did = DB.execute("INSERT INTO deposits(login,machine,agent,recipient,sha256,ciphertext,request_id,created) "
+                             "VALUES(?,?,?,?,?,?,?,?)", row).lastrowid
+            out.append({"machine": row[1], "id": did, "state": "waiting", "new": True})
+            events.append((row[2], "deposit", None, f"deliver {entry.get('env') or entry['title']} into this "
+                                                     f"machine's vault", {"deposit": did, "login": ref}))
+        event_rows(events, t0)
+    for row in rows:
+        log("owner", f"sealed {ref} for the vault of {row[1]} ({row[2]} carries it)")
+    return {"login": ref, "deposits": sorted(out, key=lambda d: d["machine"])}
+
+
+def deposit_waiting(did, agent):
+    """The delivery that this agent's helper carries, while it waits, or None."""
+    row = q1("SELECT * FROM deposits WHERE id=? AND agent=?", (did, agent))
+    return row if row and not row["finished"] else None
+
+
+def finish_deposit(row, ok, text, t0=None):
+    """End one delivery, drop its copy, and tell the manager quietly: it comes with his next read and wakes nobody,
+    because the owner watches it in the app and the manager only needs to know when an agent there can use it."""
+    t0 = t0 or now()
+    q("UPDATE deposits SET ok=?, result=?, finished=?, ciphertext=NULL WHERE id=?", (1 if ok else 0, text, t0, row["id"]))
+    entry = logins().get(row["login"]) or {}
+    name = f"The API key {entry['env']}" if entry.get("env") else f"The login {entry.get('title') or row['login']}"
+    holders = sorted(a for a, x in agents().items() if x.get("machine") == row["machine"]
+                     and row["login"] in secret_grants(a))
+    if ok:
+        said = f"[hub] {name} ({row['login']}) is now in the vault of {row['machine']}" + \
+            (f", where {', '.join(holders)} hold{'s' if len(holders) == 1 else ''} it: a task session that starts "
+             f"from now on has it." if holders else ".")
+    else:
+        said = f"[hub] {name} ({row['login']}) did not reach the vault of {row['machine']}: {text} The owner " \
+               f"delivers it again from the Secrets page of Founderizer."
+    emit(manager_name(), "say", said, extra={"quiet": True})
+    log(row["agent"], f"delivery {row['id']} of {row['login']} to {row['machine']}: {'done' if ok else 'failed: ' + text}")
+
+
+def expire_deposits(t0):
+    """A copy that its machine did not take in DEPOSIT_WAIT is dropped, and so is one whose carrier lost its broker
+    access or whose machine's pinned key changed: no broker could take it any more."""
+    for r in q("SELECT * FROM deposits WHERE finished IS NULL"):
+        why = ("Its machine did not take it in a week." if t0 - r["created"] > DEPOSIT_WAIT else
+               f"{r['agent']} has no broker access any more." if agents().get(r["agent"], {}).get("vault") != "broker"
+               else "Its machine's vault key changed since the copy was sealed."
+               if store_key(TEAM, r["machine"]) != r["recipient"] else None)
+        if why:
+            finish_deposit(r, False, why, t0)
 
 
 def unanswered_owner_message(agent):
@@ -13011,7 +13410,8 @@ TOOLS = [
      "phone, so it is never for a warning, a status, a risk or an FYI, and never for something you will go on with "
      "by default when he says nothing: those go to tell_owner, which posts with no notification, or nowhere. The "
      "hub refuses an item whose own words say nothing is needed. Use rarely. When you ask him to choose, give the "
-     "choices in options: he presses one, and its words come back as the answer.",
+     "choices in options: he presses one, and its words come back as the answer. Never ask for a key, a password or "
+     "a token here: request_secret is how the value reaches the vault without passing you.",
      S({"title": STR, "why": STR,
         "what_to_do": {"type": "string", "description": "The one thing that only the owner can do or decide now. "
                                                         "If there is none, do not raise the item."},
@@ -13021,6 +13421,28 @@ TOOLS = [
                                    f"Leave it out for a question that is not a choice; the owner can always write "
                                    f"his own answer instead."}},
        ["title", "why", "what_to_do"])),
+    ("manager", "request_secret", t_request_secret,
+     "Ask the owner for a secret that the fleet does not hold: an API key or a login. It is a Needs-you item that he "
+     "answers in a secure form in Founderizer on his Mac, so the value goes straight into the vault and never "
+     "passes you, your runtime or a chat: a key he typed in words would be in your conversation before anything "
+     "could mask it, so never ask for one in words. His answer arrives as a message in this session with the "
+     "secret's name, its reference (bws://...) and the agents that hold it now, never the value. Propose in "
+     "give_to the agents the work needs it for; he chooses. A key the catalog already has is refused, with how to "
+     "give it instead.",
+     S({"kind": {"type": "string", "enum": list(SECRET_KINDS),
+                 "description": "api_key (the default): a key an agent reads as a variable or its vault sends with "
+                                "call_api. login: a user name and a password the vault signs in with."},
+        "env": {"type": "string", "description": "An API key's variable name, for example STRIPE_SECRET_KEY: how "
+                                                 "an agent that reads it finds it in its sessions"},
+        "site": {"type": "string", "description": "The address where it is used, with https://: a login's sign-in "
+                                                  "page (required for a login), or the API an agent calls with it"},
+        "why": {"type": "string", "description": "What the work needs it for, in a sentence or two: the owner "
+                                                 "reads it before he types the value"},
+        "give_to": {"type": "object", "additionalProperties": {"type": "string", "enum": ["use", "read"]},
+                    "description": "The agents you propose should get it: use (its vault uses it, and the agent "
+                                   "never sees it) or, for an API key, read (the key is in its sessions as env). "
+                                   "The owner can change this before he saves."}},
+       ["why"])),
     # owner API 1.13: the standing duties of an agent (RESPONSIBILITIES.md)
     ("all", "see_responsibilities", t_see_responsibilities,
      "See the duties that you hold: their watches, their open cases and what is not in order. A duty stays; it "
@@ -13224,7 +13646,8 @@ TOOLS = [
      "or a deploy route), a Google service or an MCP server. It works only inside the grantable pool that the owner "
      "set, never above the level the owner allows, and never for a resource that the owner keeps (money, a production "
      "deployment, customer mail). The grant is a commit of team.json, so the owner sees it and can take it back. "
-     "Bringing a new credential into the fleet stays the owner's: for that, raise_needs_you. The agent gets it in its "
+     "Bringing a new credential into the fleet stays the owner's: for a key or a login the fleet does not hold, "
+     "request_secret; for anything else, raise_needs_you. The agent gets it in its "
      "next task session. Each grant is written into the owner's chat with you, with your own why, because you answer "
      "for giving it.",
      S({"request_id": {"type": "string", "description": "A new UUID for each write"},
@@ -13687,7 +14110,12 @@ def board_html():
     if not rows:
         p.append("<div class='muted'>Nothing.</div>")
     for r in rows:
-        if r["answer"] is None:
+        if r["answer"] is None and r["kind"] == "secret":
+            # owner feature secret_requests: a page of the hub is no place to type a key
+            p.append(f"<div><b>N-{r['id']} {esc(r['title'])}</b><br>Why: {esc(r['why'])}<br>"
+                     f"<span class='muted'>Answer it in Founderizer on your Mac: its secure form puts the value into "
+                     f"the vault. This page takes no secret.</span></div><br>")
+        elif r["answer"] is None:
             # owner feature need_options: one row for each option the agent offered, and the text box under them
             picks = "".join(f"<div><button name='choice' value='{i}'>{esc(x)}</button></div>"
                             for i, x in enumerate(need_options(r)))
@@ -15863,6 +16291,7 @@ def tick():
             allowance_sweep(t0)         # the manager's own allowance, while it can still act on it
             integrity_check(t0)
             expire_handovers(t0)
+            expire_deposits(t0)             # owner feature secret_deliveries: a copy no vault can take any more
             settle_checks(t0)
             attachment_sweep(t0)            # owner feature attachments: the files that the hub may let go
             release_sweep(t0)               # owner feature releases: the automatic poll, when the owner opted in
@@ -16815,6 +17244,7 @@ def validate_status(data):
                  "broker_read_at": read_at, "creates": _optional(vault.get("creates"), bool),      # create_login
                  "captures": _optional(vault.get("captures"), bool),                                # save_key
                  "requests": _optional(vault.get("requests"), bool),                                # call_api
+                 "deposits": _optional(vault.get("deposits"), bool),        # owner feature secret_deliveries
                  "broker_source": source}
     features = data.get("features") or []
     if not isinstance(features, list) or len(features) > 16 or \
@@ -21697,8 +22127,11 @@ class Handler(BaseHTTPRequestHandler):
             for name, a in team["agents"].items():
                 for ref, grant in (a.get("secrets") or {}).items():
                     grants.setdefault(ref, {})[name] = grant
+            delivered = {}          # owner feature secret_deliveries: the newest delivery to each machine
+            for r in q("SELECT * FROM deposits WHERE id IN (SELECT MAX(id) FROM deposits GROUP BY login, machine)"):
+                delivered.setdefault(r["login"], {})[r["machine"]] = deposit_view(r)
             catalog = {ref: dict(entry, kind=entry.get("kind", "login"), protected=ref in covered,
-                                 grants=grants.get(ref, {}))
+                                 grants=grants.get(ref, {}), deliveries=delivered.get(ref, {}))
                        for ref, entry in (team.get("logins") or {}).items()}
             made = created_logins()
         return self.json(200, dict(db=generation, revision=rev, sha256=digest, lines=lines, open_tasks=busy,
@@ -22412,6 +22845,81 @@ class Handler(BaseHTTPRequestHandler):
                     "fingerprints": [{k: x[k] for k in ("kind", "hash", "len")} for x in prints]}
         return self.ui_command("secrets/add", read, save_secret)
 
+    def ui_need_secret(self, need_id):
+        """POST /ui/needs/<id>/secret (owner feature secret_requests): the answer of one request_secret, from the app's
+        secure form once the value is in the vault and registered: login, the reference of the secret that answers
+        it, or decline, with the owner's own words or none. No value comes in, and the words that reach the agent
+        are the hub's own (answer_secret)."""
+        def read(data):
+            extra = sorted(set(data) - {"request_id", "db", "login", "decline"})
+            if extra:
+                raise ValueError(f"unknown field {extra[0]}")
+            login, decline = data.get("login"), data.get("decline")
+            if (login is None) == (decline is None):
+                raise ValueError("send login, the reference of the secret that answers this request, or decline")
+            if decline is not None and not (isinstance(decline, str) and len(decline) <= SECRET_DECLINE_MAX
+                                            and not any(c in decline for c in "\r\n")):
+                raise ValueError(f"decline is one line of at most {SECRET_DECLINE_MAX} characters, or empty")
+            return {"need": need_id, "login": self.login_reference(login) if login is not None else None,
+                    "decline": decline.strip() if decline is not None else None}
+
+        def act(body):
+            return answer_secret(body, str(self.form()["request_id"]).lower(),
+                                 self.headers.get("X-Fleet-Client", "").strip())
+        return self.ui_command(f"needs/{need_id}/secret", read, act)
+
+    def ui_secret_machines(self, query):
+        """GET /ui/secrets/machines (owner feature secret_deliveries): each machine with a worker or a lead, and
+        whether a sealed copy can go to its vault now, with the pinned key to seal it to; with login=, that secret's
+        newest delivery to each. No value and no copy."""
+        if not self.ui_allowed():
+            return
+        if query.get("db") != kv_get("db_id"):
+            return self.json(409, {"error": "hub generation changed; refresh state"})
+        try:
+            ref = self.login_reference(query["login"]) if query.get("login") else None
+        except ValueError as e:
+            return self.json(400, {"error": str(e)})
+        with LOCK:
+            machines = secret_machines(ref)
+        return self.json(200, {"db": kv_get("db_id"), "login": ref, "machines": machines}, {"Cache-Control": "no-store"})
+
+    def ui_secret_deliver(self):
+        """POST /ui/secrets/deliver (owner feature secret_deliveries): sealed copies of one secret of the catalog,
+        each sealed in the owner's app to one machine's pinned vault key, for that machine's vault. What the hub keeps
+        of the command is the checksum of each copy; the copies themselves wait in their deliveries (deliver_secret)."""
+        copies = {}
+
+        def read(data):
+            extra = sorted(set(data) - {"request_id", "db", "login", "copies"})
+            if extra:
+                raise ValueError(f"unknown field {extra[0]}")
+            given = data.get("copies")
+            if not isinstance(given, list) or not 1 <= len(given) <= DEPOSIT_COPIES:
+                raise ValueError(f"copies is a list of 1 to {DEPOSIT_COPIES} sealed copies")
+            kept = []
+            for c in given:
+                if not isinstance(c, dict) or set(c) != {"machine", "recipient", "ciphertext"} or \
+                        not isinstance(c["machine"], str) or not 1 <= len(c["machine"]) <= 64 or \
+                        not isinstance(c["recipient"], str) or not AGE_RECIPIENT.fullmatch(c["recipient"]):
+                    raise ValueError("each copy is {machine, recipient: the age1 key it is sealed to, ciphertext}")
+                if c["machine"] in copies:
+                    raise ValueError(f"two copies for {c['machine']}")
+                text = sealed_copy(c["ciphertext"])
+                if text is None:
+                    raise ValueError(f"the copy for {c['machine']} is not an armored age file sealed to an X25519 "
+                                     f"key, of at most {DEPOSIT_COPY_MAX} characters")
+                if secret_hit(text):
+                    raise Refusal(422, f"the copy for {c['machine']} holds a registered value in plain text")
+                copies[c["machine"]] = text
+                kept.append({"machine": c["machine"], "recipient": c["recipient"],
+                             "sha256": hashlib.sha256(text.encode()).hexdigest()})
+            return {"login": self.login_reference(data.get("login")), "copies": sorted(kept, key=lambda c: c["machine"])}
+
+        def act(body):
+            return deliver_secret(dict(body, request_id=str(self.form()["request_id"]).lower()), copies)
+        return self.ui_command("secrets/deliver", read, act, limit=DEPOSIT_COPIES * DEPOSIT_COPY_MAX + 8192)
+
     def ui_secret_grant(self):
         """POST /ui/secrets/grant (owner feature secrets): one agent's grant of one secret: use, read or null."""
         def read(data):
@@ -22938,6 +23446,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not need:
                     return self.json(404, {"error": "owner request does not exist"})
                 recipient = need["by"]
+                if need["kind"] == "secret":            # owner feature secret_requests: its secure form answers it
+                    return self.json(409, {"error": SECRET_NO_WORDS.format(id=need_id)})
                 if need["conversation"] and files:      # a conversation window can open no file
                     return self.json(409, {"error": "an answer that goes into a conversation carries no file"})
                 if choice is not None:      # the owner pressed a button: its own words become the answer
@@ -23866,6 +24376,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_capacity(query)
         if parts == ["ui", "secrets", "salts"]:
             return self.ui_secret_salts(query)
+        if parts == ["ui", "secrets", "machines"]:
+            return self.ui_secret_machines(query)
         if parts == ["ui", "backup"]:
             return self.ui_backup(query)
         if len(parts) == 3 and parts[:2] == ["ui", "goals"] and re.fullmatch(r"[1-9][0-9]*", parts[2]):
@@ -24094,6 +24606,8 @@ class Handler(BaseHTTPRequestHandler):
                         continue        # owner feature mcp_program: the owner's check gave up, so this asks nobody
                     if r["kind"] in ("signin", "handover", "create", "capture", "request") and not q1("SELECT id FROM jobs WHERE id=? AND finished IS NULL", (extra.get("job"),)):
                         continue
+                    if r["kind"] == "deposit" and not deposit_waiting(extra.get("deposit"), agent):
+                        continue        # owner feature secret_deliveries: a delivery that ended carries nothing
                     keep.append(r)
                 rows = keep
                 if rows or now() >= deadline:
@@ -24120,9 +24634,11 @@ class Handler(BaseHTTPRequestHandler):
             # never start a session for a task that ended while the helper was away,
             # and never redo a sign-in or handover whose asker has stopped waiting
             asked = {r["id"] for r in q("SELECT id FROM jobs WHERE finished IS NULL")}
+            carried = {r["id"] for r in q("SELECT id FROM deposits WHERE finished IS NULL")}
             rows = [r for r in rows if not (r["kind"] == "task" and r["task"] in done)
                     and not (r["kind"] in ("signin", "handover", "create", "capture", "request")
-                             and json.loads(r["extra"] or "{}").get("job") not in asked)]
+                             and json.loads(r["extra"] or "{}").get("job") not in asked)
+                    and not (r["kind"] == "deposit" and json.loads(r["extra"] or "{}").get("deposit") not in carried)]
         self.json(200, {"last": last, "db": kv_get("db_id"),
                         "events": [{"id": r["id"], "kind": r["kind"], "task": tref(r["task"]) if r["task"] else None,
                                     "text": r["text"], "extra": json.loads(r["extra"] or "{}")} for r in rows]})
@@ -24251,6 +24767,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_secret_add()
         if parts == ["ui", "secrets", "grant"]:
             return self.ui_secret_grant()
+        if parts == ["ui", "secrets", "deliver"]:
+            return self.ui_secret_deliver()
         if parts == ["ui", "team", "accounts"]:
             return self.ui_team_account()
         if parts == ["ui", "team", "repos"]:
@@ -24330,6 +24848,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.helper_status(parts[2])
         if len(parts) == 3 and parts[:2] == ["ui", "needs"] and parts[2].isdigit():
             return self.ui_submit(int(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["ui", "needs"] and parts[3] == "secret" and re.fullmatch(r"[1-9][0-9]{0,17}", parts[2]):
+            return self.ui_need_secret(int(parts[2]))
         if len(parts) == 4 and parts[:2] == ["ui", "tasks"] and parts[3] == "control" and re.fullmatch(r"[1-9][0-9]*", parts[2]):
             return self.ui_control(int(parts[2]))
         if len(parts) == 4 and parts[:2] == ["ui", "tasks"] and parts[3] == "steer" and re.fullmatch(r"[1-9][0-9]*", parts[2]):
@@ -24352,6 +24872,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.helper_dialog(parts[2], parts[3])
         if parts[:2] == ["helper", "job"] and len(parts) == 4:
             return self.helper_job_done(parts[2], parts[3])
+        if parts[:2] == ["helper", "deposit"] and len(parts) == 4 and re.fullmatch(r"[1-9][0-9]{0,17}", parts[3]):
+            return self.helper_deposit_done(parts[2], int(parts[3]))
         if parts[:2] == ["helper", "conversations"] and len(parts) == 5 and parts[4] == "start" and \
                 re.fullmatch(r"[1-9][0-9]*", parts[3]):
             return self.helper_conversation_start(parts[2], int(parts[3]))
@@ -24424,6 +24946,8 @@ class Handler(BaseHTTPRequestHandler):
                     chosen, answer = index, picks[index]
             if answer and secret_hit(answer):
                 log("owner", "BLOCKED an answer that contained a login")
+            elif row and answer and row["answer"] is None and row["kind"] == "secret":
+                log("owner", f"REFUSED an answer in words to the secret request N-{nid}")      # never the words
             elif row and answer and row["answer"] is None:
                 q("UPDATE needs SET answer=?, answered=?, chosen=? WHERE id=?", (answer, now(), chosen, nid))
                 emit(row["by"], "say", f"[owner] Answer to Needs-you N-{nid} ({row['title']}): {answer}")
@@ -24741,6 +25265,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(400, {"error": "a fingerprint request is at most 4 KiB"})
         f = self.form()
         items = f.get("fingerprints") if isinstance(f, dict) else None
+        if isinstance(f, dict) and "deposit" in f:     # owner feature secret_deliveries: a comparison, not a registration
+            return self.helper_deposit_check(agent, f)
         if isinstance(f, dict) and "login" in f:       # a value that the vault gives a session (owner feature secrets)
             if set(f) != {"login", "fingerprints"} or not isinstance(f["login"], str) or \
                     not BWS_REF.fullmatch(f["login"]) or not fingerprint_items(items):
@@ -24788,6 +25314,58 @@ class Handler(BaseHTTPRequestHandler):
         log(agent, f"vault broker registered {stored} new fingerprint(s) for {row['login']} (job {job})")
         return self.json(200, {"ok": True, "job": job, "stored": stored, "known": known})
 
+    def helper_deposit_check(self, agent, f):
+        """Before it saves a delivered value, the vault sends its salted fingerprints, and the hub compares them with
+        the ones that the owner's vault registered under that reference: each must be one of them, and the password's
+        must be there when the hub has one. So a copy that holds another value than the one the owner saved under that
+        name is never kept, whoever sealed it. Nothing is registered here."""
+        did = f.get("deposit")
+        if set(f) != {"deposit", "fingerprints"} or not isinstance(did, int) or isinstance(did, bool) or \
+                not (f["fingerprints"] == [] or fingerprint_items(f["fingerprints"])):
+            return self.json(400, {"error": "send {deposit, fingerprints}: up to three items, at most one password, "
+                                            "each {kind, hash (64 lowercase hex), len (8 or more)}"})
+        with LOCK:
+            row = deposit_waiting(did, agent)
+            if not row or not row["released"]:
+                return self.json(404, {"error": "no such delivery was taken by this agent's vault"})
+            known = {(r["label"], r["hash"], r["len"]) for r in q(
+                "SELECT label, hash, len FROM secrets WHERE label IN (?,?)",
+                tuple(fingerprint_label(row["login"], k) for k in ("password", "totp")))}
+            sent = {(fingerprint_label(row["login"], x["kind"]), x["hash"], x["len"]) for x in f["fingerprints"]}
+            password = fingerprint_label(row["login"], "password")
+            same = sent <= known and (not any(k[0] == password for k in known) or any(k[0] == password for k in sent))
+            if not same:
+                log(agent, f"REFUSED delivery {did}: its value is not the one the owner saved as {row['login']}")
+                return self.json(409, {"error": "this copy holds another value than the one the owner saved under "
+                                                "this reference, so it is not kept"})
+            q("UPDATE deposits SET verified=? WHERE id=?", (now(), did))
+        return self.json(200, {"ok": True, "deposit": did, "matched": len(sent)})
+
+    def helper_deposit_done(self, agent, did):
+        """The helper reports what came of a delivery that it carried: saved (or already there), or why not. The copy
+        is dropped either way, and the manager is told with his next read (finish_deposit)."""
+        if agent not in agents():
+            return self.json(404, {"error": "unknown agent"})
+        if not self.allowed(agent):
+            return
+        if len(self.body()) > 4096:
+            return self.json(413, {"error": "a delivery report is at most 4 KiB"})
+        f = self.form()
+        text = " ".join(CONTROL.sub(" ", str(f.get("text") or "")).split())[:DEPOSIT_RESULT_MAX]
+        ok = f.get("ok") is True
+        if secret_hit(text):
+            log(agent, "BLOCKED a delivery report that contained a login")
+            text = "The helper's report was blocked because it contained a login."
+        with LOCK:
+            row = deposit_waiting(did, agent)
+            if not row:
+                return self.json(409, {"error": "no such delivery waits for this agent"})
+            if ok and not (row["released"] and (row["verified"] or not q1(
+                    "SELECT 1 FROM secrets WHERE label=?", (fingerprint_label(row["login"], "password"),)))):
+                ok, text = False, "The vault reported a save that the hub did not see it check."
+            finish_deposit(row, ok, (text or "Saved.") if ok else (text or "The vault did not save it."))
+        return self.json(200, {"ok": True})
+
     def helper_vault_read(self, agent):
         """The API keys that this agent reads in its sessions (owner feature secrets, read), for its machine's vault at
         the start of a session: each reference, its variable name and the salts of its fingerprints. No value: the vault
@@ -24816,9 +25394,12 @@ class Handler(BaseHTTPRequestHandler):
         f = self.form()
         job, kind = f.get("job"), f.get("kind")
         if not isinstance(job, int) or isinstance(job, bool) or kind not in ("signin", "handover", "probe", "create",
-                                                                              "capture", "request"):
-            return self.json(400, {"error": "job and kind (signin, handover, probe, create, capture or request) are required"})
+                                                                              "capture", "request", "deposit"):
+            return self.json(400, {"error": "job and kind (signin, handover, probe, create, capture, request or "
+                                            "deposit) are required"})
         with LOCK:
+            if kind == "deposit":           # owner feature secret_deliveries: job is the delivery's number
+                return self.helper_deposit(agent, job)
             row = q1("SELECT * FROM jobs WHERE id=? AND agent=?", (job, agent))
             if not row or row["kind"] != kind:
                 return self.json(404, {"error": f"no such {kind} job for this agent"})
@@ -24889,6 +25470,30 @@ class Handler(BaseHTTPRequestHandler):
         log(agent, f"vault broker opened {row['login']} for {kind} job {job}" +
             (f" (made by {made['kind']} job {made['id']})" if made else ""))
         return self.json(200, answer)
+
+    def helper_deposit(self, agent, did):
+        """The vault asks for the sealed copy of a delivery that this agent's helper carries (owner feature
+        secret_deliveries), and gets it with the secret's reference, title and kind and the salts of its fingerprints.
+        It can ask again while the delivery waits: a copy that only this machine's vault opens can be given twice, and
+        a save under the same reference is the same save. Called with LOCK held."""
+        row = deposit_waiting(did, agent)
+        if not row:
+            return self.json(404, {"error": "no such delivery waits for this agent"})
+        entry = logins().get(row["login"])
+        refused = ("this agent has no broker access" if agents()[agent].get("vault") != "broker" else
+                   "the owner removed this secret from the catalog" if entry is None else
+                   "this machine's pinned vault key changed since the owner sealed this copy"
+                   if store_key(TEAM, row["machine"]) != row["recipient"] else None)
+        if refused:
+            return self.json(409, {"error": refused})
+        if not row["released"]:
+            q("UPDATE deposits SET released=? WHERE id=?", (now(), did))
+        log(agent, f"vault took delivery {did} of {row['login']}")
+        return self.json(200, {"ok": True, "job": did, "kind": "deposit", "login": row["login"],
+                               "title": entry["title"], "item": entry.get("kind") or "login",
+                               "ciphertext": row["ciphertext"],
+                               "fingerprint_salts": {k: fingerprint_salt(fingerprint_label(row["login"], k))
+                                                     for k in ("password", "totp")}})
 
     def helper_vault_create(self, agent, row):
         """The vault asks before it makes a login (create_login) or reads a key from a page (save_key: kind capture,
