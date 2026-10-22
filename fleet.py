@@ -3700,19 +3700,29 @@ def cmd_check(args):
         line(bool(shutil.which("tmux")), "tmux installed")
         line(bool(shutil.which("git")), "git installed")
         line(bool(shutil.which(runtime)), f"{runtime} command found")
-        url = f"{HUB}/mcp/{agent}"
+        # These two read what a runtime somebody starts **by hand in a terminal here** would use: Claude's
+        # registered servers and Codex's own configuration file. An agent's own sessions use neither. The helper
+        # puts the team tools on the command line when it starts one (`start_command`): Codex gets
+        # `-c mcp_servers.fleet.url=...`, and Claude gets `--strict-mcp-config --mcp-config ...`, which uses only
+        # that configuration and so ignores the registered server on purpose. So neither line says anything about
+        # whether the agent reaches its team tools, and a failure here failed a machine that works.
+        url, hand = f"{HUB}/mcp/{agent}", f"run: python3 fleet.py connect {agent}. An agent's own sessions get the " \
+                                          f"team tools on the command line and need this for nothing"
         if runtime == "claude" and shutil.which("claude") and HUB:
             try:
                 r = subprocess.run(["claude", "mcp", "list"], cwd=KIT, capture_output=True, text=True, timeout=90)
                 mine = [l for l in r.stdout.split("\n") if l.startswith("fleet:")]
-                line(bool(mine) and url in mine[0] and "Connected" in mine[0],
-                     "Claude Code connects to the team tools", f"run: python3 fleet.py connect {agent}")
+                line(True if bool(mine) and url in mine[0] and "Connected" in mine[0] else None,
+                     "Claude Code in a terminal here reaches the team tools", hand)
             except (OSError, subprocess.SubprocessError):
-                line(None, "Claude Code connects to the team tools", "could not run `claude mcp list`")
+                line(None, "Claude Code in a terminal here reaches the team tools", "could not run `claude mcp list`")
         if runtime == "codex" and HUB:
-            path = os.path.expanduser("~/.codex/config.toml")
-            text = open(path, encoding="utf-8").read() if os.path.exists(path) else ""
-            line(f'url = "{url}"' in text, "Codex is pointed at the team tools", f"run: python3 fleet.py connect {agent}")
+            path, text = os.path.expanduser("~/.codex/config.toml"), ""
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as f:
+                    text = f.read()
+            line(True if f'url = "{url}"' in text else None,
+                 "Codex in a terminal here reaches the team tools", hand)
     print("For the login tests:")
     token = os.path.join(HOME, "bws-token")
     if vault_mode(agent) == "file":
