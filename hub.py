@@ -4514,7 +4514,8 @@ def capacity_text(view, filters, needs, restricted=False, parent=None, caller=No
     mine = allowance_ahead(caller)[0] if caller else ""
     if mine:
         out.append(f"YOUR OWN ALLOWANCE: {mine} Fewer and bigger turns until the reset"
-                   + (", and raise_needs_you so that the owner knows before it stops you."
+                   + (". A warning, not a Needs-you item: tell_owner, with no notification, if the owner would "
+                      "want to know what you put off."
                       if role_of(caller) == "manager" else ", and tell your requester what will not get done.")
                    + " It is no reason to pass work to an agent that does not suit it.")
     advice = ["Choose by suitability first: expertise, responsibility, knowledge and access. Then workload "
@@ -5402,12 +5403,40 @@ def need_is_yours(agent, *texts):
     return None
 
 
+# Needs you is not a notification centre (the owner, 22 October 2026: "it is just to let me know when something
+# definitely needs me now"). An item that says in its own words that nothing is needed, or that it is only for his
+# information, is a notice: it goes to tell_owner, which posts it with no notification, or nowhere.
+NOT_A_NEED = re.compile(
+    r"\bnothing(?: else)?(?: is| at all)? (?:needed|required)\b|\bno action(?: is)? (?:needed|required)\b"
+    r"|\bno need (?:for you )?to (?:act|do|reply|answer|decide)\b|\bnothing (?:needs|for) you\b|\bfyi\b"
+    r"|\bfor your information\b|\bjust so you know\b|\bheads[- ]up\b|\bjust (?:a )?(?:warning|note|notice)\b",
+    re.I)
+
+
+def need_is_notice(*texts):
+    """The refusal of a Needs-you item that is a warning or a notice and not something the owner must do or decide
+    now, or None. Its own words say so; the hub cannot judge the rest, and the tool's description says it."""
+    hit = NOT_A_NEED.search(" ".join(t for t in texts if t))
+    if not hit:
+        return None
+    return (f'Not raised: this item says "{hit.group(0)}", so it is a notice and not a Needs-you item. Needs you is '
+            f"only for what the owner must do or decide now: a change only he can make, a sign-in only he can "
+            f"complete, money, or a choice he kept. A warning, a status or an FYI goes to tell_owner, which posts "
+            f"it with no notification, or nowhere. If you will carry on with a default when he says nothing, it "
+            f"does not need him: go on with it, and tell_owner what you chose if he would want to read it.")
+
+
 def t_raise_needs_you(agent, a):
     title = str(a.get("title") or "").strip()
     why = str(a.get("why") or "").strip()
     todo = str(a.get("what_to_do") or "").strip()
-    if not title or not why:
-        raise ToolError("A Needs-you item needs a title and a why.")
+    if not title or not why or not todo:
+        raise ToolError("A Needs-you item needs a title, a why and what_to_do: the one thing that only the owner "
+                        "can do or decide now. If there is no such thing, it is not a Needs-you item; tell_owner "
+                        "posts it with no notification.")
+    notice = need_is_notice(title, why, todo, *(a.get("options") or ()) if isinstance(a.get("options"), list) else ())
+    if notice:
+        raise ToolError(notice)
     mine = need_is_yours(agent, title, why, todo)
     if mine:
         raise ToolError(mine)
@@ -12461,9 +12490,10 @@ def allowance_sweep(t0):
     """From the hub tick: the manager's own allowance, to the manager, while it can still do something about it.
 
     It is the one allowance the whole fleet passes through, and the manager cannot see it: see_capacity lists every
-    agent but itself, so the number was in the hub and in front of nobody. The message names raise_needs_you,
-    because that is the manager's own call and the one path that reaches the owner's phone -- the hub's flags fire
-    after the limit, when nothing can be done about it. Once per window instance, and once more when it is nearly
+    agent but itself, so the number was in the hub and in front of nobody. It is a warning for the manager and not
+    for the owner's phone: it once named raise_needs_you, and the owner was paged with an item whose own words said
+    nothing was needed (22 October 2026). It names tell_owner, which posts with no notification. Once per window
+    instance, and once more when it is nearly
     gone: the signature is what was last said, so a new reset time or a worse stage says it again and an unchanged
     one says nothing."""
     if t0 - float(kv_get("allowance_sweep_at") or 0) < goal_settings()[0] * 60:
@@ -12478,10 +12508,11 @@ def allowance_sweep(t0):
     if not sig:
         return
     emit(mgr, "say", f"[hub] YOUR OWN ALLOWANCE: {said} Every question, every result and every permission prompt of "
-         f"this fleet waits for you, so when it is gone the fleet stops with you. Do now what you cannot do then: "
-         f"raise_needs_you, saying what you will stop doing and what the owner can change. Until the reset, work in "
-         f"fewer and bigger steps. This is your own allowance and not a reason to move work to an agent with more "
-         f"left: suitability comes first, as it always does.")
+         f"this fleet waits for you, so when it is gone the fleet stops with you. Until the reset, work in fewer and "
+         f"bigger steps, and put off what can wait. This is a warning for you and not a Needs-you item: the owner "
+         f"is not paged about a limit. If he would want to know what you will put off, say it once with "
+         f"tell_owner, which posts it with no notification. This is your own allowance and not a reason to move "
+         f"work to an agent with more left: suitability comes first, as it always does.")
 
 
 # ---------------------------------------------------------------- the manager's resume brief
@@ -12555,8 +12586,8 @@ def resume_lines(t0):
     # session, so a session that starts cold does not plan a week of work it cannot pay for.
     mine = allowance_ahead(manager_name())[0]
     if mine:
-        out.append(f"YOUR OWN ALLOWANCE: {mine} Fewer and bigger turns until the reset, and raise_needs_you so that "
-                   f"the owner knows before it stops you.")
+        out.append(f"YOUR OWN ALLOWANCE: {mine} Fewer and bigger turns until the reset. It is a warning, not a "
+                   f"Needs-you item: tell_owner, with no notification, if he would want to know what you put off.")
     return out
 
 
@@ -12921,15 +12952,21 @@ TOOLS = [
         "what": STR, "task": {"type": "string", "description": "The task that spends it, for example T-7"}},
        ["goal", "amount", "currency", "what"])),
     ("manager", "raise_needs_you", t_raise_needs_you,
-     "Ask the owner for something only the owner can do or decide. Use rarely. When you ask him to choose, give the "
+     "Ask the owner for something that only he can do or decide, and that the work needs now: a change only he "
+     "can make, a sign-in only he can complete, new money or a new credential, or a choice he kept. It rings his "
+     "phone, so it is never for a warning, a status, a risk or an FYI, and never for something you will go on with "
+     "by default when he says nothing: those go to tell_owner, which posts with no notification, or nowhere. The "
+     "hub refuses an item whose own words say nothing is needed. Use rarely. When you ask him to choose, give the "
      "choices in options: he presses one, and its words come back as the answer.",
-     S({"title": STR, "why": STR, "what_to_do": STR,
+     S({"title": STR, "why": STR,
+        "what_to_do": {"type": "string", "description": "The one thing that only the owner can do or decide now. "
+                                                        "If there is none, do not raise the item."},
         "options": {"type": "array", "items": {"type": "string"},
                     "description": f"The answers to offer, 2 to {NEED_OPTIONS_MAX}, each a short sentence of at "
                                    f"most {NEED_OPTION_CHARS} characters, because the app draws one row for each. "
                                    f"Leave it out for a question that is not a choice; the owner can always write "
                                    f"his own answer instead."}},
-       ["title", "why"])),
+       ["title", "why", "what_to_do"])),
     # owner API 1.13: the standing duties of an agent (RESPONSIBILITIES.md)
     ("all", "see_responsibilities", t_see_responsibilities,
      "See the duties that you hold: their watches, their open cases and what is not in order. A duty stays; it "

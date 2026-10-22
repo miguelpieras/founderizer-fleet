@@ -550,6 +550,12 @@ code, _, text = raw("POST", "/hook/activity/studio/T-2", {"tool_name": "Read"})
 check("activity hook", code == 200)
 
 # 7 needs you
+text, err = tool("manager", "raise_needs_you", title="Allowance may run out", why="70% used",
+                 what_to_do="Nothing is needed if you can wait until 20:00 UTC.")
+check("a Needs-you item that says nothing is needed is refused", err and "tell_owner" in text, text)
+text, err = tool("manager", "raise_needs_you", title="FYI: a release went out", why="Just so you know")
+check("a Needs-you item with nothing for the owner to do is refused", err and "what_to_do" in text, text)
+check("...and a refused item pages nobody", not any(e["kind"] == "notify" and "Needs you" in e["text"] for e in events("owner")))
 text, err = tool("manager", "raise_needs_you", title="Pick the codename", why="Naming is the owner's choice", what_to_do="Type a name")
 check("raise_needs_you", "N-1" in text)
 check("the owner gets a notification event", any(e["kind"] == "notify" and "N-1" in e["text"] for e in events("owner")))
