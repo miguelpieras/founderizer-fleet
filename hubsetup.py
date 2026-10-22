@@ -85,6 +85,7 @@ VAULT_CONF = VAULT_CONF_DIR + "/vault.json"         # no secret in it, and root 
 VAULT_STATE = "/var/lib/fleet-vault"                # the store, its key and the handover key: the vault user alone
 VAULT_UNIT = "/etc/systemd/system/fleet-vault.service"
 VAULT_SOCKET = "/run/fleet-vault/vault.sock"
+VAULT_SETTLE = 3                                    # seconds before the service is read: see vault_install()
 HELPER = "/usr/local/sbin/fleet-agent-user"         # the one root command the server service may run
 SUDOERS = "/etc/sudoers.d/fleet-agents"             # what that service may do, and nothing more
 EXPORT_OK = "git-daemon-export-ok"                  # git daemon serves a repository only when this file is in it
@@ -408,6 +409,10 @@ def vault_reading(user=VAULT_USER, group=AGENT_GROUP):
             "echo program=$(sha256sum %(lib)s/vault.py 2>/dev/null | cut -d' ' -f1)\n"
             "test -s %(state)s/age.key && echo key=yes || echo key=no\n"
             "echo active=$(systemctl is-active fleet-vault 2>/dev/null || true)\n"
+            # A broker that crashes on its own configuration is `active` for an instant and then gone, so the count
+            # of restarts since the last reset is what says whether it stayed up. worker4 reported a finished
+            # install three times over a service systemd had already given up on.
+            "echo restarts=$(systemctl show -p NRestarts --value fleet-vault 2>/dev/null || echo unknown)\n"
             "echo recipient=$(sed -n 's/^# public key: //p' %(state)s/age.key 2>/dev/null)\n") % {
                 "u": user, "g": group, "lib": VAULT_LIB, "state": VAULT_STATE}
 
@@ -547,17 +552,25 @@ def vault_install(kit=None, hub_address=None, user=VAULT_USER, group=AGENT_GROUP
         two = os.path.join(folder, "fleet-vault.service")
         with open(two, "w", encoding="utf-8") as f:
             f.write(unit if unit.endswith("\n") else unit + "\n")
+        # The restart counter is zeroed first, so what it reads afterwards is this start and no earlier one, and
+        # the settle gives a broker that refuses its own configuration time to exit before it is read.
         code, out, err = run("install -o root -g root -m 644 %s %s\nsystemctl daemon-reload\n"
-                             "systemctl enable fleet-vault >/dev/null 2>&1\nsystemctl restart fleet-vault\n"
-                             % (shlex.quote(two), VAULT_UNIT), timeout=300)
+                             "systemctl enable fleet-vault >/dev/null 2>&1\n"
+                             "systemctl reset-failed fleet-vault >/dev/null 2>&1 || true\n"
+                             "systemctl restart fleet-vault\nsleep %d\n"
+                             % (shlex.quote(two), VAULT_UNIT, VAULT_SETTLE), timeout=300)
         if code != 0:
             raise Stop(f"the vault broker service could not be started: {(err or out).strip()[-300:]}")
     finally:
         shutil.rmtree(folder, ignore_errors=True)
     after = kv(run(vault_reading(user, group))[1])
-    if after.get("active") != "active":
-        raise Stop(f"the vault broker of this machine is {after.get('active') or 'not running'} after its install. "
-                   f"Read `systemctl status fleet-vault` and `journalctl -u fleet-vault` on this machine.")
+    if after.get("active") != "active" or after.get("restarts") not in ("0", "unknown"):
+        raise Stop(f"the vault broker of this machine is {after.get('active') or 'not running'} "
+                   f"{VAULT_SETTLE} seconds after its install"
+                   + (f", having restarted {after['restarts']} time(s)" if after.get("restarts") not in (None, "unknown")
+                      else "") + ". It is installed and not serving, so no agent of this machine can use a secret "
+                   f"it holds. Read `journalctl -u fleet-vault -n 30` on this machine: a broker that refuses its "
+                   f"own configuration says so on its first line.")
     if not after.get("recipient"):
         raise Stop("the vault broker runs, but its handover key has no public half, so the hub could not pin it.")
     say(f"this machine's vault broker runs as {user}: it opens {store}, the agent users of {group} may ask it, and "

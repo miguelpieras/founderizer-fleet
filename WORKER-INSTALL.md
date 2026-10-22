@@ -164,7 +164,51 @@ would leave every value it holds unreadable.
 
 A Mac has no `vault.py` broker. Its vault is the signed `Fleet Vault.app`, started by
 the LaunchAgent `com.agentfleet.vault` in the owner's login session, and the app
-installs and updates it.
+installs and updates it. It holds the fleet's own store too; see the next section.
+
+## Vault broker (macOS)
+
+The Mac helper opens **one of two stores**, which its configuration chooses, exactly
+as a Linux broker does: the fleet's own store on that Mac, or a Bitwarden project.
+A fleet of Macs therefore needs no Bitwarden account either. The configuration at
+`/Library/Application Support/Fleet Vault/config.json`, root with mode 644, names
+one and never both — `"store": "fleet"` or `"region": "eu"|"us"` — and `status`
+answers that word, so `python3 fleet.py check <agent>` prints "vault broker opens
+the fleet's own store".
+
+The store is `~/Library/Application Support/Fleet Vault/store.age`, mode 600, with
+the same format as a Linux store (`{"v": 1, "items": {...}}`, one item for each
+`bws://<uuid>`), encrypted to the public half of a store key of its own. That key is
+one item of the helper's Keychain group, not a file: on a Mac the agents of the
+machine run as the vault's own user, so only the helper's signature keeps the store
+shut, and the ciphertext alone opens nothing. The handover key is a separate key, so
+rotating one does not orphan the other's values.
+
+Install it from the app repository (`miguelpieras/agents`), with the signed build:
+
+```sh
+sudo python3 app/Vault/install.py --app "<build>/Fleet Vault.app" --user <mac user> --agent <agent> --hub http://100.80.1.2:8765 --store
+```
+
+Nothing else is needed: the helper makes the store key, the handover key and an empty
+store at its first request, and `create_login` works on that store with no project and
+no setup. `--switch-store` changes a Mac that opens the other store, and **moves no
+value**: a broker opens one store or the other, so the items of the first one are then
+unreachable and the owner adds each secret again.
+
+The owner saves one item into a Mac's store with the helper's own commands, the Mac
+equivalents of `store-put` and `store-list`. The value is on standard input, so it
+stands in no argument, and no answer repeats it:
+
+```sh
+"/Applications/Fleet Vault.app/Contents/MacOS/FleetVault" store-put --title "<name>" < item.json
+"/Applications/Fleet Vault.app/Contents/MacOS/FleetVault" store-list
+```
+
+Then register the reference it gives with the hub and grant it, as for any secret.
+Because the agents of a Mac run as the vault's own user, an agent of that machine can
+run those two commands: it can add an item and read the names in the store, and no
+value and no other machine's store.
 
 ### When a release changes vault.py
 

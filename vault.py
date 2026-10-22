@@ -2151,7 +2151,7 @@ def main(argv=None):
     unchangeable(os.path.realpath(__file__), "The vault broker program")     # never the worker's checkout
     conf = load_config(args.config)
     broker = Broker(conf).open()
-    log(f"vault broker for {conf['agent']} on {conf['socket']}")
+    log(f"vault broker for {conf.get('agent') or 'the agents of this machine'} on {conf['socket']}")
     broker.serve()
     return 0
 
