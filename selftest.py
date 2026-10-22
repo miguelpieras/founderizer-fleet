@@ -8,7 +8,7 @@ Needs nothing but Python. The sealed-handover checks are skipped when `age` is n
 Takes about a minute because it waits for the hub's timers. It tests hub.py only: fleet.py needs
 tmux and real sessions, which is what the pilot itself is for.
 """
-import ast, base64, hashlib, json, os, re, shutil, socket, subprocess, sys, tempfile, threading, time, uuid
+import ast, base64, hashlib, json, os, re, shlex, shutil, socket, subprocess, sys, tempfile, threading, time, uuid
 import urllib.error, urllib.parse, urllib.request
 
 VERBOSE = "-v" in sys.argv
@@ -702,6 +702,351 @@ check("the hub takes a sealed copy and nothing else", code == 400 and "age file"
 code, _, text = owner_ui("/ui/secrets/deliver", {"login": STRIPE, "value": "x", "copies": []}, base=hubS)
 check("...and no value beside it", code == 400 and "unknown field" in text, text)
 procS.terminate()
+
+# 7c secret targets (owner feature secret_targets): a key in a machine's vault goes on to where an application reads
+# it, one variable of a server's .env file or one key of a Kubernetes Secret. The owner defines each target once; an
+# agent that holds the target and the key calls place_secret, and the vault of the target's machine writes it over SSH
+# with a key that the host's authorized_keys file allows one command, place.py, which answers a salted fingerprint of
+# what it reads back. First the rules of a target and the line that a host is given, read off the code itself; then
+# the hub's side of a placement, with a stand-in for the helper and the vault of vps, because a real vault, sshd and
+# place.py are what a machine is for. The targets are in team.json from the start, as the Targets page (POST
+# /ui/targets/save) would have left them, because that page commits team.json through git.
+import hub as hubmod, lifecycle, place as placemod
+
+
+def ssh_public(kind="ssh-ed25519"):
+    """A public SSH key of this type as a .pub file has it, without its name, with a random key."""
+    blob = len(kind).to_bytes(4, "big") + kind.encode() + (32).to_bytes(4, "big") + os.urandom(32)
+    return kind + " " + base64.b64encode(blob).decode()
+
+
+HOST_KEY, VAULT_KEY = ssh_public(), ssh_public()
+APP_ENV = {"title": "Content API .env", "kind": "env", "where": "/srv/app/shared/.env", "machine": "vps",
+           "host": "100.66.18.34", "port": 2222, "user": "app", "host_key": HOST_KEY,
+           "names": ["GEMINI_API_KEY", "OPENAI_API_KEY"], "note": "The next deploy restarts the app.",
+           "then": "touch '/srv/app/current/tmp/restart.txt'"}
+KEYS = {"title": "Cluster keys", "kind": "k8s", "where": "content/api-keys", "machine": "vps",
+        "host": "relay.example.net", "port": 22, "user": "fleetplace", "host_key": HOST_KEY,
+        "k8s": {"api": "https://10.0.0.1:6443", "ca": "/etc/fleet-place/ca.crt", "token": "/etc/fleet-place/token"}}
+TEAM_T = {"agents": REFERENCE, "targets": {"app-env": APP_ENV, "keys": KEYS}}
+
+
+def target_refused(entry, team=TEAM_T):
+    try:
+        hubmod.target_entry("app-env", entry, team)
+    except ValueError as e:
+        return str(e)
+    return ""
+
+
+def targets_refused(**change):
+    try:
+        hubmod.validate_targets(dict(TEAM_T, **change))
+    except ValueError as e:
+        return str(e)
+    return ""
+
+
+check("a target in the form the hub stores is taken as it is",
+      hubmod.target_entry("app-env", APP_ENV, TEAM_T) == APP_ENV and hubmod.target_entry("keys", KEYS, TEAM_T) == KEYS)
+for why, entry, said in (
+        ("a host key whose type is not its key's", dict(APP_ENV, host_key="ssh-rsa " + HOST_KEY.split()[1]), "host_key"),
+        ("a path with a double quote", dict(APP_ENV, where='/srv/app/"shared/.env'), "absolute path"),
+        ("a relative path", dict(APP_ENV, where="srv/app/shared/.env"), "absolute path"),
+        ("a path that climbs", dict(APP_ENV, where="/srv/app/../.env"), "absolute path"),
+        ("a command after a change with a backslash", dict(APP_ENV, then="systemctl restart app\\"), "no backslash"),
+        ("...or a double quote", dict(APP_ENV, then='echo "done"'), "no double quote"),
+        ("the owner's machine", dict(APP_ENV, machine="owner"), "machine is"),
+        ("the manager's machine", dict(APP_ENV, machine="hub"), "machine is"),
+        ("a field it does not know", dict(APP_ENV, password="x"), "unknown field password"),
+        ("a name that no env file sets", dict(APP_ENV, names=["1BAD"]), "names is"),
+        ("a Secret without its cluster", dict(APP_ENV, kind="k8s", where="content/api-keys", names=None, then=None,
+                                              note=None), "k8s is"),
+        ("a cluster that is not reached over https", dict(KEYS, k8s=dict(KEYS["k8s"], api="http://10.0.0.1:6443")),
+         "k8s is"),
+        ("a cluster on an env file", dict(APP_ENV, k8s=KEYS["k8s"]), "kind k8s")):
+    got = target_refused(entry)
+    check("a target is refused for " + why + ", with the reason", said in got, got or "taken")
+check("targets and the agents that hold them validate",
+      targets_refused(agents=dict(REFERENCE, vps=dict(REFERENCE["vps"], targets=["app-env", "keys"]))) == "")
+check("the manager holds no target, because place_secret is a tool of task sessions", "only a worker or a lead" in
+      targets_refused(agents=dict(REFERENCE, manager=dict(REFERENCE["manager"], targets=["app-env"]))))
+check("an agent holds only a target of team.json", "different names of team.json targets" in
+      targets_refused(agents=dict(REFERENCE, vps=dict(REFERENCE["vps"], targets=["db-env"]))))
+check("a target written by hand in another form is named, so the Targets page saves it again",
+      "not in the form the hub stores" in targets_refused(targets={"app-env": dict(APP_ENV, names=APP_ENV["names"][::-1])}))
+check("the targets of one line of a host's authorized_keys file share one cluster", "must be the same" in
+      targets_refused(targets={"keys": KEYS, "more-keys": dict(KEYS, where="content/other",
+                                                              k8s=dict(KEYS["k8s"], api="https://10.0.0.2:6443"))}))
+
+
+def host_line(names):
+    """The forced command of the line that the hub writes for a host, as sshd reads it, and the line's key."""
+    line = hubmod.setup_line(TEAM_T, names, VAULT_KEY, "vps")
+    m = re.fullmatch(r'command="((?:[^"\\]|\\")*)",restrict (ssh-ed25519 \S+) fleet-vault@vps', line)
+    return (shlex.split(m.group(1).replace('\\"', '"')), m.group(2)) if m else ([], line)
+
+
+argv, key = host_line(["app-env"])
+check("a host's line lets the vault's own key run one command and nothing else",
+      key == VAULT_KEY and argv[:2] == ["/usr/bin/python3", "/usr/local/lib/fleet-place/place.py"], f"{argv} {key}")
+try:
+    conf, said = placemod.setup(argv[2:]), ""
+except Exception as e:
+    conf, said = {}, f"{type(e).__name__}: {e}"
+check("...and place.py reads from it the target as the owner defined it, quotes and all",
+      conf.get("places") == {"app-env": {"sink": "env", "where": "/srv/app/shared/.env"}} and
+      conf.get("names") == {"app-env": {"GEMINI_API_KEY", "OPENAI_API_KEY"}} and
+      conf.get("then") == {"app-env": "touch '/srv/app/current/tmp/restart.txt'"}, said or str(conf))
+argv, key = host_line(["keys"])
+try:
+    conf, said = placemod.setup(argv[2:]), ""
+except Exception as e:
+    conf, said = {}, f"{type(e).__name__}: {e}"
+check("...also a Secret's, with its cluster",
+      conf.get("places") == {"keys": {"sink": "k8s", "where": "content/api-keys", "namespace": "content",
+                                      "secret": "api-keys"}} and
+      conf.get("k8s") == dict(KEYS["k8s"], server_name=None), said or str(conf))
+check("target:<name> is access like any other, at the one level use",
+      hubmod.access_needed("target:app-env") == ("target:app-env", None) and
+      hubmod.access_needed("target:app-env", "use") == ("target:app-env", "use") and
+      hubmod.resource_known("target", "app-env", TEAM_T) and not hubmod.resource_known("target", "db-env", TEAM_T))
+try:
+    hubmod.access_needed("target:app-env", "read")
+    said = ""
+except hubmod.ToolError as e:
+    said = str(e)
+check("...and no other level", "needs_level must be one of use" in said, said)
+
+GEMINI = "bws://22222222-3333-4444-8555-666666666666"
+VALUE = "AIzaSy" + base64.urlsafe_b64encode(os.urandom(24)).decode()
+VPS_KEY = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+procT, hubT = start_hub("targets", {"vps": "", "mac-studio": "", "owner": "127.0.0.1"}, "--tick", "1",
+                        "--place-wait", "4",
+                        agents={"vps": dict(REFERENCE["vps"], vault="broker", vault_recipient=KEY, targets=["app-env"],
+                                            secrets={GEMINI: "use"})},
+                        extra={"logins": {GEMINI: {"title": "GEMINI_API_KEY", "kind": "api_key",
+                                                   "env": "GEMINI_API_KEY"}},
+                               "targets": {"app-env": APP_ENV}})
+
+
+def as_vps(method, path, body=None):
+    """A call of vps's helper or vault: from its machine, with its agent key."""
+    code, _, text = raw(method, path, body, {"Authorization": "Bearer " + VPS_KEY}, base=hubT)
+    try:
+        return code, json.loads(text)
+    except ValueError:
+        return code, {"text": text}
+
+
+def in_task(agent, which, **args):
+    """A tool of the agent's task session, on the path its helper binds to the task's attempt."""
+    records = json.loads(raw("GET", "/records", base=hubT)[2])
+    t = next(t for t in records["tasks"] if "T-" + str(t["id"]) == args["task_id"])
+    rid[0] += 1
+    _, _, text = raw("POST", f"/mcp/{agent}/{records['db']}/{args['task_id']}/{t['attempt']}",
+                     {"jsonrpc": "2.0", "id": rid[0], "method": "tools/call",
+                      "params": {"name": which, "arguments": args}},
+                     {"Accept": "application/json, text/event-stream"}, base=hubT)
+    res = json.loads(text)["result"]
+    return res["content"][0]["text"], res["isError"]
+
+
+def place(**args):
+    return in_task("vps", "place_secret", **dict({"task_id": "T-1", "target": "app-env", "login": GEMINI,
+                                                  "request_id": str(uuid.uuid4())}, **args))
+
+
+def placements():
+    with sqlite3.connect(os.path.join(TMP, "targets.db"), timeout=10) as db:
+        db.row_factory = sqlite3.Row
+        rows = [dict(r) for r in db.execute("SELECT * FROM placements ORDER BY id")]
+    db.close()
+    return rows
+
+
+def report(features=None, places=True):
+    vault = {"mode": "broker", "isolated": True, "callers": True, "broker_recipient": KEY,
+             "broker_read_at": time.time(), "places": places, "place_key": VAULT_KEY if places else None}
+    return as_vps("POST", "/helper/status/vps", {"security": {"vault": vault},
+                                                  "features": list(lifecycle.FEATURES) if features is None else features})
+
+
+def mark(salt, value):
+    return {"hash": hashlib.sha256((salt + value).encode()).hexdigest(), "len": len(value)}
+
+
+taken = []
+
+
+def vault_answers(answer=None, report_with=None, hold=0.0, again=False):
+    """Stand in for vps's helper and its vault: take the newest placement event, ask the hub for that placement as the
+    vault does, then send what the target answered (answer(spec): its fields, or None for no answer) and report as the
+    helper does. hold: seconds between taking it and answering. again: ask for it a second time first."""
+    def run():
+        for _ in range(100):
+            code, got = as_vps("GET", "/events/vps?after=0&wait=0")
+            ev = [e for e in got.get("events", []) if e["kind"] == "place"]
+            if ev:
+                break
+            time.sleep(0.1)
+        else:
+            return taken.append({"event": None})
+        pid = ev[-1]["extra"]["placement"]
+        code, spec = as_vps("POST", "/helper/vault/vps", {"job": pid, "kind": "place"})
+        seen = {"event": ev[-1], "code": code, "spec": spec}
+        taken.append(seen)
+        if code != 200:
+            return
+        if again:
+            seen["again"] = as_vps("POST", "/helper/vault/vps", {"job": pid, "kind": "place"})
+        time.sleep(hold)
+        fields = answer(spec) if answer else None
+        if fields is not None:
+            seen["answer"] = as_vps("POST", "/helper/vault/vps/fingerprints", dict(fields, place=pid))
+        ok = fields is not None and seen["answer"][0] == 200
+        seen["report"] = as_vps("POST", f"/helper/place/vps/{pid}", report_with or {
+            "ok": ok, "text": "written" if ok else (seen.get("answer") or (0, {}))[1].get("error", "")})
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    return th
+
+
+def written(was="replaced", value=None, then=0):
+    return lambda spec: dict({"sink": "env", "where": "/srv/app/shared/.env", "was": was,
+                              "fingerprint": mark(spec["salt"], value or VALUE)},
+                             **({"then": {"code": then}} if then is not None else {}))
+
+
+vt = [t["name"] for t in rpc("vps", "tools/list", base=hubT)[2]["result"]["tools"]]
+st = [t["name"] for t in rpc("studio", "tools/list", base=hubT)[2]["result"]["tools"]]
+check("place_secret is a tool of an agent that holds a target, and of no other",
+      "place_secret" in vt and "place_secret" not in st, f"{'place_secret' in vt} {'place_secret' in st}")
+text, err = tool("manager", "create_task", base=hubT, owner="vps", title="Give the content API its Gemini key",
+                 done_when="GEMINI_API_KEY is in app-env", why="vps holds the key and the target")
+check("create_task for the agent that holds the target", not err and "T-1" in text, text)
+text, err = place()
+check("place_secret says what the machine's vault lacks before it can reach a target",
+      err and "The vault of vps cannot reach targets now: its agent has no agent key; its helper has not reported "
+      "its vault" in text and "Nothing was written." in text, text)
+code, _, text = owner_ui("/ui/team/agents/vps/key", {"sha256": hashlib.sha256(VPS_KEY.encode()).hexdigest()},
+                         base=hubT)
+check("the owner registers vps's agent key", code == 200, text)
+report(features=[f for f in lifecycle.FEATURES if f != "secret_places"])
+text, err = place()
+check("...a helper that does not run placements", err and "its helper is older than place_secret" in text, text)
+report(places=False)
+text, err = place()
+check("...and a vault that does not reach targets", err and "no SSH key of its own for targets" in text, text)
+code, got = report()
+check("vps reports a vault that reaches targets, with its own SSH key", code == 200, got)
+for why, args, said in (("a target that team.json does not have", {"target": "db-env"},
+                         "There is no target db-env. The targets you hold: app-env."),
+                        ("a key that the agent does not hold", {"login": "bws://33333333-4444-4555-8666-777777777777"},
+                         'needs_access="secret:bws://33333333-4444-4555-8666-777777777777"'),
+                        ("a name that the target does not take", {"name": "STRIPE_SECRET_KEY"},
+                         "takes only GEMINI_API_KEY, OPENAI_API_KEY"),
+                        ("a request_id that is not a UUID", {"request_id": "first"}, "request_id must be a UUID"),
+                        ("a check that is not true or false", {"check": "yes"}, "check is true")):
+    text, err = place(**args)
+    check("place_secret refuses " + why, err and said in text, text)
+check("...and no refused call asks a vault for anything", placements() == [], placements())
+
+FIRST = str(uuid.uuid4())
+th = vault_answers(written())
+text, err = place(request_id=FIRST)
+th.join(15)
+seen, said = taken[-1], text
+check("the vault of the target's machine is given the target, the key's reference, the name and a salt, and no value",
+      seen["code"] == 200 and seen["spec"]["login"] == GEMINI and seen["spec"]["name"] == "GEMINI_API_KEY" and
+      seen["spec"]["op"] == "place" and re.fullmatch(r"[0-9a-f]{32}", seen["spec"]["salt"]) and seen["spec"]["target"] ==
+      {"host": "100.66.18.34", "port": 2222, "user": "app", "host_key": HOST_KEY, "place": "app-env", "kind": "env"}
+      and VALUE not in json.dumps(seen), seen)
+check("place_secret says where the key went, what was there, that the command after a change ran, and the owner's note",
+      not err and "P-1: GEMINI_API_KEY (" + GEMINI + ") is in app-env (/srv/app/shared/.env): written in the place of "
+      "the value it had." in text and "the hub had no fingerprint of that key" in text and
+      "Its command after a change ran and ended well." in text and
+      "The owner's note for this target: The next deploy restarts the app." in text, text)
+check("...and its helper's report after the hub took the target's answer is taken", seen["report"][0] == 200, seen)
+text, err = in_task("vps", "report_progress", task_id="T-1", note=f"placed {VALUE}")
+check("the fingerprint the target read back is registered, so the key is masked from then on",
+      err and "Blocked" in text, text)
+text, err = place(request_id=FIRST)
+check("the same request_id again gives the same outcome and runs no vault again",
+      not err and text == said and len(placements()) == 1, text)
+text, err = place(request_id=FIRST, check=True)
+check("...and with other fields it is refused", err and "belongs to another placement" in text, text)
+code, got = as_vps("POST", "/helper/vault/vps", {"job": 1, "kind": "place"})
+check("a placement that ended gives its vault nothing", code == 404, got)
+
+th = vault_answers(written("same", then=None))
+text, err = place()
+th.join(15)
+check("placing it again is safe: the target holds it, nothing changes, and it is the owner's value",
+      not err and "P-2:" in text and "it was there already, so nothing changed." in text and
+      "The target read back the value the owner saved under that reference." in text, text)
+th = vault_answers(lambda spec: {"sink": "env", "where": "/srv/app/shared/.env", "present": True,
+                                 "fingerprint": mark(spec["salt"], VALUE)})
+text, err = place(check=True)
+th.join(15)
+check("check reads what the target holds, and compares it with the owner's",
+      not err and "P-3: app-env (/srv/app/shared/.env) holds GEMINI_API_KEY, and it is the value the owner saved as "
+      + GEMINI in text and taken[-1]["spec"]["op"] == "check", text)
+th = vault_answers(written(value="AIzaSyAnotherKeyThatIsNotTheOwners0"))
+text, err = place()
+th.join(15)
+check("a target that reads back another value than the owner's is recorded as such, and said",
+      err and "P-4: Written, and what app-env holds now is not the value the owner saved as " + GEMINI in text and
+      taken[-1]["answer"][0] == 409, text)
+th = vault_answers(report_with={"ok": False, "unknown": True,
+                                "text": "the connection to the target ended before its answer"})
+text, err = place()
+th.join(15)
+check("a cut connection is an outcome that is not known, and placing it again settles it",
+      err and "P-5: the outcome is not known. The connection to the target ended before its answer. Placing it again "
+      "is safe" in text, text)
+th = vault_answers(report_with={"ok": False, "text": "the target refused: it runs as another user than the "
+                                                      "file's owner"})
+text, err = place()
+th.join(15)
+check("a target that refused is not placed, in the vault's words",
+      err and "P-6: not placed. The target refused: it runs as another user than the file's owner." in text, text)
+th = vault_answers(written(), hold=5, again=True)
+SLOW = str(uuid.uuid4())
+text, err = place(request_id=SLOW)
+check("a placement that takes longer than the call is still working, and the call says to ask again",
+      not err and "P-7: the vault of vps is still working on GEMINI_API_KEY" in text and
+      "same request_id for its outcome" in text, text)
+check("...its vault is given it once", taken[-1]["again"][0] == 409, taken[-1].get("again"))
+th.join(15)
+text, err = place(request_id=SLOW)
+check("...and the same request_id then gives its outcome", not err and "P-7: GEMINI_API_KEY" in text and
+      "written in the place of the value it had" in text, text)
+text, err = place()
+check("a placement that no vault takes is not placed, and nothing was written",
+      err and "P-8: not placed. The vault of vps did not take it in 4 seconds, so nothing was written." in text, text)
+code, got = as_vps("POST", "/helper/vault/vps", {"job": 8, "kind": "place"})
+check("...and a vault that asks for it afterwards gets nothing", code == 404, got)
+code, _, text = owner_ui("/ui/targets/test", {"name": "app-env"}, base=hubT)
+pid = json.loads(text).get("placement") if code == 200 else None
+check("the owner's Test asks the target's vault to check it", code == 200 and pid == 9, text)
+vault_answers(lambda spec: {"sink": "env", "where": "/srv/app/shared/.env", "writable": True,
+                            "fingerprint": None}).join(15)
+row, seen = next((r for r in placements() if r["id"] == pid), {}), taken[-1]
+check("...with no key: the vault is given no reference and no name, only the target",
+      seen["spec"]["op"] == "check" and seen["spec"]["login"] is None and seen["spec"]["name"] is None, seen)
+check("...and the outcome is the owner's record of that target", row.get("ok") == 1 and row.get("present") == 1 and
+      row.get("agent") == "owner", row)
+code, _, text = owner_ui("/ui/targets/test", {"name": "db-env"}, base=hubT)
+check("the owner's Test is for a target that team.json has", code == 400, text)
+rows = {r["id"]: r for r in placements()}
+check("the hub keeps who placed which key where, for which task, what was there and how it was confirmed",
+      [(rows[1][k]) for k in ("agent", "task", "login", "target", "name", "was", "place_where", "then_code",
+                              "verified", "ok")] ==
+      ["vps", 1, GEMINI, "app-env", "GEMINI_API_KEY", "replaced", "/srv/app/shared/.env", 0, None, 1] and
+      rows[2]["verified"] == 1 and rows[4]["verified"] == 0 and rows[5]["unknown"] and not rows[6]["unknown"], rows)
+check("no value reached the hub", json.loads(raw("GET", "/leakcheck", base=hubT)[2])["hits"] == [])
+procT.terminate()
 
 # 8 outbox, practice site, fingerprints, seatbelt
 check("outbox starts empty", json.loads(raw("GET", "/outbox?key=launch")[2])["count"] == 0)

@@ -319,3 +319,86 @@ answer and no key). `KillMode=control-group` is the default of the unit that
 `vault.py unit` prints: with it, a restart of the broker also ends a curl child that
 runs, so no request goes on without its broker. To undo: remove the key and
 restart; the broker then sends no requests, and `requests.json` stays.
+
+### Keys into a server or a cluster (`place_secret`): targets
+
+A key in a machine's vault often has to reach the place where an application reads
+it: one variable of a server's `.env` file, or one key of a Kubernetes Secret. The
+owner defines each such place once, on the Targets page, and an agent that holds the
+target and the key calls `place_secret` (owner feature `secret_targets`). The vault
+of the machine that the owner chose reads the key from its own store and sends it on
+one SSH connection, with an SSH key of its own, to `place.py` on the target's host,
+which writes it, reads it back and answers a salted fingerprint. No value passes the
+hub, a helper or an agent, and the host's line in `authorized_keys` lets that key run
+`place.py` with the owner's places and nothing else.
+
+**On the vault's machine.** The join line adds `"ssh": "/usr/bin/ssh"` to
+`/etc/fleet-vault/vault.json` and restarts the broker; by hand, add that key and run
+`systemctl restart fleet-vault`. At its start the broker makes its own key,
+`/var/lib/fleet-vault/place_ed25519`, once, with the `ssh-keygen` beside that `ssh`.
+It takes a `vault.py` with the `place` operation (see "When a release changes
+vault.py"). Check: the machine row shows `security.vault.places: true` and its
+`place_key`, and `journalctl -u fleet-vault` has no line "no targets".
+
+**In Founderizer, the Targets page.** A target is its kind (`env` or `k8s`), where it
+is (the absolute path of the `.env` file, or `NAMESPACE/SECRET`), the machine whose
+vault reaches the host, and the host's SSH address, port and user, with the host's
+own public key as `/etc/ssh/ssh_host_ed25519_key.pub` on that host has it, without
+the name at the end. Optionally the only names it takes, a note that every agent that
+places a key there reads, and a command that the host runs after a change (a restart
+of the application). The page then gives one line for each user of each host that a
+vault reaches, and it shows the SHA-256 of the `place.py` that the host must run.
+
+**On the target's host, once, as root:**
+
+```bash
+install -d -o root -g root -m 755 /usr/local/lib/fleet-place
+install -o root -g root -m 644 <a fleet checkout>/place.py /usr/local/lib/fleet-place/place.py
+# then add the line from the Targets page to the authorized_keys file of the user of the target
+```
+
+- The user is the owner of the file that it writes, or root: a file written by
+  another user would change its owner, so `place.py` refuses that. It needs a login
+  shell (sshd runs a forced command through it, and `/usr/sbin/nologin` runs nothing)
+  and no password: the line's `restrict` gives the vault's key no shell, no terminal
+  and no forwarding.
+- The `.env` file is there already: `place.py` changes one variable and keeps the
+  rest of the file, its owner, its group, its mode and its single link, and it puts a
+  complete new file in its place, never a half-written one.
+- The line names every place of that user on that host. When the owner adds a target
+  there, or changes a place, its names or its command, the page shows a new line:
+  put it in the place of the old one. A changed host key or address needs no new line.
+- The host's sshd is the one at the target's port: on a host whose port 22 belongs to
+  Tailscale SSH, the plain sshd at its own port (2222, for example).
+
+**A Kubernetes Secret.** When the cluster's API is reached only from inside (a node,
+or a host that its firewall admits), the target's host is that host: `place.py` calls
+the API there with a token of a ServiceAccount that may change only the Secret it
+needs, and the token stays on that host. For example, for `content/api-keys`:
+
+```bash
+kubectl -n content create serviceaccount fleet-place
+kubectl -n content create role fleet-place --verb=get,patch --resource=secrets --resource-name=api-keys
+kubectl -n content create rolebinding fleet-place --role=fleet-place --serviceaccount=content:fleet-place
+kubectl -n content apply -f - <<'YAML'
+apiVersion: v1
+kind: Secret
+metadata: {name: fleet-place-token, annotations: {kubernetes.io/service-account.name: fleet-place}}
+type: kubernetes.io/service-account-token
+YAML
+kubectl -n content get secret fleet-place-token -o jsonpath='{.data.token}' | base64 -d > token
+kubectl -n content get secret fleet-place-token -o jsonpath='{.data.ca\.crt}' | base64 -d > ca.crt
+```
+
+Put the two files on the target's host (for example `/etc/fleet-place/token`, owned by
+the target's user with mode 600, and `/etc/fleet-place/ca.crt`), and delete the copies
+that the commands left. Make the Secret first (`kubectl -n content create secret
+generic api-keys`): Kubernetes cannot limit `create` to one name, so this role has
+none. The target's `k8s` settings are the API's https address as that host reaches
+it, the two files, and `server_name` when the API's certificate does not name that
+address.
+
+Check: the Test button on the Targets page connects with the vault's key and says
+whether the place can be written, and writes nothing. To undo: take the line out of
+`authorized_keys`. To stop a machine's vault from reaching any target, remove `ssh`
+from its `vault.json` and restart it; its key stays in `/var/lib/fleet-vault`.

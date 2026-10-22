@@ -452,6 +452,7 @@ def vault_config(hub_address, group=AGENT_GROUP, before=None):
 
     `worker_group` is the one field this always brings up to date: the group of every agent user of this machine
     (AGENT_GROUP), so an agent added later, or one whose OS user changed, reaches the broker with no change here.
+    `ssh` is added once and kept as it is after that.
     An existing `worker_uid` stays beside it, because a uid of this machine's own making is an agent user either
     way and removing a field the owner did not write buys nothing."""
     conf = dict(before or {})
@@ -459,6 +460,9 @@ def vault_config(hub_address, group=AGENT_GROUP, before=None):
         conf = {"hub": hub_address, "store": VAULT_STATE + "/store.age", "store_key": VAULT_STATE + "/store.key",
                 "age_key": VAULT_STATE + "/age.key", "socket": VAULT_SOCKET, "age": "/usr/bin/age"}
     conf["worker_group"] = group
+    # The ssh client that the broker writes a key into a target with (place_secret, owner feature secret_targets).
+    # A broker whose machine has none says so in its log and writes to no target; nothing else changes.
+    conf.setdefault("ssh", "/usr/bin/ssh")
     return conf
 
 

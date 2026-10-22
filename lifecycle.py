@@ -30,7 +30,7 @@ import urllib.parse
 import onboard      # the vendors' installers, which the runtime updates run (update_runtime)
 
 REPORT_EVERY = 300          # seconds between status reports when nothing changes
-OWNER_ONLY = re.compile(r"(?:^|/)(?:test_[^/]*|ui_fixture|selftest|verify|pilot|vault)\.py$")  # never loaded here
+OWNER_ONLY = re.compile(r"(?:^|/)(?:test_[^/]*|ui_fixture|selftest|verify|pilot|vault|place)\.py$")  # never loaded here
 TICK = 15                   # seconds between idle checks
 RESTART_GRACE = 120         # seconds this process may live on after it asked for its own restart
 CONFIG_BRANCH = "config"    # the configuration ref that the fleet runs: the hub writes it, the code branch waits
@@ -43,7 +43,8 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "app_server_tasks",     # helper abilities that the hub may use; app_server_tasks: app_server_task below
             "manager_switch",       # the manager's helper closes its previous runtime's session after a switch
             "mcp_program",          # it resolves a command MCP server's program for POST /ui/mcp/check
-            "secret_deposits"]      # it carries a sealed copy of the owner's into this machine's vault (deposit)
+            "secret_deposits",      # it carries a sealed copy of the owner's into this machine's vault (deposit)
+            "secret_places"]        # its vault writes a stored key into a target of the owner's (place)
 # ---------------------------------------------------------------- the runtimes
 #
 # What the fleet knows about a runtime is here, in one entry for each provider, and nowhere else. hub.py, fleet.py and
@@ -1264,6 +1265,22 @@ class Lifecycle:
             return code, " ".join((err or out).split())[-160:]
 
         why = self.vendor_install(name, exe) or onboard.updates_off(name, self.home)
+        if why and self.adoptable(name, exe):
+            # The vendor's own installation for this user, at the version Founderizer pins, in front of the other one
+            # on this user's PATH (onboard.SERVICE_PATH); then the update below takes it to the newest.
+            local = os.path.join(self.home, ".local", "bin", name)
+            pin = onboard.RUNTIME_PINS[name]
+            code, said = shell(onboard.runtime_install(name, pin))
+            version, problem = self.runtime_check(name, local) if os.path.exists(local) else \
+                (None, said or "the installer put nothing in ~/.local/bin")
+            if problem:
+                with contextlib.suppress(OSError):
+                    os.remove(local)            # the other installation answers again, as it did before
+                return outcome("skipped", f"{exe} is not the vendor's installation, and the vendor's {name} {pin} "
+                                          f"for this user failed its check ({problem}), so {exe} stays.")
+            if name == "claude":        # its own updates follow the stable channel, as install_runtime sets them
+                self.run([sys.executable, "-c", onboard.CLAUDE_CHANNEL, local], timeout=120)
+            exe, why = local, onboard.updates_off(name, self.home)
         if why:
             return outcome("skipped", f"{why}, so it stays as it is.")
         old, problem = self.runtime_check(name, exe)
@@ -1302,6 +1319,17 @@ class Lifecycle:
         except OSError:
             return f"{exe} cannot be read"
         return f"{exe} is a script and not the vendor's program" if script else None
+
+    def adoptable(self, name, exe):
+        """True when this user takes the vendor's own installation in place of a system one: on Linux, an agent's own
+        OS user (`fleet-<agent>`) whose PATH finds the runtime in /usr/bin or /usr/local/bin (a system package, an
+        npm install as root), with nothing of it in ~/.local/bin yet. A runtime that was on the machine before
+        Founderizer made the agent's install skip the vendor's installer, so it never got an update (the owner's own
+        hub ran Claude Code 2.1.285 from /usr/bin on 22 October 2026). A Mac keeps one user with a person in it, so its
+        installations stay that person's, and Homebrew's stay Homebrew's."""
+        return (self.platform == "linux" and os.path.dirname(os.path.normpath(exe)) in ("/usr/bin", "/usr/local/bin")
+                and os.path.basename(os.path.normpath(self.home)).startswith("fleet-")
+                and not os.path.lexists(os.path.join(self.home, ".local", "bin", name)))
 
     def runtime_check(self, name, exe):
         """(version, problem) of one installed runtime: the version that its --version answers, and why the check

@@ -44,6 +44,13 @@ With the fleet's own store, a Linux broker also takes a key or a login that the 
 Mac (deposit): the app seals the value to this broker's pinned key, the hub carries the sealed copy, and the broker
 opens it, has the hub compare the value's fingerprints with the owner's, and saves it under the same reference.
 
+With an ssh program in its configuration, a Linux broker also writes one stored key into a target that the owner
+defined (place): an application's .env file or a Kubernetes Secret on another host. It connects with its own SSH key,
+which it makes once in its state folder and which the target host allows only the place helper (place.py), checks the
+host key that the owner pinned, and sends the value on that connection's standard input. The helper answers with a
+salted fingerprint of what it reads back, which the broker and then the hub compare with the value's own. The hub names
+the key, the variable and the target for one confirmed job; the broker takes nothing of that from its caller.
+
 Run a copy that the worker's user cannot change (root-owned, outside the worker's checkout), with a root-owned
 configuration, Bitwarden settings and programs, because an agent can change every file in its own checkout:
     python3 /usr/local/lib/fleet-vault/vault.py serve --config /etc/fleet-vault/vault.json
@@ -69,6 +76,7 @@ import platform
 import pwd
 import re
 import secrets
+import shutil
 import signal
 import socket
 import stat
@@ -102,7 +110,7 @@ STORE_KEYS = {"store", "store_key"}
 BITWARDEN_KEYS = {"region", "token_file", "bws", "bws_config"}
 AGENT_NAME = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
 CALLER_KEY = re.compile(r"[A-Za-z0-9_-]{43}")          # an agent key (owner API 1.12): 256 bits, base64url
-OPERATIONS = ("status", "signin", "handover", "probe", "create", "request", "cancel", "read", "deposit")
+OPERATIONS = ("status", "signin", "handover", "probe", "create", "request", "cancel", "read", "deposit", "place")
 ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,59}")         # read: the variable name of an API key, as the hub checks it
 READS = 32                  # read: the most values that one session gets
 # The write setup (create_login): all three keys or none. sdk: the installed library; sdk_sha256: its checksum;
@@ -111,6 +119,22 @@ WRITE_KEYS = {"sdk", "sdk_sha256", "write_project"}
 STORE = 1                           # the format of the fleet's own store
 LOCAL = "local"                     # where an item of that store is: it holds one place and names no project
 REQUEST_KEY = "curl"                # optional (call_api): the curl program that sends a request; without it, none is sent
+PLACE_KEY = "ssh"                   # optional (place_secret): the ssh program that reaches a target; without it, none
+PLACE_FILE = "place_ed25519"        # the broker's own SSH key for targets, in its private state folder
+PLACE_LIMIT = 330                   # seconds of one placement: the helper's own command after a change gets 300
+PLACE_ANSWER = 65536                # bytes of the helper's answer
+PLACE_PUBLIC = re.compile(r"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}")
+HOST_KEY = re.compile(r"(ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-rsa) "
+                      r"([A-Za-z0-9+/]{20,1400}={0,3})")
+TARGET_HOST = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?|\[[0-9A-Fa-f:.]{2,45}\]")
+TARGET_USER = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
+TARGET_PLACE = re.compile(r"[a-z][a-z0-9-]{0,39}")
+PLACE_NAMES = {"env": re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}"), "k8s": re.compile(r"[-._a-zA-Z0-9]{1,253}")}
+NO_PLACES = "This machine's vault is not set up to reach targets."
+# What ssh says when it failed before the server ran any command: only these prove that nothing was written.
+PRE_SESSION = ("host key verification failed", "remote host identification has changed", "permission denied",
+               "connect to host", "could not resolve hostname", "kex_exchange_identification", "connection closed by",
+               "no route to host", "network is unreachable", "connection refused")
 # What the manifest of an installed library must say: the pinned recipe (vault_sdk_build.py), nothing else.
 SDK_PIN = {"v": 1, "sdk": "2.1.0", "rev": "0520690b9710af7a8b1e47aad776f002f369688f", "crate": "bitwarden-c",
            "addition_sha256": "43d0eb44d44fd18bdeba6ea9631a25a03bdc07ff2359430c19843aff0b8ace2f",
@@ -219,7 +243,7 @@ def load_config(path):
     given = set(conf) if isinstance(conf, dict) else set()
     stores = [group for group in (STORE_KEYS, BITWARDEN_KEYS) if given & group]
     if not isinstance(conf, dict) or given - KEYS - CALLER_KEYS - STORE_KEYS - BITWARDEN_KEYS - WRITE_KEYS \
-            - {REQUEST_KEY, "agent"} or \
+            - {REQUEST_KEY, PLACE_KEY, "agent"} or \
             not KEYS <= given or not given & CALLER_KEYS or len(stores) != 1 or not stores[0] <= given or \
             (given & WRITE_KEYS) not in (set(), WRITE_KEYS) or (given & WRITE_KEYS and stores[0] is STORE_KEYS):
         raise SystemExit("The vault configuration needs exactly: " + ", ".join(sorted(KEYS)) + "; optionally agent, "
@@ -228,7 +252,7 @@ def load_config(path):
                          ", ".join(sorted(STORE_KEYS)) + " (the fleet's own) or all of " +
                          ", ".join(sorted(BITWARDEN_KEYS)) + " (a Bitwarden project), never both; for new logins in "
                          "Bitwarden also all of: " + ", ".join(sorted(WRITE_KEYS)) + "; and for API requests also: "
-                         + REQUEST_KEY)
+                         + REQUEST_KEY + "; and for targets also: " + PLACE_KEY)
     if "agent" in conf and (not isinstance(conf["agent"], str) or not AGENT_NAME.match(conf["agent"])):
         raise SystemExit("agent must be the Fleet name of the one agent whose vault this is, or be left out")
     if "region" in conf and conf["region"] not in ("eu", "us"):
@@ -263,6 +287,8 @@ def load_config(path):
         if not isinstance(conf[REQUEST_KEY], str) or not os.path.isabs(conf[REQUEST_KEY]):
             raise SystemExit("curl must be an absolute path")
         unchangeable(conf[REQUEST_KEY], "The curl program")
+    if PLACE_KEY in conf and (not isinstance(conf[PLACE_KEY], str) or not os.path.isabs(conf[PLACE_KEY])):
+        raise SystemExit("ssh must be an absolute path")        # the program itself is checked when the broker starts
     if WRITE_KEYS <= set(conf):         # the write setup: its form here; the library itself is checked at the start
         if not isinstance(conf["sdk"], str) or not os.path.isabs(conf["sdk"]):
             raise SystemExit("sdk must be an absolute path")
@@ -1690,6 +1716,247 @@ def cancel(conf, req):
     return {"ok": True, "v": PROTOCOL, "task": task, "attempt": attempt, "stopped": True, "ended": ended}
 
 
+# ---------------------------------------------------------------- targets (place_secret)
+
+def place_public(path):
+    """The broker's own SSH key for targets: the public line of its private key file, which only the vault user reads.
+    No comment: the hub writes the machine's name beside it in the line that the owner gives the target host."""
+    read_private(path, "target key")
+    try:
+        with open(path + ".pub", encoding="utf-8") as f:
+            line = f.read(4096).strip()
+    except (OSError, UnicodeError):
+        raise Refused("the vault's target key has no public half") from None
+    public = " ".join(line.split()[:2])
+    if not PLACE_PUBLIC.fullmatch(public):
+        raise Refused("the vault's target key is not an Ed25519 key")
+    return public
+
+
+def with_places(conf):
+    """The configuration with the broker's target key (`_places`) when it names an ssh program that the worker's user
+    cannot change: the key is made once, in the state folder, by the ssh-keygen beside that program. Else the
+    configuration as it is, and the reason in the log: that broker writes to no target."""
+    if PLACE_KEY not in conf:
+        return conf
+    try:
+        try:
+            unchangeable(conf[PLACE_KEY], "The ssh program")
+        except (SystemExit, OSError) as e:
+            raise Refused(str(e) if isinstance(e, SystemExit) else f"there is no ssh program at {conf[PLACE_KEY]}")
+        key = os.path.join(state_folder(conf), PLACE_FILE)
+        if not os.path.exists(key):
+            keygen = os.path.join(os.path.dirname(conf[PLACE_KEY]), "ssh-keygen")
+            try:
+                unchangeable(keygen, "The ssh-keygen program")
+            except (SystemExit, OSError):
+                raise Refused(f"there is no ssh-keygen beside {conf[PLACE_KEY]} to make the target key") from None
+            r = run([keygen, "-q", "-t", "ed25519", "-N", "", "-C", "fleet-vault", "-f", key], None)
+            if r is None or r.returncode != 0 or not os.path.exists(key):
+                raise Refused("the target key could not be made")
+            os.chmod(key, 0o600)
+        return dict(conf, _places={"key": key, "public": place_public(key)})
+    except Refused as e:
+        log(f"no targets: {e}")
+        return conf
+
+
+def place_target(data):
+    """The target of a confirmed placement, from the hub's answer, each field checked again with a full match: the
+    host, its port, the user, the pinned host key, the name of the place on that host and its kind."""
+    target = data.get("target")
+    if not isinstance(target, dict):
+        raise Refused("the hub named no target for this placement")
+    host, port, user, key, name, sink = (target.get(k) for k in ("host", "port", "user", "host_key", "place", "kind"))
+    m = HOST_KEY.fullmatch(key) if isinstance(key, str) else None
+    try:
+        blob = base64.b64decode(m.group(2), validate=True) if m else b""
+    except ValueError:
+        blob = b""
+    good = bool(m) and blob[:4] == len(m.group(1)).to_bytes(4, "big") and blob[4:4 + len(m.group(1))] == m.group(1).encode()
+    if not (isinstance(host, str) and TARGET_HOST.fullmatch(host) and isinstance(port, int) and not isinstance(port, bool)
+            and 1 <= port <= 65535 and isinstance(user, str) and TARGET_USER.fullmatch(user) and good
+            and isinstance(name, str) and TARGET_PLACE.fullmatch(name) and sink in PLACE_NAMES):
+        raise Refused("the hub named no valid target for this placement")
+    return {"host": host, "port": port, "user": user, "host_key": key, "place": name, "kind": sink}
+
+
+def stored_value(store, ref):
+    """The one secret value of a stored item that a target takes: an API key, or a login's password."""
+    found = store.item(SECRET_REF.fullmatch(ref).group(1))["value"]
+    try:
+        item = json.loads(found)
+    except ValueError:
+        raise Refused("the stored item is not a saved value") from None
+    return (check_value(found) if isinstance(item, dict) and "url" not in item else check_login(found))["password"]
+
+
+def connect_target(conf, target, line):
+    """(the helper's answer, None) or (None, why the outcome is not known): one SSH connection to the target host
+    with the broker's own key, which checks the pinned host key and reads no configuration file of anyone's. The
+    request goes on the connection's standard input, so the value stands in no argument and no environment. The
+    broker serves other requests while it waits."""
+    places, lock = conf["_places"], conf.get("_lock")
+    folder = tempfile.mkdtemp(prefix="place-", dir=state_folder(conf))
+    try:
+        known = os.path.join(folder, "known_hosts")
+        with open(known, "w", encoding="utf-8") as f:
+            f.write(f"fleet-place {target['host_key']}\n")
+        argv = [conf[PLACE_KEY], "-F", "/dev/null", "-T", "-a", "-x", "-i", places["key"],
+                "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none", "-o", "BatchMode=yes",
+                "-o", "PreferredAuthentications=publickey", "-o", "StrictHostKeyChecking=yes",
+                "-o", f"UserKnownHostsFile={known}", "-o", "GlobalKnownHostsFile=/dev/null",
+                "-o", "HostKeyAlias=fleet-place", "-o", "CheckHostIP=no", "-o", "UpdateHostKeys=no",
+                "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
+                "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "PermitLocalCommand=no",
+                "-o", "ClearAllForwardings=yes", "-o", "RequestTTY=no", "-o", "LogLevel=ERROR",
+                "-p", str(target["port"]), "-l", target["user"], "--", target["host"].strip("[]"), "place"]
+        if lock is not None:
+            lock.release()              # only here: a status and a session's read are served while the target works
+        try:
+            r = subprocess.run(argv, input=line, capture_output=True, text=True, timeout=PLACE_LIMIT,
+                               env={"PATH": "/usr/bin:/bin", "HOME": folder}, start_new_session=True)
+        except subprocess.TimeoutExpired:
+            return None, f"the target did not answer in {PLACE_LIMIT} seconds"
+        except (OSError, subprocess.SubprocessError, UnicodeError):
+            raise Refused("the vault could not start ssh, so nothing was written") from None
+        finally:
+            if lock is not None:
+                lock.acquire()
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    answer = r.stdout.split("\n", 1)[0] if len(r.stdout) <= PLACE_ANSWER else ""
+    try:
+        got = json.loads(answer)
+    except ValueError:
+        got = None
+    if isinstance(got, dict) and got.get("v") == 1 and isinstance(got.get("ok"), bool):
+        return got, None                # the helper ran to its end, whatever the connection did after
+    said = r.stderr.lower()
+    if r.returncode == 255 and any(x in said for x in PRE_SESSION):     # ssh failed before any command could run
+        raise Refused("the target's host key is not the one the owner pinned, so nothing was sent"
+                      if "host key" in said or "host identification" in said else
+                      "the target's SSH server did not take this vault's key: the line for its authorized_keys is on "
+                      "the Targets page of Founderizer" if "permission denied" in said else
+                      f"the target could not be reached at {target['host']} port {target['port']}")
+    if r.returncode in (126, 127) and not r.stdout:
+        raise Refused("the target's forced command is not the place helper, so nothing was written")
+    if r.returncode == 255:             # the connection ended while the helper may have worked
+        return None, "the connection to the target ended before its answer"
+    return None, "the target gave no answer that the vault understands"
+
+
+def said(error, value):
+    """The target's own words about a failure, when they are one plain line that holds no part of the value; else
+    None."""
+    if not (isinstance(error, str) and plain_line(error, 300)):
+        return None
+    if value and len(value) >= 4 and any(value[i:i + 8] in error for i in range(max(1, len(value) - 7))):
+        return None
+    return error
+
+
+def placed(got, op, target, name, salt, value):
+    """The helper's answer, checked against what the broker asked for: (the fields for the hub, None) or (None, why
+    it failed)."""
+    if not got["ok"]:
+        return None, said(got.get("error"), value) or "the target refused, and said nothing that can be passed on"
+    sink, where, mark = got.get("sink"), got.get("where"), got.get("fingerprint")
+    if got.get("op") != op or got.get("place") != target["place"] or got.get("name") != name or \
+            sink != target["kind"] or not plain_line(where, 300):
+        return None, "the target answered for another place or name than the vault asked for"
+    out = {"sink": sink, "where": where}
+    if mark is not None:
+        if not (isinstance(mark, dict) and isinstance(mark.get("hash"), str) and re.fullmatch(r"[0-9a-f]{64}", mark["hash"])
+                and isinstance(mark.get("len"), int) and not isinstance(mark.get("len"), bool) and mark["len"] > 0):
+            return None, "the target's fingerprint is not valid"
+        out["fingerprint"] = {"hash": mark["hash"], "len": mark["len"]}
+    if op == "place":
+        if got.get("was") not in ("new", "same", "replaced"):
+            return None, "the target did not say what was there before"
+        out["was"] = got["was"]
+        if out.get("fingerprint") != {"hash": hashlib.sha256((salt + value).encode()).hexdigest(), "len": len(value)}:
+            return None, "the target reads back another value than the vault sent"
+        ran = got.get("then")
+        if isinstance(ran, dict) and (ran.get("code") is None or
+                                      (isinstance(ran.get("code"), int) and not isinstance(ran.get("code"), bool))):
+            out["then"] = {"code": ran.get("code")}
+    elif name is None:
+        out["writable"] = got.get("writable") is True
+    else:
+        out["present"] = got.get("present") is True
+    return out, None
+
+
+def place(conf, number):
+    """place_secret: write one stored key into a target for a confirmed job, or check what the target holds. The hub
+    names the key, the variable, the target and the salt of the key's fingerprint; the target's helper writes it and
+    reads it back, and the broker and then the hub compare that fingerprint with the value's own. The answer holds no
+    part of the value. `unknown` says that the target can have written it: placing the same key again is safe, and
+    says what is there."""
+    if conf.get("_places") is None:
+        raise Refused(NO_PLACES)
+    store = opened_store(conf)          # a store that does not open refuses before the hub's job is used
+    code, data = hub(conf, "POST", f"/helper/vault/{conf['agent']}", {"job": number, "kind": "place"})
+    if code != 200 or not isinstance(data, dict) or data.get("ok") is not True or data.get("job") != number \
+            or data.get("kind") != "place":
+        reason = data.get("error") if isinstance(data, dict) else None
+        raise Refused("the hub did not confirm this placement" + (f": {reason}" if isinstance(reason, str) else ""))
+    target = place_target(data)
+    op, ref, name, salt = data.get("op"), data.get("login"), data.get("name"), data.get("salt")
+    whole = op == "check" and ref is None and name is None          # a check of the place alone
+    if not (op in ("place", "check") and isinstance(salt, str) and re.fullmatch(r"[0-9a-f]{32}", salt) and
+            (whole or (isinstance(ref, str) and SECRET_REF.fullmatch(ref) and isinstance(name, str)
+                       and PLACE_NAMES[target["kind"]].fullmatch(name)))):
+        raise Refused("the hub did not confirm this placement")
+    value = stored_value(store, ref) if op == "place" else None
+    line = json.dumps(dict({"v": 1, "op": op, "place": target["place"], "salt": salt},
+                           **({"name": name} if name is not None else {}),
+                           **({"value": value} if value is not None else {}))) + "\n"
+    try:
+        return place_sent(conf, number, op, target, name, salt, value, line)
+    except Refused:
+        raise                           # each one of these says that nothing was written, or the op was a check
+    except Exception as e:              # once ssh can have started, an error proves nothing
+        if op == "check":
+            raise
+        log(f"place job={number}: outcome not known ({type(e).__name__})")
+        return {"ok": False, "v": PROTOCOL, "job": number, "unknown": True,
+                "error": f"the vault hit an error ({type(e).__name__}) while it reached the target; it can have been written"}
+
+
+def place_sent(conf, number, op, target, name, salt, value, line):
+    """The rest of place, from the connection to the target on: a refusal here proves that nothing was written."""
+    got, unknown = connect_target(conf, target, line)
+    if got is not None and got["ok"] is False and got.get("unknown") is True and op == "place":
+        unknown = said(got.get("error"), value) or "the target could not finish the write"     # it had begun
+    if unknown:
+        log(f"place job={number}: outcome not known")
+        if op == "check":               # a check writes nothing
+            raise Refused(unknown)
+        return {"ok": False, "v": PROTOCOL, "job": number, "unknown": True, "error": unknown + "; it can have been written"}
+    out, failed = placed(got, op, target, name, salt, value)
+    if failed:
+        log(f"place job={number}: refused by the target")
+        if got["ok"] and op == "place":     # the target says it wrote, but not what was asked: it can hold anything
+            return {"ok": False, "v": PROTOCOL, "job": number, "unknown": True,
+                    "error": failed + "; place it again to see what it holds"}
+        raise Refused(failed)
+    try:
+        code, data = hub(conf, "POST", f"/helper/vault/{conf['agent']}/fingerprints", dict(out, place=number))
+    except Refused:
+        code, data = None, None
+    if code != 200 or not isinstance(data, dict) or data.get("ok") is not True or data.get("place") != number:
+        reason = data.get("error") if isinstance(data, dict) else None
+        if op == "place" and not (code == 409 and isinstance(reason, str)):     # the hub never heard of the write
+            return {"ok": False, "v": PROTOCOL, "job": number, "unknown": True,
+                    "error": "the target took it, and the hub did not take its answer; place it again to confirm it"}
+        raise Refused("the hub did not take the target's answer" + (f": {reason}" if isinstance(reason, str) else ""))
+    log(f"place job={number}: {op} {out.get('was') or ('present' if out.get('present') else 'checked')}")
+    return dict({"ok": True, "v": PROTOCOL, "job": number, "op": op}, **out,
+                **({"verified": data["verified"]} if isinstance(data.get("verified"), bool) else {}))
+
+
 def caller(req):
     """The calling agent and its key (shared broker callers): both or neither. The key is used for the hub calls of
     this request only: never stored, logged or answered."""
@@ -1721,6 +1988,9 @@ def handle(conf, line, uid):
             status["requests"] = True
         if backend(conf) == "store":                # the fleet's own store takes a secret the owner delivers
             status["deposits"] = True
+        if conf.get("_places") is not None:         # only with an ssh program: this broker writes to targets
+            status["places"] = True
+            status["place_key"] = conf["_places"]["public"]
         return status
     who = caller(req)
     if who:                             # this request acts for its caller; the store does not change
@@ -1750,6 +2020,13 @@ def handle(conf, line, uid):
         if not isinstance(job, int) or isinstance(job, bool) or job < 1:
             raise Refused("a deposit needs the number of its delivery")
         return deposit(conf, job)
+    if op == "place":
+        job = req.get("job")
+        if not who:
+            raise Refused("a placement needs the caller fields")
+        if not isinstance(job, int) or isinstance(job, bool) or job < 1:
+            raise Refused("a placement needs the number of its job")
+        return place(conf, job)
     if op == "signin":
         raise Refused("signing in needs a browser: only the Mac vault helper signs in")
     if op == "read":
@@ -1842,7 +2119,8 @@ class Broker:
         # One request works at a time, as before. Only a request's wait for its curl child is outside this lock, so
         # that a cancel and a status are served meanwhile.
         self.lock, self.room = threading.Lock(), threading.BoundedSemaphore(SERVED)
-        self.conf, self.sock = with_source(with_requests(with_writes(conf), self.lock)), None
+        self.conf = with_source(with_places(with_requests(with_writes(conf), self.lock)))
+        self.conf, self.sock = dict(self.conf, _lock=self.lock), None
 
     def open(self):
         path = self.conf["socket"]
