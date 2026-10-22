@@ -18482,8 +18482,8 @@ def vault_source(rev):
 
 
 def broker_programs(t0=None):
-    """For each machine with a vault broker that says what its own program hashes to: that checksum, the agent whose
-    helper read it last and that machine's worker user, for the one line that reinstalls it.
+    """For each machine with a vault broker that says what its own program hashes to: that checksum and the agent
+    whose helper read it last, which is the agent the warning about it names.
 
     One broker serves every agent of its machine, so this is by machine and not by agent. A broker that says nothing
     is left out — a Mac's signed helper, which the app updates itself, and a broker older than this one — because
@@ -18495,9 +18495,7 @@ def broker_programs(t0=None):
             continue
         at = report.get("broker_read_at") or 0
         if at >= out.get(machine, {"at": -1})["at"]:
-            st = q1("SELECT data FROM machine_status WHERE agent=?", (name,))
-            out[machine] = {"at": at, "agent": name, "source": report["broker_source"],
-                            "user": ((json.loads(st["data"]) if st else {}).get("access") or {}).get("user")}
+            out[machine] = {"at": at, "agent": name, "source": report["broker_source"]}
     return out
 
 
@@ -20802,12 +20800,22 @@ def health_view():
                  f"Update {m['agent'].capitalize()}." + (" Its machine kept the revision it had."
                                                          if m["update"]["state"] == "failed" else ""),
                  agent=m["agent"])
-    # The vault broker is the one piece of the fleet that a release does not reach: it runs a root-owned copy of
-    # vault.py outside every checkout a helper updates, and `lifecycle.OWNER_ONLY` lets a commit that changes only
-    # that file count as taken, so every machine reports "current" while its broker runs whatever was installed by
-    # hand. The broker says what its own program hashes to and the hub compares it with its own vault.py, because
-    # nothing else can. A machine that is stale or behind is left out: it has not taken the release at all, its own
-    # warning already carries that, and two lines for one cause say less than one.
+    # The vault broker is the one piece of the fleet that a release does not reach by itself: it runs a root-owned
+    # copy of vault.py outside every checkout a helper updates, and `lifecycle.OWNER_ONLY` lets a commit that
+    # changes only that file count as taken, so a machine reports "current" whatever its broker runs. The broker
+    # says what its own program hashes to and the hub compares it with its own vault.py, because nothing else can.
+    #
+    # Each machine now catches its own broker up: its server service reads the installed program, which is
+    # world-readable, and where it differs from the vault.py of its checkout it asks the one root command the
+    # installers put in place for it (`hubsetup.vault_program_script`), which fetches the program from the
+    # configuration ref itself and restarts the broker. So this warning is no longer the fleet's way of telling
+    # the owner to paste a command per release: it is what says that the catch-up could not happen, which is why
+    # the fix line is to run that same command by hand and read what it says. The cases it covers: a machine with
+    # a broker and no server service, a machine whose installers are older than that root command, no route to the
+    # ref, and a new program the broker did not come up on, which keeps the one that was serving.
+    #
+    # A machine that is stale or behind is left out: it has not taken the release at all, its own warning already
+    # carries that, and two lines for one cause say less than one.
     want = vault_source(desired)
     held = {m["machine"] for m in machines if m["stale"] or m["update"]["state"] != "current"}
     for machine, broker in (broker_programs(t0).items() if want else ()):
@@ -20815,15 +20823,16 @@ def health_view():
             continue
         warn("vault_behind",
              f"The vault broker on {machine} does not run the vault.py of revision {desired[:12]}, which is the "
-             f"revision that machine reports. A release updates the agents' checkout and never this program, so the "
-             f"broker kept the copy that was installed by hand.",
-             # The agent's own checkout, which is `~<its user>/fleet-<agent>` (server.py), and never `fleet-pilot`:
-             # that is the folder of a fleet that ran every agent as one user, and a line naming it answers "No
-             # such file or directory" on every machine of this one. A fix line that cannot be pasted is worse
-             # than none, because it reads as the fleet telling the owner to run something broken.
-             f"On {machine}, as root: install -o root -g root -m 644 "
-             f"~{broker['user'] or '<worker>'}/fleet-{broker['agent']}/{VAULT_PROGRAM} /usr/local/lib/fleet-vault/"
-             f"{VAULT_PROGRAM} && systemctl restart fleet-vault",
+             f"revision that machine reports. That machine brings its own broker onto a release within ten "
+             f"minutes of taking it, so a broker still behind means it could not: it has no server service, it "
+             f"cannot reach this hub's configuration ref, or the broker did not come up on the new program and "
+             f"kept the one that was serving. A machine whose installers are older than that root command has it "
+             f"nowhere yet, and its join line, run again, puts it in place and brings the broker up to date.",
+             # One command, no path and no argument, so it is the same line on every machine: the pasted
+             # `install` line it replaces named a checkout, and a path that is wrong on this fleet's machines
+             # reads as the fleet telling the owner to run something broken.
+             f"On {machine}, as root: /usr/local/sbin/fleet-vault-program. It says what it did or what stopped "
+             f"it; `journalctl -u fleet-vault -n 30` holds the rest.",
              agent=broker["agent"])
     flag = manager_warning()
     if flag:

@@ -105,8 +105,9 @@ Other options: `--port N` (default 8765), `--timezone Z` (default the server's o
    machine, this machine's address, `"vault": "none"`, and no credential of any kind.
    Then the claim, below. The file is committed on `config` and pushed to the hub's own
    repository, so the record starts at the first minute.
-8. **The root helper that makes an agent's OS user**, below:
-   `/usr/local/sbin/fleet-agent-user` and `/etc/sudoers.d/fleet-agents`.
+8. **The two root commands of this machine**, below:
+   `/usr/local/sbin/fleet-agent-user`, `/usr/local/sbin/fleet-vault-program` and
+   `/etc/sudoers.d/fleet-agents`.
 9. **One OS user for each agent of this machine**, below.
 10. **The services** `fleet-hub` and `fleet-git`, as systemd user services of `fleet`,
     enabled and started. No agent's service is here any more: each one belongs to its
@@ -164,22 +165,30 @@ installer's own step for it is step 11, and three things follow from it:
 A Mac keeps one user for its agents: a Mac agent's service is a LaunchAgent of a desktop
 session, so a second user would have to be logged in at the screen.
 
-### The root helper that makes an agent's OS user
+### The two root commands of this machine
 
 An agent the owner adds later from the app is installed by the server service, which runs
-as that machine's service user without root, so it cannot make a user by itself. Both
-installers therefore put two files in place, with `visudo -c` on the second before it is
+as that machine's service user without root, so it cannot make a user by itself, and it
+cannot bring that machine's vault broker onto the `vault.py` of a release either. Both
+installers therefore put three files in place, with `visudo -c` on the last before it is
 moved in:
 
 - `/usr/local/sbin/fleet-agent-user` — one root command that takes one argument,
   `fleet-<agent>`, checks it against the agent names the hub allows, and makes that user.
-- `/etc/sudoers.d/fleet-agents` — it gives the service user two rights and nothing else:
-  that one command as root, and any command as a member of the group `fleet-agents`,
+- `/usr/local/sbin/fleet-vault-program` — one root command that takes **no** argument and
+  brings this machine's vault broker onto the `vault.py` of the fleet's configuration ref
+  (WORKER-INSTALL.md, "When a release changes vault.py"). It fetches that program itself,
+  from the address this machine already takes all of its code from, so the caller passes
+  no bytes and names no path.
+- `/etc/sudoers.d/fleet-agents` — it gives the service user three rights and nothing else:
+  those two commands as root, and any command as a member of the group `fleet-agents`,
   which holds the agent users and nobody else.
 
-The service user needs the second right to install an agent under its own user, and
+The service user needs the last right to install an agent under its own user, and
 `verify` needs it to read one. That user is not an agent and runs no AI session, so it is
-not a way from one agent to another.
+not a way from one agent to another. Neither root command takes a path, a value or a
+command from its caller, so neither is a way for that user to run code of its own as
+root, which is the one thing a root right of it must not become.
 
 ### The claim: the owner's own Mac
 
@@ -338,9 +347,9 @@ the checkout and the service of an agent that was added since.
   reports its output in its result instead.
 - **A vault broker**, which an agent needs before it can use a saved login
   (WORKER-INSTALL.md, "Vault broker"). The hub itself needs none: the manager holds no
-  credential. A broker is also installed by hand once and updated by hand: a release
-  changes no root-owned file, so `/ui/health` raises `vault_behind` for a machine whose
-  broker is behind the hub's own `vault.py`, and the owner runs the one line it gives
+  credential. A joined machine's broker is installed by its own join line and brought onto
+  each release by its own server service, through the root command of step 8; `/ui/health`
+  raises `vault_behind` only for a machine where that could not happen
   (WORKER-INSTALL.md, "When a release changes vault.py").
 - **The apps.** The Mac app and the iPhone app are installed on the owner's own
   machines, not here.

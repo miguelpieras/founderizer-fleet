@@ -444,19 +444,22 @@ tries again"
 no work"
 }
 
-agent_helper() { # the one root command that makes an agent's OS user, and the sudoers file that says who may run it
-    heading "the root helper that makes an agent's OS user"
+agent_helper() { # the two root commands of this machine, and the sudoers file that says who may run them
+    heading "the root helpers that make an agent's OS user and update this machine's vault broker"
     if [ "$check" = yes ]; then
-        plan "run: python3 $kit/hubsetup.py agent-helper --user $HUB_USER"
-        plan "write /usr/local/sbin/fleet-agent-user, the one root command that makes the OS user of one agent, and \
-/etc/sudoers.d/fleet-agents, which lets $HUB_USER run that command and become the group fleet-agents and nothing \
-else; the sudoers file is read by visudo -c before it is moved in"
+        plan "run: python3 $kit/hubsetup.py agent-helper --user $HUB_USER --repo git://$address/fleet-pilot.git"
+        plan "write /usr/local/sbin/fleet-agent-user, the one root command that makes the OS user of one agent, \
+/usr/local/sbin/fleet-vault-program, which takes no argument and brings this machine's vault broker onto the \
+vault.py of the fleet's configuration ref, and /etc/sudoers.d/fleet-agents, which lets $HUB_USER run those two \
+commands and become the group fleet-agents and nothing else; the sudoers file is read by visudo -c before it is \
+moved in"
         plan "let an agent the owner adds later from the app, which the server service installs without root, get a \
-user of its own, so that fleet.py verify can read each agent (PRODUCT.md 4.1)"
+user of its own, so that fleet.py verify can read each agent (PRODUCT.md 4.1), and let a release that changed \
+vault.py reach a vault broker on this machine, which no checkout holds"
         return 0
     fi
-    python3 "$kit/hubsetup.py" agent-helper --user "$HUB_USER" \
-        || stop "the root helper of this machine's agent users could not be put in place."
+    python3 "$kit/hubsetup.py" agent-helper --user "$HUB_USER" --repo "git://$address/fleet-pilot.git" \
+        || stop "the root helpers of this machine's agent users and its vault broker could not be put in place."
 }
 
 agent_users() {  # one OS user for each agent of this machine, so that no agent's home is readable by another's user

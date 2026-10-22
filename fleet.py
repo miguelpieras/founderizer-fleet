@@ -4031,10 +4031,16 @@ def cmd_check(args):
                  "this broker is older than the fleet's own store")
             line(status.get("recipient") == conf.get("vault_recipient"), "vault broker key is the one pinned in team.json",
                  "set vault_recipient for this agent to the broker's public key")
-            if store == "store":            # owner feature secret_deliveries: the owner's keys reach this store so
+            # This machine's server service brings the broker onto the vault.py of its own checkout by itself,
+            # with the one root command the installers put in place for it; by hand it is that same command, which
+            # takes no argument (WORKER-INSTALL.md, "When a release changes vault.py").
+            catch_up = ("update Fleet Vault with the Founderizer app" if sys.platform == "darwin" else
+                        "as root: /usr/local/sbin/fleet-vault-program (WORKER-INSTALL.md, \"When a release "
+                        "changes vault.py\")")
+            if store == "store":            # owner feature secret_deliveries: the owner's keys reach this store,
+                # so this is the line that says whether this broker is new enough to take one
                 line(status.get("deposits") is True or None, "vault broker takes the keys the owner delivers",
-                     "update Fleet Vault with the Founderizer app" if sys.platform == "darwin" else
-                     "install vault.py again and restart fleet-vault (WORKER-INSTALL.md, \"Vault broker\")")
+                     catch_up)
             # The broker runs a root-owned copy of vault.py that no release reinstalls, so this is the one line that
             # says whether it runs the vault of this checkout. The hub says the same against the revision it serves.
             try:
@@ -4044,8 +4050,7 @@ def cmd_check(args):
                 mine = None
             line(None if not (status.get("source") and mine) else status["source"] == mine,
                  "vault broker runs the vault.py of this checkout",
-                 "this broker says nothing about its program" if not status.get("source") else
-                 "install vault.py again and restart fleet-vault (WORKER-INSTALL.md, \"Vault broker\")")
+                 "this broker says nothing about its program" if not status.get("source") else catch_up)
         except Refused as e:
             line(False, "vault broker", str(e))
     elif os.path.exists(token):

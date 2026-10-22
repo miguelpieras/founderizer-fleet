@@ -8,8 +8,13 @@ its agents (fleet on Linux, the Mac user on a Mac). Standard library only.
     python3 server.py run                                               the service
 
 The service sends the server's reading every five minutes, takes the server's jobs from the hub and updates its own
-checkout when it has no job. Two job kinds. install: an agent. Its steps on Linux: the agent's own OS user
-fleet-<agent>, then its runtime, its checkout ~fleet-<agent>/fleet-<agent>, its service and the runtime's sign-in
+checkout when it has no job. With no job it also brings this machine's vault broker onto the vault.py of that
+checkout, through the second root command the installers put in place (hubsetup.vault_program_script): a release
+reaches every checkout here and never the broker's root-owned copy, so without that step a release that changed
+vault.py left the broker behind while this machine reported the new revision.
+
+Two job kinds. install: an agent. Its steps on Linux: the agent's own OS user fleet-<agent>, then its
+runtime, its checkout ~fleet-<agent>/fleet-<agent>, its service and the runtime's sign-in
 when that user is not signed in (Codex: a link and a code in Fleet; Claude Code: the sign-in that the hub drives for
 that agent, machine_signin, which the owner finishes in the app and never in a terminal). Everything of one agent is
 in that user's home at mode 700, so no other agent of the machine can read its runtime credential or its vault token. This service has no root, so the user is made by the one root command the
@@ -58,6 +63,12 @@ NAME = re.compile(r"[a-z][a-z0-9-]{1,30}")
 AGENT_USER = "fleet-%s"
 AGENT_HELPER = "/usr/local/sbin/fleet-agent-user"
 AGENT_PATH = os.pathsep.join(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
+# This machine's vault broker: the root-owned copy of vault.py it runs (hubsetup.VAULT_LIB), and the other root
+# command the installers put in place, which brings that copy onto the vault.py of the fleet's configuration ref
+# (hubsetup.VAULT_UPDATE). A release reaches every checkout here and never that copy, so this service asks for it.
+VAULT_PROGRAM = "/usr/local/lib/fleet-vault/vault.py"
+VAULT_HELPER = "/usr/local/sbin/fleet-vault-program"
+VAULT_EVERY = 600               # seconds before a try that did not settle it is made again
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
@@ -119,6 +130,16 @@ def die(text):
 
 def tail(text, n=200):
     return ANSI.sub("", (text or "").strip())[-n:]
+
+
+def program_sha256(path):
+    """The SHA-256 of a file, or None when it cannot be read. The broker's installed program is root-owned and
+    world-readable, so this service reads it with no root at all."""
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
 
 
 def server_key(make=False):
@@ -255,6 +276,7 @@ class Service:
         self.loaded = self.revision()
         self.desired = self.last_report = None
         self.stuck = None               # a revision that did not fast-forward: no new try for it
+        self.vault_tried = None         # when the vault broker was last asked to catch up (vault_program)
 
     @staticmethod
     def command(argv, cwd=None, timeout=120, env=None):
@@ -381,6 +403,7 @@ class Service:
                 self.work(job)
                 self.report()
             if jobs == []:
+                self.vault_program()
                 self.update()
             self.sleep(POLL)
 
@@ -671,6 +694,47 @@ class Service:
         if any(p.endswith(".py") or p == "team.json" for p in out.split()):
             self.restart()
         self.loaded = desired
+
+    def vault_program(self):
+        """This machine's vault broker onto the vault.py of this checkout, through the one root command the
+        installers put in place for it (hubsetup.vault_program_script).
+
+        **Why the service does this at all.** A release updates every checkout on this machine and never the
+        broker: it runs a root-owned copy of vault.py outside all of them as a system service, and a helper never
+        loads that file (lifecycle.OWNER_ONLY), so a commit that changes only it advances the revision this
+        machine reports. A release that changed vault.py therefore left the broker running the copy installed
+        before it while the Updates page said the fleet was current, and the owner pasted one root command per
+        machine after every such release. This is that catch-up, done by the machine that needs it.
+
+        **The gate is a reading and needs no root.** The installed program is root-owned and world-readable, so
+        this service hashes it and this checkout's vault.py itself and asks for nothing while they agree. Where
+        they differ it asks, and root fetches the bytes from the configuration ref itself: this service passes no
+        bytes, no path and no revision, so a wrong reading here can only cost root one fetch that finds nothing to
+        do. A try that did not settle it -- no network, or a broker that did not come up and kept the program that
+        was serving -- is made again at VAULT_EVERY and not once a round; a broker that stays behind is what the
+        hub's own `vault_behind` warning is for."""
+        if self.platform == "darwin":
+            return                      # a Mac's vault is the signed app, which Founderizer updates itself
+        here = program_sha256(os.path.join(self.kit, "vault.py"))
+        there = program_sha256(VAULT_PROGRAM)
+        if not here or not there or here == there:
+            return                      # no broker on this machine, or it runs this vault.py already
+        if self.vault_tried is not None and self.clock() - self.vault_tried < VAULT_EVERY:
+            return
+        self.vault_tried = self.clock()
+        code, out, err = self.run(["sudo", "-n", VAULT_HELPER], timeout=300)
+        said = tail(err or out, 300)
+        if code == 0:
+            print(said or f"Fleet brought this machine's vault broker onto the vault.py of "
+                          f"{str(self.loaded)[:12]}.", flush=True)
+            return
+        # The command says its own name, so a line that does not carry it is sudo refusing the command and not the
+        # command refusing the work: the first needs the installer run again, the second needs reading.
+        ran = said.startswith(os.path.basename(VAULT_HELPER) + ":")
+        print(f"Fleet could not bring this machine's vault broker onto the vault.py of {str(self.loaded)[:12]}: "
+              + (said if ran else f"{said or 'the command said nothing'}. The server needs {VAULT_HELPER} from "
+                                  f"the Fleet installer; run the join line again on {self.name}."),
+              file=sys.stderr, flush=True)
 
     def restart(self):
         os.execv(sys.executable, [sys.executable, os.path.join(self.kit, "server.py"), "run"])

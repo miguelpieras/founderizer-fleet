@@ -15,6 +15,9 @@ Standard library only, and it reads no credential of a model provider.
     python3 hubsetup.py agent-users --team PATH --machine NAME [--check]
                                                     one OS user for each agent of this machine, so that no agent's
                                                     user can read another agent's home
+    python3 hubsetup.py agent-helper [--user NAME] [--repo URL] [--check]
+                                                    the two root commands this machine's service user may run, and
+                                                    the one sudoers file that says so
     python3 hubsetup.py vault --hub URL [--kit PATH] [--check]
                                                     this machine's vault broker: its own user keeps the store's key
                                                     and the handover key, so no agent of the machine can read either
@@ -86,7 +89,10 @@ VAULT_STATE = "/var/lib/fleet-vault"                # the store, its key and the
 VAULT_UNIT = "/etc/systemd/system/fleet-vault.service"
 VAULT_SOCKET = "/run/fleet-vault/vault.sock"
 VAULT_SETTLE = 3                                    # seconds before the service is read: see vault_install()
-HELPER = "/usr/local/sbin/fleet-agent-user"         # the one root command the server service may run
+VAULT_SOURCE = VAULT_LIB + "/source.git"            # root's own bare clone of the ref: see vault_program_script()
+ROOT_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"   # a root command's own PATH
+HELPER = "/usr/local/sbin/fleet-agent-user"         # one of the two root commands the server service may run
+VAULT_UPDATE = "/usr/local/sbin/fleet-vault-program"    # the other: the broker's program, and nothing else
 SUDOERS = "/etc/sudoers.d/fleet-agents"             # what that service may do, and nothing more
 EXPORT_OK = "git-daemon-export-ok"                  # git daemon serves a repository only when this file is in it
 PRIVATE = re.compile(r"100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.(?:[0-9]{1,3})\.(?:[0-9]{1,3})$")
@@ -334,69 +340,200 @@ def helper_script():
                 "sudoers": SUDOERS, "group": AGENT_GROUP, "name": shlex.quote(name), "script": user_script("$u")}
 
 
+def vault_program_script(repo, branch=lifecycle.CONFIG_BRANCH):
+    """The second root command of this machine: `/usr/local/sbin/fleet-vault-program` brings the vault broker onto
+    the `vault.py` of the fleet's configuration ref, and does nothing else. It takes no argument at all.
+
+    **Why it exists.** A release updates every checkout on a machine and never the broker, which runs a root-owned
+    copy of `vault.py` outside all of them as a system service, and `lifecycle.OWNER_ONLY` lets a commit that
+    changes only that file count as taken. So a release that changed `vault.py` left every broker running the copy
+    installed before it while each machine reported `current`, and the owner pasted one root command per machine to
+    catch them up -- for ever, and from memory. Measured on 22 October 2026: four releases of one day touched
+    `vault.py`, both Linux brokers were behind after each one, they were brought level by hand twice in one
+    afternoon, and in between both lacked the `deposit` operation that those releases shipped.
+
+    **What the service user gains, exactly.** It can ask root to replace the broker's program with the `vault.py`
+    on the fleet's configuration ref and restart the broker. It cannot name the file, the source, the destination,
+    the revision or the service, and it passes no bytes: the bytes are fetched here, as root, from the address this
+    machine already takes all of its code from, into a bare repository that only root can write. So this adds no
+    trust -- the fleet's code reaches this machine from that ref either way -- and it removes the hop the pasted
+    command had through a checkout a user can write. Nothing else of the broker is touched: its user, its store,
+    its store key and its handover key are never read here, and the handover key is never remade, because a new one
+    would turn every agent's access into `vault_store_mismatch`.
+
+    Nothing is fetched into a working tree and nothing of the fetched repository is ever run: the program is read
+    out of the fetch with `git cat-file`, so no hook, filter or submodule of it executes as root.
+
+    **A broker that does not come up keeps the program that was serving.** This runs unattended after a release, and
+    an installed broker that is not serving means no agent of that machine can use a secret it holds. So the copy
+    that was serving goes back, and the hub's own `vault_behind` warning is then the one that says this machine
+    needs a person -- which is what that warning is for.
+
+    `repo` is the address of the fleet's configuration ref, as the hub serves it to this machine. Without one the
+    command refuses and says to run the join line again, because a source read from anywhere else on this machine
+    is a source somebody else can write."""
+    return ("#!/bin/sh\n"
+            "# Founderizer: bring this machine's vault broker onto the vault.py of the fleet's configuration ref,\n"
+            "# and nothing else. hubsetup.py writes this file.\n"
+            "#\n"
+            "# It is one of the two root commands that this machine's service user may run (%(sudoers)s), and it\n"
+            "# takes no argument. A release updates every checkout here and never the broker, which runs the\n"
+            "# root-owned copy of vault.py at %(lib)s outside all of them, so without this a release that changed\n"
+            "# that file left the broker behind and the owner pasted one root command per machine after every one.\n"
+            "#\n"
+            "# What the service user gains is exactly this: it can ask root to replace the broker's program with\n"
+            "# the vault.py on the configuration ref and restart the broker. It names no file, no source, no\n"
+            "# destination and no service, and it passes no bytes: they are fetched here, as root, from the\n"
+            "# address this machine already takes all of its code from, into a bare repository only root can\n"
+            "# write. Nothing is checked out and nothing fetched is ever run, so no hook of it runs as root. The\n"
+            "# broker's user, its store, its store key and its handover key are not read here, and the handover\n"
+            "# key is never remade. A broker that does not come up gets back the program that was serving.\n"
+            "set -eu\n"
+            # Root's own PATH and not the caller's, so that none of the commands below can be chosen by whoever
+            # ran this. sudo already resets it on a stock Debian or Ubuntu; this does not depend on that.
+            "PATH=%(path)s\n"
+            "export PATH\n"
+            'test "$(id -u)" = 0 || { echo "fleet-vault-program: this command needs root" >&2; exit 1; }\n'
+            'test "$#" = 0 || { echo "fleet-vault-program: this command takes no argument" >&2; exit 2; }\n'
+            "# A machine with no broker is not behind: there is nothing here to bring up to date.\n"
+            'test -s %(conf)s && test -s %(program)s || { echo "fleet-vault-program: this machine has no vault'
+            ' broker"; exit 0; }\n'
+            "repo=%(repo)s\n"
+            'test -n "$repo" || { echo "fleet-vault-program: this machine has no address for the fleet\'s'
+            ' configuration ref. Run the join line again." >&2; exit 3; }\n'
+            "umask 077\n"
+            'new=$(mktemp); old=$(mktemp)\n'
+            "trap 'rm -f \"$new\" \"$old\"' EXIT\n"
+            "test -d %(source)s || git init -q --bare %(source)s\n"
+            # Into a ref of its own and not FETCH_HEAD: what a fetch leaves unreachable is what the next
+            # housekeeping run throws away, and then every catch-up downloads the whole repository again.
+            'git -C %(source)s fetch -q --no-tags "$repo" %(refspec)s\n'
+            "git -C %(source)s cat-file blob %(local)s:vault.py > \"$new\"\n"
+            'test -s "$new" || { echo "fleet-vault-program: the configuration ref carries no vault.py" >&2;'
+            " exit 4; }\n"
+            'want=$(sha256sum "$new" | cut -d\' \' -f1)\n'
+            "have=$(sha256sum %(program)s | cut -d' ' -f1)\n"
+            'if [ "$want" = "$have" ]; then\n'
+            '    echo "fleet-vault-program: the broker already runs this vault.py ($want)"\n'
+            "    exit 0\n"
+            "fi\n"
+            "cp -p %(program)s \"$old\"\n"
+            'install -o root -g root -m 644 "$new" %(program)s\n'
+            "systemctl reset-failed fleet-vault >/dev/null 2>&1 || true\n"
+            "systemctl restart fleet-vault || true\n"
+            "sleep %(settle)d\n"
+            "active=$(systemctl is-active fleet-vault 2>/dev/null || true)\n"
+            "# As the installer reads it: a broker that crashes on its own program is active for an instant and\n"
+            "# then gone, so the restarts since the reset are what say whether it stayed up. An older systemd that\n"
+            "# does not answer the property says nothing either way.\n"
+            "crashes=$(systemctl show -p NRestarts --value fleet-vault 2>/dev/null || true)\n"
+            'if [ "$active" = active ] && { [ -z "$crashes" ] || [ "$crashes" = 0 ] ||'
+            ' [ "$crashes" = unknown ]; }; then\n'
+            '    echo "fleet-vault-program: the broker runs the vault.py of the configuration ref ($want)"\n'
+            "    exit 0\n"
+            "fi\n"
+            'install -o root -g root -m 644 "$old" %(program)s\n'
+            "systemctl reset-failed fleet-vault >/dev/null 2>&1 || true\n"
+            "systemctl restart fleet-vault || true\n"
+            'echo "fleet-vault-program: the broker did not come up on the new vault.py, so this machine keeps the'
+            ' one that was serving. Read: journalctl -u fleet-vault -n 30" >&2\n'
+            "exit 5\n") % {
+                "sudoers": SUDOERS, "lib": VAULT_LIB, "conf": VAULT_CONF, "program": VAULT_LIB + "/vault.py",
+                "source": VAULT_SOURCE, "repo": shlex.quote(repo or ""), "path": ROOT_PATH,
+                "refspec": shlex.quote(f"+{branch}:refs/heads/{branch}"),
+                "local": shlex.quote(f"refs/heads/{branch}"), "settle": VAULT_SETTLE}
+
+
 def sudoers_text(service_user):
-    """What this machine's service user may do with root, and nothing else: the one helper above as root, and any
+    """What this machine's service user may do with root, and nothing else: the two helpers above as root, and any
     command as a member of `fleet-agents`, which holds the agent users alone. The service installs each agent under
-    its own user with the second right, and `fleet.py verify` reads one with it (PRODUCT.md 4.1). That user is no
-    agent and runs no AI session on a joined server, so this is not a way from one agent to another."""
-    return ("# Founderizer: hubsetup.py writes this file. Two rights for the user that runs this machine's Founderizer\n"
-            "# services, and nothing else: the helper that makes one agent's OS user, as root; and any command as\n"
-            "# a member of the group %(group)s, which holds the agent users alone. It may not become root.\n"
+    its own user with the last right, and `fleet.py verify` reads one with it (PRODUCT.md 4.1). That user is no
+    agent and runs no AI session on a joined server, so this is not a way from one agent to another.
+
+    **Both root rights are one mechanical act with no input.** `fleet-agent-user` makes the OS user of one agent,
+    and its only argument is checked against the agent users a fleet can have before a line of it runs.
+    `fleet-vault-program` takes no argument at all and fetches what it installs itself. Neither takes a path, a
+    value or a command from the caller, so neither is a way for this user to run code of its own as root -- which
+    is the one thing a second root right must not become."""
+    return ("# Founderizer: hubsetup.py writes this file. Three rights for the user that runs this machine's\n"
+            "# Founderizer services, and nothing else: the helper that makes one agent's OS user, as root; the\n"
+            "# helper that brings this machine's vault broker onto the vault.py of the fleet's configuration ref,\n"
+            "# as root; and any command as a member of the group %(group)s, which holds the agent users alone.\n"
+            "# Each root command does one mechanical thing and takes nothing from the caller: the first takes one\n"
+            "# agent user name, which it checks itself, and the second takes no argument and fetches what it\n"
+            "# installs itself. This user may not become root.\n"
             "%(user)s ALL=(root) NOPASSWD: %(helper)s\n"
+            "%(user)s ALL=(root) NOPASSWD: %(vault)s\n"
             "%(user)s ALL=(%%%(group)s) NOPASSWD: ALL\n") % {
-                "group": AGENT_GROUP, "user": service_user, "helper": HELPER}
+                "group": AGENT_GROUP, "user": service_user, "helper": HELPER, "vault": VAULT_UPDATE}
 
 
-def helper_install_script(helper_from, sudoers_from):
-    """The shell that puts the group, the root helper and the sudoers file in place. `visudo -c` reads the new file
-    before it is moved in, because a file that sudo cannot parse takes sudo away from the whole machine."""
+def helper_install_script(helper_from, vault_from, sudoers_from):
+    """The shell that puts the group, the two root helpers and the sudoers file in place. `visudo -c` reads the new
+    file before it is moved in, because a file that sudo cannot parse takes sudo away from the whole machine."""
     return ("groupadd -f %(group)s\n"
             "install -o root -g root -m 755 %(helper_from)s %(helper)s\n"
+            "install -o root -g root -m 755 %(vault_from)s %(vault)s\n"
             "visudo -cqf %(sudoers_from)s\n"
             "install -o root -g root -m 440 %(sudoers_from)s %(sudoers)s\n") % {
                 "group": AGENT_GROUP, "helper_from": shlex.quote(helper_from), "helper": HELPER,
+                "vault_from": shlex.quote(vault_from), "vault": VAULT_UPDATE,
                 "sudoers_from": shlex.quote(sudoers_from), "sudoers": SUDOERS}
 
 
-def agent_helper(service_user="fleet", check=False, run=None, read=None):
-    """The group, the root helper and the sudoers file that the agent-add path and `verify` need on this machine.
+def agent_helper(service_user="fleet", repo=None, check=False, run=None, read=None):
+    """The group, the two root helpers and the sudoers file that the agent-add path, the vault broker and `verify`
+    need on this machine.
 
     An agent the owner adds later from the app is installed by the server service, which runs as this machine's
-    service user without root (server.py), so it cannot make the OS user of the agent it installs. This puts the
-    one root command in place that it may run, and the one sudoers file that says what it may do. Both installers
-    call it; nothing of it reaches a Mac, which keeps one user for its agents (PRODUCT.md P2).
+    service user without root (server.py), so it cannot make the OS user of the agent it installs, and it cannot
+    bring the machine's vault broker onto the `vault.py` of a release either. This puts the two root commands in
+    place that it may run, and the one sudoers file that says what it may do -- all three together, so that the
+    rights and the commands they name can never be read apart. Both installers call it; nothing of it reaches a
+    Mac, which keeps one user for its agents (PRODUCT.md P2) and whose vault is the signed app the owner's Mac
+    updates itself.
 
-    Safe to run again, and it changes nothing when both files are already the ones this version writes.
+    `repo` is the address of the fleet's configuration ref, which the vault helper fetches the broker's program
+    from; both installers know it already. Without one that helper refuses and says to run the join line again.
+
+    Safe to run again, and it changes nothing when all three files are already the ones this version writes.
     Returns "made", "there" or "would make"."""
     run = run or _shell
     read = read or (lambda path: pathlib.Path(path).read_text(encoding="utf-8"))
-    helper, sudoers = helper_script(), sudoers_text(service_user)
+    helper, vault, sudoers = helper_script(), vault_program_script(repo), sudoers_text(service_user)
     try:
-        there = read(HELPER) == helper and read(SUDOERS) == sudoers
+        there = read(HELPER) == helper and read(VAULT_UPDATE) == vault and read(SUDOERS) == sudoers
     except OSError:
         there = False
     if there:
-        say(f"{HELPER} and {SUDOERS} are in place already: the server service can make one agent's OS user, and "
-            f"nothing else with root")
+        say(f"{HELPER}, {VAULT_UPDATE} and {SUDOERS} are in place already: the server service can make one agent's "
+            f"OS user and bring this machine's vault broker onto a release, and nothing else with root")
         return "there"
     if check:
-        say(f"  would write {HELPER}, the one root command that makes the OS user of one agent, and {SUDOERS}, "
-            f"which lets {service_user} run that command and become the group {AGENT_GROUP} and nothing else")
+        say(f"  would write {HELPER}, the one root command that makes the OS user of one agent, {VAULT_UPDATE}, "
+            f"which brings this machine's vault broker onto the vault.py of the fleet's configuration ref, and "
+            f"{SUDOERS}, which lets {service_user} run those two commands and become the group {AGENT_GROUP} and "
+            f"nothing else")
         return "would make"
     folder = tempfile.mkdtemp(prefix="fleet-agent-helper-")
     try:
-        one, two = os.path.join(folder, "fleet-agent-user"), os.path.join(folder, "sudoers")
-        for path, text in ((one, helper), (two, sudoers)):
+        one, two = os.path.join(folder, "fleet-agent-user"), os.path.join(folder, "fleet-vault-program")
+        three = os.path.join(folder, "sudoers")
+        for path, text in ((one, helper), (two, vault), (three, sudoers)):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(text)
-        code, out, err = run(helper_install_script(one, two))
+        code, out, err = run(helper_install_script(one, two, three))
         if code != 0:
-            raise Stop(f"the root helper of this machine's agents could not be put in place: "
+            raise Stop(f"the root helpers of this machine's agents and its vault broker could not be put in place: "
                        f"{(err or out).strip()[-300:]}")
     finally:
         shutil.rmtree(folder, ignore_errors=True)
-    say(f"{HELPER} makes the OS user of one agent, and {SUDOERS} lets {service_user} run that one command as root "
-        f"and become the group {AGENT_GROUP}: nothing else, and never root")
+    say(f"{HELPER} makes the OS user of one agent, {VAULT_UPDATE} brings this machine's vault broker onto the "
+        f"vault.py of the fleet's configuration ref, and {SUDOERS} lets {service_user} run those two commands as "
+        f"root and become the group {AGENT_GROUP}: nothing else, and never root")
+    if not repo:
+        say(f"  this run had no address for the configuration ref, so {VAULT_UPDATE} refuses until the join line "
+            f"is run again; a release that changes vault.py then leaves this machine's broker behind")
     return "made"
 # ---------------------------------------------------------------- the machine's vault broker (PRODUCT.md P5)
 
@@ -938,7 +1075,7 @@ def cmd_agent_users(args):
 
 
 def cmd_agent_helper(args):
-    agent_helper(service_user=args.user, check=args.check)
+    agent_helper(service_user=args.user, repo=args.repo, check=args.check)
 
 
 def cmd_vault(args):
@@ -989,6 +1126,8 @@ def main(argv=None):
     va.set_defaults(fn=cmd_vault)
     ah = sub.add_parser("agent-helper")
     ah.add_argument("--user", default="fleet", help="the user that runs this machine's Founderizer services")
+    ah.add_argument("--repo", help="the address of the fleet's configuration ref, which the vault helper fetches "
+                                   "the broker's program from, for example git://100.80.1.2/fleet-pilot.git")
     ah.add_argument("--check", action="store_true", help="say what it would write, change nothing")
     ah.set_defaults(fn=cmd_agent_helper)
     al = sub.add_parser("agent-list")

@@ -103,10 +103,14 @@ These commands keep the repository, outputs, usage records and runtime login.
 ## Vault broker (Linux, V3)
 
 **The join line installs it.** `join.sh` runs `python3 hubsetup.py vault --hub <hub>`
-as root on a Linux machine, beside the root helper and the agent users, so a machine
+as root on a Linux machine, beside the root helpers and the agent users, so a machine
 that joins the fleet ends with a working broker and the owner runs nothing by hand.
 It is safe to run again: every step reads first, and the service is restarted only
 when something changed. Run the join line again to repair a machine.
+
+The join line also puts `/usr/local/sbin/fleet-vault-program` in place, the one root
+command that brings this broker onto the `vault.py` of a release; the machine's own
+server service runs it. See "When a release changes vault.py".
 
 The broker holds the key of the store and the key that opens sealed handovers, as
 its own user `fleet-vault`, so that no agent of the machine can read either and no
@@ -223,41 +227,63 @@ value and no other machine's store.
 
 ### When a release changes vault.py
 
-**A release never reaches the broker.** It updates each agent's own checkout and
-its own user service; the broker runs the root-owned copy at
+**A release reaches no checkout's copy of the broker.** It updates each agent's
+own checkout and its own user service; the broker runs the root-owned copy at
 `/usr/local/lib/fleet-vault/vault.py` as a system service, and nothing in the
 fleet may touch that without root. `lifecycle.OWNER_ONLY` also lists `vault.py`
 among the files a helper never loads, so a commit that changes only that file
-advances the revision every machine reports: the Updates page says the fleet is
-current and each broker goes on running the copy that was installed by hand.
+advances the revision every machine reports.
 
-The fleet says so instead of hiding it. The broker's `status` answers `source`,
-the SHA-256 of the program it runs, the helper sends it to the hub as
-`security.vault.broker_source`, and `/ui/health` raises one `vault_behind`
-warning for each machine whose broker differs from the hub's own `vault.py`. The
-checksum is read once, when the broker starts, so a copy installed under a broker
-that was not restarted does not clear the warning — the running code is still the
-old one.
-
-So after a release that changed `vault.py`, run this as root on each worker that
-has a broker, which is the warning's own `fix` line:
+**So the machine brings its own broker along.** The server service of a joined
+machine reads the installed program, which is root-owned and world-readable, and
+where it differs from the `vault.py` of its own checkout it runs the second root
+command the installers put in place:
 
 ```bash
-install -o root -g root -m 644 ~<worker>/fleet-pilot/vault.py /usr/local/lib/fleet-vault/vault.py && systemctl restart fleet-vault
+/usr/local/sbin/fleet-vault-program
 ```
 
-Running the join line again does the same thing and needs no path: the install
-step reads the checksum of the installed program first and replaces it only when it
-differs from the `vault.py` of the machine's own checkout. Take the path above from
-that checkout and no other — on a machine with one OS user for each agent the agent's
-checkout is `/home/fleet-<agent>/fleet-<agent>`, and an older folder of a fleet that
-was replaced holds older code.
+It takes **no argument**. It fetches `vault.py` from the fleet's configuration ref
+itself, as root, into a bare repository under `/usr/local/lib/fleet-vault` that only
+root can write, installs it `root:root` 644 and restarts `fleet-vault`; a broker
+that does not come up gets back the program that was serving. So the service user
+passes no bytes and names no path, source, destination or service: what it may ask
+for is this one act and nothing else. That is narrower than the command this
+replaced, which installed from a checkout a user can write.
 
-Then `python3 fleet.py check <agent>` as the worker shows "vault broker runs the
-vault.py of this checkout", and the warning goes at that machine's next status
-report (within ten minutes). A broker that says nothing about its program — one
-older than this, or a Mac's signed helper, which the app updates itself — raises
-no warning, because unknown is not behind.
+Nothing else of the broker is touched. Its user, its store, its store key and its
+handover key are never read, and the handover key is never remade — a new one would
+leave every value the store holds unreadable and turn every agent's access into
+`vault_store_mismatch`.
+
+Each machine does this within ten minutes of taking a release, so after a release
+that changed `vault.py` the owner runs nothing.
+
+**A machine installed before this needs its join line run once.** The root command
+is written by the installers, and nothing in the fleet can put a new root-owned file
+in place by itself. So on a machine whose broker was installed earlier, run that
+machine's join line again (Founderizer, Servers, the line it shows) once: it puts
+the command in place and brings the broker up to date in the same run. Every release
+after that is automatic.
+
+**The warning is now about the machine that could not.** The broker's `status`
+answers `source`, the SHA-256 of the program it runs, the helper sends it to the hub
+as `security.vault.broker_source`, and `/ui/health` raises one `vault_behind`
+warning for each machine whose broker differs from the hub's own `vault.py`. A
+warning that stays is one of four things: the machine has a broker and no server
+service, its installers are older than that root command (run its join line again),
+it cannot reach the hub's configuration ref, or the broker did not come up on the
+new program and kept the one that was serving. The `fix` is to run the command above
+by hand on that machine and read what it says; `journalctl -u fleet-vault -n 30`
+holds the rest. Running the join line again also does it, and needs no path either.
+
+The checksum is read once, when the broker starts, so a copy installed under a
+broker that was not restarted does not clear the warning — the running code is
+still the old one. Then `python3 fleet.py check <agent>` as the worker shows "vault
+broker runs the vault.py of this checkout", and the warning goes at that machine's
+next status report (within ten minutes). A broker that says nothing about its
+program — one older than this, or a Mac's signed helper, which the app updates
+itself — raises no warning, because unknown is not behind.
 
 ### New logins on a Linux broker (`create_login`): the write setup
 

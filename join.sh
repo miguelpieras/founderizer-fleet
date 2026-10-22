@@ -107,12 +107,14 @@ current() {     # $1: the checkout; $2: how to run a command as the user of the 
     "$2" git -C "$1" pull -q --ff-only </dev/null || say "$1 could not take the hub's newest commit; it stays as it is"
 }
 
-agent_helper() { # $1: the checkout. The one root command that makes an agent's OS user, and the sudoers file that
-                 # says who may run it. The server service installs the agents the owner adds later and has no root
-                 # of its own, so this is how an agent gets a user, and how `fleet.py verify` reads one.
-    say "the root helper that makes an agent's OS user, and the one sudoers line for it"
-    python3 "$1/hubsetup.py" agent-helper --user "$WORKER" </dev/null \
-        || stop "The root helper of this machine's agent users could not be put in place."
+agent_helper() { # $1: the checkout. The two root commands of this machine, and the sudoers file that says who may
+                 # run them. The server service installs the agents the owner adds later and has no root of its
+                 # own, so this is how an agent gets a user, how `fleet.py verify` reads one, and how a release
+                 # that changed vault.py reaches this machine's vault broker, which no checkout holds.
+    say "the root helpers that make an agent's OS user and update this machine's vault broker, and the sudoers \
+lines for them"
+    python3 "$1/hubsetup.py" agent-helper --user "$WORKER" --repo "$REPO" </dev/null \
+        || stop "The root helpers of this machine's agent users and its vault broker could not be put in place."
 }
 
 agent_users() { # $1: the checkout whose team.json names this fleet's agents. One OS user for each agent of this
