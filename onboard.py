@@ -521,12 +521,46 @@ def not_older(current, wanted):
     return bool(have and want) and tuple(map(int, have.group(0).split("."))) >= tuple(map(int, want.group(0).split(".")))
 
 
+# The vendor's Codex installer, for the worker user into ~/.local/bin. Without --release it installs the newest release.
+CODEX_INSTALLER = ("curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_INSTALLER_USE_RELEASES_OPENAI_COM=false "
+                   "CODEX_NON_INTERACTIVE=1 sh -s --")
+# A setting in the env of ~/.claude/settings.json that turns Claude Code's updates off (UI-API.md, "To stop updates on
+# one machine"). CLAUDE_CHANNEL above reads the same two names.
+CLAUDE_UPDATES_OFF = ("DISABLE_AUTOUPDATER", "DISABLE_UPDATES")
+
+
 def runtime_install(rt, ver):
-    """The vendor's installer of one runtime version for the worker user, into ~/.local/bin."""
+    """The vendor's installer of one runtime version for the worker user, into ~/.local/bin. The helper also runs it,
+    to put the previous version back after an update that failed its check (lifecycle.Lifecycle.update_runtime)."""
     if rt == "codex":
-        return ("curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_INSTALLER_USE_RELEASES_OPENAI_COM=false "
-                "CODEX_NON_INTERACTIVE=1 sh -s -- --release %s" % shlex.quote(ver))
+        return CODEX_INSTALLER + " --release %s" % shlex.quote(ver)
     return "curl -fsSL https://claude.ai/install.sh | bash -s %s" % shlex.quote(ver)
+
+
+def runtime_update(rt):
+    """The vendor's own update of one runtime of the worker user in ~/.local/bin, to the newest version that the vendor
+    gives: Claude Code's `update` command, which follows the channel and the floor that CLAUDE_CHANNEL set and does
+    not go below the build that runs it, and Codex's installer without a release. The helper runs it, as the worker
+    user, and checks what it installed (lifecycle.Lifecycle.update_runtime)."""
+    if rt == "codex":
+        return CODEX_INSTALLER
+    return '"$HOME/.local/bin/claude" update'
+
+
+def updates_off(rt, home):
+    """Why the owner keeps this runtime's version as it is in this home, or None. For Claude Code that is a setting
+    that turns its updates off (CLAUDE_UPDATES_OFF), and the helper's updates keep to it as Claude Code's own do.
+    Codex has no such setting."""
+    if rt != "claude":
+        return None
+    try:
+        with open(os.path.join(home, ".claude", "settings.json")) as f:
+            env = json.load(f).get("env")
+    except (OSError, ValueError, AttributeError):
+        return None
+    off = [key for key in CLAUDE_UPDATES_OFF if isinstance(env, dict)
+           and str(env.get(key, "")).strip().lower() not in ("", "0", "false")]
+    return ("%s in ~/.claude/settings.json turns its updates off" % " and ".join(off)) if off else None
 
 
 def claude_login_command(config, ip, login, checkout='"$HOME/fleet-pilot"', exe='"$HOME/.local/bin/claude"'):

@@ -53,9 +53,9 @@ import mcp
 import push
 import releases
 from lifecycle import (APP_SERVER, APP_SERVER_RUNTIME, DEPLOY_APP_NOTE, GITHUB_TOKEN, MCP_LIMIT, MCP_NAME,
-                       REPO_ACCESS, REPO_NAME, RUNTIMES, SWITCH_RUNTIMES, TOOL_CATALOG, app_server_task, mcp_server,
-                       mcp_variable, no_sign_in, runtime_fact, runtimes_with, switch_target, tool_catalog,
-                       tool_needs)
+                       REPO_ACCESS, REPO_NAME, RUNTIMES, RUNTIME_RESULTS, SWITCH_RUNTIMES, TOOL_CATALOG,
+                       app_server_task, mcp_server, mcp_variable, no_sign_in, runtime_fact, runtimes_with,
+                       switch_target, tool_catalog, tool_needs)
 
 DESKTOP = Frames()
 
@@ -8228,7 +8228,7 @@ def profile_view(agent, rev):
 
 _code_diffs = {}
 FLEET_FILES = re.compile(r"(?:^|/)[^/]+\.py$|^team\.json$|^bws\.toml$|^profiles/|^(?:RULES|CLAUDE|AGENTS)\.md$")
-OWNER_ONLY = re.compile(r"(?:^|/)(?:test_[^/]*|onboard|ui_fixture|selftest|verify|pilot|vault)\.py$")  # never run by helpers
+OWNER_ONLY = re.compile(r"(?:^|/)(?:test_[^/]*|ui_fixture|selftest|verify|pilot|vault)\.py$")  # never run by helpers
 
 
 def same_code(rev, desired):
@@ -17207,6 +17207,17 @@ def _optional(value, kind, limit=200):
     return value.strip()
 
 
+def runtime_update(value):
+    """The last update of one runtime by its helper (lifecycle.Lifecycle.update_runtime): {result, at, detail}, or None.
+    It is an optional field of a newer helper, so a value of another shape is dropped and never refuses the status."""
+    if not isinstance(value, dict) or value.get("result") not in RUNTIME_RESULTS:
+        return None
+    at, detail = value.get("at"), value.get("detail")
+    if isinstance(at, bool) or not isinstance(at, (int, float)) or not math.isfinite(at) or not isinstance(detail, str):
+        return None
+    return {"result": value["result"], "at": at, "detail": detail.strip()[:300]}
+
+
 def validate_status(data):
     """A helper's machine status report. Unknown fields are dropped; missing fields are null."""
     if not isinstance(data, dict):
@@ -17275,8 +17286,13 @@ def validate_status(data):
     if runtimes is not None and (not isinstance(runtimes, dict) or set(runtimes) - set(SWITCH_RUNTIMES) or
                                  not all(isinstance(r, dict) for r in runtimes.values())):
         raise ValueError("runtimes must map codex and claude to {version, signed_in}")
-    runtimes = {n: {"version": _optional(r.get("version"), str, 120), "signed_in": _optional(r.get("signed_in"), bool)}
-                for n, r in (runtimes or {}).items()} if runtimes is not None else None
+    kept = {}
+    for n, r in (runtimes or {}).items():
+        kept[n] = {"version": _optional(r.get("version"), str, 120), "signed_in": _optional(r.get("signed_in"), bool)}
+        update = runtime_update(r.get("update"))      # a helper from before the runtime updates sends none
+        if update:
+            kept[n]["update"] = update
+    runtimes = kept if runtimes is not None else None
     other = data.get("other_runtime_windows")
     if other is not None and (not isinstance(other, list) or len(other) > 8 or
                               not all(isinstance(w, str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,40}", w) for w in other)):

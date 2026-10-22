@@ -2793,6 +2793,23 @@ class Helper:
         r = tmux("capture-pane", "-p", "-t", target)
         return r.returncode == 0 and bool(WORKING.search("\n".join(r.stdout.rstrip().split("\n")[-15:])))
 
+    def runtimes_busy(self):
+        """True while a session of this OS user may be using a runtime, so that an update of the runtimes waits
+        (Lifecycle.update_runtimes): a task window, a turn that runs in a standing or conversation window, or a
+        sign-in. Every Fleet session of the user counts and not only this agent's, because a Mac keeps one user,
+        one ~/.local/bin and one tmux server for all of its agents. A tmux that gives no answer counts as busy."""
+        r = tmux("list-windows", "-a", "-F", "#{session_name}\t#{window_name}")
+        if r.returncode != 0:
+            return True
+        for line in r.stdout.splitlines():
+            session, _, window = line.partition("\t")
+            if not session.startswith("fleet-") or window == "home":
+                continue
+            if session.startswith(LOGIN_SESSION % "") or re.fullmatch(r"T-\d+", window) or \
+                    self.working(f"{session}:={window}"):
+                return True
+        return False
+
     def window_runtime(self, window):
         """The program that a window started (codex, claude, ...), from its launch argv; "" when it cannot be read,
         None when the window is not there. The window list decides that: tmux can answer a display-message for a
@@ -3646,7 +3663,8 @@ def cmd_run(args):
                             busy=lambda: any(re.fullmatch(r"T-\d+", w) for w in h.look()) or h.outside > 0 or
                             h.manager_lock is not None,     # no restart while a previous runtime's manager closes
                             vault=lambda: vault_status(agent), probe=lambda job: probe_logins(agent, job),
-                            legacy=h.legacy_windows, switch=h.switch_state)
+                            legacy=h.legacy_windows, switch=h.switch_state,
+                            runtimes_busy=h.runtimes_busy, say=h.say)       # it updates this user's runtimes
     threading.Thread(target=h.lifecycle.run_forever, name="machine-status", daemon=True).start()
     threading.Thread(target=h.tailer.run, name="thread-records", daemon=True).start()
     has_key, keyed, enrolled_at = False, False, 0.0

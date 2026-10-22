@@ -4,8 +4,13 @@ The helper reports what its machine runs and how it is protected, using only com
 no root. It updates its own Fleet checkout only when it has no task session: a fast-forward to the
 hub's revision, then a restart of its own service. A failed step is reported; nothing is forced.
 While an update runs, no task or chat session can start (see session_start).
+
+It also updates the agent runtimes of its OS user, at most every six hours and only while no session of that user
+works: the vendor's own update, a check of the new version, and the previous version back when the check fails
+(update_runtimes).
 """
 import contextlib
+import fcntl
 import json
 import os
 import plistlib
@@ -22,8 +27,10 @@ import threading
 import time
 import urllib.parse
 
+import onboard      # the vendors' installers, which the runtime updates run (update_runtime)
+
 REPORT_EVERY = 300          # seconds between status reports when nothing changes
-OWNER_ONLY = re.compile(r"(?:^|/)(?:test_[^/]*|onboard|ui_fixture|selftest|verify|pilot|vault)\.py$")  # never loaded here
+OWNER_ONLY = re.compile(r"(?:^|/)(?:test_[^/]*|ui_fixture|selftest|verify|pilot|vault)\.py$")  # never loaded here
 TICK = 15                   # seconds between idle checks
 RESTART_GRACE = 120         # seconds this process may live on after it asked for its own restart
 CONFIG_BRANCH = "config"    # the configuration ref that the fleet runs: the hub writes it, the code branch waits
@@ -250,6 +257,15 @@ def switch_target(runtime):
 FLEET_DIR = ".fleet"
 SIGNED_IN_FILE = "signed-in-%s.json"
 MODELS_EVERY = 6 * 3600         # seconds between readings of the runtime's model options
+# The helper's updates of the runtimes of its OS user (update_runtimes). One round at most every six hours for each
+# user, whose ~/.fleet keeps when the last one began and what it did, and one helper at a time: a Mac keeps one user,
+# and so one ~/.local/bin, for all of its agents. RUNTIME_RESULTS are the outcomes that its status reports.
+RUNTIME_UPDATE_EVERY = 6 * 3600
+RUNTIME_INSTALL_WAIT = 600      # seconds that one vendor installer may take
+RUNTIME_UPDATES_FILE = "runtime-updates.json"
+RUNTIME_UPDATES_LOCK = "runtime-updates.lock"
+RUNTIME_RESULTS = ("updated", "current", "rolled_back", "failed", "skipped")
+VERSION = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?")     # the version in a runtime's --version line
 MODEL_NAME = re.compile(r"[A-Za-z0-9._:/\[\]-]{1,120}")
 EFFORT_NAME = re.compile(r"[a-z]{1,20}")
 LOGIN_REASONS = ("ok", "not_found", "no_access", "bad_format", "no_token", "timeout", "error")
@@ -569,8 +585,14 @@ def follow_config_ref(kit, run=None):
 class Lifecycle:
     def __init__(self, kit, agent, conf, post, busy, restart=None, run=_run, clock=time.time,
                  platform_name=sys.platform, home=None, vault=None, probe=None, models=codex_model_list, legacy=None,
-                 switch=None, which=None, monotonic=time.monotonic):
+                 switch=None, which=None, monotonic=time.monotonic, runtimes_busy=None, say=print):
         self.kit, self.agent, self.conf, self.post, self.busy = kit, agent, conf, post, busy
+        # () -> True while a session of this OS user may be using a runtime: its updates wait for False
+        # (update_runtimes). None: this process updates no runtime, as for the server service's readings.
+        self.runtimes_busy = runtimes_busy
+        self.say = say                  # (text) -> a line in the helper's own log
+        self.runtimes_tried = None      # when this process last tried a round of runtime updates (monotonic)
+        self.runtime_round = None       # the thread of the round that runs now
         self.legacy = legacy            # () -> the windows without a session credential (owner API 1.12)
         self.switch = switch            # () -> {other_runtime_windows, owner_chat_bound}, for a manager also
                                         # manager_bound and manager_handover (owner feature runtime_switch)
@@ -741,9 +763,14 @@ class Lifecycle:
         runtimes = {name: self.runtime(name) for name in SWITCH_RUNTIMES}
         self.remember_signed_in(runtimes)
         name = self.conf.get("runtime")
+        said = {n: {"version": r["version"], "signed_in": r["signed_in"]} for n, r in runtimes.items()}
+        outcomes = self.runtime_updates().get("runtimes") if self.runtimes_busy else None
+        for n, outcome in outcomes.items() if isinstance(outcomes, dict) else ():
+            if n in said and isinstance(outcome, dict):     # its last update, by any helper of this user
+                said[n]["update"] = outcome
         return {"revision": self.running(), "os": self.os_info(), "security": self.security(),
                 "runtime": runtimes[name] if name in runtimes else self.runtime(),
-                "runtimes": {n: {"version": r["version"], "signed_in": r["signed_in"]} for n, r in runtimes.items()},
+                "runtimes": said,
                 "access": dict(self.access(), user=pwd.getpwuid(os.getuid()).pw_name),
                 "update": update, "features": list(FEATURES),
                 "legacy_windows": self.legacy() if self.legacy else None,
@@ -810,22 +837,25 @@ class Lifecycle:
         for a machine check. No model runs for it."""
         if not force and self.models and self.clock() - self.models["read_at"] < MODELS_EVERY:
             return self.models
-        name, options, error, source = self.conf.get("runtime"), None, None, None
-        exe = self.exe(name)
-        if name == "codex":
-            source = "codex app-server model/list"
-            options, error = self.codex_models(exe) if exe else (None, "codex is not installed")
-        elif name == "claude":
-            source = "claude --help"
-            code, out, _ = self.run([exe, "--help"]) if exe else (1, "", "")
-            options, error = claude_model_list(out) if code == 0 else (None, "claude is not installed" if not exe
-                                                                        else "claude --help did not answer")
-        else:
-            error = "This runtime reports no model list."
+        name = self.conf.get("runtime")
+        options, error, source = self.model_options(name, self.exe(name))
         self.models = {"runtime": name, "ok": options is not None, "read_at": self.clock(), "source": source,
                        "other_names": name == "claude", "error": None if options is not None else error,
                        "options": options or []}
         return self.models
+
+    def model_options(self, name, exe):
+        """(options, error, source): one runtime's own model options, read with its executable exe (None when it is
+        not installed). The reading of read_models, and the check of a runtime update (runtime_check)."""
+        if name == "codex":
+            options, error = self.codex_models(exe) if exe else (None, "codex is not installed")
+            return options, error, "codex app-server model/list"
+        if name == "claude":
+            code, out, _ = self.run([exe, "--help"]) if exe else (1, "", "")
+            options, error = claude_model_list(out) if code == 0 else (None, "claude is not installed" if not exe
+                                                                        else "claude --help did not answer")
+            return options, error, "claude --help"
+        return None, "This runtime reports no model list.", None
 
     def verify(self, status, probe_job=None):
         """The setup check: what this machine can prove now, with no AI. Each item is ok, failed or not_verified;
@@ -1086,6 +1116,7 @@ class Lifecycle:
             self.gate.release()
         if self.monotonic() - self.last_report >= REPORT_EVERY:
             self.report()
+        self.start_runtime_updates()
         with self.lock:
             ready = self.state == "waiting_idle"
             desired = self.pending
@@ -1110,3 +1141,180 @@ class Lifecycle:
             except Exception:
                 pass
             time.sleep(TICK)
+
+    # ---- runtime updates (the owner, 22 October 2026: "they should probably update themselves too, right?")
+    def start_runtime_updates(self):
+        """Start one round of runtime updates when it is due and no session of this user uses a runtime. A Fleet
+        update that waits or runs goes first. The idle check is made with the session gate held, so no session
+        starts from that check on; the round runs in a thread of its own that keeps the gate until it ends, and this
+        thread goes on sending the status reports while an installer works."""
+        if self.runtimes_busy is None or (self.runtime_round and self.runtime_round.is_alive()):
+            return
+        with self.lock:
+            if self.state in ("waiting_idle", "updating"):
+                return
+        if not self.runtimes_due() or not self.gate.acquire(blocking=False):
+            return
+        try:
+            idle = not self.busy() and not self.runtimes_busy()
+        except Exception:
+            idle = False
+        if not idle:
+            self.gate.release()
+            return
+        try:
+            self.runtime_round = threading.Thread(target=self.update_runtimes, name="runtime-updates", daemon=True)
+            self.runtime_round.start()
+        except Exception:
+            self.gate.release()         # a gate that nothing releases would keep every session from starting
+            raise
+
+    def runtimes_due(self):
+        """True when the last round of this user's runtime updates began RUNTIME_UPDATE_EVERY ago or more. The time
+        is kept in the user's ~/.fleet, because a helper restarts with every Fleet update and a time in its memory
+        alone would be due again after each one. A time ahead of the clock is not believed, so a clock that was set
+        back never stops the updates. This process's own last try also counts, on its monotonic clock, so a file
+        or a lock that cannot be written never lets one try follow another at every tick."""
+        if self.runtimes_tried is not None and self.monotonic() - self.runtimes_tried < RUNTIME_UPDATE_EVERY:
+            return False
+        at = self.runtime_updates().get("at")
+        return not (isinstance(at, (int, float)) and 0 <= self.clock() - at < RUNTIME_UPDATE_EVERY)
+
+    def runtime_updates(self):
+        """{at, runtimes} of this user's ~/.fleet: when its last round of runtime updates began, and the outcome for
+        each runtime (update_runtime). {} when there is none, or none that can be read."""
+        try:
+            with open(os.path.join(self.home, FLEET_DIR, RUNTIME_UPDATES_FILE)) as f:
+                saved = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        return saved if isinstance(saved, dict) else {}
+
+    def save_runtime_updates(self, saved):
+        """Write {at, runtimes} whole or not at all, because the other helpers of this user read it. A failure is
+        said, and the round goes on: runtimes_tried keeps this process's next try six hours away."""
+        path = os.path.join(self.home, FLEET_DIR, RUNTIME_UPDATES_FILE)
+        try:
+            os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+            with open(path + ".new", "w") as f:
+                json.dump(saved, f)
+            os.replace(path + ".new", path)
+        except OSError as e:
+            self.say(f"runtime updates: {path} could not be written ({type(e).__name__})")
+
+    @contextlib.contextmanager
+    def runtime_lock(self):
+        """This user's lock on its runtime updates, taken without a wait: True inside when this process has it. The
+        helpers of one user share its ~/.local/bin, so two of them never run an installer into it at the same time."""
+        path = os.path.join(self.home, FLEET_DIR, RUNTIME_UPDATES_LOCK)
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        with open(path, "a") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held = True
+            except OSError:
+                held = False
+            yield held                  # the lock ends with the file
+
+    def update_runtimes(self):
+        """One round, in its own thread, with the session gate that start_runtime_updates took: no task, chat or
+        conversation session starts until it ends, so none starts on a runtime that is being replaced or checked. A
+        session that runs keeps the program it started with and is not restarted; the next session starts on what
+        the round leaves. The round ends with a status report, so that the hub has the new versions at once."""
+        try:
+            with self.runtime_lock() as held:
+                # Due again under the lock: another helper of this user can have done the round a moment ago.
+                if held and self.runtimes_due():
+                    began, done = self.clock(), {}
+                    self.save_runtime_updates({"at": began, "runtimes": done})
+                    for name in onboard.RUNTIME_PINS:       # the runtimes that Fleet installs, and so updates
+                        outcome = self.update_runtime(name)
+                        if outcome:
+                            done[name] = outcome
+                            self.say(f"runtime update of {runtime_fact(name, 'label', name)} ({outcome['result']}): "
+                                     f"{outcome['detail']}")
+                            self.save_runtime_updates({"at": began, "runtimes": done})
+        except Exception as e:
+            self.say(f"runtime updates: the round stopped ({type(e).__name__})")
+        finally:
+            self.runtimes_tried = self.monotonic()      # whatever happened, this process tries again in six hours
+            self.gate.release()
+        self.report()
+
+    def update_runtime(self, name):
+        """One runtime of this user brought to the vendor's newest version, and checked. None when it is not
+        installed, else the outcome {result (RUNTIME_RESULTS), at, detail}:
+
+        1. Only the vendor's own installation (vendor_install), only when its owner did not turn its updates off
+           (onboard.updates_off), and only a version that passes the check now, because the new one is held to
+           what the installed one does. Otherwise it is skipped and nothing runs.
+        2. The vendor's update (onboard.runtime_update), as this user, for at most RUNTIME_INSTALL_WAIT.
+        3. The same check of what is there now (runtime_check), and a version that is not older than before.
+        4. When that fails, the previous version again (onboard.runtime_install), which must answer as it did."""
+        exe = self.exe(name)
+        if not exe:
+            return None
+
+        def outcome(result, detail):
+            return {"result": result, "at": self.clock(), "detail": detail[:300]}
+
+        def shell(script):
+            code, out, err = self.run(["/bin/sh", "-c", 'mkdir -p "$HOME/.local/bin" && ' + script],
+                                      timeout=RUNTIME_INSTALL_WAIT, cwd=self.home)
+            return code, " ".join((err or out).split())[-160:]
+
+        why = self.vendor_install(name, exe) or onboard.updates_off(name, self.home)
+        if why:
+            return outcome("skipped", f"{why}, so it stays as it is.")
+        old, problem = self.runtime_check(name, exe)
+        if problem:
+            return outcome("skipped", f"The installed {old or name} does not pass the check now ({problem}), so no "
+                                      f"new version is tried.")
+        code, said = shell(onboard.runtime_update(name))
+        new, problem = self.runtime_check(name, exe)
+        if not problem and not onboard.not_older(new, old):
+            problem = f"it is older than {old}"
+        if not problem:
+            if new != old:
+                return outcome("updated", f"Updated from {old} to {new}, which passed its check.")
+            if code == 0:
+                return outcome("current", f"{old} stays: the vendor gives no newer version.")
+            return outcome("failed", f"The update did not run ({said or 'exit status %d' % code}); {old} stays and "
+                                     f"passes its check.")
+        tried = new or "The new version"
+        code, said = shell(onboard.runtime_install(name, old))
+        if self.version_of(exe) == old:
+            return outcome("rolled_back", f"{tried} failed its check ({problem}), so {old} is installed again.")
+        return outcome("failed", f"{tried} failed its check ({problem}), and {old} did not come back "
+                                 f"({said or 'exit status %d' % code}). Install {old} again on this machine.")
+
+    def vendor_install(self, name, exe):
+        """Why this runtime is not the vendor's own installation, which the helper updates, or None when it is: the
+        command that this user's PATH finds is ~/.local/bin/<name>, where the vendor's installer puts it, and it is
+        the vendor's program and no script. Another installer's runtime (Homebrew, npm, a system package) is that
+        installer's to update, and a launcher of the owner's own in ~/.local/bin (one that reads a key from the
+        Keychain first, say) stays exactly as it is."""
+        if os.path.normpath(exe) != os.path.join(os.path.normpath(self.home), ".local", "bin", name):
+            return f"{exe} is not the vendor's installation in ~/.local/bin"
+        try:
+            with open(exe, "rb") as f:          # through the link that the vendor's installer makes, if any
+                script = f.read(2) == b"#!"
+        except OSError:
+            return f"{exe} cannot be read"
+        return f"{exe} is a script and not the vendor's program" if script else None
+
+    def runtime_check(self, name, exe):
+        """(version, problem) of one installed runtime: the version that its --version answers, and why the check
+        fails, or None when it passes. The check is the helper's own reading for the hub: --version answers a
+        version, and the runtime's model options can be read (model_options). No model runs."""
+        version = self.version_of(exe)
+        if not version:
+            return None, f"{name} --version answers no version"
+        options, error, _ = self.model_options(name, exe)
+        return version, None if options is not None else error
+
+    def version_of(self, exe):
+        """The version that a runtime's --version answers, or None."""
+        code, out, _ = self.run([exe, "--version"])
+        found = VERSION.search(out) if code == 0 else None
+        return found.group(0) if found else None
