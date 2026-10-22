@@ -550,8 +550,22 @@ code, _, text = raw("POST", "/hook/activity/studio/T-2", {"tool_name": "Read"})
 check("activity hook", code == 200)
 
 # 7 needs you
-text, err = tool("manager", "raise_needs_you", title="Pick the codename", why="Naming is the owner's choice", what_to_do="Type a name")
-check("raise_needs_you", "N-1" in text)
+text, err = tool("manager", "raise_needs_you", title="Allowance may run out", why="70% used",
+                 what_to_do="Nothing is needed if you can wait until 20:00 UTC.")
+check("a Needs-you item that says nothing is needed is refused", err and "tell_owner" in text, text)
+text, err = tool("manager", "raise_needs_you", title="A release went out", why="It shipped")
+check("a Needs-you item with nothing for the owner to do is refused", err and "what_to_do" in text, text)
+text, err = tool("manager", "raise_needs_you", title="FYI: a release went out", why="It shipped", what_to_do="Read it")
+check("an FYI is refused as a Needs-you item", err and "tell_owner" in text, text)
+text, err = tool("manager", "raise_needs_you", title="Allowance may run out", why="70% used", what_to_do="Choose one",
+                 options=["Fine, no action needed", "Add capacity"])
+check("...also when only an option says nothing is needed", err and "tell_owner" in text, text)
+text, err = tool("manager", "raise_needs_you", title="Pick", why="Naming", what_to_do="Choose", options=[1, 2])
+check("options that are not texts are refused, not a crash", err and "options is a list" in text, text)
+check("...and a refused item pages nobody", not any(e["kind"] == "notify" and "Needs you" in e["text"] for e in events("owner")))
+text, err = tool("manager", "raise_needs_you", title="Pick the codename", why="Naming is the owner's choice",
+                 what_to_do="Type a name. Nothing else is needed from you.")
+check("raise_needs_you, also when it says nothing else is needed", "N-1" in text, text)
 check("the owner gets a notification event", any(e["kind"] == "notify" and "N-1" in e["text"] for e in events("owner")))
 before = events("manager")[-1]["id"]
 code, headers, _ = raw("POST", "/needs/1", form={"answer": "Tide"})
