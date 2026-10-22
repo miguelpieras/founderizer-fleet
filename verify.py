@@ -119,15 +119,20 @@ def _line(text):
     return " ".join(str(text).split())[:300]
 
 
+# The programs a fix may start with. A fix that is a command to paste keeps the command's own spelling: "Sudo
+# timedatectl set-ntp true" is not a command any shell runs (found by the installer test of 22 October 2026).
+COMMANDS = {"git", "loginctl", "python3", "runuser", "sudo", "systemctl", "tailscale", "timedatectl", "ufw"}
+
+
 def _said(text):
     """One line the owner reads in the app, so it starts with a capital (the owner, 19 October 2026: every message
     he reads starts with one). A line that starts with a name this machine itself uses keeps that name as it is: a
-    unit (fleet-hub), a file (team.json), an address, a count or a revision. So the rule reaches the words and not
-    the names, and a fix that is a command to paste keeps the command's own spelling."""
+    unit (fleet-hub), a file (team.json), a program (`COMMANDS`), an address, a count or a revision. So the rule
+    reaches the words and not the names, and a fix that is a command to paste keeps the command's own spelling."""
     line = _line(text)
     head = line.split(" ", 1)[0]
     word = head[:-2] if head.endswith("'s") else head      # an agent's name in the possessive is a word too
-    if word[:1].islower() and word.isalpha() and not re.fullmatch(r"[0-9a-f]{7,}", word):
+    if word[:1].islower() and word.isalpha() and word not in COMMANDS and not re.fullmatch(r"[0-9a-f]{7,}", word):
         return line[0].upper() + line[1:]
     return line
 
@@ -450,9 +455,13 @@ class Verify:
         code, out, err = self.run([sys.executable, path], timeout=self.selftest_wait)
         summary = self.summary(out)
         if not summary:
-            return self.answer(FAIL, f"the self-test did not answer in {self.selftest_wait} seconds: "
-                                     f"{_line(err or out) or 'no output'}",
-                               f"run it by hand: cd {self.kit} && python3 selftest.py")
+            # A run that ended without its summary line crashed; only one that never ended ran out of time. The
+            # last line of its error output is the one that says why (the installer test of 22 October 2026 read
+            # a timeout for a self-test that had stopped on an error after 24 seconds).
+            last = ([line for line in (err or out or "").splitlines() if line.strip()] or ["no output"])[-1]
+            said = (f"the self-test did not answer in {self.selftest_wait} seconds" if "timed out after" in (err or "")
+                    else f"the self-test stopped with an error: {_line(last)}")
+            return self.answer(FAIL, said, f"run it by hand: cd {self.kit} && python3 selftest.py")
         passed, total, failed = summary
         says = f"{passed} of {total} checks passed"
         new = [name for name in failed if name not in SELFTEST_BASELINE]

@@ -1053,6 +1053,37 @@ def event_rows(rows, t0):
         DB.execute(EVENT, (agent, kind, task, str(text), t0, json.dumps(extra or {})))
 
 
+# A "say" that wakes nobody. Every signal is one more turn of a standing session over its whole context, so a message
+# that asks nothing of its reader at once must not cost one. A quiet message ("quiet" in its extra) is left out of the
+# delivery to the helper, so nothing is typed for it, and it comes with its reader's next read: a release, the
+# manager's own allowance, a usage limit that has reset. LATER_SAY is for the hub's own reminders of something to
+# decide that will keep for a while (its lists of goals, duties, reports and circles, a goal's budget warning, another
+# agent's usage limit): it comes with the next read too, and wakes its reader itself only when nothing else has for
+# LATER_WAIT. What needs the manager now still wakes it: the owner's words, results, questions, permission prompts.
+QUIET_SAY = {"quiet": True}
+LATER_WAIT = 3600               # seconds
+LATER_SAY = {"quiet": True, "wake_after": LATER_WAIT}
+
+
+def quiet_waits(created, extra, t0):
+    """Whether the delivery to the helper still leaves this "say" out: a quiet one, unless it carries a wake_after
+    and has waited that long unread."""
+    if not extra.get("quiet"):
+        return False
+    wait = extra.get("wake_after")
+    return not isinstance(wait, (int, float)) or t0 - created < wait
+
+
+def sweep_news(key, items):
+    """Whether a sweep's set of items has one that it did not have the last time, and keep the new set under `key`.
+    A set that only shrank is the manager's own work getting done: each sweep used to say the rest of it again when
+    the set changed at all, so every decision woke the manager to read the list it was working through. An item
+    that leaves and comes back is news again."""
+    old = set(filter(None, (kv_get(key) or "").split(",")))
+    kv_set(key, ",".join(items) or None)
+    return bool(set(items) - old)
+
+
 CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")      # typed into a terminal, these would act as keys
 
 
@@ -2473,7 +2504,7 @@ def start_limit(agent, resets_at, task_id=None):
          f"The hub holds its work until {clock(until)}" + ("" if known else NO_RESET) +
          f": {', '.join(held) or 'no open tasks'}.{shared} New tasks for {agent} wait too. There are no nudges or "
          f"restarts until then, and the hub resumes the held work one time after the reset. To move an urgent task, "
-         f"cancel it and create it for another worker -- one that does not spend this allowance.")
+         f"cancel it and create it for another worker -- one that does not spend this allowance.", extra=LATER_SAY)
     log("hub", f"{agent} is limited until {clock(until)}" +
         (f"; so are {', '.join(also)}, on the same account" if also else ""))
 
@@ -2551,13 +2582,13 @@ def end_limits(t0):
         if len(told) == 1 and not lim["cause"]:
             agent, done = told[0]
             emit(manager_name(), "say", f"[hub] {agent}'s usage limit has reset. The hub resumed its held work one "
-                 f"time: {', '.join(done) or 'nothing was waiting'}.")
+                 f"time: {', '.join(done) or 'nothing was waiting'}.", extra=QUIET_SAY)
         elif told:
             names = " and ".join(a for a, _ in told)
             emit(manager_name(), "say", f"[hub] The usage limit of the provider account that {names} "
                  f"{'share' if len(told) > 1 else 'shares'} has reset. The hub resumed "
                  f"{'their' if len(told) > 1 else 'its'} held work one time -- "
-                 + "; ".join(f"{a}: {', '.join(d) or 'nothing was waiting'}" for a, d in told) + ".")
+                 + "; ".join(f"{a}: {', '.join(d) or 'nothing was waiting'}" for a, d in told) + ".", extra=QUIET_SAY)
         log("hub", f"{lim['agent']}'s usage limit ended; resumed "
                    f"{sum(len(d) for _, d in told)} task(s) of {len(told)} agent(s)")
 
@@ -7565,7 +7596,8 @@ def t_record_spend(agent, a):
 
 def goal_sweep(t0):
     """Fixed checks on every open goal, from the hub tick. No AI turn: the manager gets a message only for a
-    budget step, a changed set of goals that need attention, and one daily review."""
+    budget step, a goal that newly needs attention, and one daily review. The first two wait for its next read, an
+    hour at most (LATER_SAY); the budget that is used up and the daily review wake it."""
     import datetime
     mgr = manager_name()
     minutes, hour, zone = goal_settings()
@@ -7574,7 +7606,7 @@ def goal_sweep(t0):
         if not budget_pause(g) and not g["warned"] and share is not None and 0.8 <= share < 1:
             q("UPDATE goals SET warned=1 WHERE id=?", (g["id"],))
             emit(mgr, "say", f"[goal {gref(g['id'])}] {g['title']} has used {share:.0%} of its budget ({budget_text(g)}). "
-                 f"Plan the rest within the limit.")
+                 f"Plan the rest within the limit.", extra=LATER_SAY)
         g = goal_row(g["id"])
         planned = live_next_step(g) or (g["wake_at"] and g["wake_at"] > t0)
         if g["state"] == "active" and not planned and not g["idle_since"]:
@@ -7599,11 +7631,9 @@ def goal_sweep(t0):
             if deadline and t0 < deadline <= t0 + 86400:
                 lines.append(f"{gref(g['id'])} {g['title']}: due {goal_time(deadline)}.")
                 sig.append(f"{g['id']}:due")
-        if ",".join(sig) != (kv_get("goal_sweep_sig") or ""):
-            kv_set("goal_sweep_sig", ",".join(sig) or None)
-            if lines:
-                emit(mgr, "say", "[hub] Goal sweep. These goals need you:\n" + "\n".join(lines) +
-                     "\nFor each one, act, then call update_goal with a next step or a date.")
+        if sweep_news("goal_sweep_sig", sig):
+            emit(mgr, "say", "[hub] Goal sweep. These goals need you:\n" + "\n".join(lines) +
+                 "\nFor each one, act, then call update_goal with a next step or a date.", extra=LATER_SAY)
     local = datetime.datetime.fromtimestamp(t0, zone)
     if local.hour >= hour and kv_get("goal_review_day") != local.strftime("%Y-%m-%d"):
         kv_set("goal_review_day", local.strftime("%Y-%m-%d"))
@@ -9771,7 +9801,7 @@ def duty_marker(r, t0):
 
 def duty_sweep(t0):
     """Fixed checks on every duty that is not retired, from the hub tick. No AI turn: the manager gets one message
-    when the set of duties that are not in order changes."""
+    when a duty is newly not in order, and it waits for the manager's next read, an hour at most (LATER_SAY)."""
     for row in q("SELECT * FROM responsibilities WHERE state IN ('active','paused') ORDER BY id"):
         r = duty_row(row["id"])
         kind, detail = duty_marker(r, t0)
@@ -9789,14 +9819,12 @@ def duty_sweep(t0):
                      f"{r['marker_kind'].replace('_', ' ')}. "
                      f"{r['marker_detail']}")
         sig.append(f"{r['id']}:{r['marker_kind']}")
-    if ",".join(sig) != (kv_get("duty_sweep_sig") or ""):
-        kv_set("duty_sweep_sig", ",".join(sig) or None)
-        if lines:
-            emit(manager_name(), "say", "[hub] Duty sweep. These duties are not in order:\n" + "\n".join(lines) +
-                 "\nYou are the authority over them: ask the agent, put the duty right, change its words or its "
-                 "holder with set_duty, pause or retire it with change_duty, or give the work to another suitable "
-                 "agent. A duty that nothing needs any more is yours to retire. Raise Needs you only for what the "
-                 "owner alone can do.")
+    if sweep_news("duty_sweep_sig", sig):
+        emit(manager_name(), "say", "[hub] Duty sweep. These duties are not in order:\n" + "\n".join(lines) +
+             "\nYou are the authority over them: ask the agent, put the duty right, change its words or its "
+             "holder with set_duty, pause or retire it with change_duty, or give the work to another suitable "
+             "agent. A duty that nothing needs any more is yours to retire. Raise Needs you only for what the "
+             "owner alone can do.", extra=LATER_SAY)
 
 
 def duty_case_text(c, r):
@@ -12038,18 +12066,14 @@ def t_decide_report(agent, a):
 
 
 def report_sweep(t0):
-    """The reports nobody decided, from the hub tick. No AI turn: one message to the manager when the set changes,
-    the same shape as duty_sweep. A lead with an undecided report is in that message, because a lead has no standing
-    session and the manager is the one that stays on top of it (rule 7)."""
+    """The reports nobody decided, from the hub tick. No AI turn: one message to the manager when a report joins
+    them, the same shape as duty_sweep, and not when one is decided. A lead with an undecided report is in that
+    message, because a lead has no standing session and the manager is the one that stays on top of it (rule 7)."""
     if t0 - float(kv_get("report_sweep_at") or 0) < goal_settings()[0] * 60:
         return
     kv_set("report_sweep_at", t0)
     rows = [r for r in open_reports(kinds=False) if t0 - r["created"] > REPORT_GRACE]
-    sig = ",".join(str(r["id"]) for r in rows)
-    if sig == (kv_get("report_sweep_sig") or ""):
-        return
-    kv_set("report_sweep_sig", sig or None)
-    if not rows:
+    if not sweep_news("report_sweep_sig", [str(r["id"]) for r in rows]):
         return
     mine = [r for r in rows if r["to_agent"] == manager_name()]
     theirs = [r for r in rows if r["to_agent"] != manager_name()]
@@ -12058,7 +12082,7 @@ def report_sweep(t0):
     emit(manager_name(), "say", f"[hub] {len(rows)} report(s) wait for a decision:\n" + "\n".join(lines) +
          "\nDecide each of yours with decide_report: " + "; ".join(REPORT_DECISIONS) +
          (". A report that waits with a lead is that lead's to decide in its task session; ask it with message_agent."
-          if theirs else "."))
+          if theirs else "."), extra=LATER_SAY)
 
 
 # ---------------------------------------------------------------- see_history: a number with the window before it
@@ -12476,18 +12500,14 @@ def tasks_stuck(t0):
 
 
 def circle_sweep(t0):
-    """From the hub tick: the circles the fleet is running in, to the manager, when the set changes. The hub reports;
-    the decision stays the manager's."""
+    """From the hub tick: the circles the fleet is running in, to the manager, when a new one joins them. The hub
+    reports; the decision stays the manager's."""
     if t0 - float(kv_get("circle_sweep_at") or 0) < goal_settings()[0] * 60:
         return
     kv_set("circle_sweep_at", t0)
     found = circles(t0)
     circle_watched(found, t0)       # before the signature check: an unchanged set keeps its first sighting
-    sig = ",".join(s for s, _ in found)
-    if sig == (kv_get("circle_sweep_sig") or ""):
-        return
-    kv_set("circle_sweep_sig", sig or None)
-    if not found:
+    if not sweep_news("circle_sweep_sig", [s for s, _ in found]):
         return
     emit(manager_name(), "say", f"[hub] {len(found)} thing(s) look like running in circles:\n" +
          "\n".join("  " + line for _, line in found[:CIRCLE_SHOWN]) +
@@ -12495,7 +12515,11 @@ def circle_sweep(t0):
          "\nThe hub only sees the pattern and changes nothing: the third attempt is sometimes the right one. Decide "
          "each: write the answer where it is read next time (a profile, a knowledge file, the task's own words), "
          "give the work to a suitable agent, settle the access, cancel what nothing needs, or leave it as it is. "
-         "see_history tells you what moved and what did not.")
+         "see_history tells you what moved and what did not.", extra=LATER_SAY)
+
+
+ALLOWANCE_STAGES = {"pace": 1, "last": 2, "spent": 3}  # allowance_worth_saying's why, each one worse than the one before
+ALLOWANCE_SAME = 3600           # seconds: two readings of one window whose resets are closer than this are one window
 
 
 def allowance_sweep(t0):
@@ -12504,26 +12528,45 @@ def allowance_sweep(t0):
     It is the one allowance the whole fleet passes through, and the manager cannot see it: see_capacity lists every
     agent but itself, so the number was in the hub and in front of nobody. It is a warning for the manager and not
     for the owner's phone: it once named raise_needs_you, and the owner was paged with an item whose own words said
-    nothing was needed (22 October 2026). It names tell_owner, which posts with no notification. Once per window
-    instance, and once more when it is nearly gone: the signature is what was last said, so a new reset time or a
-    worse stage says it again and an unchanged one says nothing."""
+    nothing was needed (22 October 2026). It names tell_owner, which posts with no notification.
+
+    Once per window, and once more for each worse stage of it. What was said is kept for each window of the account
+    (allowance_said: {label: its reset and the stage}), and only the window's own reset ends it. Until 22 October 2026
+    the signature was the window's id, its exact reset and the stage, and it was cleared whenever nothing was worth
+    saying, so a reading that moved the reset by a moment said it all again, and so did a pace that dipped under the
+    line for one sweep: every 15 minutes, each copy one more turn of the manager over its whole context. The warning
+    about the allowance was what spent it. It is quiet too (QUIET_SAY): it asks for nothing at once, so it comes with
+    the manager's next read and wakes nothing."""
     if t0 - float(kv_get("allowance_sweep_at") or 0) < goal_settings()[0] * 60:
         return
     kv_set("allowance_sweep_at", t0)
     mgr = manager_name()
     said, w, why = allowance_ahead(mgr)
-    sig = f"{w['id']}|{w['resets_at']}|{why}" if said else ""
-    if sig == (kv_get("allowance_sweep_sig") or ""):
-        return
-    kv_set("allowance_sweep_sig", sig or None)
-    if not sig:
+    if not said:
+        return              # what was said stays: a pace that dips under the line and back is the same warning
+    try:
+        known = json.loads(kv_get("allowance_said") or "{}")
+    except ValueError:
+        known = {}
+    known = {k: v for k, v in (known if isinstance(known, dict) else {}).items() if isinstance(v, dict) and
+             not (isinstance(v.get("resets_at"), (int, float)) and v["resets_at"] < t0 - ALLOWANCE_SAME)}
+    last, reset = known.get(w["label"], {}), w["resets_at"]
+    was = last.get("resets_at")
+    same = bool(last) and (reset is None and was is None or reset is not None and isinstance(was, (int, float))
+                           and abs(reset - was) < ALLOWANCE_SAME)
+    worse = ALLOWANCE_STAGES[why] > (ALLOWANCE_STAGES.get(last.get("stage"), 0) if same else 0)
+    # The reset that this reading gives is kept even when nothing is said, so a reset that creeps is still this window.
+    known[w["label"]] = {"resets_at": reset, "stage": why if worse else last.get("stage")}
+    kv_set("allowance_said", json.dumps(known))
+    if not worse:
         return
     emit(mgr, "say", f"[hub] YOUR OWN ALLOWANCE: {said} Every question, every result and every permission prompt of "
          f"this fleet waits for you, so when it is gone the fleet stops with you. Until the reset, work in fewer and "
          f"bigger steps, and put off what can wait. This is a warning for you and not a Needs-you item: the owner "
          f"is not paged about a limit. If he would want to know what you will put off, say it once with "
          f"tell_owner, which posts it with no notification. This is your own allowance and not a reason to move "
-         f"work to an agent with more left: suitability comes first, as it always does.")
+         f"work to an agent with more left: suitability comes first, as it always does. The hub says this once for "
+         f"this window, and again only if it gets worse.", extra=QUIET_SAY)
 
 
 # ---------------------------------------------------------------- the manager's resume brief
@@ -15838,8 +15881,10 @@ def tick():
             traceback.print_exc()           # a broken trigger must not stop the reminders and manager checks below
         # the one exception: the hub tells the owner itself when the manager is gone
         kind, flag = None, None
-        pending = q1("SELECT MIN(created) ts FROM events WHERE agent=? AND kind='say' AND read_at IS NULL "
-                     "AND NOT COALESCE(json_extract(extra, '$.quiet'), 0)", (mgr,))["ts"]     # a quiet one wakes nobody
+        # A quiet one wakes nobody, so it is not a message the manager left unread; a LATER_SAY is one from its wake.
+        pending = q1("SELECT MIN(created + COALESCE(json_extract(extra, '$.wake_after'), 0)) ts FROM events "
+                     "WHERE agent=? AND kind='say' AND read_at IS NULL AND (NOT COALESCE(json_extract(extra, "
+                     "'$.quiet'), 0) OR json_extract(extra, '$.wake_after') IS NOT NULL)", (mgr,))["ts"]
         if pending and t0 - max(float(pending), limit_ended(mgr), switch_ended(mgr)) > CFG["manager_silence"]:
             kind = "silent"
             flag = (f"The manager has not acted on a message for {span(t0 - float(pending))}. "
@@ -20170,8 +20215,9 @@ def machine_rows():
 # The entitlement is carried, never enforced: it goes to the channel as a bearer and whatever comes back is kept.
 # Nothing in this file refuses work when it expires — only our side refuses (4.2).
 #
-# A fleet whose owner has not opted in to automatic updates reaches the channel only when the owner presses Check
-# or Update, so a hub that is never asked never leaves its own network.
+# A fleet takes each release by itself (the owner, 22 October 2026: "do they get the latest updates, improvements
+# and bug fixes automatically? it must be like that!"). An owner who turned that off reaches the channel only when
+# he presses Check or Update, and a fleet with no entitlement does not ask at all, because our side would refuse it.
 
 RELEASE_POLL = 900              # seconds between automatic polls of the channel
 RELEASE_ROWS = 10               # releases the app reads at once, newest first
@@ -20223,11 +20269,13 @@ def fleet_id():
 
 
 def releases_automatic():
-    return kv_get("releases_auto") == "1"
+    """On unless the owner turned it off. Until 22 October 2026 it was off unless he turned it on, and "off" was
+    then stored as nothing, so a fleet that had turned it off is on again with this line and says so in the app."""
+    return kv_get("releases_auto") != "0"
 
 
 def set_releases_automatic(on):
-    kv_set("releases_auto", "1" if on else None)
+    kv_set("releases_auto", "1" if on else "0")
     log("owner", f"automatic releases are {'on' if on else 'off'}")
     return {"automatic": bool(on)}
 
@@ -20459,13 +20507,13 @@ def finish_release(rid, state, step, says, automatic, result=None):
     # Every machine, the hub's own included: its agent's helper fast-forwards its own checkout and restarts its own
     # user service, exactly as a worker's does (request_update). The hub process is the line below.
     asked = [name for name in agents() if request_update(name, row["reached"]) == "requested"]
-    # A quiet message ("quiet" in its extra): the delivery to the helper leaves it out, so nothing is typed for it and
-    # it comes with the manager's next read. It woke the manager at every release, ten a day, to read RULES.md and its
-    # profile again: each one a turn of the standing session and some 17,000 tokens that stayed in its context, while
-    # no release changes a profile and most change no rule. So it names the sections of RULES.md that changed.
+    # Quiet (QUIET_SAY): it comes with the manager's next read. It woke the manager at every release, ten a day, to
+    # read RULES.md and its profile again: each one a turn of the standing session and some 17,000 tokens that stayed
+    # in its context, while no release changes a profile and most change no rule. So it names the sections of
+    # RULES.md that changed.
     emit(manager_name(), "say", f"[hub] This fleet took release {row['version']} ({row['reached'][:12]}). "
          + rules_news(row["pinned"], row["reached"])
-         + (f" {len(asked)} machine(s) update when they are idle." if asked else ""), extra={"quiet": True})
+         + (f" {len(asked)} machine(s) update when they are idle." if asked else ""), extra=QUIET_SAY)
     restart_hub_soon(row["pinned"], row["reached"])
     return row
 
@@ -20537,8 +20585,9 @@ def restart_hub_soon(pinned, reached, always=False):
 
 
 def release_sweep(t0):
-    """The automatic poll, for an owner who opted in. Without that opt-in nothing here reaches the network."""
-    if not releases_automatic():
+    """The automatic poll, unless the owner turned it off. A fleet with no entitlement is not polled either: our
+    side refuses a fleet that carries none, so asking would only reach the network to be told no."""
+    if not releases_automatic() or not entitlement_token():
         return
     if t0 - float(kv_get("releases_checked") or 0) < RELEASE_POLL:
         return
@@ -21123,8 +21172,8 @@ class Handler(BaseHTTPRequestHandler):
         return self.ui_command("releases/update", lambda data: {}, lambda body: start_release_work(True))
 
     def ui_release_auto(self):
-        """POST /ui/releases/auto: opt in to automatic updates, or out again. A held release is not taken even with
-        this on, because the hold is in the signed manifest."""
+        """POST /ui/releases/auto: automatic updates off, or on again (on is the default). A held release is not taken
+        even with this on, because the hold is in the signed manifest."""
         def read(data):
             if not isinstance(data.get("automatic"), bool):
                 raise ValueError("automatic must be true or false")
@@ -24018,7 +24067,7 @@ class Handler(BaseHTTPRequestHandler):
                         continue        # no window now: the message waits in the hub until this agent can answer
                     if held and r["kind"] == "say":
                         continue        # held until the manager's new session runs; the read receipt stays open
-                    if r["kind"] == "say" and extra.get("quiet"):
+                    if r["kind"] == "say" and quiet_waits(r["created"], extra, now()):
                         continue        # a quiet message comes with the agent's next read; nothing is typed for it
                     if worker and r["kind"] in ("task", "say") and t and active_hold(t["id"]):
                         continue        # nothing is typed into a held session

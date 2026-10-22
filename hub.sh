@@ -147,33 +147,46 @@ or Debian 12."
         [ "$check" = yes ] || stop "systemd is required: the hub runs as a systemd user service."
         say "  no systemd here; the hub runs as a systemd user service"
     fi
+    # The clone and the check of the copy's commit both need git, which a minimal server does not carry: without
+    # it a copy of the repository was refused as "not a git checkout" (the installer test of 22 October 2026).
+    if ! command -v git >/dev/null 2>&1; then
+        if [ "$check" = yes ]; then
+            plan "install git, which the clone and the check of this copy's commit need"
+        else
+            say "  installing git"
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get -o DPkg::Lock::Timeout=300 update -q </dev/null >/dev/null
+            apt-get -o DPkg::Lock::Timeout=300 install -y -q --no-install-recommends git </dev/null >/dev/null
+        fi
+    fi
     if [ -n "$source" ]; then
         plan "clone the Founderizer repository from $source, then install from that clone"
-        if [ "$check" = no ]; then
-            if ! command -v git >/dev/null 2>&1; then      # the clone needs git before the package step
-                say "  installing git for the clone"
-                export DEBIAN_FRONTEND=noninteractive
-                apt-get -o DPkg::Lock::Timeout=300 update -q </dev/null >/dev/null
-                apt-get -o DPkg::Lock::Timeout=300 install -y -q --no-install-recommends git </dev/null >/dev/null
-            fi
-            fresh="/root/fleet-kit"
-            if git -C "$fresh" rev-parse --git-dir >/dev/null 2>&1; then
-                say "  the Founderizer repository is in $fresh already"
-            else
-                [ ! -e "$fresh" ] || stop "$fresh is there and is not a Founderizer checkout. Move it away, or run the \
-line from a copy of the repository without --source."
-                say "  cloning the Founderizer repository into $fresh"
-                git clone -q -- "$source" "$fresh" || stop "Could not clone the Founderizer repository from $source."
-            fi
-            tree=$fresh
+        if [ "$check" = yes ]; then
+            # The clone is not made in check mode, so there is no copy yet to measure.
+            plan "check that the clone carries $NEEDED, and a commit"
+            return 0
         fi
+        fresh="/root/fleet-kit"
+        if git -C "$fresh" rev-parse --git-dir >/dev/null 2>&1; then
+            say "  the Founderizer repository is in $fresh already"
+        else
+            [ ! -e "$fresh" ] || stop "$fresh is there and is not a Founderizer checkout. Move it away, or run the \
+line from a copy of the repository without --source."
+            say "  cloning the Founderizer repository into $fresh"
+            git clone -q -- "$source" "$fresh" || stop "Could not clone the Founderizer repository from $source."
+        fi
+        tree=$fresh
     fi
     missing=""
     for f in $NEEDED; do [ -f "$tree/$f" ] || missing="$missing $f"; done
     [ -z "$missing" ] || stop "$tree is not a copy of the Founderizer repository: it has no$missing. Copy the repository to \
 this server, or pass --source with its address."
-    git -C "$tree" rev-parse HEAD >/dev/null 2>&1 || stop "$tree is not a git checkout with a commit. The hub's own \
+    if [ "$check" = yes ] && ! command -v git >/dev/null 2>&1; then
+        plan "check that $tree is a git checkout with a commit, once git is installed"
+    else
+        git -C "$tree" rev-parse HEAD >/dev/null 2>&1 || stop "$tree is not a git checkout with a commit. The hub's own \
 repository is made from this one, so it must carry its history: copy a git checkout, or pass --source with its address."
+    fi
     say "  Founderizer is in $tree"
 }
 
@@ -187,11 +200,11 @@ packages() {
         say "  every package is installed"
         return 0
     fi
-    say "  installing$missing"
     if [ "$check" = yes ]; then
         plan "apt-get update, then apt-get install$missing"
         return 0
     fi
+    say "  installing$missing"
     export DEBIAN_FRONTEND=noninteractive
     apt-get -o DPkg::Lock::Timeout=300 update -q </dev/null >/dev/null
     # shellcheck disable=SC2086
@@ -205,7 +218,7 @@ hub_user() {
     else
         act useradd --create-home --shell /bin/bash --user-group "$HUB_USER"
     fi
-    act passwd -l "$HUB_USER"
+    if [ "$check" = yes ]; then act passwd -l "$HUB_USER"; else passwd -l "$HUB_USER" >/dev/null; fi
     act chmod 700 "/home/$HUB_USER"
     for g in sudo admin wheel; do
         [ "$check" = yes ] || gpasswd -d "$HUB_USER" "$g" >/dev/null 2>&1 || true
@@ -438,8 +451,8 @@ agent_helper() { # the one root command that makes an agent's OS user, and the s
         plan "write /usr/local/sbin/fleet-agent-user, the one root command that makes the OS user of one agent, and \
 /etc/sudoers.d/fleet-agents, which lets $HUB_USER run that command and become the group fleet-agents and nothing \
 else; the sudoers file is read by visudo -c before it is moved in"
-        plan "so an agent the owner adds later from the app, which the server service installs without root, gets a \
-user of its own, and fleet.py verify can read each agent (PRODUCT.md 4.1)"
+        plan "let an agent the owner adds later from the app, which the server service installs without root, get a \
+user of its own, so that fleet.py verify can read each agent (PRODUCT.md 4.1)"
         return 0
     fi
     python3 "$kit/hubsetup.py" agent-helper --user "$HUB_USER" \

@@ -156,7 +156,7 @@ would read as an empty fleet instead of as a mistake.
 | `control_task` / `steer_task` | `/ui/tasks/<id>/control`, `/steer` | Pause, stop, resume; steer an open task. |
 | `goal_state` / `duty_state` / `trigger_state` | `/ui/goals/<id>/state` and the two beside it | Pause, resume, finish, drop. |
 | `settle_outcome` | `/ui/outcomes/<id>` | Record whether an unknown outcome took effect. |
-| `check_releases` / `take_release` / `automatic_releases` | `/ui/releases/*` | Ask the channel; take the release; opt in. |
+| `check_releases` / `take_release` / `automatic_releases` | `/ui/releases/*` | Ask the channel; take the release; turn automatic updates off or on (on by default). |
 | `take_backup` | `/ui/backup`, `/ui/backups/confirm` | A copy of the fleet into a file on this Mac, checked. |
 
 **A goal and a duty have no form.** UI-API.md version 1.20 took the owner's own writers out of the

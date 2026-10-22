@@ -61,7 +61,7 @@ import urllib.request
 import uuid
 
 from threads import MARKER, THREAD_ID, CodexFiles, Tailer, Translator, complete_rows, manager_transcript, text_of
-from usage import Collector, local_model
+from usage import Collector, local_model, timestamp
 from lifecycle import (GITHUB_TOKEN, MCP_PROGRAM, REPO_ACCESS, REPO_NAME, RUNTIMES, TOOL_CATALOG, Lifecycle,
                        Updating, app_server_task, exe, follow_config_ref, mcp_variable, no_sign_in, runtime_fact,
                        runtimes_with, tool_catalog, tool_needs)
@@ -788,6 +788,65 @@ MANAGER_RUNTIMES = tuple(sorted(runtimes_with("manager")))
 # fleet's state is in the hub (goals, plans, duties, tasks), never only in a session, so a summary loses nothing that
 # a read cannot give back. CLAUDE_CODE_AUTO_COMPACT_WINDOW wins over the owner's own /autocompact and settings.
 STANDING_COMPACT = 200000
+# A standing Claude session that is told of a message after the provider's cache of it has expired reads its whole
+# context again at the price of writing it. Claude keeps a session's cache for an hour (five minutes on some plans,
+# which its own records say), and the manager's session waited for hours between messages, so each of those messages
+# cost the whole of a long context: 3 to 4 percent of a week's allowance each by the manager's own count on 22 October
+# 2026, while a new session costs only its start and the hub's brief. So a message that finds the manager's session cold, with a context that
+# has grown FRESH_GROWN past the start of its conversation, starts a new conversation instead (Helper.restart_fresh).
+CACHE_SECONDS = 3600
+FRESH_GROWN = 50000             # tokens
+FRESH_SPACING = 600             # seconds between two new conversations at the least, whatever the readings say
+CONTEXT_BYTES = 1 << 20         # read of the head and of the tail of a conversation file, which can be hundreds of MB
+
+
+def call_context(line):
+    """(tokens, time, cache seconds or None) of one line of a Claude conversation file that is a model call of the
+    main conversation: the tokens that the call read, new, from the cache and written to it, are its context. None
+    for any other line, for a subagent's call and for a call that read nothing (a message of Claude Code's own)."""
+    if b'"assistant"' not in line:
+        return None
+    try:
+        row = json.loads(line)
+    except ValueError:
+        return None             # also the line cut at the edge of a read, and one still being written
+    message = row.get("message") if isinstance(row, dict) and row.get("type") == "assistant" and \
+        not row.get("isSidechain") else None
+    usage = message.get("usage") if isinstance(message, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    tokens = sum(v for v in (usage.get(k) for k in ("input_tokens", "cache_read_input_tokens",
+                                                     "cache_creation_input_tokens")) if isinstance(v, int))
+    try:
+        at = timestamp(row.get("timestamp"))
+    except ValueError:
+        return None
+    if not tokens or at is None:
+        return None
+    written = usage.get("cache_creation") if isinstance(usage.get("cache_creation"), dict) else {}
+    return tokens, at, 3600 if written.get("ephemeral_1h_input_tokens") else \
+        300 if written.get("ephemeral_5m_input_tokens") else None
+
+
+def claude_context(path):
+    """(tokens now, tokens at its start, time of its last model call, cache seconds) of a Claude conversation file,
+    from its first and its last model call (call_context); None when either is not found. Only the head and the tail
+    of the file are read. A compaction stays in the same file, so the last call is the context after it. The cache
+    seconds are those of the newest call that wrote to the cache, else CACHE_SECONDS."""
+    try:
+        with open(path, "rb") as stream:
+            head = stream.read(CONTEXT_BYTES)
+            stream.seek(max(0, os.fstat(stream.fileno()).st_size - CONTEXT_BYTES))
+            tail = stream.read(CONTEXT_BYTES)
+    except OSError:
+        return None
+    first = next(filter(None, map(call_context, head.splitlines())), None)
+    calls = [c for c in map(call_context, tail.splitlines()) if c]
+    if not first or not calls:
+        return None
+    return calls[-1][0], first[0], calls[-1][1], next((c[2] for c in reversed(calls) if c[2]), CACHE_SECONDS)
+
+
 # Claude Code puts RULES.md in the context through CLAUDE.md, so a session that also read it was given its
 # 17,000 tokens twice; a Codex session reads it. The first 60 characters find a session from before session ids
 # (manager_windows), so they stay as they were.
@@ -1243,7 +1302,7 @@ def manager_conversation(agent, runtime, record):
     return window, found
 
 
-def manager_start(agent, conf, generation, token):
+def manager_start(agent, conf, generation, token, fresh=False):
     """The one decision of both starts of the standing manager session, the helper's own and `fleet.py start`:
     (command, session id, record, note). Each runtime keeps its own record of its conversation (owner feature
     runtime_switch), so that a switch back continues that runtime's conversation: ~/.fleet/manager-<agent>.claude.json
@@ -1254,7 +1313,8 @@ def manager_start(agent, conf, generation, token):
     record is the one to save before the window starts; None when the saved one stays. A new conversation starts
     only with no record, with a record of another DB generation, or with a record whose start never began its
     conversation (a Codex record with no thread whose marker no rollout carries, a Claude record with "begun": false
-    and no file; note says so).
+    and no file; note says so), or with fresh: the helper closed the recorded one because it was cold and long
+    (Helper.restart_fresh), and its file stays where it is.
     Refused when the record cannot be read or is not valid, or when its conversation file is not found: then nothing
     starts and the record stays, so that the conversation is never replaced without notice. Another runtime starts as
     before and has no record."""
@@ -1263,7 +1323,9 @@ def manager_start(agent, conf, generation, token):
         record = load_chat_record(agent, runtime, "manager")
     env = session_env(agent, conf, "manager")
     note = "a new conversation: the recorded one is of another hub database" if record else ""
-    if record and record["generation"] == generation:
+    if record and record["generation"] == generation and fresh:
+        note = "a new conversation with the hub's brief, in place of the recorded one, which was cold and long"
+    elif record and record["generation"] == generation:
         window, found = manager_conversation(agent, runtime, record)
         if found:
             if runtime == "claude":     # its file is there: it began, and a later start that misses that file stops
@@ -1860,6 +1922,7 @@ class Helper:
         self.told = {}            # {window: (tmux window id, the event ids its last signal told of)} (signal)
         self.retold = {}          # {window: seconds before the same unread messages are told again}
         self.wanted = {}          # {window: ids of this poll's events that want a signal} (handle_events)
+        self.typed_at = {}        # {window: when its last signal was typed}, a model call of its session (restart_fresh)
         self.manager_session = None
         self.retiring = None      # (first quiet reading, its marks) of the previous runtime's chat (runtime_switch)
         self.retired_left = {}    # {pid: args} of that chat's processes that did not end when it closed
@@ -1872,6 +1935,9 @@ class Helper:
         self.manager_seen_old = None    # (runtime, session id, manager_keeps) of that session at the latest reading
         self.manager_tried = None       # the last try to start the manager session (manage); None before the first
         self.manager_due = False        # its start is due (manage)
+        self.manager_fresh = False      # that start is a new conversation (restart_fresh)
+        self.fresh_at = None            # when this helper last started one so (restart_fresh)
+        self.compact_restarted = False  # the session without STANDING_COMPACT was closed once (restart_fresh)
         self.manager_pending = None     # (session id, note) of a start whose tmux reading failed (start_manager)
         self.manager_asked = None       # when this helper last told the hub of a question on its screen
         # {pid: args} of its processes that did not end when it closed, also from before a restart of this helper
@@ -2023,7 +2089,8 @@ class Helper:
                 self.manager_pending = None         # it did not start: a new start
                 generation = manager_generation(self.agent)
                 token = manager_credential(self.agent, generation)
-                command, session, record, note = manager_start(self.agent, self.conf, generation, token)
+                command, session, record, note = manager_start(self.agent, self.conf, generation, token,
+                                                               fresh=self.manager_fresh)
                 save_handover(self.agent, start_handover(self.agent, generation))
                 if record:      # first: no window runs without it (a start that never begins is replaced next time)
                     save_chat_record(self.agent, record, self.conf.get("runtime"), "manager")
@@ -2146,7 +2213,8 @@ class Helper:
         standing session is not typed into while a turn runs (STANDING_WINDOWS): it reads once more at the end of the
         turn, and a message that came during the turn and is still unread then is told as soon as the turn ends. A
         task session is still told during its turn, once, so that a steer reaches it. A new window (its tmux id)
-        knows nothing of earlier signals."""
+        knows nothing of earlier signals. A manager session that a message finds cold and long is not told at all:
+        it starts again on a new conversation, and that one is told (restart_fresh)."""
         target = f"{self.session}:={window}"
         if time.monotonic() - self.signalled.get(window, 0) < SIGNAL_GAP:
             return
@@ -2158,12 +2226,18 @@ class Helper:
             return
         if window in STANDING_WINDOWS and self.working(target):
             return                  # a turn runs: it reads its messages at its end, and this tells it after that
+        try:
+            if window == "manager" and self.restart_fresh(target):
+                return              # a new conversation starts instead, and the next poll tells it
+        except Exception as e:      # a check that fails never keeps a message from the manager: it is told as before
+            self.say(f"manager: the check for a cold session failed ({type(e).__name__})")
         text = (CONVERSATION_SIGNAL if CONVERSATION_WINDOW.fullmatch(window) else
                 f'New fleet messages. Call read_messages(task_id="{window}") now.'
                 if self.worker and window != "owner-chat" else CHAT_SIGNAL)
         got = type_into(self.session, window, text)
         self.signalled[window] = time.monotonic()
         if got == "typed":
+            self.typed_at[window] = time.monotonic()
             self.told[window] = (wid, ids)
             self.retold[window] = RESIGNAL_FIRST if fresh else \
                 min(RESIGNAL_MAX, 2 * self.retold.get(window, RESIGNAL_FIRST))
@@ -2508,31 +2582,53 @@ class Helper:
         self.manager_due = True
         self.say("manager: its team tools changed, so its session starts again on the same conversation")
 
-    def restart_for_compact(self):
-        """A standing Claude session compacts at STANDING_COMPACT only when it starts with it (session_command), and
-        one that started before it would keep its 1M window for as long as it stands. So it starts again one time,
-        between two turns and on the same conversation, the way restart_for_tools does it; its next turn compacts."""
-        if self.conf.get("role") != "manager" or self.conf.get("runtime") != "claude" or \
-                getattr(self, "compact_restarted", False):
-            return
+    def restart_fresh(self, target):
+        """True when this closed the standing Claude manager session so that it starts again on a new conversation,
+        with the hub's brief, instead of being told of its messages (signal): its watch starts it within ten
+        seconds, and the next poll tells the new session. Between two turns only, and for one of two reasons:
+
+        - It is cold. Its last model call is older than the provider's cache (CACHE_SECONDS, or what its own records
+          say), and its context has grown FRESH_GROWN past the start of its conversation, so telling it would read
+          all of that again at the price of writing it, where a new session pays only for a start. Nothing is lost
+          that a read cannot give back: the fleet's state is in the hub, and the brief opens with it.
+        - It started without the compaction window (STANDING_COMPACT), before this helper had it: one time.
+
+        A signal that this helper typed less than one cache lifetime ago counts as a model call, so a conversation file
+        that is not where it should be never makes a session that is still cached look cold. A start does not: a
+        session that continues its conversation makes no call until it is told of a message."""
+        if self.conf.get("role") != "manager" or self.conf.get("runtime") != "claude":
+            return False
         if self.manager_due or self.manager_left or self.manager_retiring is not None or self.outdated():
-            return
-        target = f"{self.session}:=manager"
+            return False                # a start or a switch is already going to replace this session
+        if self.fresh_at is not None and time.monotonic() - self.fresh_at < FRESH_SPACING:
+            return False
         if self.window_runtime("manager") != "claude":
-            return
-        start = tmux("display-message", "-p", "-t", target, "#{pane_start_command}")
+            return False
+        r = tmux("display-message", "-p", "-t", target, "#{@fleet_session}\t#{pane_start_command}")
         screen = tmux("capture-pane", "-p", "-t", target)
-        if start.returncode != 0 or not start.stdout.strip() or "CLAUDE_CODE_AUTO_COMPACT_WINDOW=" in start.stdout:
-            return
-        if screen.returncode != 0 or WORKING.search("\n".join(screen.stdout.rstrip().split("\n")[-15:])) or \
-                shows_question(screen.stdout):
-            return                      # a turn runs, or a question waits on its screen: at a later round
-        self.compact_restarted = True   # one time for this helper, whatever the new start says
+        if r.returncode != 0 or screen.returncode != 0 or shows_question(screen.stdout) or \
+                WORKING.search("\n".join(screen.stdout.rstrip().split("\n")[-15:])):
+            return False                # unknown, a question waits on its screen, or a turn runs: not now
+        session, _, start = r.stdout.rstrip("\n").partition("\t")
+        if start.strip() and "CLAUDE_CODE_AUTO_COMPACT_WINDOW=" not in start and not self.compact_restarted:
+            self.compact_restarted = True       # one time for this helper, whatever the new start says
+            why = f"it started without the {STANDING_COMPACT}-token compaction window"
+        else:
+            path = claude_chat_file(session if THREAD_ID.fullmatch(session) else self.manager_session)
+            seen = claude_context(path) if path else None
+            if not seen:
+                return False
+            tokens, first, at, cached = seen
+            idle = min(time.time() - at, time.monotonic() - self.typed_at.get("manager", float("-inf")))
+            if idle < cached or tokens - first < FRESH_GROWN:
+                return False
+            why = (f"its {tokens // 1000}K tokens of context are no longer cached after {idle / 60:.0f} quiet "
+                   f"minutes, and a new session costs only its start of about {first // 1000}K")
         with contextlib.suppress(subprocess.CalledProcessError, Refused):
             tmux("kill-window", "-t", target)
-        self.manager_due = True
-        self.say(f"manager: its session started without the {STANDING_COMPACT}-token compaction window, so it starts "
-                 f"again on the same conversation")
+        self.fresh_at, self.manager_due, self.manager_fresh = time.monotonic(), True, True
+        self.say(f"manager: {why}, so its session starts again on a new conversation with the hub's brief")
+        return True
 
     def restart_after_login(self):
         """A session that started before this machine had a credential is sitting at the provider's own sign-in
@@ -3169,13 +3265,13 @@ class Helper:
         warning carries (owner feature manager_start); it is tried at most each 10 seconds, and it stays due until a
         start succeeds, also when a later step of the round fails."""
         self.restart_for_tools()
-        self.restart_for_compact()
         if self.conf.get("role") == "manager" and not self.manager_due and self.manager_gone():
             self.manager_due = True
             self.say_manager("manager: its session is not running; the helper starts it again")
         if self.manager_due and (self.manager_tried is None or time.monotonic() - self.manager_tried > 10):
             self.manager_tried = time.monotonic()
             self.manager_due = self.start_manager()
+            self.manager_fresh = self.manager_fresh and self.manager_due   # only the start that it was due for
         if self.retire_old_manager():
             self.manager_due = True
         self.report_manager_bound()
