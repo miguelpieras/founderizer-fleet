@@ -19627,8 +19627,12 @@ def health_view():
              f"The vault broker on {machine} does not run the vault.py of revision {desired[:12]}, which is the "
              f"revision that machine reports. A release updates the agents' checkout and never this program, so the "
              f"broker kept the copy that was installed by hand.",
+             # The agent's own checkout, which is `~<its user>/fleet-<agent>` (server.py), and never `fleet-pilot`:
+             # that is the folder of a fleet that ran every agent as one user, and a line naming it answers "No
+             # such file or directory" on every machine of this one. A fix line that cannot be pasted is worse
+             # than none, because it reads as the fleet telling the owner to run something broken.
              f"On {machine}, as root: install -o root -g root -m 644 "
-             f"~{broker['user'] or '<worker>'}/fleet-pilot/{VAULT_PROGRAM} /usr/local/lib/fleet-vault/"
+             f"~{broker['user'] or '<worker>'}/fleet-{broker['agent']}/{VAULT_PROGRAM} /usr/local/lib/fleet-vault/"
              f"{VAULT_PROGRAM} && systemctl restart fleet-vault",
              agent=broker["agent"])
     flag = manager_warning()

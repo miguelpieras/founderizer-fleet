@@ -3715,15 +3715,18 @@ def cmd_check(args):
             line(f'url = "{url}"' in text, "Codex is pointed at the team tools", f"run: python3 fleet.py connect {agent}")
     print("For the login tests:")
     token = os.path.join(HOME, "bws-token")
-    if vault_mode(agent) != "broker":
+    if vault_mode(agent) == "file":
         # Only this user's own vault files use them. A broker keeps its store, its region and its programs in its own
-        # root-owned configuration, and one that opens the fleet's own store has no Bitwarden account at all, so
-        # these two lines would fail a correctly installed broker for something that is not its business. The
-        # broker's own lines below say which store it opens.
+        # root-owned configuration, and one that opens the fleet's own store has no Bitwarden account at all; an
+        # agent with no credential access has nothing to open either way. In both of those this failed a machine
+        # that is exactly as it should be, for something that is not its business.
         line(True if shutil.which("bws") else None, "Bitwarden Secrets Manager CLI (bws) installed", "not installed")
         line(TEAM.get("bitwarden_region") in ("eu", "us"), "Bitwarden region is eu or us",
              "set bitwarden_region in team.json")
-    if vault_mode(agent) == "broker":
+    if vault_mode(agent) == "none":
+        line(None, "no credential access, so this agent has no login to test",
+             "the owner gives an agent its machine's vault in Founderizer")
+    elif vault_mode(agent) == "broker":
         readable = vault_readable()
         line(not readable, "vault token and handover key are not readable by this user (vault broker)",
              "move ~/.fleet/" + " and ~/.fleet/".join(readable) + " to the vault")
