@@ -18,6 +18,12 @@ A broker opens its logins from one of two stores, which its configuration choose
 The operation set is the same for both, and so is every answer: an outcome, or a copy that only the receiving
 machine's broker can open. A fresh fleet needs no Bitwarden account; a fleet that has one keeps it.
 
+A broker belongs to a machine and not to one agent: `worker_group` is the group of that machine's agent users, so an
+agent the owner adds later, or one whose OS user changed, reaches it with no change to its configuration. Such a
+broker has no `agent` of its own and every request to it names its caller, which is how it can be installed with the
+machine, before it has its first agent (`hubsetup.vault_install`). `worker_uid`, one user, is the form of a machine
+that ran one agent, and it still works.
+
 A Linux broker does handovers. Signing in needs a browser, so it is the Mac vault helper's work (same protocol).
 
 A Linux broker also makes a new login for a confirmed job (create_login): it makes the password, keeps a record
@@ -53,6 +59,7 @@ import codecs
 import fcntl
 import hashlib
 import json
+import grp
 import os
 import platform
 import pwd
@@ -74,7 +81,17 @@ import uuid
 
 PROTOCOL = 2
 PROVENANCE = 1          # a locked copy says which handover job and source login made it
-KEYS = {"agent", "hub", "worker_uid", "age_key", "socket", "age"}            # every broker, whatever its store
+KEYS = {"hub", "age_key", "socket", "age"}                                   # every broker, whatever its store
+# agent is the one agent whose vault this is, the form of a machine that ran one agent, and it is optional: a broker
+# that serves the agents of its machine has no agent of its own, and every request of such a broker names its caller
+# (caller()). It can therefore be installed before the machine has its first agent, which is when a Linux machine is
+# installed. A request with no caller and no agent here is refused, because nothing would say who asked.
+# Who may ask this broker, one of the two or both. worker_group is the group of every agent user of this machine
+# (hubsetup.AGENT_GROUP), so an agent added later, or one whose user changed, reaches the broker with no change
+# here; worker_uid is one user, the form of a machine that ran one agent. A configuration with neither is refused,
+# because then nobody could ask.
+CALLER_KEYS = {"worker_uid", "worker_group"}
+GROUP_NAME = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 # The store, all of one group or all of the other: the fleet's own encrypted file on this machine, or a Bitwarden
 # Secrets Manager project. A configuration with both is refused, because then no answer says which one holds a login.
 STORE_KEYS = {"store", "store_key"}
@@ -197,23 +214,36 @@ def load_config(path):
         conf = json.load(f)
     given = set(conf) if isinstance(conf, dict) else set()
     stores = [group for group in (STORE_KEYS, BITWARDEN_KEYS) if given & group]
-    if not isinstance(conf, dict) or given - KEYS - STORE_KEYS - BITWARDEN_KEYS - WRITE_KEYS - {REQUEST_KEY} or \
-            not KEYS <= given or len(stores) != 1 or not stores[0] <= given or \
+    if not isinstance(conf, dict) or given - KEYS - CALLER_KEYS - STORE_KEYS - BITWARDEN_KEYS - WRITE_KEYS \
+            - {REQUEST_KEY, "agent"} or \
+            not KEYS <= given or not given & CALLER_KEYS or len(stores) != 1 or not stores[0] <= given or \
             (given & WRITE_KEYS) not in (set(), WRITE_KEYS) or (given & WRITE_KEYS and stores[0] is STORE_KEYS):
-        raise SystemExit("The vault configuration needs exactly: " + ", ".join(sorted(KEYS)) + "; and one store: all "
-                         "of " + ", ".join(sorted(STORE_KEYS)) + " (the fleet's own) or all of " +
+        raise SystemExit("The vault configuration needs exactly: " + ", ".join(sorted(KEYS)) + "; optionally agent, "
+                         "the one agent whose vault it is; who may ask it: " +
+                         " or ".join(sorted(CALLER_KEYS)) + ", or both; and one store: all of " +
+                         ", ".join(sorted(STORE_KEYS)) + " (the fleet's own) or all of " +
                          ", ".join(sorted(BITWARDEN_KEYS)) + " (a Bitwarden project), never both; for new logins in "
                          "Bitwarden also all of: " + ", ".join(sorted(WRITE_KEYS)) + "; and for API requests also: "
                          + REQUEST_KEY)
-    if not isinstance(conf["agent"], str) or not AGENT_NAME.match(conf["agent"]):
-        raise SystemExit("agent must be the worker's Fleet name")
+    if "agent" in conf and (not isinstance(conf["agent"], str) or not AGENT_NAME.match(conf["agent"])):
+        raise SystemExit("agent must be the Fleet name of the one agent whose vault this is, or be left out")
     if "region" in conf and conf["region"] not in ("eu", "us"):
         raise SystemExit("region must be eu or us")
     if not re.fullmatch(r"https?://[^/\s]+", str(conf["hub"])):
         raise SystemExit("hub must be the hub's address, for example http://100.80.1.2:8765")
-    uid = conf["worker_uid"]
-    if not isinstance(uid, int) or isinstance(uid, bool) or uid < 0 or uid == os.getuid():
+    uid = conf.get("worker_uid")
+    if "worker_uid" in conf and (not isinstance(uid, int) or isinstance(uid, bool) or uid < 0 or uid == os.getuid()):
         raise SystemExit("worker_uid must be the worker's user ID, never the vault user's")
+    group = conf.get("worker_group")
+    if "worker_group" in conf:
+        if not isinstance(group, str) or not GROUP_NAME.match(group):
+            raise SystemExit("worker_group must be the name of the group of this machine's agent users")
+        try:
+            members = grp.getgrnam(group)
+        except KeyError:
+            raise SystemExit(f"there is no group {group} on this machine") from None
+        if pwd.getpwuid(os.getuid()).pw_name in members.gr_mem or members.gr_gid == os.getgid():
+            raise SystemExit("worker_group must be the group of the agents' users, never one the vault user is in")
     for key in ["age_key", "socket", "age"] + sorted((STORE_KEYS | BITWARDEN_KEYS - {"region"}) & given):
         if not isinstance(conf[key], str) or not os.path.isabs(conf[key]):
             raise SystemExit(f"{key} must be an absolute path")
@@ -290,6 +320,23 @@ def public_key(path, what):
 def recipient(conf):
     """This broker's public handover key."""
     return public_key(conf["age_key"], "handover key")
+
+
+def admitted(conf, uid):
+    """May this user ask the broker: the one worker user of the configuration (worker_uid), or any user of the group
+    of this machine's agent users (worker_group). The socket's own mode already limits callers to that group, and
+    this reads the same boundary again by user, so a renamed or added agent user reaches the broker with no change
+    to the configuration and no user of another group reaches it through a group it shares with one."""
+    if conf.get("worker_uid") is not None and uid == conf["worker_uid"]:
+        return True
+    group = conf.get("worker_group")
+    if not group:
+        return False
+    try:
+        who, members = pwd.getpwuid(uid), grp.getgrnam(group)
+    except KeyError:
+        return False
+    return who.pw_name in members.gr_mem or who.pw_gid == members.gr_gid
 
 
 def peer_uid(conn):
@@ -1573,8 +1620,8 @@ def caller(req):
 
 
 def handle(conf, line, uid):
-    if uid != conf["worker_uid"]:
-        raise Refused("only the worker's user may ask this broker")
+    if not admitted(conf, uid):
+        raise Refused("only an agent user of this machine may ask this broker")
     try:
         req = json.loads(line)
     except ValueError:
@@ -1583,7 +1630,7 @@ def handle(conf, line, uid):
         raise Refused("unsupported protocol version")
     op = req.get("op")
     if op == "status":
-        status = {"ok": True, "v": PROTOCOL, "agent": conf["agent"], "store": "user", "backend": backend(conf),
+        status = {"ok": True, "v": PROTOCOL, "agent": conf.get("agent"), "store": "user", "backend": backend(conf),
                   "user": pwd.getpwuid(os.getuid()).pw_name, "recipient": recipient(conf), "callers": True,
                   "source": conf.get("_source")}
         if conf.get("_journal") is not None:        # this broker can make a login: its own store, or the write setup
@@ -1594,6 +1641,8 @@ def handle(conf, line, uid):
     who = caller(req)
     if who:                             # this request acts for its caller; the store does not change
         conf = dict(conf, agent=who[0], agent_key=who[1])
+    elif conf.get("agent") is None:     # a broker of a machine, not of one agent: nothing else says who asked
+        raise Refused("this broker serves the agents of its machine, so a request must name its caller")
     if op == "create":
         job = req.get("job")
         if not who:
@@ -1925,8 +1974,9 @@ def store_init(config, user, keygen="age-keygen"):
         info = pwd.getpwnam(user)
     except KeyError:
         raise SystemExit(f"There is no user {user}. Make the vault user first.") from None
-    if info.pw_uid == 0 or info.pw_uid == conf["worker_uid"]:
-        raise SystemExit("The store belongs to the vault user, never to root and never to the worker's user.")
+    if info.pw_uid == 0 or admitted(conf, info.pw_uid):
+        raise SystemExit("The store belongs to the vault user, never to root and never to a user that may ask the "
+                         "broker.")
     folder, key, store = state_folder(conf), conf["store_key"], conf["store"]
     if os.path.dirname(os.path.abspath(key)) != folder:
         raise SystemExit(f"store_key must be in the broker's state folder ({folder}).")
@@ -2090,7 +2140,7 @@ def main(argv=None):
         return 0
     if args.cmd == "unit":
         with open(args.config, encoding="utf-8") as f:
-            agent = json.load(f)["agent"]
+            agent = json.load(f).get("agent") or "the agents of this machine"
         print(UNIT.format(agent=agent, user=args.user, group=args.group, config=args.config,
                           script=os.path.abspath(__file__)), end="")
         return 0

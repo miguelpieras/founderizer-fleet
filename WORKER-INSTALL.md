@@ -102,61 +102,69 @@ These commands keep the repository, outputs, usage records and runtime login.
 
 ## Vault broker (Linux, V3)
 
-The `vps` worker has a running broker; a worker without one is set up as follows.
-It needs root and the owner's approval. It moves the Bitwarden
-token and the handover key from the worker's user to a separate user, so that
-agents cannot read them, and no broker answer gives a login (UI-API.md, "Vault
-isolation (V3)"). `<worker>` is the worker's OS user (`claude`
-on the VPS, `fleet` on onboarded workers), `<group>` its primary group, and
-`<agent>` its Founderizer name. Run as root on the worker:
+**The join line installs it.** `join.sh` runs `python3 hubsetup.py vault --hub <hub>`
+as root on a Linux machine, beside the root helper and the agent users, so a machine
+that joins the fleet ends with a working broker and the owner runs nothing by hand.
+It is safe to run again: every step reads first, and the service is restarted only
+when something changed. Run the join line again to repair a machine.
 
-```bash
-useradd --system --home-dir /var/lib/fleet-vault --shell /usr/sbin/nologin fleet-vault
-install -d -o root -g root -m 755 /usr/local/lib/fleet-vault /etc/fleet-vault
-install -o root -g root -m 644 ~<worker>/fleet-pilot/vault.py /usr/local/lib/fleet-vault/vault.py
-install -o root -g root -m 644 ~<worker>/fleet-pilot/bws.toml /etc/fleet-vault/bws.toml
-apt-get install -y age      # /usr/bin/age, owned by root
-```
+The broker holds the key of the store and the key that opens sealed handovers, as
+its own user `fleet-vault`, so that no agent of the machine can read either and no
+broker answer gives a login (UI-API.md, "Vault isolation (V3)"). What the install
+puts in place, all of it mechanical and none of it a credential of the owner's: the
+user; `/usr/local/lib/fleet-vault/vault.py` and `/etc/fleet-vault`, owned by root;
+`age`; the handover key in `/var/lib/fleet-vault/age.key`;
+`/etc/fleet-vault/vault.json`; the store; and the service.
 
-Install `/usr/local/bin/bws` (owner root, mode 755) from the official Bitwarden
-Secrets Manager CLI release: check the downloaded zip against the release's
-published SHA-256 list, then unzip it. Do not copy the worker's own `bws` (for
-example `~/.local/bin/bws`): the worker's user, and so its agents, could have
-changed it, and the broker gives this program the token.
+**It belongs to the machine, not to one agent.** A machine joins before it has its
+first agent, so the configuration it gets has no `agent` and every request to such a
+broker names its caller, which every current helper does. Who may ask it is
+`worker_group`, the group of this machine's agent users (`fleet-agents`): an agent
+the owner adds later, or one whose OS user changed, reaches the broker with no change
+to its configuration. That is the one thing to get right, because a broker that
+admits one user ID was left unreachable by the move to one OS user for each agent --
+running, current, and serving nobody.
 
-Write `/etc/fleet-vault/vault.json` (owner root, mode 644, no secret in it):
+**A machine with no broker gets the fleet's own store**: one `age` file on that
+machine (`store`, `store_key`), made by `vault.py store-init`, with no Bitwarden
+account, no organization and no token. So installing a machine needs nothing of the
+owner's, and the one thing that cannot be automatic does not arise. A machine whose
+broker opens a **Bitwarden project** keeps it, token and write setup included: the
+install changes only who may ask it. A broker opens one store or the other, never
+both, so a machine with the fleet's own store cannot open a secret of a Bitwarden
+project, and the owner's existing brokers are left as they are.
 
-```json
-{"agent": "<agent>", "hub": "http://100.80.1.2:8765", "worker_uid": <id -u of the worker>,
- "region": "eu", "token_file": "/var/lib/fleet-vault/bws-token",
- "age_key": "/var/lib/fleet-vault/age.key", "socket": "/run/fleet-vault/vault.sock",
- "bws": "/usr/local/bin/bws", "bws_config": "/etc/fleet-vault/bws.toml", "age": "/usr/bin/age"}
-```
+**The configuration is root with mode 644 and holds no secret.** Do not make it
+`root:fleet-vault` 640: the service sets `Group=`, so the vault user's own group is
+not among the service's groups, the broker fails on its own configuration, and the
+unit restarts for ever.
 
-Then start the broker and move the token and the handover key (they are moved,
-never shown or copied; the key keeps its public half, so handovers already made
-for this machine stay readable):
+**Then the fleet is told, by the owner's own click.** The hub records a machine's
+store key when the owner first gives an agent of that machine its vault, on the
+Secrets page or in the agent's Knowledge & access step; `hub.offered_store` takes the
+key the machine's own broker reports when Fleet has recorded none, because the only
+writer of `vault_stores` is a grant and the first grant would otherwise be refused
+for ever (`no_vault_store`). After that, a reported key that differs is refused
+(`vault_store_mismatch`). Until that click the agent holds its secrets and cannot use
+them, and the Secrets page says so on the secret itself.
 
-```bash
-python3 /usr/local/lib/fleet-vault/vault.py unit --config /etc/fleet-vault/vault.json --group <group> > /etc/systemd/system/fleet-vault.service
-systemctl daemon-reload && systemctl enable --now fleet-vault
-mv ~<worker>/.fleet/bws-token /var/lib/fleet-vault/bws-token
-chown fleet-vault:fleet-vault /var/lib/fleet-vault/bws-token && chmod 600 /var/lib/fleet-vault/bws-token
-mv ~<worker>/.fleet/age.key /var/lib/fleet-vault/age.key
-chown fleet-vault:fleet-vault /var/lib/fleet-vault/age.key && chmod 600 /var/lib/fleet-vault/age.key
-grep '^# public key:' /var/lib/fleet-vault/age.key     # the public half: vault_recipient
-```
+Check, as the worker: `sudo -u <worker> sudo -n true` must fail ("a password is
+required"), because a worker user with passwordless sudo can read the vault as root
+and the broker is then no boundary for it; `sudo -u <worker> cat
+/var/lib/fleet-vault/age.key` must fail with "Permission denied"; `python3 fleet.py
+check <agent>` must show "vault broker answers (kept by fleet-vault)", which store it
+opens, "vault broker key is the one pinned in team.json" and "vault broker runs the
+vault.py of this checkout"; and the machine row must show `security.vault`
+`{"mode": "broker", "isolated": true}`.
 
-Set `"vault": "broker"` and `"vault_recipient": "<the public half>"` for `<agent>` in
-`team.json`, commit, reload the team and update the worker. Check: `sudo -u <worker> sudo -n true` must fail ("a password is required"): a
-worker user with passwordless sudo can read the vault as root, so the broker is no
-boundary for it. `sudo -u <worker> cat /var/lib/fleet-vault/bws-token` and
-`sudo -u <worker> cat /var/lib/fleet-vault/age.key` must fail with "Permission denied"; `python3 fleet.py check <agent>` as the worker
-must show "vault broker answers (kept by fleet-vault)", "vault broker key is the
-one pinned in team.json" and "vault broker runs the vault.py of this checkout"; and the machine row must show `security.vault`
-`{"mode": "broker", "isolated": true}`. To undo: set `"vault": "file"`, move both
-files back to `~<worker>/.fleet/` (owner `<worker>`, mode 600), and
-`systemctl disable --now fleet-vault`.
+To undo on one machine: `systemctl disable --now fleet-vault`, and set `"vault":
+"none"` for its agents in the app. The store and both keys stay in
+`/var/lib/fleet-vault`, so the same machine's broker can be started again; a new key
+would leave every value it holds unreadable.
+
+A Mac has no `vault.py` broker. Its vault is the signed `Fleet Vault.app`, started by
+the LaunchAgent `com.agentfleet.vault` in the owner's login session, and the app
+installs and updates it.
 
 ### When a release changes vault.py
 
@@ -182,6 +190,13 @@ has a broker, which is the warning's own `fix` line:
 ```bash
 install -o root -g root -m 644 ~<worker>/fleet-pilot/vault.py /usr/local/lib/fleet-vault/vault.py && systemctl restart fleet-vault
 ```
+
+Running the join line again does the same thing and needs no path: the install
+step reads the checksum of the installed program first and replaces it only when it
+differs from the `vault.py` of the machine's own checkout. Take the path above from
+that checkout and no other — on a machine with one OS user for each agent the agent's
+checkout is `/home/fleet-<agent>/fleet-<agent>`, and an older folder of a fleet that
+was replaced holds older code.
 
 Then `python3 fleet.py check <agent>` as the worker shows "vault broker runs the
 vault.py of this checkout", and the warning goes at that machine's next status

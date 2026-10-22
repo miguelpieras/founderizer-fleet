@@ -3714,9 +3714,15 @@ def cmd_check(args):
             text = open(path, encoding="utf-8").read() if os.path.exists(path) else ""
             line(f'url = "{url}"' in text, "Codex is pointed at the team tools", f"run: python3 fleet.py connect {agent}")
     print("For the login tests:")
-    line(True if shutil.which("bws") else None, "Bitwarden Secrets Manager CLI (bws) installed", "not installed")
-    line(TEAM.get("bitwarden_region") in ("eu", "us"), "Bitwarden region is eu or us", "set bitwarden_region in team.json")
     token = os.path.join(HOME, "bws-token")
+    if vault_mode(agent) != "broker":
+        # Only this user's own vault files use them. A broker keeps its store, its region and its programs in its own
+        # root-owned configuration, and one that opens the fleet's own store has no Bitwarden account at all, so
+        # these two lines would fail a correctly installed broker for something that is not its business. The
+        # broker's own lines below say which store it opens.
+        line(True if shutil.which("bws") else None, "Bitwarden Secrets Manager CLI (bws) installed", "not installed")
+        line(TEAM.get("bitwarden_region") in ("eu", "us"), "Bitwarden region is eu or us",
+             "set bitwarden_region in team.json")
     if vault_mode(agent) == "broker":
         readable = vault_readable()
         line(not readable, "vault token and handover key are not readable by this user (vault broker)",

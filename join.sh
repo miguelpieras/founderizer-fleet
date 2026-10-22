@@ -69,6 +69,7 @@ linux() {
     current "/home/$WORKER/fleet-server" as_worker
     agent_helper "/home/$WORKER/fleet-server"
     agent_users "/home/$WORKER/fleet-server"
+    vault_broker "/home/$WORKER/fleet-server"
     verify_step "/home/$WORKER/fleet-server" as_worker
     say "done. Add an agent to this server in Founderizer: Agents, Add agent."
 }
@@ -125,6 +126,17 @@ agent_users() { # $1: the checkout whose team.json names this fleet's agents. On
     fi
     python3 "$1/hubsetup.py" agent-users --team "$1/team.json" --machine "$name" </dev/null \
         || stop "The OS users of this machine's agents could not be made."
+}
+
+vault_broker() { # $1: the checkout. This machine's vault broker: its own user keeps the key of the store and the key
+                 # that opens sealed handovers, so that no agent of this machine can read either and no answer of it
+                 # gives a login. It belongs to the machine and not to one agent, so it is installed now, before the
+                 # machine has its first agent; the agents the owner adds later reach it through the group of their
+                 # OS users. A machine with no broker gets the fleet's own store, which needs no account and no
+                 # token of the owner's. A broker that is already there keeps the store it has.
+    say "this machine's vault, kept by its own user"
+    python3 "$1/hubsetup.py" vault --hub "$HUB" --kit "$1" </dev/null \
+        || stop "The vault of this machine could not be set up. Nothing of the owner's was read or changed."
 }
 
 verify_step() { # $1: the checkout; $2: how to run a command as the user of the service. The last step: the one health

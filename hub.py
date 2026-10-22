@@ -17217,14 +17217,48 @@ VAULT_FRESH = 600           # seconds: a helper's broker report counts for a gra
 
 
 def store_key(team, machine):
-    """The public key of a machine's vault store that the owner trusts (shared broker callers): its vault_stores
-    entry, else the pinned recipient of an agent with broker access on that machine. Never a reported key."""
+    """The public key of a machine's vault store that the owner **has pinned** (shared broker callers): its
+    vault_stores entry, else the pinned recipient of an agent with broker access on that machine. Never a reported
+    key, and that is the whole of what this answers: a pin is also what `handover_key` locks a sealed copy to, so a
+    machine that reports another key must not be able to move it and read copies meant for the store it replaced.
+    A reported key that differs from a pin is therefore `vault_store_mismatch` and the owner looks at the machine.
+
+    Before the first pin there is nothing to protect and nothing to compare against, and that is `offered_store`'s
+    one job. The two are not in disagreement: this one says what is pinned, that one says what the owner's next
+    command would pin."""
     key = (team.get("vault_stores") or {}).get(machine)
     if key:
         return key
     addresses = team.get("addresses") or {}
     return next((a.get("vault_recipient") for a in team["agents"].values() if a.get("vault") == "broker"
                  and addresses.get(a.get("machine")) == addresses.get(machine) and a.get("vault_recipient")), None)
+
+
+def reported_store(team, machine, t0=None):
+    """The public store key that this machine's own agents report now, when they all agree on one: the key its vault
+    broker answers with (`security.vault.broker_recipient` of a fresh helper report). It is what the machine says
+    about itself, so nothing takes it as the trusted key by itself; `offered_store` is where the owner's own command
+    makes it one."""
+    addresses = team.get("addresses") or {}
+    keys = {r["broker_recipient"] for r in (broker_report(name, t0) for name, a in team["agents"].items()
+                                            if addresses.get(a.get("machine")) == addresses.get(machine))
+            if r and r.get("broker_recipient")}
+    return keys.pop() if len(keys) == 1 else None
+
+
+def offered_store(team, machine, t0=None):
+    """The store key Fleet would pin for this machine's **first** broker access: the one it has recorded, else the
+    one the machine's own broker reports now.
+
+    `store_key` is the pinned key and nothing else, and it has to be: a pin also locks sealed handovers to that
+    machine (`handover_key`), so a reported key that differs from one is a reason to refuse
+    (`vault_store_mismatch`), never a reason to move it. But
+    before the first grant there is nothing to compare against, and the only writer of `vault_stores` is a grant
+    itself, so a machine whose broker was just installed could never be granted at all - `no_vault_store`, for
+    ever, and the owner's only way out a team.json written by hand. So the first key comes from the machine that
+    holds the store, and the owner's own command is what records it. `no_vault_store` then means what it says: this
+    machine has no vault broker."""
+    return store_key(team, machine) or reported_store(team, machine, t0)
 
 
 def broker_report(name, t0=None):
@@ -17295,7 +17329,7 @@ def vault_grant(name, team, t0=None):
     st = q1("SELECT data FROM machine_status WHERE agent=?", (name,))
     if "broker_callers" not in ((json.loads(st["data"]) if st else {}).get("features") or []):
         missing.append("helper_without_broker_callers")
-    key, report = store_key(team, a["machine"]), broker_report(name, t0)
+    key, report = offered_store(team, a["machine"], t0), broker_report(name, t0)
     if key is None:
         missing.append("no_vault_store")
     elif not report or report.get("broker_recipient") is None:
@@ -17328,7 +17362,7 @@ def save_vault(agent, body):
                "settings_pending": settings_pending(agent), "activation": None, "open_tasks": open_tasks}
     if new == old:
         return receipt
-    key = store_key(team, a["machine"])
+    key = offered_store(team, a["machine"])
     if new == "broker":
         grant = vault_grant(agent, team)
         if not grant["ready"]:
@@ -18103,7 +18137,7 @@ def save_grant(body, by="owner"):
     if old == grant and not (access and access["ready"]):
         return receipt
     if access and access["ready"]:
-        key = store_key(team, a["machine"])
+        key = offered_store(team, a["machine"])
         a["vault"], a["vault_recipient"] = "broker", key
         if a["machine"] not in (team.get("vault_stores") or {}):
             team["vault_stores"] = dict(team.get("vault_stores") or {}, **{a["machine"]: key})     # the binding stays

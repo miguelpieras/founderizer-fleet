@@ -15,6 +15,9 @@ Standard library only, and it reads no credential of a model provider.
     python3 hubsetup.py agent-users --team PATH --machine NAME [--check]
                                                     one OS user for each agent of this machine, so that no agent's
                                                     user can read another agent's home
+    python3 hubsetup.py vault --hub URL [--kit PATH] [--check]
+                                                    this machine's vault broker: its own user keeps the store's key
+                                                    and the handover key, so no agent of the machine can read either
     python3 hubsetup.py check --address IP [--port N] [--kit PATH]
                                                     the end checks on this machine: selftest.py and GET /health
     python3 hubsetup.py fleet-id [--db PATH]        this fleet's own id in the hub's key store, made once
@@ -39,6 +42,7 @@ import http.server
 import json
 import os
 import pathlib
+import platform
 import re
 import secrets
 import shlex
@@ -74,6 +78,13 @@ AGENT_USER = "fleet-%s"
 DB_PATH = os.path.join("~", ".fleet", "pilot.db")   # the hub's own records, where hub.py --db keeps them
 USER_LIMIT = 32                                     # the longest user name this system makes (useradd)
 AGENT_GROUP = "fleet-agents"                        # every agent user of this machine, and nobody else
+VAULT_USER = "fleet-vault"                          # the broker's own user: the only one that reads the store's key
+VAULT_LIB = "/usr/local/lib/fleet-vault"            # the broker program, root-owned and outside every checkout
+VAULT_CONF_DIR = "/etc/fleet-vault"
+VAULT_CONF = VAULT_CONF_DIR + "/vault.json"         # no secret in it, and root with mode 644: see vault_install()
+VAULT_STATE = "/var/lib/fleet-vault"                # the store, its key and the handover key: the vault user alone
+VAULT_UNIT = "/etc/systemd/system/fleet-vault.service"
+VAULT_SOCKET = "/run/fleet-vault/vault.sock"
 HELPER = "/usr/local/sbin/fleet-agent-user"         # the one root command the server service may run
 SUDOERS = "/etc/sudoers.d/fleet-agents"             # what that service may do, and nothing more
 EXPORT_OK = "git-daemon-export-ok"                  # git daemon serves a repository only when this file is in it
@@ -386,6 +397,174 @@ def agent_helper(service_user="fleet", check=False, run=None, read=None):
     say(f"{HELPER} makes the OS user of one agent, and {SUDOERS} lets {service_user} run that one command as root "
         f"and become the group {AGENT_GROUP}: nothing else, and never root")
     return "made"
+# ---------------------------------------------------------------- the machine's vault broker (PRODUCT.md P5)
+
+def vault_reading(user=VAULT_USER, group=AGENT_GROUP):
+    """The shell that reads this machine's broker, so that a second run of the installer changes nothing."""
+    return ("id -u %(u)s >/dev/null 2>&1 && echo user=yes || echo user=no\n"
+            "getent group %(g)s >/dev/null 2>&1 && echo group=yes || echo group=no\n"
+            "command -v age >/dev/null 2>&1 && echo age=yes || echo age=no\n"
+            "command -v age-keygen >/dev/null 2>&1 && echo keygen=yes || echo keygen=no\n"
+            "echo program=$(sha256sum %(lib)s/vault.py 2>/dev/null | cut -d' ' -f1)\n"
+            "test -s %(state)s/age.key && echo key=yes || echo key=no\n"
+            "echo active=$(systemctl is-active fleet-vault 2>/dev/null || true)\n"
+            "echo recipient=$(sed -n 's/^# public key: //p' %(state)s/age.key 2>/dev/null)\n") % {
+                "u": user, "g": group, "lib": VAULT_LIB, "state": VAULT_STATE}
+
+
+def vault_user_script(user=VAULT_USER, group=AGENT_GROUP):
+    """The shell that makes the broker's user and the folders it needs, each line safe to run again. The user has no
+    login and no home of its own making; its state folder is made here, because the handover key is written into it
+    before the service starts for the first time (systemd's StateDirectory comes too late for that)."""
+    return ("id -u %(u)s >/dev/null 2>&1 || useradd --system --home-dir %(state)s --shell /usr/sbin/nologin %(u)s\n"
+            "groupadd -f %(g)s\n"
+            "install -d -o root -g root -m 755 %(lib)s %(conf_dir)s\n"
+            "install -d -o %(u)s -g %(u)s -m 700 %(state)s\n") % {
+                "u": user, "g": group, "lib": VAULT_LIB, "conf_dir": VAULT_CONF_DIR, "state": VAULT_STATE}
+
+
+AGE_INSTALL = ("export DEBIAN_FRONTEND=noninteractive\n"
+               "apt-get -o DPkg::Lock::Timeout=300 update -q </dev/null >/dev/null\n"
+               "apt-get -o DPkg::Lock::Timeout=300 install -y -q --no-install-recommends age </dev/null >/dev/null\n")
+
+
+def vault_key_script(user=VAULT_USER):
+    """The shell that makes the broker's handover key, once. A key that is there is kept: a new one would leave
+    every handover already made for this machine unreadable, and the hub pins its public half."""
+    return ("umask 077\n"
+            "test -s %(key)s || age-keygen -o %(key)s >/dev/null 2>&1\n"
+            "chown %(u)s:%(u)s %(key)s\n"
+            "chmod 600 %(key)s\n") % {"u": user, "key": VAULT_STATE + "/age.key"}
+
+
+def vault_config(hub_address, group=AGENT_GROUP, before=None):
+    """The broker's own configuration, which holds no secret: what it opens, where its keys are, and who may ask it.
+
+    A machine that has no broker yet gets **the fleet's own store** (`store`, `store_key`): one age file on this
+    machine, made by `vault.py store-init`, with no account, no organization and no token, so that installing a
+    machine needs nothing of the owner. A broker that is already there keeps the store it has, whatever it is: the
+    token of a Bitwarden project is the owner's and this installer neither reads nor replaces it.
+
+    `worker_group` is the one field this always brings up to date: the group of every agent user of this machine
+    (AGENT_GROUP), so an agent added later, or one whose OS user changed, reaches the broker with no change here.
+    An existing `worker_uid` stays beside it, because a uid of this machine's own making is an agent user either
+    way and removing a field the owner did not write buys nothing."""
+    conf = dict(before or {})
+    if not conf:
+        conf = {"hub": hub_address, "store": VAULT_STATE + "/store.age", "store_key": VAULT_STATE + "/store.key",
+                "age_key": VAULT_STATE + "/age.key", "socket": VAULT_SOCKET, "age": "/usr/bin/age"}
+    conf["worker_group"] = group
+    return conf
+
+
+def vault_install(kit=None, hub_address=None, user=VAULT_USER, group=AGENT_GROUP, check=False, run=None, read=None,
+                  system=None):
+    """This machine's vault broker, as a step of installing the machine instead of a page of commands the owner runs
+    by hand (WORKER-INSTALL.md, "Vault broker").
+
+    The broker holds the key of the store and the key that opens sealed handovers, as its own user, so that no agent
+    of this machine can read either and no answer of it gives a login (UI-API.md, "Vault isolation (V3)"). Every
+    part of that is mechanical and needs root, which the installer has: the user, the folders, `age`, the root-owned
+    copy of the broker program, the handover key, the configuration, the store and the service. Nothing here reads
+    or writes a credential of the owner's.
+
+    It belongs to the machine and not to one agent, so it is installed before the machine has its first agent: such
+    a broker has no `agent` of its own and every request to it names its caller (`vault.py`). The agents the owner
+    adds later reach it through `worker_group` with no change to it.
+
+    **The configuration is root with mode 644 and holds no secret.** Group-reading it would be worse than useless:
+    the service sets `Group=`, so the vault user's own group is not among its groups, and the broker would fail on
+    its own configuration and the service would restart for ever.
+
+    Safe to run again: each step reads first, and the service is restarted only when something changed. Returns
+    `{"state": "made"|"there"|"would make", "store": ..., "recipient": ..., "active": ...}`; the recipient is the
+    broker's public handover key, which the hub records when the owner first gives an agent of this machine its
+    vault (`hub.offered_store`)."""
+    run = run or _shell
+    read = read or (lambda path: pathlib.Path(path).read_text(encoding="utf-8"))
+    kit = kit or KIT
+    if system and system != "Linux":
+        # A Mac's vault is the signed Fleet Vault.app in the owner's login session, which the app installs and
+        # updates. Nothing of this program runs there, and a file written for it would be read by no process.
+        say(f"this machine runs {system}, whose vault is the signed Fleet Vault app that Founderizer installs "
+            f"itself, so there is nothing to set up here")
+        return {"state": "there", "store": None, "recipient": None, "active": None}
+    if not hub_address:
+        raise Stop("the vault broker needs the hub's address, which the installer reads from this machine's join.")
+    before = kv(run(vault_reading(user, group))[1])
+    try:
+        current = json.loads(read(VAULT_CONF))
+        current = current if isinstance(current, dict) else None
+    except (OSError, ValueError):
+        current = None
+    conf = vault_config(hub_address, group, current)
+    store = "the fleet's own store" if "store" in conf else "a Bitwarden project"
+    try:
+        program = hashlib.sha256(pathlib.Path(os.path.join(kit, "vault.py")).read_bytes()).hexdigest()
+    except OSError:
+        raise Stop(f"{os.path.join(kit, 'vault.py')} is not readable, so the broker program cannot be installed.") from None
+    done = (before.get("user") == "yes" and before.get("age") == "yes" and before.get("keygen") == "yes"
+            and before.get("key") == "yes" and before.get("program") == program and current == conf
+            and before.get("active") == "active")
+    if done:
+        say(f"this machine's vault broker is in place already, kept by {user}: it opens {store}, and the agent "
+            f"users of {group} may ask it")
+        return {"state": "there", "store": store, "recipient": before.get("recipient") or None, "active": True}
+    if check:
+        say(f"  would {'install' if current is None else 'bring up to date'} this machine's vault broker: the user "
+            f"{user}, age, the root-owned broker program, its handover key, {store}, and the service that keeps "
+            f"them away from every agent of this machine")
+        return {"state": "would make", "store": store, "recipient": before.get("recipient") or None, "active": False}
+    for script, what in ((vault_user_script(user, group), f"the user {user} and the folders of the vault broker"),
+                         (AGE_INSTALL if before.get("age") != "yes" or before.get("keygen") != "yes" else "",
+                          "the age program, which locks the store and a handover"),
+                         (vault_key_script(user), "the broker's handover key")):
+        if not script:
+            continue
+        code, out, err = run(script, timeout=900)
+        if code != 0:
+            raise Stop(f"{what} could not be put in place: {(err or out).strip()[-300:]}")
+    folder = tempfile.mkdtemp(prefix="fleet-vault-install-")
+    try:
+        one = os.path.join(folder, "vault.json")
+        with open(one, "w", encoding="utf-8") as f:
+            f.write(json.dumps(conf, indent=2) + "\n")
+        # The program first, because `unit` and `store-init` are run from the installed copy, which checks that the
+        # worker's user can neither change nor replace it; then the configuration it reads.
+        code, out, err = run("install -o root -g root -m 644 %s %s/vault.py\n"
+                             "install -o root -g root -m 644 %s %s\n"
+                             % (shlex.quote(os.path.join(kit, "vault.py")), VAULT_LIB, shlex.quote(one), VAULT_CONF))
+        if code != 0:
+            raise Stop(f"the broker program and its configuration could not be installed: {(err or out).strip()[-300:]}")
+        if "store" in conf:     # the fleet's own store: its key and an empty store, and a store that is there stays
+            code, out, err = run(f"python3 {VAULT_LIB}/vault.py store-init --config {VAULT_CONF} --user {user}",
+                                 timeout=300)
+            if code != 0:
+                raise Stop(f"the fleet's own store could not be made on this machine: {(err or out).strip()[-300:]}")
+        code, unit, err = run(f"python3 {VAULT_LIB}/vault.py unit --config {VAULT_CONF} --user {user} --group {group}")
+        if code != 0 or "ExecStart=" not in unit:
+            raise Stop(f"the service of the vault broker could not be written: {(err or unit).strip()[-300:]}")
+        two = os.path.join(folder, "fleet-vault.service")
+        with open(two, "w", encoding="utf-8") as f:
+            f.write(unit if unit.endswith("\n") else unit + "\n")
+        code, out, err = run("install -o root -g root -m 644 %s %s\nsystemctl daemon-reload\n"
+                             "systemctl enable fleet-vault >/dev/null 2>&1\nsystemctl restart fleet-vault\n"
+                             % (shlex.quote(two), VAULT_UNIT), timeout=300)
+        if code != 0:
+            raise Stop(f"the vault broker service could not be started: {(err or out).strip()[-300:]}")
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    after = kv(run(vault_reading(user, group))[1])
+    if after.get("active") != "active":
+        raise Stop(f"the vault broker of this machine is {after.get('active') or 'not running'} after its install. "
+                   f"Read `systemctl status fleet-vault` and `journalctl -u fleet-vault` on this machine.")
+    if not after.get("recipient"):
+        raise Stop("the vault broker runs, but its handover key has no public half, so the hub could not pin it.")
+    say(f"this machine's vault broker runs as {user}: it opens {store}, the agent users of {group} may ask it, and "
+        f"its store key and handover key belong to {user} alone")
+    say(f"  its public handover key is {after['recipient']}; Founderizer records it when you first give an agent of "
+        f"this machine its vault")
+    return {"state": "made", "store": store, "recipient": after["recipient"], "active": True}
 
 
 def keep_fleet_id(db=None):
@@ -745,6 +924,10 @@ def cmd_agent_helper(args):
     agent_helper(service_user=args.user, check=args.check)
 
 
+def cmd_vault(args):
+    vault_install(kit=args.kit or KIT, hub_address=args.hub, check=args.check, system=platform.system())
+
+
 def cmd_agent_list(args):
     """One line for each agent of this machine: its name, its runtime and its OS user. The installers read it, so
     it prints nothing else."""
@@ -782,6 +965,11 @@ def main(argv=None):
     au.add_argument("--machine", required=True, help="the machine of team.json whose agents get a user here")
     au.add_argument("--check", action="store_true", help="say what it would make, change nothing")
     au.set_defaults(fn=cmd_agent_users)
+    va = sub.add_parser("vault")
+    va.add_argument("--hub", required=True, help="the hub's address, for example http://100.80.1.2:8765")
+    va.add_argument("--kit", help="the checkout whose vault.py is installed; default: this one")
+    va.add_argument("--check", action="store_true")
+    va.set_defaults(fn=cmd_vault)
     ah = sub.add_parser("agent-helper")
     ah.add_argument("--user", default="fleet", help="the user that runs this machine's Founderizer services")
     ah.add_argument("--check", action="store_true", help="say what it would write, change nothing")
