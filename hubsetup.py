@@ -348,9 +348,12 @@ def vault_program_script(repo, branch=lifecycle.CONFIG_BRANCH):
     copy of `vault.py` outside all of them as a system service, and `lifecycle.OWNER_ONLY` lets a commit that
     changes only that file count as taken. So a release that changed `vault.py` left every broker running the copy
     installed before it while each machine reported `current`, and the owner pasted one root command per machine to
-    catch them up -- for ever, and from memory. Measured on 22 October 2026: four releases of one day touched
-    `vault.py`, both Linux brokers were behind after each one, they were brought level by hand twice in one
-    afternoon, and in between both lacked the `deposit` operation that those releases shipped.
+    catch them up -- for ever, and from memory. Measured on 22 October 2026: two releases of one day changed
+    `vault.py`, nobody in the fleet had cut either of them, both left every Linux broker behind, both brokers were
+    brought level by hand that afternoon, and in between both lacked the `deposit` operation those releases
+    shipped. What the hand route pastes is this command's own reason for existing: it installs `vault.py` from an
+    agent's checkout, which that agent owns and can write, so automating it this way is narrower than the line it
+    replaces and not wider.
 
     **What the service user gains, exactly.** It can ask root to replace the broker's program with the `vault.py`
     on the fleet's configuration ref and restart the broker. It cannot name the file, the source, the destination,
