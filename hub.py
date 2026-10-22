@@ -31,6 +31,7 @@ import os
 import platform
 import re
 import secrets
+import shlex
 import sqlite3
 import stat
 import subprocess
@@ -310,6 +311,18 @@ CREATE TABLE IF NOT EXISTS deposits(id INTEGER PRIMARY KEY, login TEXT NOT NULL,
   agent TEXT NOT NULL, recipient TEXT NOT NULL, sha256 TEXT NOT NULL, ciphertext TEXT, request_id TEXT NOT NULL,
   created REAL NOT NULL, released REAL, verified REAL, finished REAL, ok INTEGER, result TEXT);
 CREATE INDEX IF NOT EXISTS deposit_of ON deposits(login, machine, id);
+-- Owner feature secret_targets: one key that a machine's vault placed into a target the owner defined (place_secret),
+-- or one check of what a target holds. The hub keeps who asked, for which task, which key went where, and the
+-- target's own answer: what was there before, and whether the fingerprint of what it reads back is the owner's
+-- (verified). `spec` is the target as it was asked for, so a target the owner changed meanwhile gets nothing. Never a
+-- value. agent "owner" with no task: the owner's own test of a target.
+CREATE TABLE IF NOT EXISTS placements(id INTEGER PRIMARY KEY, agent TEXT NOT NULL, task INTEGER, attempt INTEGER,
+  request_id TEXT NOT NULL, op TEXT NOT NULL, login TEXT, target TEXT NOT NULL, name TEXT, machine TEXT NOT NULL,
+  carrier TEXT NOT NULL, spec TEXT NOT NULL, created REAL NOT NULL, released REAL, checked REAL, verified INTEGER,
+  present INTEGER, was TEXT, place_where TEXT, then_code INTEGER, unknown REAL, finished REAL, ok INTEGER,
+  result TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS placement_request ON placements(agent, request_id);
+CREATE INDEX IF NOT EXISTS placement_of ON placements(target, id);
 
 """
 EVENT_CAP = 5000                                    # thread records kept per task attempt
@@ -609,7 +622,7 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "releases", "entitlement", "agent_signin", "github_app", "need_options", "restore",
                "manager_start", "agent_notes", "edit_in_place", "machine_access", "push",
                "attachment_knowledge", "asking_and_waiting", "account_limits", "secret_requests",
-               "secret_deliveries"]
+               "secret_deliveries", "secret_targets"]
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 
 
@@ -1064,7 +1077,7 @@ def filed_under(agent, kind, task):
 
 def emit(agent, kind, text, task=None, extra=None):
     """Queue a message for one agent's helper. Kinds: task, say, chat, stop, control, signin, handover, create,
-    capture, request, deposit, notify, mcp_program, manager_start."""
+    capture, request, deposit, place, notify, mcp_program, manager_start."""
     return ins(EVENT, (agent, kind, filed_under(agent, kind, task), str(text), now(), json.dumps(extra or {})))
 
 
@@ -1595,6 +1608,8 @@ def holdings_parts(agent):
     parts += google_clauses(agent)
     if a.get("tools"):
         parts.append("MCP servers " + named_few(sorted(a["tools"])))
+    if a.get("targets"):
+        parts.append("targets that place_secret puts a key into: " + named_few(sorted(a["targets"])))
     keys = [name for _, name in read_secrets(agent)]
     if keys:
         parts.append("API keys in this session: " + named_few(keys))
@@ -1658,6 +1673,8 @@ def colleague_facts(name):
             out.append(f"{GOOGLE_NAMES[service]} at the level {google[service]['level']}")
     if a.get("tools"):
         out.append("MCP servers " + named_few(sorted(a["tools"]), TEAM_ITEMS))
+    if a.get("targets"):
+        out.append("targets " + named_few(sorted(a["targets"]), TEAM_ITEMS))
     return out
 
 
@@ -2726,7 +2743,8 @@ FOLLOWS_CHAIN = 5       # how far back the chain of followed tasks is read
 # The fleet tools that leave the building: rule 9's send, post and payment. A new session reads what the attempt
 # before it, or the task it follows, already did with them, before it repeats anything that cannot be taken back.
 OUTWARD_TOOLS = ("gmail_send", "gmail_draft", "gmail_label", "drive_write", "drive_sheet", "drive_move",
-                 "call_api", "sign_in", "create_login", "save_key", "hand_over", "message_owner", "reply")
+                 "call_api", "sign_in", "create_login", "save_key", "hand_over", "message_owner", "reply",
+                 "place_secret")
 
 
 def clip(text, limit=WARM_LINE):
@@ -3203,7 +3221,8 @@ def access_needed(value, level=None):
         return None, None
     if len(rid) > 200 or not resource_parts(rid)[0]:
         raise ToolError(f"needs_access must be <kind>:<what>, with a kind of {', '.join(sorted(RESOURCE_LEVELS))}: "
-                        f"repo:acme/web, secret:bws://<uuid>, gmail:a@b.com, drive:a@b.com or tool:<MCP server>. "
+                        f"repo:acme/web, secret:bws://<uuid>, gmail:a@b.com, drive:a@b.com, tool:<MCP server> or "
+                        f"target:<name>. "
                         f"Leave it out for a question that is not about access, and for a key or a login that the "
                         f"fleet does not hold at all, which has no reference yet: say in the question which one and "
                         f"what for, and the owner is asked for it.")
@@ -5891,6 +5910,594 @@ def expire_deposits(t0):
                if store_key(TEAM, r["machine"]) != r["recipient"] else None)
         if why:
             finish_deposit(r, False, why, t0)
+
+
+# ---------------------------------------------------------------- a key into a target of the owner's (place_secret)
+#
+# Owner feature secret_targets. A key in a machine's vault often has to reach the place where an application reads it:
+# one variable of a server's .env file, or one key of a Kubernetes Secret. The owner defines each such place once, as
+# a target in team.json "targets": what it is on its host, the machine whose vault reaches it, and the SSH address,
+# user and pinned host key of that host. The target itself is the approval (the owner, 22 October 2026: "it needs to
+# work end to end seamlessly"): an agent that holds the target (agents.<name>.targets, the resource target:<name>
+# like any other) and holds the key calls place_secret, and that machine's vault reads the key from its own store and
+# sends it on one SSH connection, with a key of its own that the host's authorized_keys file allows one forced command
+# and nothing else: place.py, which writes it, reads it back and answers a salted fingerprint. The vault and then the
+# hub compare that fingerprint with the value's own. No value reaches the hub, a helper, an agent or a log; the hub
+# keeps who placed which key where, for which task, and what was there before. Placing is safe to repeat: a key that
+# is there already is "same", so an outcome that is not known is settled by placing it again.
+TARGET_LIMIT = 32                   # entries of team.json "targets"
+TARGET_NAME = re.compile(r"[a-z][a-z0-9-]{0,39}")      # also the name of its place in its host's forced command
+TARGET_HOST = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?|\[[0-9A-Fa-f:.]{2,45}\]")
+TARGET_USER = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
+TARGET_KINDS = {"env": "one variable of an env file", "k8s": "one key of a Kubernetes Secret"}
+TARGET_FIELDS = ("title", "kind", "where", "machine", "host", "port", "user", "host_key", "names", "note", "then",
+                 "k8s")
+HOST_KEY = re.compile(r"(ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-rsa) "
+                      r"([A-Za-z0-9+/]{20,1400}={0,3})")
+PLACE_PUBLIC = re.compile(r"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}")     # a vault's key for targets
+PLACE_VAR = {"env": re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}"), "k8s": re.compile(r"[-._a-zA-Z0-9]{1,253}")}
+K8S_PLACE = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?/[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?")
+# What goes into a host's forced command: one line with no double quote and no backslash, so the line needs no
+# escape of its own beyond the quotes that shlex writes (and sshd reads \" back as ").
+LINE_TEXT = re.compile(r"[^\x00-\x1f\x7f\"\\]{1,300}")
+PLACE_PROGRAM = "/usr/local/lib/fleet-place/place.py"
+PLACE_HELPER = "/usr/bin/python3 " + PLACE_PROGRAM
+PLACE_WAIT = 75                     # seconds that place_secret waits, as call_api does
+PLACE_STALE = 900                   # seconds after its vault took a placement with no report: its outcome is not known
+PLACE_DROP = 86400                  # seconds after which a report of a placement is not waited for any more
+PLACE_KEPT = 10                     # placements of one target that GET /ui/targets carries
+PLACE_RESULT_MAX = 300
+PLACE_TAKEN = ("This request_id belongs to another placement. A new placement needs a new request_id; the same "
+               "request_id with the same fields gives that placement's outcome.")
+
+
+def targets(team=None):
+    """team.json "targets" (owner feature secret_targets): {name: target}, as target_entry checked it."""
+    return (team or TEAM).get("targets") or {}
+
+
+def host_key_valid(key):
+    """True for a host's public SSH key as its .pub file says it, without a comment: a type and a key of that type."""
+    m = HOST_KEY.fullmatch(key) if isinstance(key, str) else None
+    try:
+        blob = base64.b64decode(m.group(2), validate=True) if m else b""
+    except ValueError:
+        return False
+    kind = m.group(1).encode() if m else b""
+    return bool(m) and blob[:4] == len(kind).to_bytes(4, "big") and blob[4:4 + len(kind)] == kind
+
+
+def line_text(value, most=300):
+    """True for one line of 1 to `most` characters that can stand in a host's forced command."""
+    return isinstance(value, str) and len(value) <= most and value == value.strip() and bool(LINE_TEXT.fullmatch(value))
+
+
+def target_entry(name, entry, team):
+    """One checked target of team.json "targets", in the form the hub stores. ValueError with the reason, in the
+    owner's words."""
+    if not (isinstance(name, str) and TARGET_NAME.fullmatch(name)):
+        raise ValueError(f"target {str(name)[:40]!r} needs a name of a-z 0-9 - that starts with a letter, at most 40 "
+                         f"characters")
+    if not isinstance(entry, dict):
+        raise ValueError(f"target {name} must be an object")
+    extra = sorted(set(entry) - set(TARGET_FIELDS))
+    if extra:
+        raise ValueError(f"target {name}: unknown field {extra[0]}")
+    title = entry.get("title")
+    if not (isinstance(title, str) and 1 <= len(title) <= 60 and title == title.strip() and not CONTROL.search(title)):
+        raise ValueError(f"target {name}: title must be one line of 1 to 60 characters")
+    kind, where = entry.get("kind"), entry.get("where")
+    if kind not in TARGET_KINDS:
+        raise ValueError(f"target {name}: kind is env ({TARGET_KINDS['env']}) or k8s ({TARGET_KINDS['k8s']})")
+    if kind == "env" and not (line_text(where) and where.startswith("/") and len(where) > 1
+                              and os.path.normpath(where) == where):
+        raise ValueError(f"target {name}: where is the absolute path of the env file on its host, for example "
+                         f"/srv/app/shared/.env")
+    if kind == "k8s" and not (isinstance(where, str) and K8S_PLACE.fullmatch(where)):
+        raise ValueError(f"target {name}: where is NAMESPACE/SECRET, the Kubernetes Secret it writes one key of")
+    machine = entry.get("machine")
+    if machine == "owner" or not any(a.get("machine") == machine and a.get("role") in ("worker", "lead")
+                                     for a in team["agents"].values()):
+        raise ValueError(f"target {name}: machine is the machine of a worker or a lead whose vault reaches the host")
+    host, port, user, key = (entry.get(k) for k in ("host", "port", "user", "host_key"))
+    if not (isinstance(host, str) and TARGET_HOST.fullmatch(host)):
+        raise ValueError(f"target {name}: host is the SSH address of the host that holds it: a name or an IP address")
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError(f"target {name}: port is the port of that host's SSH server")
+    if not (isinstance(user, str) and TARGET_USER.fullmatch(user)):
+        raise ValueError(f"target {name}: user is the user on that host who owns what it writes")
+    if not host_key_valid(key):
+        raise ValueError(f"target {name}: host_key is that host's own public SSH key, its type and its key as "
+                         f"/etc/ssh/ssh_host_ed25519_key.pub has them, without the name at the end")
+    out = {"title": title, "kind": kind, "where": where, "machine": machine, "host": host, "port": port,
+           "user": user, "host_key": key}
+    names = entry.get("names")
+    if names is not None:
+        if not (isinstance(names, list) and 1 <= len(names) <= 32 and len(set(map(str, names))) == len(names)
+                and all(isinstance(n, str) and PLACE_VAR[kind].fullmatch(n) for n in names)):
+            raise ValueError(f"target {name}: names is a list of 1 to 32 different " +
+                             ("variable names" if kind == "env" else "keys of the Secret") + ", the only ones it takes")
+        out["names"] = sorted(names)
+    for field, what in (("note", "a line for the agents that place a key here, for example what restarts the "
+                                 "application"), ("then", "the command that the host runs after a change")):
+        value = entry.get(field)
+        if value is None:
+            continue
+        if not (line_text(value) if field == "then" else isinstance(value, str) and 1 <= len(value) <= 300
+                and value == value.strip() and not CONTROL.search(value)):
+            raise ValueError(f"target {name}: {field} is {what}: one line of at most 300 characters" +
+                             (", with no double quote and no backslash" if field == "then" else ""))
+        out[field] = value
+    k8s = entry.get("k8s")
+    if kind == "k8s":
+        api = (k8s or {}).get("api") if isinstance(k8s, dict) else None
+        parts = urllib.parse.urlsplit(api) if line_text(api) else None
+        if not (isinstance(k8s, dict) and not set(k8s) - {"api", "ca", "token", "server_name"} and parts
+                and parts.scheme == "https" and parts.hostname and not parts.username and not parts.query
+                and not parts.fragment and all(line_text(k8s.get(f)) and k8s[f].startswith("/")
+                                               for f in ("ca", "token"))
+                and (k8s.get("server_name") is None or (isinstance(k8s["server_name"], str) and
+                                                        re.fullmatch(r"[A-Za-z0-9.-]{1,253}", k8s["server_name"])))):
+            raise ValueError(f"target {name}: k8s is {{api, ca, token, server_name}}: the https address of the "
+                             f"cluster's API, and the absolute paths on the host of the cluster's authority and of a "
+                             f"token that may get, create and patch only the Secrets it needs; server_name only when "
+                             f"the API's certificate names another host")
+        out["k8s"] = {k: v for k, v in k8s.items() if v is not None}
+    elif k8s is not None:
+        raise ValueError(f"target {name}: k8s is for a target of kind k8s")
+    return out
+
+
+def validate_targets(team):
+    """team.json "targets" and the agents' holds of them. The targets that one vault reaches as one user of one host
+    share one line of that host's authorized_keys file, so they need one cluster's settings."""
+    conf = team.get("targets", {})
+    if not isinstance(conf, dict) or len(conf) > TARGET_LIMIT:
+        raise ValueError(f"targets must map up to {TARGET_LIMIT} target names to their target")
+    for name, entry in conf.items():
+        if target_entry(name, entry, team) != entry:
+            raise ValueError(f"target {name} is not in the form the hub stores: save it from the Targets page")
+    for names in target_groups(team).values():
+        clusters = {json.dumps(conf[n]["k8s"], sort_keys=True) for n in names if conf[n]["kind"] == "k8s"}
+        if len(clusters) > 1:
+            raise ValueError(f"the targets {', '.join(names)} share one line of their host's authorized_keys file, "
+                             f"so their k8s settings must be the same")
+    for name, a in team["agents"].items():
+        held = a.get("targets", [])
+        if not isinstance(held, list) or len(set(map(str, held))) != len(held) or \
+                not all(isinstance(t, str) and t in conf for t in held):
+            raise ValueError(f"agent {name}: targets must be different names of team.json targets")
+        if held and a.get("role") not in ("worker", "lead"):
+            raise ValueError(f"agent {name}: only a worker or a lead holds a target, because place_secret is a tool of "
+                             f"task sessions")
+
+
+def target_groups(team=None):
+    """{(machine, host, port, user): [target names]}: the targets that one line of a host's authorized_keys file
+    serves, because one vault reaches them as one user of one host."""
+    out = {}
+    for name, t in sorted(targets(team).items()):
+        out.setdefault((t["machine"], t["host"], t["port"], t["user"]), []).append(name)
+    return out
+
+
+def forced_command(team, names):
+    """The forced command of one line of a host's authorized_keys file, for these targets: place.py with each place,
+    the names it takes and its command after a change, and the cluster's settings when one of them is a Secret. Each
+    argument is one shell word."""
+    conf, words = targets(team), []
+    for name in names:
+        t = conf[name]
+        words += ["--place", f"{name}={t['kind']}:{t['where']}"]
+        if t.get("names"):
+            words += ["--names", f"{name}={','.join(t['names'])}"]
+        if t.get("then"):
+            words += ["--then", f"{name}={t['then']}"]
+    k8s = next((conf[n]["k8s"] for n in names if conf[n]["kind"] == "k8s"), None)
+    if k8s:
+        words += ["--k8s-api", k8s["api"], "--k8s-ca", k8s["ca"], "--k8s-token", k8s["token"]]
+        if k8s.get("server_name"):
+            words += ["--k8s-server-name", k8s["server_name"]]
+    return PLACE_HELPER + " " + " ".join(shlex.quote(w) for w in words)
+
+
+def setup_line(team, names, public, machine):
+    """The line of the host's authorized_keys file for these targets: the vault's own key, which may run the forced
+    command and nothing else (restrict: no shell, no terminal, no forwarding). The values of the command hold no
+    double quote and no backslash (target_entry), so its only quotes are the ones shlex wrote, escaped as sshd reads
+    them."""
+    command = forced_command(team, names).replace('"', '\\"')
+    return f'command="{command}",restrict {public} fleet-vault@{machine}'
+
+
+def target_spec(t):
+    """What a placement was asked for: the parts of a target that its vault and its host use. A placement whose
+    target the owner changed meanwhile is given to no vault."""
+    return {k: t.get(k) for k in ("kind", "where", "machine", "host", "port", "user", "host_key", "names")}
+
+
+def place_carrier(machine, t0=None):
+    """(the agent whose helper and vault place a key from this machine, its vault's public key for targets, []) or
+    (None, None, the codes of what is missing): an agent with broker access and its own key, whose helper and broker
+    both say that they reach targets. The newest report wins, as for a delivery."""
+    t0 = t0 or now()
+    brokers = [n for n, a in sorted(agents().items()) if a.get("machine") == machine
+               and a.get("role") in ("worker", "lead") and a.get("vault") == "broker"]
+    best, fresh, key, missing = None, -1, None, None
+    for n in brokers:
+        r, lack = broker_report(n, t0), [] if agent_key(n) else ["agent_without_key"]
+        if not r:
+            lack.append("broker_status_unknown")
+        else:
+            lack += [code for code, good in (("broker_without_callers", r.get("callers") is True),
+                                             ("helper_without_places", "secret_places" in r["features"]),
+                                             ("broker_without_places", r.get("places") is True
+                                              and bool(r.get("place_key")))) if not good]
+        if not lack and (r.get("broker_read_at") or 0) > fresh:
+            best, fresh, key = n, r.get("broker_read_at") or 0, r["place_key"]
+        elif lack and (missing is None or len(lack) < len(missing)):
+            missing = lack
+    if best:
+        return best, key, []
+    return None, None, missing or ["no_broker_access"]
+
+
+# What each code of place_carrier means, for the agent that cannot place and the owner's Test.
+PLACE_LACKS = {"no_broker_access": "no agent of it has broker access",
+               "agent_without_key": "its agent has no agent key",
+               "broker_status_unknown": "its helper has not reported its vault in the last 10 minutes",
+               "broker_without_callers": "its vault is older than the vault that serves each agent of a machine",
+               "helper_without_places": "its helper is older than place_secret",
+               "broker_without_places": "its vault has no SSH program or no SSH key of its own for targets"}
+
+
+def place_lacks(machine, missing):
+    """Why the vault of this machine cannot reach targets now, in words."""
+    return f"the vault of {machine} cannot reach targets now: " + "; ".join(PLACE_LACKS.get(c, c) for c in missing)
+
+
+def placement_state(row):
+    """waiting (no vault took it yet), running, done, failed (nothing was written) or unknown (it can have been
+    written: placing it again says what the target holds)."""
+    if row["finished"]:
+        return "done" if row["ok"] else "unknown" if row["unknown"] else "failed"
+    return "unknown" if row["unknown"] else "running" if row["released"] else "waiting"
+
+
+def placement_view(row):
+    """One placement, for the owner: who asked for which key in which place, and what came of it. Never a value."""
+    whole = row["op"] == "check" and row["name"] is None
+    return {"id": row["id"], "state": placement_state(row), "op": row["op"], "agent": row["agent"],
+            "task": tref(row["task"]) if row["task"] else None, "login": row["login"], "name": row["name"],
+            "target": row["target"], "machine": row["machine"], "carrier": row["carrier"],
+            "created": row["created"], "taken": row["released"], "finished": row["finished"], "was": row["was"],
+            "where": row["place_where"], "verified": None if row["verified"] is None else bool(row["verified"]),
+            "present": None if whole or row["present"] is None else bool(row["present"]),
+            "writable": bool(row["present"]) if whole and row["present"] is not None else None,
+            "then_code": row["then_code"], "result": row["result"]}
+
+
+def as_sentence(text):
+    """A reported line as a sentence of its own, whoever wrote it: a capital first letter and a full stop."""
+    text = " ".join(str(text or "").split())
+    return text[:1].upper() + text[1:] + ("" if text[-1:] in ".!?" else ".") if text else ""
+
+
+def place_text(row):
+    """What the agent reads about one placement: the outcome in words that hold no value, and what to do next."""
+    t = targets().get(row["target"]) or {}
+    state, pid = placement_state(row), f"P-{row['id']}"
+    what = f"{row['name']} ({row['login']})" if row["name"] else row["target"]
+    where = row["place_where"] or t.get("where") or row["target"]
+    if state == "running" or state == "waiting":
+        return (f"{pid}: the vault of {row['machine']} is still working on {what}. Call place_secret again with the "
+                f"same request_id for its outcome.")
+    if state == "failed" and row["op"] == "place" and row["verified"] == 0:       # written, and not the owner's value
+        return f"{pid}: {as_sentence(row['result'])}"
+    if state == "failed":
+        return f"{pid}: not placed. {as_sentence(row['result']) or 'Nothing was written.'}"
+    if state == "unknown":
+        return (f"{pid}: the outcome is not known. {as_sentence(row['result']) or 'No report came.'} Placing it "
+                f"again is safe: call place_secret with a new request_id, and the target says what it holds; nothing "
+                f"is written twice.")
+    if row["op"] == "check":
+        if row["name"] is None:
+            return f"{pid}: {row['target']} ({where}) " + ("can be written." if row["present"] else "cannot be written.")
+        if not row["present"]:
+            return f"{pid}: {row['target']} ({where}) does not hold {row['name']}."
+        return (f"{pid}: {row['target']} ({where}) holds {row['name']}, " +
+                ("and it is the value the owner saved as " + row["login"] + "." if row["verified"] == 1 else
+                 "and it is not the value the owner saved as " + row["login"] + "." if row["verified"] == 0 else
+                 "and the hub has no fingerprint of " + row["login"] + " to compare it with."))
+    was = {"new": "written", "same": "it was there already, so nothing changed",
+           "replaced": "written in the place of the value it had"}.get(row["was"], "written")
+    text = f"{pid}: {row['name']} ({row['login']}) is in {row['target']} ({where}): {was}."
+    text += (" The target read back the value the owner saved under that reference." if row["verified"] == 1 else
+             " The target read back the value the vault sent; the hub had no fingerprint of that key to compare "
+             "it with.")
+    if row["then_code"] is not None:
+        text += (" Its command after a change ran and ended well." if row["then_code"] == 0 else
+                 f" Its command after a change ended with code {row['then_code']}: the host runs it again with the "
+                 f"next placement there.")
+    if t.get("note"):
+        text += f" The owner's note for this target: {t['note']}"
+    return text
+
+
+def finish_placement(row, ok, text, unknown=False, t0=None):
+    """End one placement: done, failed (nothing was written) or not known. The record stays; it is what the owner
+    reads of who placed which key where."""
+    t0 = t0 or now()
+    q("UPDATE placements SET ok=?, unknown=?, result=?, finished=? WHERE id=?",
+      (1 if ok else 0, (row["unknown"] or t0) if unknown else None, (text or "")[:PLACE_RESULT_MAX] or None, t0,
+       row["id"]))
+    log(row["agent"], f"placement {row['id']} ({row['op']} {row['name'] or '-'} of {row['login'] or '-'} into "
+                      f"{row['target']}): " + ("done" if ok else "not known: " if unknown else "failed: ") +
+        ("" if ok else (text or "")[:120]))
+
+
+def placement_refusal(row):
+    """None, or why the vault gets nothing for this placement now: the owner changed or removed the target, the
+    carrier is not its machine's vault any more, or the asker no longer holds the target or the key, or its task
+    ended or is held. The same checks as the tool's, made again when the vault asks."""
+    t = targets().get(row["target"])
+    if t is None:
+        return "the owner removed this target"
+    if target_spec(t) != json.loads(row["spec"]):
+        return "the owner changed this target since it was asked for"
+    carrier = agents().get(row["carrier"]) or {}
+    if carrier.get("machine") != t["machine"] or carrier.get("vault") != "broker":
+        return f"{row['carrier']} is not the vault of {t['machine']} any more"
+    if row["agent"] == "owner":
+        return None
+    a = agents().get(row["agent"]) or {}
+    task = q1("SELECT * FROM tasks WHERE id=?", (row["task"],))
+    if not task or task["owner"] != row["agent"] or task["state"] in TERMINAL:
+        return "the task that asked for it has ended"
+    if active_hold(task["id"]):
+        return "the task that asked for it is paused or stopped"
+    if task["attempt"] != row["attempt"]:
+        return "the attempt that asked for it has ended"
+    if row["target"] not in (a.get("targets") or []):
+        return f"{row['agent']} does not hold the target {row['target']} any more"
+    if row["login"] and (a.get("vault") == "none" or row["login"] not in granted_logins(row["agent"])):
+        return f"{row['agent']} does not hold {row['login']} any more"
+    return None
+
+
+def expire_placements(t0):
+    """A placement that no vault took is not placed; one that its vault took and did not report on is not known after
+    PLACE_STALE, and the hub stops waiting for its report after PLACE_DROP."""
+    for r in q("SELECT * FROM placements WHERE finished IS NULL"):
+        if not r["released"] and t0 - r["created"] > PLACE_WAIT + 60:
+            finish_placement(r, False, f"The vault of {r['machine']} did not take it, so nothing was written.", t0=t0)
+        elif r["released"] and t0 - r["released"] > PLACE_DROP:
+            finish_placement(r, False, r["result"] or "No report came.", unknown=True, t0=t0)
+        elif r["released"] and not r["unknown"] and t0 - r["released"] > PLACE_STALE:
+            q("UPDATE placements SET unknown=?, result=? WHERE id=?",
+              (t0, f"the vault of {r['machine']} took it and reported nothing in {PLACE_STALE // 60} minutes.",
+               r["id"]))
+
+
+def place_args(agent, a):
+    """The checked fields of one place_secret call: (request_id, target name, target, login, variable, op)."""
+    request = a.get("request_id")
+    try:
+        if not isinstance(request, str) or str(uuid.UUID(request)) != request.lower():
+            raise ValueError()
+    except (ValueError, AttributeError):
+        raise ToolError("request_id must be a UUID. Use a new one for each new placement.") from None
+    name = str(a.get("target") or "").strip().lower()
+    held = sorted((agents().get(agent) or {}).get("targets") or [])
+    t = targets().get(name)
+    if t is None:
+        raise ToolError(f"There is no target {name or '(none)'}. " + (f"The targets you hold: {', '.join(held)}."
+                                                                       if held else "You hold no target."))
+    if name not in held:
+        raise ToolError(f"You do not hold the target {name}. If this task needs it, call ask_my_requester with "
+                        f"needs_access=\"target:{name}\".")
+    login = a.get("login")
+    if not isinstance(login, str) or not BWS_REF.fullmatch(login.strip()):
+        raise ToolError("login must be the reference of the key: bws://<secret-id>.")
+    login = login.strip().lower()
+    if (agents().get(agent) or {}).get("vault") == "none":
+        raise ToolError("You have no credential access. Ask your requester: only the owner changes that.")
+    if login not in granted_logins(agent):
+        raise ToolError(f"You do not hold {login}. If this task needs it, call ask_my_requester with "
+                        f"needs_access=\"secret:{login}\".")
+    entry = logins().get(login) or {}
+    var = a.get("name")
+    var = entry.get("env") if var in (None, "") else var
+    if not (isinstance(var, str) and PLACE_VAR[t["kind"]].fullmatch(var)):
+        raise ToolError(("name is the variable that the env file sets, for example GEMINI_API_KEY" if t["kind"] == "env"
+                         else "name is the key of the Secret, for example GEMINI_API_KEY") +
+                        (". This secret is a login, so name the variable that takes its password."
+                         if entry.get("kind", "login") == "login" else "."))
+    if t.get("names") and var not in t["names"]:
+        raise ToolError(f"The target {name} takes only {', '.join(t['names'])}; the owner chose that.")
+    check = a.get("check", False)
+    if not isinstance(check, bool):
+        raise ToolError("check is true (only read what the target holds) or false (place the key).")
+    return request.lower(), name, t, login, var, "check" if check else "place"
+
+
+def t_place_secret(agent, a):
+    """place_secret: the vault of a target's machine writes one key of the catalog into that target, or reads what the
+    target holds (check), for an agent that holds both. One placement for one request_id: the same call again gives
+    its outcome. A new request_id places it again, which is safe: a key that is there already changes nothing."""
+    tid = parse_task(a.get("task_id"))
+    task = get_task(tid, owner=agent)
+    if task["state"] in TERMINAL:
+        raise ToolError(f"{tref(tid)} is already {task['state']}.")
+    with LOCK:
+        request, name, t, login, var, op = place_args(agent, a)
+        row = q1("SELECT * FROM placements WHERE agent=? AND request_id=?", (agent, request))
+        if row:
+            if (row["task"], row["op"], row["login"], row["target"], row["name"]) != (tid, op, login, name, var):
+                raise ToolError(PLACE_TAKEN)
+            pid, again = row["id"], True
+        else:
+            carrier, _, missing = place_carrier(t["machine"])
+            if not carrier:
+                raise ToolError(as_sentence(place_lacks(t["machine"], missing)) + " Nothing was written. Ask your "
+                                "requester: that is the machine's setup, not this task's.")
+            pid, again = ins("INSERT INTO placements(agent,task,attempt,request_id,op,login,target,name,machine,"
+                             "carrier,spec,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                             (agent, tid, task["attempt"], request, op, login, name, var, t["machine"], carrier,
+                              json.dumps(target_spec(t), sort_keys=True), now())), False
+    activity(tid, "place_secret")
+    if not again:               # one event for one placement: its vault is asked once
+        emit(carrier, "place", f"{'check' if op == 'check' else 'place'} {var} in the target {name}",
+             extra={"placement": pid})
+        log(agent, f"place_secret {pid}: {op} {var} of {login} into {name} through the vault of {t['machine']} "
+                   f"({carrier})")
+    wait = CFG.get("place_wait", PLACE_WAIT)
+    deadline = now() + wait
+    while now() < deadline:
+        row = q1("SELECT finished, unknown FROM placements WHERE id=?", (pid,))
+        if row["finished"] or row["unknown"]:
+            break
+        time.sleep(0.3)
+    with LOCK:
+        fence(agent, tid)
+        row = q1("SELECT * FROM placements WHERE id=?", (pid,))
+        if not row["finished"] and not row["released"]:     # no vault took it, and a later ask is refused
+            finish_placement(row, False, f"The vault of {row['machine']} did not take it in {int(wait)} seconds, so "
+                                         f"nothing was written. Ask your requester whether its helper runs.")
+            row = q1("SELECT * FROM placements WHERE id=?", (pid,))
+    activity(tid)
+    text = place_text(row)
+    if placement_state(row) in ("failed", "unknown"):
+        raise ToolError(text)
+    return text
+
+
+def targets_view(team, t0=None):
+    """GET /ui/targets: each target with who holds it, whether its machine's vault reaches targets now and its newest
+    placements; each machine's vault key for targets; and one line of a host's authorized_keys file for each group of
+    targets, which the owner (or an agent that may change that host) puts there once. No value."""
+    t0 = t0 or now()
+    machines = {}
+    for m in sorted({a.get("machine") for a in team["agents"].values()
+                     if a.get("role") in ("worker", "lead") and a.get("machine")}):
+        carrier, key, missing = place_carrier(m, t0)
+        machines[m] = {"machine": m, "carrier": carrier, "public_key": key, "missing": missing}
+    lines = []
+    for (machine, host, port, user), names in sorted(target_groups(team).items()):
+        key = (machines.get(machine) or {}).get("public_key")
+        lines.append({"machine": machine, "host": host, "port": port, "user": user, "targets": names,
+                      "command": forced_command(team, names),
+                      "line": setup_line(team, names, key, machine) if key else None})
+    out = []
+    for name, t in sorted(targets(team).items()):
+        rows = q("SELECT * FROM placements WHERE target=? ORDER BY id DESC LIMIT ?", (name, PLACE_KEPT))
+        out.append(dict(t, name=name, holders=[h["agent"] for h in resource_holders("target", name, team)],
+                        grant=(team.get("resources") or {}).get(f"target:{name}"),
+                        ready=bool((machines.get(t["machine"]) or {}).get("carrier")),
+                        placements=[placement_view(r) for r in rows]))
+    try:
+        with open(os.path.join(kit_dir(), "place.py"), "rb") as f:
+            source = hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        source = None
+    return {"targets": out, "machines": list(machines.values()), "lines": lines,
+            "kinds": [{"kind": k, "what": w} for k, w in TARGET_KINDS.items()], "limit": TARGET_LIMIT,
+            "helper": {"program": PLACE_PROGRAM, "command": PLACE_HELPER, "source": "place.py", "sha256": source}}
+
+
+def save_target(body):
+    """POST /ui/targets/save: the owner sets one target, or removes it (target null), which also ends every agent's
+    hold of it and its standing in the grantable pool. One commit of team.json, as for a tool."""
+    name, entry = body["name"], body["target"]
+
+    def change(team):
+        conf = dict(team.get("targets") or {})
+        if entry is None:
+            if name not in conf:
+                return False
+            del conf[name]
+            for a in team["agents"].values():
+                held = [x for x in a.get("targets") or [] if x != name]
+                if held:
+                    a["targets"] = held
+                else:
+                    a.pop("targets", None)
+            pool = {k: v for k, v in (team.get("resources") or {}).items() if k != f"target:{name}"}
+            if pool:
+                team["resources"] = pool
+            else:
+                team.pop("resources", None)
+        else:
+            try:
+                new = target_entry(name, entry, team)
+            except ValueError as e:
+                raise Refusal(400, str(e)) from None
+            if conf.get(name) == new:
+                return False
+            if name not in conf and len(conf) >= TARGET_LIMIT:
+                raise Refusal(400, f"team.json has room for {TARGET_LIMIT} targets")
+            conf[name] = new
+        if conf:
+            team["targets"] = dict(sorted(conf.items()))
+        else:
+            team.pop("targets", None)
+        return True
+    result = save_integration(body["base_sha256"], change,
+                              f"Owner {'removed' if entry is None else 'set'} the target {name}")
+    t = targets().get(name)
+    if result["changed"]:
+        emit(manager_name(), "say", f"[hub] The owner removed the target {name}." if t is None else
+             f"[hub] The owner set the target {name}: {t['title']} ({TARGET_KINDS[t['kind']]} on {t['host']}, "
+             f"reached by the vault of {t['machine']}). An agent that holds it puts a key there with place_secret: "
+             f"the owner gives it on the Access page, and you with grant_access when it is in the grantable pool.")
+    return dict(result, name=name, target=t)
+
+
+def save_target_holders(body):
+    """POST /ui/team/targets: the agents that hold one target, as POST /ui/team/tools does for a tool."""
+    name, chosen = body["target"], body["agents"]
+
+    def change(team):
+        known_agents(team, chosen)
+        if name not in (team.get("targets") or {}):
+            raise Refusal(404, "no such target")
+        changed = False
+        for agent, a in team["agents"].items():
+            old = list(a.get("targets") or [])
+            new = sorted({x for x in old if x != name} | ({name} if agent in chosen else set()))
+            if set(new) != set(old):
+                changed = True
+                if new:
+                    a["targets"] = new
+                else:
+                    a.pop("targets", None)
+        return changed
+    result = save_integration(body["base_sha256"], change, f"Owner changed the agents of the target {name}")
+    if result["changed"]:
+        emit(manager_name(), "say", f"[hub] The owner changed who holds the target {name}: "
+             f"{', '.join(chosen) or 'no agent'}. An agent gets place_secret for it in its next task session.")
+    return dict(result, target=name, agents=chosen)
+
+
+def test_target(name, request_id):
+    """POST /ui/targets/test: the owner's check of one target. Its machine's vault connects with its own key, and the
+    host's helper says whether the place can be written; nothing is written. The outcome comes with GET /ui/targets.
+    Called with LOCK held."""
+    t = targets().get(name)
+    if t is None:
+        raise Refusal(404, "no such target")
+    carrier, _, missing = place_carrier(t["machine"])
+    if not carrier:
+        raise Conflict(place_lacks(t["machine"], missing), missing=missing)
+    t0 = now()
+    with transaction():
+        pid = DB.execute("INSERT INTO placements(agent,task,attempt,request_id,op,login,target,name,machine,carrier,"
+                         "spec,created) VALUES('owner',NULL,NULL,?,'check',NULL,?,NULL,?,?,?,?)",
+                         (request_id, name, t["machine"], carrier, json.dumps(target_spec(t), sort_keys=True),
+                          t0)).lastrowid
+        event_rows([(carrier, "place", None, f"check the target {name}", {"placement": pid})], t0)
+    log("owner", f"test of the target {name} through the vault of {t['machine']} ({carrier})")
+    return {"name": name, "placement": pid, "state": "waiting"}
 
 
 def unanswered_owner_message(agent):
@@ -9638,6 +10245,8 @@ def duty_toolbox(agent):
         parts.append("GitHub " + ", ".join(f"{r} ({v})" for r, v in sorted(a["repos"].items())))
     if a.get("tools"):
         parts.append("tools " + ", ".join(sorted(a["tools"])))
+    if a.get("targets"):
+        parts.append("targets for keys (place_secret) " + ", ".join(sorted(a["targets"])))
     keys = [name for _, name in read_secrets(agent)]
     if keys:
         parts.append("API keys in your session: " + ", ".join(keys))
@@ -11767,6 +12376,7 @@ def t_write_knowledge(agent, a):
 #   repo:<owner>/<name>   a GitHub repository, through the hub's GitHub App: read or write
 #   drive:<account>       Google Drive of one of the owner's accounts; gmail:<account>  its Gmail
 #   tool:<name>           an MCP server of team.json or a tool of Fleet's catalog, which an agent has or has not
+#   target:<name>         a target of team.json, where place_secret puts a key (owner feature secret_targets)
 #
 # The grant is the authorization (the owner, 17 October 2026: "I dont want to preapprove sending emails or deploying
 # to production! If I grant access to a repo/database/system/server is for the relevant agent to take full
@@ -11777,15 +12387,16 @@ def t_write_knowledge(agent, a):
 # The levels of each kind run from the lowest to the highest, so a policy's max can be compared.
 GRANT_WHY_MAX = 300          # the manager's own line about one grant, in the owner's record of it
 RESOURCE_LEVELS = {"secret": ("use", "read"), "repo": REPO_ACCESS, "drive": GOOGLE_LEVELS["drive"],
-                   "gmail": GOOGLE_LEVELS["gmail"], "tool": ("use",)}
+                   "gmail": GOOGLE_LEVELS["gmail"], "tool": ("use",), "target": ("use",)}
 # What each kind is, in one word for a sentence, and the heading of its group on the owner's Access page.
 RESOURCE_WORDS = {"secret": "secret", "repo": "GitHub repository", "drive": "Google Drive", "gmail": "Gmail",
-                  "tool": "MCP server"}
+                  "tool": "MCP server", "target": "target"}
 RESOURCE_TITLES = {"secret": "Data sources and deploy routes", "repo": "Repositories", "drive": "Drive accounts",
-                   "gmail": "Mail accounts", "tool": "MCP servers"}
+                   "gmail": "Mail accounts", "tool": "MCP servers", "target": "Targets for keys"}
 # What a duty uses each kind for, for the owner's Access page.
 RESOURCE_NEEDS = {"secret": "a data source or a deploy route", "repo": "a repository to change",
-                  "drive": "files", "gmail": "a mail account", "tool": "an MCP server"}
+                  "drive": "files", "gmail": "a mail account", "tool": "an MCP server",
+                  "target": "a place on a server where a key goes"}
 RESOURCE_AUDIENCE = "workers"       # a policy's "to": its one audience, any worker or lead
 RESOURCE_LIMIT = 256                # entries of team.json "resources"
 RESOURCE_HISTORY = 10               # grants of one resource that GET /ui/resources carries
@@ -11812,6 +12423,8 @@ def resource_known(kind, what, team):
         return what in (team.get("logins") or {})
     if kind == "tool":
         return what in tool_catalog(team)
+    if kind == "target":
+        return what in (team.get("targets") or {})
     if kind == "repo":
         return bool(REPO_NAME.fullmatch(what))
     return bool(google_account(what))
@@ -11855,6 +12468,8 @@ def resource_title(kind, what, team=None):
         return got.get("env") or got.get("title") or what
     if kind == "tool":
         return (tool_catalog(team or TEAM).get(what) or {}).get("title") or what
+    if kind == "target":
+        return ((targets(team).get(what) or {}).get("title") or what)
     return what
 
 
@@ -11874,6 +12489,8 @@ def resource_holders(kind, what, team=None):
             level = (a.get("repos") or {}).get(what)
         elif kind == "tool":
             level = "use" if what in (a.get("tools") or []) else None
+        elif kind == "target":
+            level = "use" if what in (a.get("targets") or []) else None
         else:
             got = (a.get("google") or {}).get(kind) or {}
             level = got.get("level") if got.get("account") == what else None
@@ -11892,6 +12509,8 @@ def resource_uses(kind, what, team=None):
         return [], "github_app"
     if kind in ("drive", "gmail"):
         return [], "google"
+    if kind == "target":            # its machine's vault holds the SSH key, and the agent's own key grant is apart
+        return [], "vault"
     entry = tool_catalog(team or TEAM).get(what) or {}
     if not entry.get("custom", True):
         return [], "fleet"
@@ -11949,6 +12568,7 @@ def resource_ids(team, accounts):
     too."""
     ids = {f"secret:{ref}" for ref in (team.get("logins") or {})}
     ids |= {f"tool:{name}" for name in tool_catalog(team)}
+    ids |= {f"target:{name}" for name in (team.get("targets") or {})}
     ids |= {f"{service}:{email}" for email in accounts for service in GOOGLE_LEVELS}
     for a in (team.get("agents") or {}).values():
         ids |= {f"repo:{repo}" for repo in (a.get("repos") or {})}
@@ -12108,11 +12728,12 @@ def grant_resource(by, rid, agent, level, phrase):
                     repos[what] = level
                 put(a, "repos", dict(sorted(repos.items())))
                 return True
-            if kind == "tool":
-                tools = set(a.get("tools") or [])
-                if (what in tools) == bool(level):
+            if kind in ("tool", "target"):
+                field = kind + "s"
+                held = set(a.get(field) or [])
+                if (what in held) == bool(level):
                     return False
-                put(a, "tools", sorted((tools | {what}) if level else (tools - {what})))
+                put(a, field, sorted((held | {what}) if level else (held - {what})))
                 return True
             levels = dict(a.get("google") or {})           # one account for each service: a new one takes its place
             want = {"account": what, "level": level} if level else None
@@ -13104,7 +13725,8 @@ TOOLS = [
                     "does not pause and the call returns at once. Leave it out when you are blocked, and never give "
                     "one for access, money or anything that leaves the building."},
         "needs_access": {"type": "string", "description": "The access that the task needs, as <kind>:<what>: "
-                         "repo:acme/web, secret:bws://<uuid>, gmail:a@b.com, drive:a@b.com or tool:<MCP server>"},
+                         "repo:acme/web, secret:bws://<uuid>, gmail:a@b.com, drive:a@b.com, tool:<MCP server> or "
+                         "target:<name>"},
         "needs_level": {"type": "string", "description": "The level of that thing that the task needs, when you "
                         "already hold it at a lower one: a GitHub repository runs read, write, deploy, so an agent "
                         "with write that must change a workflow file or run GitHub Actions asks for the same "
@@ -13195,6 +13817,22 @@ TOOLS = [
                                    "are the vault's and are refused; every other header is yours"},
         "auth": {"type": "string", "description": "How the key is sent: bearer, basic, or header:<Name>"}},
        ["task_id", "request_id", "login", "method", "path", "auth"])),
+    ("worker", "place_secret", t_place_secret,
+     "Have the vault of a target's machine put one saved key into a target that the owner defined: one variable of "
+     "a server's env file, or one key of a Kubernetes Secret. You name the target, the key's reference and, for a "
+     "key without a variable name of its own, the variable. You never see or pass the value: the vault sends it to "
+     "the target's host, which reads it back, and the hub compares it with the owner's. One request_id is one "
+     "placement, and the same call again gives its outcome. Placing again with a new request_id is safe: a key that "
+     "is there already changes nothing, so it is also how you settle an outcome that is not known. check=true only "
+     "reads whether the target holds that key, and whether it is the owner's value. The application reads a new "
+     "value when it starts again: the owner's note on the target says how.",
+     S({"task_id": TASK_ID, "request_id": {"type": "string", "description": "A new UUID for each new placement"},
+        "target": {"type": "string", "description": "The name of a target that you hold"},
+        "login": {"type": "string", "description": "bws://<secret-id>: the saved key that goes there"},
+        "name": {"type": "string", "description": "The variable of the env file, or the key of the Secret. Leave "
+                                                  "it out for an API key: its own variable name is used"},
+        "check": {"type": "boolean", "description": "true: write nothing, only read what the target holds"}},
+       ["task_id", "request_id", "target", "login"])),
     ("worker", "see_earlier_work", t_see_earlier_work,
      "Read the work that came before this task: the task it follows, what that one followed, and your own earlier "
      "attempts of this task. With no argument it gives one line for each. task=\"T-<id>\" gives one of them in full "
@@ -13653,10 +14291,11 @@ TOOLS = [
      S({"request_id": {"type": "string", "description": "A new UUID for each write"},
         "agent": {"type": "string", "description": "The worker or lead that gets the access"},
         "resource": {"type": "string", "description": "The resource, <kind>:<what>: repo:acme/web, "
-                     "secret:bws://<uuid>, gmail:a@b.com, drive:a@b.com or tool:<MCP server>"},
+                     "secret:bws://<uuid>, gmail:a@b.com, drive:a@b.com, tool:<MCP server> or target:<name>"},
         "level": {"type": "string", "description": "repo: read, write, or deploy for write and the repository's own "
                   "deployment (its workflow files and its GitHub Actions runs). secret: use, or read for an API key. "
-                  "drive: read, write or write_shared. gmail: read or write. tool: use."},
+                  "drive: read, write or write_shared. gmail: read or write. tool: use. target: use (a place on a "
+                  "server where place_secret puts a key)."},
         "why": {"type": "string", "description": "The one line the owner reads about this grant: what the work needs "
                 "it for"},
         "task_id": TASK_ID}, ["request_id", "agent", "resource", "level"])),
@@ -13838,6 +14477,8 @@ def tools_for(agent, context=None):
             (name not in ("create_login", "save_key") or agents()[agent].get("vault_create") is True) and
             # call_api: only for an agent whose machine has the vault broker
             (name != "call_api" or agents()[agent].get("vault") == "broker") and
+            # place_secret: only for an agent that holds a target (owner feature secret_targets)
+            (name != "place_secret" or bool(agents()[agent].get("targets"))) and
             # owner feature google: the tools of the agent's levels in team.json now
             (name not in GOOGLE_TOOLS or google_allowed(agent, name))]
 
@@ -13948,7 +14589,8 @@ def call_tool(agent, name, args, context=None):
             if tname == name and (r in (role, "all") or (role == "lead" and (r == "worker" or name in LEAD_TEAM_TOOLS))):
                 # These wait for an answer, a helper or Google, or read many files (search_knowledge): not under LOCK.
                 if name in ("ask_my_requester", "sign_in", "hand_over", "create_login", "save_key", "call_api",
-                            "message_agent", "search_knowledge", "write_knowledge") or name in GOOGLE_TOOLS:
+                            "place_secret", "message_agent", "search_knowledge", "write_knowledge") or \
+                        name in GOOGLE_TOOLS:
                     text = fn(agent, args)
                 else:
                     with LOCK:
@@ -16292,6 +16934,7 @@ def tick():
             integrity_check(t0)
             expire_handovers(t0)
             expire_deposits(t0)             # owner feature secret_deliveries: a copy no vault can take any more
+            expire_placements(t0)           # owner feature secret_targets: a placement that nobody took or reported
             settle_checks(t0)
             attachment_sweep(t0)            # owner feature attachments: the files that the hub may let go
             release_sweep(t0)               # owner feature releases: the automatic poll, when the owner opted in
@@ -17239,17 +17882,23 @@ def validate_status(data):
         source = vault.get("broker_source")             # the SHA-256 of the broker's own program (vault_revision)
         if source is not None and not (isinstance(source, str) and re.fullmatch(r"[0-9a-f]{64}", source)):
             raise ValueError("broker_source must be a sha256 or null")
+        place_key = vault.get("place_key")              # its own SSH key for targets (place_secret)
+        if place_key is not None and not (isinstance(place_key, str) and PLACE_PUBLIC.fullmatch(place_key)):
+            raise ValueError("place_key must be an ssh-ed25519 public key or null")
         vault = {"mode": mode, "isolated": _optional(vault.get("isolated"), bool),       # shared broker callers:
                  "callers": _optional(vault.get("callers"), bool), "broker_recipient": recipient,
                  "broker_read_at": read_at, "creates": _optional(vault.get("creates"), bool),      # create_login
                  "captures": _optional(vault.get("captures"), bool),                                # save_key
                  "requests": _optional(vault.get("requests"), bool),                                # call_api
                  "deposits": _optional(vault.get("deposits"), bool),        # owner feature secret_deliveries
-                 "broker_source": source}
+                 "places": _optional(vault.get("places"), bool),            # owner feature secret_targets
+                 "place_key": place_key, "broker_source": source}
     features = data.get("features") or []
-    if not isinstance(features, list) or len(features) > 16 or \
+    # 32: a helper names each feature it has (lifecycle.FEATURES), fifteen of them since secret_places, and a report
+    # with one name too many is refused whole, which would take the machine's broker and its deliveries with it.
+    if not isinstance(features, list) or len(features) > 32 or \
             not all(isinstance(f, str) and re.fullmatch(r"[a-z_]{1,40}", f) for f in features):
-        raise ValueError("features must be a list of at most 16 names of a-z and _")
+        raise ValueError("features must be a list of at most 32 names of a-z and _")
     settings = data.get("settings")
     if settings is not None and (
             not isinstance(settings, dict) or set(settings) != {"model", "effort", "can"}
@@ -17512,6 +18161,7 @@ def validate_team(team):
                              f"variable name")
     # "projects" is gone (the owner's decision of 18 October 2026). A team.json that a running fleet still has one
     # in is read as it is: the key is not checked, not written and not read anywhere.
+    validate_targets(team)          # owner feature secret_targets: the owner's targets and who holds each
     validate_resources(team)        # owner feature resource_grants: the grantable pool and the owner's ceiling
     validate_chat_apps(team)
     check_lines({n: (a["role"], a.get("reports_to")) for n, a in team["agents"].items()})
@@ -22884,6 +23534,63 @@ class Handler(BaseHTTPRequestHandler):
             machines = secret_machines(ref)
         return self.json(200, {"db": kv_get("db_id"), "login": ref, "machines": machines}, {"Cache-Control": "no-store"})
 
+    def ui_targets(self, query):
+        """GET /ui/targets (owner feature secret_targets): the owner's targets, who holds each, whether its machine's
+        vault reaches targets now, the line of each host's authorized_keys file, and the newest placements. No
+        value."""
+        if not self.ui_allowed():
+            return
+        if query.get("db") != kv_get("db_id"):
+            return self.json(409, {"error": "hub generation changed; refresh state"})
+        with LOCK:
+            try:
+                team, digest, _ = team_view(kit_revision(fresh=True))
+            except Refusal as e:
+                return self.json(e.status, {"error": str(e)})
+            view = targets_view(team)
+        return self.json(200, dict(view, db=kv_get("db_id"), base_sha256=digest), {"Cache-Control": "no-store"})
+
+    def ui_target_save(self):
+        """POST /ui/targets/save (owner feature secret_targets): one target of team.json, or null to remove it."""
+        def read(data):
+            base = self.integration_base(data, ("name", "target"))
+            name, entry = data.get("name"), data.get("target")
+            if not (isinstance(name, str) and TARGET_NAME.fullmatch(name)):
+                raise ValueError("name must be 1 to 40 characters a-z 0-9 - that start with a letter")
+            if "target" not in data:
+                raise ValueError("target is the target, or null to remove it")
+            if entry is not None:
+                target_entry(name, entry, TEAM)         # ValueError with the reason
+            return {"base_sha256": base, "name": name, "target": entry}
+        return self.ui_command("targets/save", read, save_target)
+
+    def ui_target_test(self):
+        """POST /ui/targets/test (owner feature secret_targets): the vault of one target's machine connects and its
+        host says whether the place can be written. Nothing is written; GET /ui/targets carries the outcome."""
+        def read(data):
+            extra = sorted(set(data) - {"request_id", "db", "name"})
+            if extra:
+                raise ValueError(f"unknown field {extra[0]}")
+            if data.get("name") not in targets():
+                raise ValueError("name must be a target of team.json")
+            return {"name": data["name"]}
+
+        def act(body):
+            return test_target(body["name"], str(self.form()["request_id"]).lower())
+        return self.ui_command("targets/test", read, act)
+
+    def ui_team_targets(self):
+        """POST /ui/team/targets (owner feature secret_targets): the agents that hold one target."""
+        def read(data):
+            base, name, names = self.integration_base(data, ("target", "agents")), data.get("target"), data.get("agents")
+            if name not in targets():
+                raise ValueError("target must be a target of team.json")
+            if not isinstance(names, list) or not all(isinstance(n, str) and AGENT_NAME.match(n) for n in names) or \
+                    len(set(names)) != len(names):
+                raise ValueError("agents must be a list of different agent names")
+            return {"base_sha256": base, "target": name, "agents": sorted(names)}
+        return self.ui_command("team/targets", read, save_target_holders)
+
     def ui_secret_deliver(self):
         """POST /ui/secrets/deliver (owner feature secret_deliveries): sealed copies of one secret of the catalog,
         each sealed in the owner's app to one machine's pinned vault key, for that machine's vault. What the hub keeps
@@ -24378,6 +25085,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_secret_salts(query)
         if parts == ["ui", "secrets", "machines"]:
             return self.ui_secret_machines(query)
+        if parts == ["ui", "targets"]:
+            return self.ui_targets(query)
         if parts == ["ui", "backup"]:
             return self.ui_backup(query)
         if len(parts) == 3 and parts[:2] == ["ui", "goals"] and re.fullmatch(r"[1-9][0-9]*", parts[2]):
@@ -24608,6 +25317,10 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                     if r["kind"] == "deposit" and not deposit_waiting(extra.get("deposit"), agent):
                         continue        # owner feature secret_deliveries: a delivery that ended carries nothing
+                    if r["kind"] == "place" and not q1("SELECT id FROM placements WHERE id=? AND carrier=? AND "
+                                                       "released IS NULL AND finished IS NULL",
+                                                       (extra.get("placement"), agent)):
+                        continue        # owner feature secret_targets: a placement taken or ended asks nobody
                     keep.append(r)
                 rows = keep
                 if rows or now() >= deadline:
@@ -24635,10 +25348,12 @@ class Handler(BaseHTTPRequestHandler):
             # and never redo a sign-in or handover whose asker has stopped waiting
             asked = {r["id"] for r in q("SELECT id FROM jobs WHERE finished IS NULL")}
             carried = {r["id"] for r in q("SELECT id FROM deposits WHERE finished IS NULL")}
+            placing = {r["id"] for r in q("SELECT id FROM placements WHERE released IS NULL AND finished IS NULL")}
             rows = [r for r in rows if not (r["kind"] == "task" and r["task"] in done)
                     and not (r["kind"] in ("signin", "handover", "create", "capture", "request")
                              and json.loads(r["extra"] or "{}").get("job") not in asked)
-                    and not (r["kind"] == "deposit" and json.loads(r["extra"] or "{}").get("deposit") not in carried)]
+                    and not (r["kind"] == "deposit" and json.loads(r["extra"] or "{}").get("deposit") not in carried)
+                    and not (r["kind"] == "place" and json.loads(r["extra"] or "{}").get("placement") not in placing)]
         self.json(200, {"last": last, "db": kv_get("db_id"),
                         "events": [{"id": r["id"], "kind": r["kind"], "task": tref(r["task"]) if r["task"] else None,
                                     "text": r["text"], "extra": json.loads(r["extra"] or "{}")} for r in rows]})
@@ -24769,6 +25484,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_secret_grant()
         if parts == ["ui", "secrets", "deliver"]:
             return self.ui_secret_deliver()
+        if parts == ["ui", "targets", "save"]:
+            return self.ui_target_save()
+        if parts == ["ui", "targets", "test"]:
+            return self.ui_target_test()
+        if parts == ["ui", "team", "targets"]:
+            return self.ui_team_targets()
         if parts == ["ui", "team", "accounts"]:
             return self.ui_team_account()
         if parts == ["ui", "team", "repos"]:
@@ -24874,6 +25595,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.helper_job_done(parts[2], parts[3])
         if parts[:2] == ["helper", "deposit"] and len(parts) == 4 and re.fullmatch(r"[1-9][0-9]{0,17}", parts[3]):
             return self.helper_deposit_done(parts[2], int(parts[3]))
+        if parts[:2] == ["helper", "place"] and len(parts) == 4 and re.fullmatch(r"[1-9][0-9]{0,17}", parts[3]):
+            return self.helper_place_done(parts[2], int(parts[3]))
         if parts[:2] == ["helper", "conversations"] and len(parts) == 5 and parts[4] == "start" and \
                 re.fullmatch(r"[1-9][0-9]*", parts[3]):
             return self.helper_conversation_start(parts[2], int(parts[3]))
@@ -25267,6 +25990,8 @@ class Handler(BaseHTTPRequestHandler):
         items = f.get("fingerprints") if isinstance(f, dict) else None
         if isinstance(f, dict) and "deposit" in f:     # owner feature secret_deliveries: a comparison, not a registration
             return self.helper_deposit_check(agent, f)
+        if isinstance(f, dict) and "place" in f:       # owner feature secret_targets: what a target answered
+            return self.helper_place_check(agent, f)
         if isinstance(f, dict) and "login" in f:       # a value that the vault gives a session (owner feature secrets)
             if set(f) != {"login", "fingerprints"} or not isinstance(f["login"], str) or \
                     not BWS_REF.fullmatch(f["login"]) or not fingerprint_items(items):
@@ -25366,6 +26091,118 @@ class Handler(BaseHTTPRequestHandler):
             finish_deposit(row, ok, (text or "Saved.") if ok else (text or "The vault did not save it."))
         return self.json(200, {"ok": True})
 
+    def helper_place(self, agent, pid):
+        """The vault of a target's machine asks for one placement that this agent's helper carries (owner feature
+        secret_targets), once. It gets the target as the owner defined it, the key's reference, the variable and the
+        salt of the key's fingerprint, after the hub checked again that the target is unchanged and that the asker
+        still holds it and the key in a task that runs. Called with LOCK held."""
+        row = q1("SELECT * FROM placements WHERE id=? AND carrier=?", (pid, agent))
+        if not row or row["finished"]:
+            return self.json(404, {"error": "no such placement waits for this agent's vault"})
+        if row["released"]:         # one vault run for one placement; placing it again is a new placement
+            return self.json(409, {"error": "this placement was given to the vault already"})
+        refused = placement_refusal(row)
+        if refused:
+            finish_placement(row, False, f"Nothing was written: {refused}.")
+            return self.json(409, {"error": refused})
+        t = targets()[row["target"]]
+        q("UPDATE placements SET released=? WHERE id=?", (now(), pid))
+        log(agent, f"vault took placement {pid}: {row['op']} {row['name'] or '-'} of {row['login'] or '-'} into "
+                   f"{row['target']}")
+        return self.json(200, {"ok": True, "job": pid, "kind": "place", "op": row["op"], "login": row["login"],
+                               "name": row["name"],
+                               "target": {"host": t["host"], "port": t["port"], "user": t["user"],
+                                          "host_key": t["host_key"], "place": row["target"], "kind": t["kind"]},
+                               "salt": fingerprint_salt(fingerprint_label(row["login"], "password")) if row["login"]
+                               else secrets.token_hex(16)})
+
+    def helper_place_check(self, agent, f):
+        """What the target answered, which the vault sends before it reports (owner feature secret_targets): where it
+        wrote, what was there before, the command after a change, and the fingerprint of the value as the target reads
+        it back, which the vault has compared with what it sent. For a place the hub compares that fingerprint with
+        the ones it knows under the key's reference, and registers it when it knows none, so the value is masked from
+        then on. A target that holds another value than the owner's is recorded as such and refused. Nothing else
+        stops the record: the write is done, whatever happened to the task meanwhile."""
+        pid, mark, then = f.get("place"), f.get("fingerprint"), f.get("then")
+        valid = (isinstance(pid, int) and not isinstance(pid, bool) and
+                 not set(f) - {"place", "sink", "where", "fingerprint", "was", "then", "present", "writable"} and
+                 f.get("sink") in TARGET_KINDS and isinstance(f.get("where"), str) and 1 <= len(f["where"]) <= 300
+                 and not CONTROL.search(f["where"]) and
+                 (mark is None or (isinstance(mark, dict) and set(mark) == {"hash", "len"} and
+                                   isinstance(mark["hash"], str) and re.fullmatch(r"[0-9a-f]{64}", mark["hash"]) and
+                                   isinstance(mark["len"], int) and not isinstance(mark["len"], bool) and
+                                   mark["len"] > 0)) and
+                 f.get("was") in (None, "new", "same", "replaced") and
+                 (then is None or (isinstance(then, dict) and set(then) == {"code"} and
+                                   (then["code"] is None or (isinstance(then["code"], int)
+                                                             and not isinstance(then["code"], bool))))) and
+                 all(f.get(k) is None or isinstance(f[k], bool) for k in ("present", "writable")))
+        if not valid:
+            return self.json(400, {"error": "send {place, sink, where, fingerprint {hash, len} or null, and was, then, "
+                                            "present or writable as the target said them}"})
+        with LOCK:
+            row = q1("SELECT * FROM placements WHERE id=? AND carrier=?", (pid, agent))
+            if not row or not row["released"]:
+                return self.json(404, {"error": "no such placement was taken by this agent's vault"})
+            if row["finished"] or row["checked"]:
+                return self.json(409, {"error": "this placement has its outcome already"})
+            whole = row["op"] == "check" and row["name"] is None
+            if (row["op"] == "place") != (f.get("was") is not None) or \
+                    (row["op"] == "place" and mark is None) or (whole and f.get("writable") is None) or \
+                    (row["op"] == "check" and not whole and f.get("present") is None):
+                return self.json(400, {"error": "the answer does not fit this placement's op"})
+            verified, label = None, fingerprint_label(row["login"], "password") if row["login"] else None
+            if mark is not None and label:
+                known = q("SELECT hash, len FROM secrets WHERE label=?", (label,))
+                same = any(k["hash"] == mark["hash"] and k["len"] == mark["len"] for k in known)
+                verified = 1 if same else 0 if known else None
+            if row["op"] == "place" and verified == 0:
+                q("UPDATE placements SET checked=?, verified=0, was=?, place_where=?, then_code=? WHERE id=?",
+                  (now(), f["was"], f["where"], (then or {}).get("code"), pid))
+                text = (f"Written, and what {row['target']} holds now is not the value the owner saved as "
+                        f"{row['login']}: the vault of {row['machine']} keeps another value under that reference. "
+                        f"Tell your requester; the owner delivers the key to {row['machine']} again, and placing it "
+                        f"then puts the right one there.")
+                finish_placement(row, False, text)
+                log(agent, f"placement {pid}: the target holds another value than the owner's {row['login']}")
+                return self.json(409, {"error": text})
+            if row["op"] == "place" and verified is None and mark["len"] >= 8:      # as fingerprint_items allows
+                register_fingerprints(row["login"], [{"kind": "password", "hash": mark["hash"], "len": mark["len"]}])
+            q("UPDATE placements SET checked=?, verified=?, present=?, was=?, place_where=?, then_code=? WHERE id=?",
+              (now(), verified, (f.get("writable") if whole else f.get("present")), f.get("was"), f["where"],
+               (then or {}).get("code"), pid))
+        return self.json(200, {"ok": True, "place": pid, "verified": verified == 1})
+
+    def helper_place_done(self, agent, pid):
+        """The helper reports what came of a placement that its vault ran (owner feature secret_targets): done, not
+        placed, or not known. A placement whose answer the hub took is done, whatever the report says after it."""
+        if agent not in agents():
+            return self.json(404, {"error": "unknown agent"})
+        if not self.allowed(agent):
+            return
+        if len(self.body()) > 4096:
+            return self.json(413, {"error": "a placement report is at most 4 KiB"})
+        f = self.form()
+        text = " ".join(CONTROL.sub(" ", str(f.get("text") or "")).split())[:PLACE_RESULT_MAX]
+        ok, unknown = f.get("ok") is True, f.get("unknown") is True
+        if secret_hit(text):
+            log(agent, "BLOCKED a placement report that contained a login")
+            text = "The helper's report was blocked because it contained a login."
+        with LOCK:
+            row = q1("SELECT * FROM placements WHERE id=? AND carrier=?", (pid, agent))
+            if not row or not row["released"]:
+                return self.json(404, {"error": "no such placement was taken by this agent's vault"})
+            if row["finished"]:
+                return self.json(409, {"error": "this placement has its outcome already"})
+            if row["checked"]:          # the hub has the target's own answer: that is the outcome
+                ok, unknown, text = True, False, ""
+            elif ok:
+                ok, unknown, text = False, True, ("The vault reported it done, and the hub never saw the target's "
+                                                  "answer.")
+            finish_placement(row, ok, text or ("" if ok else "The vault did not place it."),
+                             unknown=unknown and not ok)
+        return self.json(200, {"ok": True})
+
     def helper_vault_read(self, agent):
         """The API keys that this agent reads in its sessions (owner feature secrets, read), for its machine's vault at
         the start of a session: each reference, its variable name and the salts of its fingerprints. No value: the vault
@@ -25394,12 +26231,14 @@ class Handler(BaseHTTPRequestHandler):
         f = self.form()
         job, kind = f.get("job"), f.get("kind")
         if not isinstance(job, int) or isinstance(job, bool) or kind not in ("signin", "handover", "probe", "create",
-                                                                              "capture", "request", "deposit"):
-            return self.json(400, {"error": "job and kind (signin, handover, probe, create, capture, request or "
-                                            "deposit) are required"})
+                                                                              "capture", "request", "deposit", "place"):
+            return self.json(400, {"error": "job and kind (signin, handover, probe, create, capture, request, "
+                                            "deposit or place) are required"})
         with LOCK:
             if kind == "deposit":           # owner feature secret_deliveries: job is the delivery's number
                 return self.helper_deposit(agent, job)
+            if kind == "place":             # owner feature secret_targets: job is the placement's number
+                return self.helper_place(agent, job)
             row = q1("SELECT * FROM jobs WHERE id=? AND agent=?", (job, agent))
             if not row or row["kind"] != kind:
                 return self.json(404, {"error": f"no such {kind} job for this agent"})
@@ -26007,6 +26846,8 @@ def main():
     ap.add_argument("--job-wait", type=float, default=50, help="seconds a sign-in or handover waits for the helper")
     ap.add_argument("--request-wait", type=float, default=API_WAIT,
                     help="seconds call_api waits for the helper: more than the vault's 60 seconds for the service")
+    ap.add_argument("--place-wait", type=float, default=PLACE_WAIT,
+                    help="seconds place_secret waits for the target's vault before it says to call again")
     ap.add_argument("--stop-after", type=float, default=60, help="seconds after delivery before the session is closed")
     ap.add_argument("--offline-after", type=float, default=90, help="seconds without a helper check-in before it counts as offline")
     ap.add_argument("--tick", type=float, default=5)
@@ -26016,7 +26857,7 @@ def main():
     args = ap.parse_args()
     CFG.update(silence=args.silence, question_wait=args.question_wait, manager_silence=args.manager_silence,
                ask_wait=args.ask_wait, ask_max=args.ask_max, hook_wait=args.hook_wait, job_wait=args.job_wait,
-               request_wait=args.request_wait,
+               request_wait=args.request_wait, place_wait=args.place_wait,
                stop_after=args.stop_after, offline_after=args.offline_after, tick=args.tick)
     CFG["team_path"] = os.path.abspath(args.team)
     with open(args.team, encoding="utf-8") as f:

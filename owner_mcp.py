@@ -306,6 +306,8 @@ PAGES = {
     "responsibility": ("/ui/responsibilities/{id}", "one duty with its cases, newest first"),
     "goal": ("/ui/goals/{id}", "one goal with its recorded spending and its history"),
     "resources": ("/ui/resources", "the grantable pool: each resource, the owner's standing for it, who holds it"),
+    "targets": ("/ui/targets", "the owner's targets for keys: who holds each, whether its machine's vault reaches it, "
+                               "the authorized_keys line of each host and the newest placements"),
     "profiles": ("/ui/profiles", "every agent's profile at the hub revision"),
     "knowledge": ("/ui/knowledge", "one owner knowledge file with its text (give path)"),
     "people": ("/ui/people", "the people the owner added, their roles and handles, and the unknown senders"),
@@ -486,7 +488,7 @@ def with_revision(route, read, fields, what):
     return run
 
 
-GRANTS = {"repo": "/ui/team/repos", "tool": "/ui/team/tools", "secret": "/ui/secrets/grant",
+GRANTS = {"repo": "/ui/team/repos", "tool": "/ui/team/tools", "target": "/ui/team/targets", "secret": "/ui/secrets/grant",
           "drive": "/ui/team/google", "gmail": "/ui/team/google"}
 
 
@@ -514,11 +516,25 @@ def grant_access(args):
         names = {line["agent"]: "use" for line in held["lines"] if what in (line.get("tools") or [])}
         held_now = _one_moved_map(names, agent, level)
         return _team_command("/ui/team/tools", {"tool": what, "agents": sorted(held_now)}, what_for, args)
+    if kind == "target":
+        page = get("/ui/targets", "the targets").data or {}
+        found = next((t for t in page.get("targets") or [] if t.get("name") == what), None)
+        if found is None:
+            raise Refused(f"There is no target {what}. Read fleet_read(page=\"targets\") for the ones there are.")
+        held_now = _one_moved_map({n: "use" for n in found.get("holders") or []}, agent, level)
+        return _team_command("/ui/team/targets", {"target": what, "agents": sorted(held_now)}, what_for, args)
     access = {line["agent"]: (line.get("google") or {})[kind]["level"]
               for line in held["lines"]
               if ((line.get("google") or {}).get(kind) or {}).get("account") == what}
     return _one_moved(access, agent, level, "/ui/team/google", {"account": what, "service": kind}, "access",
                       what_for, args)
+
+
+def save_target(args):
+    """`POST /ui/targets/save`: one target of the owner's, or delete true to remove it, which also ends every hold of
+    it. No value: a target is a place on a server, its address and its pinned host key."""
+    body = {"name": args.get("name"), "target": None if args.get("delete") is True else args.get("target")}
+    return _team_command("/ui/targets/save", body, f"the target {args.get('name')}", args)
 
 
 def _one_moved_map(held_now, agent, level):
@@ -970,7 +986,8 @@ def tools():
         tool("grant_access", "Give one agent a resource the fleet already holds, or end that hold with level null: "
                              "repo:<owner/name> read|write|deploy (deploy also runs its workflows), "
                              "secret:bws://<uuid> use|read, drive:<email> "
-                             "read|write|write_shared, gmail:<email> read|write|send, tool:<name> use. The grant is "
+                             "read|write|write_shared, gmail:<email> read|write|send, tool:<name> use, "
+                             "target:<name> use (place_secret puts a key there). The grant is "
                              "the authorization: the agent then does what that access allows, and the hub records "
                              "who gave what to whom.",
              {"resource": S["text"], "agent": S["text"], "level": S["level"], **rid},
@@ -981,6 +998,25 @@ def tools():
              {"resource": S["text"], "max": {"type": ["string", "null"]},
               "to": {"type": "string", "enum": ["workers"]}, **rid},
              ("resource",), share_resource),
+        tool("save_target", "Define one target for keys, change it, or remove it with delete true: one variable "
+                            "of an env file (kind env, where = its absolute path) or one key of a Kubernetes Secret "
+                            "(kind k8s, where = NAMESPACE/SECRET, with k8s {api, ca, token} as paths on its host), on "
+                            "a host that the vault of machine reaches over SSH as user, with the host's own public "
+                            "key pinned in host_key. names limits the variables it takes, note tells the agents what "
+                            "restarts the application, then is a command the host runs after a change. An agent "
+                            "that holds target:<name> (grant_access) then puts a key there with place_secret, and "
+                            "never sees it. fleet_read(page=\"targets\") gives the one line each host's "
+                            "authorized_keys file needs.",
+             {"name": S["text"],
+              "target": {"type": "object", "description": "title, kind, where, machine, host, port, user, host_key, "
+                                                          "and optionally names, note, then and k8s. No value of a "
+                                                          "key is ever part of it."},
+              "delete": S["bool"], **rid}, ("name",), save_target),
+        tool("test_target", "Check one target end to end without writing: its machine's vault connects with its own "
+                            "key and the host says whether the place can be written. The outcome is in "
+                            "fleet_read(page=\"targets\"), under the target's placements.",
+             {"name": S["text"], **rid}, ("name",),
+             plain("/ui/targets/test", ("name",), "the test of this target")),
         tool("take_resource", "End one agent's hold of one resource, whoever gave it.",
              {"resource": S["text"], "agent": S["text"], **rid}, ("resource", "agent"),
              plain("/ui/resources/take", ("resource", "agent"), "the end of this hold")),

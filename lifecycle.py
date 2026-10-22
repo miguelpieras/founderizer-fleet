@@ -23,7 +23,7 @@ import time
 import urllib.parse
 
 REPORT_EVERY = 300          # seconds between status reports when nothing changes
-OWNER_ONLY = re.compile(r"(?:^|/)(?:test_[^/]*|onboard|ui_fixture|selftest|verify|pilot|vault)\.py$")  # never loaded here
+OWNER_ONLY = re.compile(r"(?:^|/)(?:test_[^/]*|onboard|ui_fixture|selftest|verify|pilot|vault|place)\.py$")  # never loaded here
 TICK = 15                   # seconds between idle checks
 RESTART_GRACE = 120         # seconds this process may live on after it asked for its own restart
 CONFIG_BRANCH = "config"    # the configuration ref that the fleet runs: the hub writes it, the code branch waits
@@ -36,7 +36,8 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "app_server_tasks",     # helper abilities that the hub may use; app_server_tasks: app_server_task below
             "manager_switch",       # the manager's helper closes its previous runtime's session after a switch
             "mcp_program",          # it resolves a command MCP server's program for POST /ui/mcp/check
-            "secret_deposits"]      # it carries a sealed copy of the owner's into this machine's vault (deposit)
+            "secret_deposits",      # it carries a sealed copy of the owner's into this machine's vault (deposit)
+            "secret_places"]        # its vault writes a stored key into a target of the owner's (place)
 # ---------------------------------------------------------------- the runtimes
 #
 # What the fleet knows about a runtime is here, in one entry for each provider, and nowhere else. hub.py, fleet.py and
