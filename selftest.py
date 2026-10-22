@@ -401,18 +401,26 @@ check("a worker's own start text names the other agents and the tool that reache
       "YOUR TEAM" in opening and "message_agent" in opening and "pa [lead" in opening, opening[:800])
 check("a start text has RULES.md read only by a session that does not hold it yet",
       "only if your context does not hold it yet" in opening, opening[:300])
-# A quiet message (a release notice): never typed for, so it wakes nobody; it comes with the next read. The hub has
-# no route that writes one on demand, so this check writes the row the way emit() does.
+# A quiet message (a release notice): never typed for, so it wakes nobody; it comes with the next read. One that waits
+# for a decision (LATER_SAY) is typed for once it has waited its hour unread. The hub has no route that writes one on
+# demand, so this check writes the rows the way emit() does.
 import sqlite3
 with sqlite3.connect(os.path.join(TMP, "moment.db"), timeout=10) as db:
-    db.execute("INSERT INTO events(agent,kind,task,text,created,extra) VALUES(?,?,?,?,?,?)",
-               ("manager", "say", None, "[hub] This fleet took release 9.9.9.", time.time(), json.dumps({"quiet": True})))
+    for said, created, extra in (("[hub] This fleet took release 9.9.9.", time.time(), {"quiet": True}),
+                                 ("[hub] Duty sweep. The hour is up.", time.time() - 3610,
+                                  {"quiet": True, "wake_after": 3600}),
+                                 ("[hub] Duty sweep. Just now.", time.time(), {"quiet": True, "wake_after": 3600})):
+        db.execute("INSERT INTO events(agent,kind,task,text,created,extra) VALUES(?,?,?,?,?,?)",
+                   ("manager", "say", None, said, created, json.dumps(extra)))
 db.close()
 delivered = json.loads(raw("GET", "/events/manager?delivery=1&after=0&wait=0", base=hubL)[2])["events"]
 check("a quiet message is not delivered for a signal", not any("9.9.9" in e["text"] for e in delivered), str(delivered))
+check("a quiet message that waits for a decision is delivered for a signal after its hour and not before",
+      any("The hour is up" in e["text"] for e in delivered) and not any("Just now" in e["text"] for e in delivered),
+      str(delivered))
 text, err = tool("manager", "read_messages", base=hubL)
 check("a quiet message comes with the next read, and the hub's own words carry no owner-chat guidance",
-      not err and "9.9.9" in text and "Owner-chat guidance" not in text, text[:300])
+      not err and "9.9.9" in text and "Just now" in text and "Owner-chat guidance" not in text, text[:300])
 raw("POST", "/say", form={"text": "Morning"}, base=hubL)
 text, err = tool("manager", "read_messages", base=hubL)
 check("the owner's own words come with the owner-chat guidance", not err and "[owner] Morning" in text
