@@ -1465,14 +1465,24 @@ def t_read_messages(agent, a):
             kv_set("mgr_screen", None)
         if not rows:
             return "No unread messages. Wait for the next signal."
-        messages = "\n\n".join(f"Message M-{r['id']}:\n{r['text']}" for r in rows)
+        # A task's start event is the text that its session began with, as its first prompt or its appended system
+        # prompt (fleet.session_command), so its first read gave the same thousands of characters a second time.
+        messages = "\n\n".join(f"Message M-{r['id']}:\n" + (START_READ if r["kind"] == "task" else r["text"])
+                               for r in rows)
         if agents()[agent].get("role") == "manager":
             # The first line names the messages: after a switch the helper finds them there in the previous session's
-            # conversation file (fleet.read_ids), where no message text can stand in for that line.
+            # conversation file (fleet.read_ids), where no message text can stand in for that line. The guidance is
+            # about the owner's own words, so it comes with them and not with every read.
             messages = ("Unread messages: " + ", ".join(f"M-{r['id']}" for r in rows) + ".\n\n"
-                        "Owner-chat guidance: answer greetings and casual questions naturally with tell_owner. "
-                        "Do not turn a greeting into tasks or list tests, task inventories or pilot history unless asked.\n\n" + messages)
+                        + (OWNER_CHAT_GUIDANCE if any(r["text"].startswith("[owner") for r in rows) else "")
+                        + messages)
         return messages
+
+
+START_READ = ("The start of this task attempt: the text that this session began with, so it is not repeated here. "
+              "list_my_tasks gives the task again.")
+OWNER_CHAT_GUIDANCE = ("Owner-chat guidance: answer greetings and casual questions naturally with tell_owner. Do not "
+                       "turn a greeting into tasks or list tests, task inventories or pilot history unless asked.\n\n")
 
 
 # ---------------------------------------------------------------- what an agent holds, and what it has left
@@ -1688,7 +1698,8 @@ RULE_FOUR = (" Never contact the owner: if you are blocked, use ask_my_requester
 
 def start_text(agent, task_id, resume=False):
     head = (f'You are agent "{agent}" in Founderizer. Read RULES.md and '
-            f'profiles/{agent}.md in this folder first. Your helper brought this folder up to date just before this '
+            f'profiles/{agent}.md in this folder first, but RULES.md only if your context does not hold it yet: '
+            f'Claude Code loads it through CLAUDE.md. Your helper brought this folder up to date just before this '
             f'session; do not pull at the start. Call read_messages with task_id \"{tref(task_id)}\" now and whenever signalled. '
             # What the fleet's own record says this agent holds, who else is on the fleet and what each of them
             # holds, and what is left of its allowance: the facts that change its first action, so they are here
@@ -15827,7 +15838,8 @@ def tick():
             traceback.print_exc()           # a broken trigger must not stop the reminders and manager checks below
         # the one exception: the hub tells the owner itself when the manager is gone
         kind, flag = None, None
-        pending = q1("SELECT MIN(created) ts FROM events WHERE agent=? AND kind='say' AND read_at IS NULL", (mgr,))["ts"]
+        pending = q1("SELECT MIN(created) ts FROM events WHERE agent=? AND kind='say' AND read_at IS NULL "
+                     "AND NOT COALESCE(json_extract(extra, '$.quiet'), 0)", (mgr,))["ts"]     # a quiet one wakes nobody
         if pending and t0 - max(float(pending), limit_ended(mgr), switch_ended(mgr)) > CFG["manager_silence"]:
             kind = "silent"
             flag = (f"The manager has not acted on a message for {span(t0 - float(pending))}. "
@@ -20447,11 +20459,47 @@ def finish_release(rid, state, step, says, automatic, result=None):
     # Every machine, the hub's own included: its agent's helper fast-forwards its own checkout and restarts its own
     # user service, exactly as a worker's does (request_update). The hub process is the line below.
     asked = [name for name in agents() if request_update(name, row["reached"]) == "requested"]
+    # A quiet message ("quiet" in its extra): the delivery to the helper leaves it out, so nothing is typed for it and
+    # it comes with the manager's next read. It woke the manager at every release, ten a day, to read RULES.md and its
+    # profile again: each one a turn of the standing session and some 17,000 tokens that stayed in its context, while
+    # no release changes a profile and most change no rule. So it names the sections of RULES.md that changed.
     emit(manager_name(), "say", f"[hub] This fleet took release {row['version']} ({row['reached'][:12]}). "
-         f"Read RULES.md and your profile again when your next session starts."
-         + (f" {len(asked)} machine(s) update when they are idle." if asked else ""))
+         + rules_news(row["pinned"], row["reached"])
+         + (f" {len(asked)} machine(s) update when they are idle." if asked else ""), extra={"quiet": True})
     restart_hub_soon(row["pinned"], row["reached"])
     return row
+
+
+def rules_sections(text):
+    """[(heading, first line, last line, body)] of the "## " sections of RULES.md, lines counted from 1. The text
+    before the first heading is the section "" (its opening)."""
+    out, lines = [], text.split("\n")
+    for number, line in enumerate(lines, 1):
+        if line.startswith("## ") or number == 1:
+            out.append([line[3:].strip() if line.startswith("## ") else "", number, number, []])
+        out[-1][2] = number
+        out[-1][3].append(line)
+    return [(head, first, last, "\n".join(body).strip()) for head, first, last, body in out]
+
+
+def rules_news(old, new):
+    """One sentence for the manager: which sections of RULES.md changed from revision `old` to `new`, and their
+    lines now, so that it reads those and not the whole file. A revision that cannot be read says so."""
+    texts = []
+    for rev in (old, new):
+        code, out, _ = git_kit("show", f"{rev}:RULES.md") if rev else (1, "", "")
+        if code != 0:
+            return ("RULES.md may have changed: read it again before you act on a rule you hold from memory. "
+                    "No release changes a profile.")
+        texts.append(rules_sections(out))
+    before = {head: body for head, _, _, body in texts[0]}
+    changed = [(head or "the opening", first, last) for head, first, last, body in texts[1] if before.get(head) != body]
+    gone = [head or "the opening" for head in before if head not in {h for h, *_ in texts[1]}]
+    if not changed and not gone:
+        return "RULES.md did not change, and no release changes a profile: there is nothing to read again."
+    return ("RULES.md changed in " + ", ".join(f'"{head}" (lines {first}-{last})' for head, first, last in changed)
+            + (("; " if changed else "") + "it no longer has " + ", ".join(f'"{h}"' for h in gone) if gone else "")
+            + ". Read those lines again; the rest of RULES.md is as it was, and no release changes a profile.")
 
 
 def restart_hub_soon(pinned, reached, always=False):
@@ -23970,6 +24018,8 @@ class Handler(BaseHTTPRequestHandler):
                         continue        # no window now: the message waits in the hub until this agent can answer
                     if held and r["kind"] == "say":
                         continue        # held until the manager's new session runs; the read receipt stays open
+                    if r["kind"] == "say" and extra.get("quiet"):
+                        continue        # a quiet message comes with the agent's next read; nothing is typed for it
                     if worker and r["kind"] in ("task", "say") and t and active_hold(t["id"]):
                         continue        # nothing is typed into a held session
                     if pending and (r["kind"] == "task" or (r["kind"] == "chat" and not chat_open)):

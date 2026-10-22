@@ -399,6 +399,24 @@ check("a session is told the tools its Google levels give, by name and not by th
 # start text -- the one text read at the moment a worker needs a colleague.
 check("a worker's own start text names the other agents and the tool that reaches them",
       "YOUR TEAM" in opening and "message_agent" in opening and "pa [lead" in opening, opening[:800])
+check("a start text has RULES.md read only by a session that does not hold it yet",
+      "only if your context does not hold it yet" in opening, opening[:300])
+# A quiet message (a release notice): never typed for, so it wakes nobody; it comes with the next read. The hub has
+# no route that writes one on demand, so this check writes the row the way emit() does.
+import sqlite3
+with sqlite3.connect(os.path.join(TMP, "moment.db"), timeout=10) as db:
+    db.execute("INSERT INTO events(agent,kind,task,text,created,extra) VALUES(?,?,?,?,?,?)",
+               ("manager", "say", None, "[hub] This fleet took release 9.9.9.", time.time(), json.dumps({"quiet": True})))
+db.close()
+delivered = json.loads(raw("GET", "/events/manager?delivery=1&after=0&wait=0", base=hubL)[2])["events"]
+check("a quiet message is not delivered for a signal", not any("9.9.9" in e["text"] for e in delivered), str(delivered))
+text, err = tool("manager", "read_messages", base=hubL)
+check("a quiet message comes with the next read, and the hub's own words carry no owner-chat guidance",
+      not err and "9.9.9" in text and "Owner-chat guidance" not in text, text[:300])
+raw("POST", "/say", form={"text": "Morning"}, base=hubL)
+text, err = tool("manager", "read_messages", base=hubL)
+check("the owner's own words come with the owner-chat guidance", not err and "[owner] Morning" in text
+      and "Owner-chat guidance" in text, text[:300])
 procL.terminate()
 
 # The universe this check reads: the tool tables as the source has them. Tied to the three tool lists above, so a
@@ -452,6 +470,8 @@ pending = lambda: json.loads(raw("GET", "/events/studio?delivery=1&after=999999&
 check("a sent task stays pending without a read receipt", any(e["task"] == "T-1" for e in pending()))
 text, err = tool("studio", "read_messages", task_id="T-1")
 check("agent read returns the message and removes it from delivery", not err and "Message M-" in text and not pending())
+check("the read names the start of the attempt instead of giving its text a second time",
+      "list_my_tasks gives the task again" in text and "You are agent" not in text, text[:300])
 records = json.loads(raw("GET", "/records")[2])
 msg = {"jsonrpc":"2.0","id":900,"method":"tools/call","params":{"name":"report_progress","arguments":{"task_id":"T-1","note":"stale"}}}
 resp = json.loads(raw("POST", f"/mcp/studio/{records['db']}/T-1/0", msg)[2])["result"]
