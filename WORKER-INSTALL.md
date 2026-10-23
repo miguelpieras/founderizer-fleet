@@ -256,6 +256,19 @@ handover key are never read, and the handover key is never remade — a new one 
 leave every value the store holds unreadable and turn every agent's access into
 `vault_store_mismatch`.
 
+**What root's own clone proves, and what it does not.** It proves that nobody
+below root on that machine wrote those bytes. It does not prove they are the
+bytes the owner meant: whoever can push the configuration ref can put a program
+there, and this one runs as the vault's own user, which holds the store key. The
+agents' code already comes from that ref, so the ref could always run code as
+every agent — but never as the vault user, and that is the step this adds. What
+closes it is a signature over the released revision, verified on the machine
+before the blob becomes the program, with the public half pinned root-owned at
+install. `release-key.pub` already carries the release key and its private half
+is on the website host and never on a hub, so the key exists; what is missing is
+a signature this program can check with a stock tool. Until then the trust in
+this command is the trust in that ref.
+
 Each machine does this within ten minutes of taking a release, so after a release
 that changed `vault.py` the owner runs nothing.
 

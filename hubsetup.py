@@ -358,11 +358,21 @@ def vault_program_script(repo, branch=lifecycle.CONFIG_BRANCH):
     **What the service user gains, exactly.** It can ask root to replace the broker's program with the `vault.py`
     on the fleet's configuration ref and restart the broker. It cannot name the file, the source, the destination,
     the revision or the service, and it passes no bytes: the bytes are fetched here, as root, from the address this
-    machine already takes all of its code from, into a bare repository that only root can write. So this adds no
-    trust -- the fleet's code reaches this machine from that ref either way -- and it removes the hop the pasted
-    command had through a checkout a user can write. Nothing else of the broker is touched: its user, its store,
-    its store key and its handover key are never read here, and the handover key is never remade, because a new one
-    would turn every agent's access into `vault_store_mismatch`.
+    machine already takes all of its code from, into a bare repository that only root can write. So it removes the
+    hop the pasted command had through a checkout a user can write -- that command read `vault.py` out of an
+    agent's own checkout. Nothing else of the broker is touched: its user, its store, its store key and its
+    handover key are never read here, and the handover key is never remade, because a new one would turn every
+    agent's access into `vault_store_mismatch`.
+
+    **What root's own clone proves, and what it does not.** It proves that nobody below root on this machine wrote
+    those bytes. It does not prove they are the bytes the owner meant: whoever can push the configuration ref can
+    put a program here, and this one runs as the vault's own user, which holds the store key. The agents' code
+    already comes from that ref, so the ref could always run code as every agent -- but never as the vault user,
+    and that is the step this adds. What closes it is a signature over the released revision, verified here before
+    the blob becomes the program, with the public half pinned root-owned at install; `release-key.pub` already
+    carries the release key and its private half is on the website host and never on a hub, so the key exists and
+    what is missing is a signature this program can check with a stock tool. Until then the trust in this command
+    is the trust in that ref, which is the honest way to read it.
 
     Nothing is fetched into a working tree and nothing of the fetched repository is ever run: the program is read
     out of the fetch with `git cat-file`, so no hook, filter or submodule of it executes as root.
