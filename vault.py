@@ -64,6 +64,19 @@ configuration, Bitwarden settings and programs, because an agent can change ever
 Protocol 2: one JSON line in, one JSON line out, on a Unix socket. See UI-API.md, "Vault isolation (V3)".
 Standard library only; Python 3.9+.
 """
+# This is the one Fleet file that a release never delivers. The broker runs a root-owned copy at
+# /usr/local/lib/fleet-vault/vault.py, outside every checkout a helper updates, and `lifecycle.OWNER_ONLY` lists
+# this file among the ones a helper never loads -- so a commit that changes only this file advances the revision
+# every machine reports and reaches no broker. Each machine brings its own copy across instead: its server service
+# compares the installed program with the vault.py of its checkout and, where they differ, runs the one root
+# command the installers put there, /usr/local/sbin/fleet-vault-program (server.Service.vault_program,
+# hubsetup.vault_program_script). A broker that does not come up on a new program gets back the one that was
+# serving, and a broker still behind ten minutes later is what the hub's `vault_behind` warning is for.
+#
+# So **changing this file is the only thing that exercises that path**, and on 23 October 2026 it had never run:
+# over the whole retained journal of both Linux hosts, `journalctl _UID=$(id -u fleet)` held no line "brought this
+# machine's vault broker onto", and eight of "could not bring" -- the command was missing until that morning, and
+# the brokers were then caught up by hand. This comment is the change that tests it for the first time.
 import argparse
 import base64
 import codecs
