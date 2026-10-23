@@ -2636,6 +2636,7 @@ class Helper:
         self.fresh_at, self.manager_due, self.manager_fresh = time.monotonic(), True, True
         self.say(f"manager: {why}, so its session starts again on a new conversation with the hub's brief")
         return True
+
     def account_changed(self):
         """**A sign-in is an account change, and the app says so only from a reading.** The address on the owner's
         machine card is the account of this machine's own last usage reading, and the collector takes one every
