@@ -3328,7 +3328,7 @@ def t_ask_my_requester(agent, a):
         # on with, and the answer -- if one comes -- arrives as a message, the path t_answer already has for an
         # asker whose call has ended.
         with LOCK:
-            fence(agent, tid)
+            open_under_lock(agent, tid)
             qid = ins("INSERT INTO questions(task,asker,requester,text,asked,waiting,assumed) VALUES(?,?,?,?,?,0,?)",
                       (tid, agent, t["requester"], question, now(), assumed))
             activity(tid, "ask_my_requester")
@@ -3342,7 +3342,7 @@ def t_ask_my_requester(agent, a):
                 f"what you already did on this reading before you continue (rule 9). Never a default for access, "
                 f"money or anything that leaves the building: for those, ask without one and wait.")
     with LOCK:
-        fence(agent, tid)
+        open_under_lock(agent, tid)
         qid = ins("INSERT INTO questions(task,asker,requester,text,asked,waiting,access,access_level) "
                   "VALUES(?,?,?,?,?,1,?,?)", (tid, agent, t["requester"], question, now(), rid, want))
         q("UPDATE tasks SET state='input-required', waiting_on=? WHERE id=?", (f"Q-{qid}", tid))
@@ -3358,18 +3358,36 @@ def t_ask_my_requester(agent, a):
             break
         time.sleep(0.5)
     with LOCK:
-        fence(agent, tid)
-        row = q1("SELECT answer FROM questions WHERE id=?", (qid,))
+        # First, whatever the fence says: this call waits no more, so an answer from now on goes as a message. A fence
+        # that refused here (a new session replaced this one meanwhile) left waiting at 1, and the answer reached
+        # nobody: answer() sends no message to an asker it thinks is still inside its call.
         q("UPDATE questions SET waiting=0 WHERE id=?", (qid,))
+        ended = fence(agent, tid)["state"]
+        row = q1("SELECT answer FROM questions WHERE id=?", (qid,))
         if row["answer"] is not None:
             return f"Answer from {t['requester']}: {row['answer']}"
         if active_hold(tid):
             return f"STOP: {tref(tid)} is {held_word(active_hold(tid))}. Stop working on it now and wait."
+        if ended in TERMINAL:       # canceled while this call waited: the cancel's own message reaches no session
+            return f"STOP: {tref(tid)} is {ended}. Stop working on it now."
     return (f"No answer yet (waited {wait}s). Question Q-{qid} is with {t['requester']} and {tref(tid)} is paused. " +
             (f"It names {resource_phrase(*resource_parts(rid))} ({rid})" + (f" at {want}" if want else "") +
              f" as the access that you need; your requester reads who holds it and whether it may give it. "
              if rid else "") +
             f"Stop working on {tref(tid)} now. The answer will arrive as a message in this session.")
+
+
+def open_under_lock(agent, tid):
+    """fence, and the task still open, both under the lock that the write after it holds.
+
+    ask_my_requester reads its task before it takes the lock, because it waits for the answer without one. A cancel
+    that landed between that read and the lock used to be overwritten: the question set the canceled task back to
+    input-required, so its session was never closed, its question was chased, and an answer set it working again
+    and had liveness start a new session of a task its requester had ended."""
+    t = fence(agent, tid)
+    if t["state"] in TERMINAL:
+        raise ToolError(f"{tref(tid)} is already {t['state']}.")
+    return t
 
 
 def work_was_hard(t):
@@ -3454,10 +3472,12 @@ def t_deliver_result(agent, a):
         said = (f" You recorded nothing learned and {hard}. If something would have saved that, say it in learned "
                 f"when you next deliver; if you found a wall instead, say that in tried, with what it cost.")
     duty_after_deliver(t, agent, outcome)       # owner API 1.13: a case whose steps are all recorded closes itself
+    left = case_left_open(case_id=t["duty_case"]) if t["duty_case"] else None
+    left = case_left_open_text(left) + " " if left else ""
     emit(t["requester"], "say",
          f"[hub] Result for {tref(tid)} ({t['title']}) from {agent}: {outcome}. Done: {what.rstrip('.')}. "
          f"Output: {(where or '-').rstrip('.')}. Checked: {(how or '-').rstrip('.')}. "
-         + went_on_with(tid) + step_stands_text(t["step"]) +
+         + went_on_with(tid) + step_stands_text(t["step"]) + left +
          f"-- Check it, then call check_result(task_id=\"{tref(tid)}\", accepted=true or false).", task=tid)
     return f"Delivered. {tref(tid)} is {outcome}.{said} You are done with it: stop now."
 
@@ -3604,7 +3624,7 @@ def lead_overview(agent, parent):
     if waiting:
         out += ["", "REPORTS WAITING FOR YOUR DECISION"] + [report_line(r) for r in waiting[:LEAD_LOOK_ROWS]] + \
                ["  Decide each with decide_report: " + "; ".join(REPORT_DECISIONS) + "."]
-    ids = [t["id"] for t in rows] or [0]
+    ids = [t["id"] for t in rows if t["state"] not in TERMINAL] or [0]
     marks = ",".join("?" * len(ids))
     out += ["", "OPEN QUESTIONS"] + [f"  Q-{r['id']} from {r['asker']} on {tref(r['task'])}: {r['text']}" +
                                      (f" NOT WAITING: it goes on with \"{r['assumed']}\". Answer only if that is "
@@ -3681,12 +3701,27 @@ def check_task(agent, a):
     if len(why) > 300:
         raise ToolError("why is at most 300 characters.")
     guard(agent, title, done_when, details, goal, why)
-    case_id = a.get("case_id")
-    if case_id and not q1("SELECT id FROM cases WHERE id=?", (case_id,)):
-        raise ToolError("Unknown case_id. Use the case named by the owner.")
+    case_id, duty_case = a.get("case_id"), None
+    if case_id and CASE_REF.match(str(case_id)):
+        # A duty's case: the manager gives a case's work to the agent that suits it and keeps the case (RULES.md),
+        # and this field's description says so. The check knew only the pilot's practice cases, so R-1/C-3 was
+        # refused as unknown, and a case's work went out as a plain task that no result of it could close.
+        duty_case = case_ref(case_id)
+        r = duty_row(duty_case["responsibility"])
+        if not r or not duty_read_allowed(agent, r):
+            raise ToolError(f"{cref(duty_case)} is not a case of a duty you may read.")
+        if duty_case["state"] != "open":
+            raise ToolError(f"{cref(duty_case)} is closed ({duty_case['outcome']}). A new event is a new case.")
+        details = ((details + "\n\n") if details else "") + duty_case_line(r, duty_case["id"], bool(
+            duty_case["repeated"])) + (" Record what you do in it with record_step: your completed result closes it "
+                                       "unless another task of it is still open.")
+        case_id = None
+    elif case_id and not q1("SELECT id FROM cases WHERE id=?", (case_id,)):
+        raise ToolError("Unknown case_id. Give a duty's case as R-<id>/C-<id>, or the practice case the owner named.")
     return {"owner": owner, "title": title, "details": details, "done_when": done_when, "needs": needs, "goal": goal,
             "goal_id": goal_id, "parent": parent, "step": step, "follows": follows, "case_id": case_id,
-            "why": why or None}
+            "duty_case": duty_case["id"] if duty_case else None,
+            "responsibility": duty_case["responsibility"] if duty_case else None, "why": why or None}
 
 
 def split_step(agent, value, goal_id, parent):
@@ -3724,11 +3759,11 @@ def admit_task(requester, f, trigger_id=None, trigger_run=None):
     generation = DB.execute("SELECT v FROM kv WHERE k='db_id'").fetchone()
     t0 = now()
     tid = DB.execute("INSERT INTO tasks(title,details,done_when,needs,goal,goal_id,parent,step,owner,requester,state,"
-                     "follows,created,last_activity,case_id,trigger_id,trigger_run,why) "
-                     "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                     "follows,created,last_activity,case_id,trigger_id,trigger_run,why,responsibility,duty_case) "
+                     "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                      (f["title"], f["details"], f["done_when"], f["needs"], f["goal"], f["goal_id"], f["parent"],
                       f.get("step"), f["owner"], requester, "submitted", f["follows"], t0, t0, f["case_id"],
-                      trigger_id, trigger_run, f.get("why"))).lastrowid
+                      trigger_id, trigger_run, f.get("why"), f.get("responsibility"), f.get("duty_case"))).lastrowid
     DB.execute("INSERT INTO attempts(task,attempt,created,reason) VALUES(?,1,?,'created')", (tid, t0))
     DB.execute("INSERT INTO events(agent,kind,task,text,created,extra) VALUES(?,?,?,?,?,?)",     # emit's row
                (f["owner"], "task", tid,
@@ -3760,6 +3795,8 @@ def t_create_task(agent, a):
                      "with create_task step=<n>. see_capacity says who suits it and which accounts have allowance "
                      "left. Never place a part on an agent that does not suit it because it is free.")
     said = f"Created {tref(tid)} for {owner}."
+    if f.get("duty_case"):
+        said += f" It is work of {cref(case_row(f['duty_case']))}: its completed result closes the case."
     if f.get("step") is not None:
         s = q1("SELECT goal, n FROM goal_steps WHERE id=?", (f["step"],))
         others = [r for r in step_parts(f["step"]) if r["id"] != tid]
@@ -3783,7 +3820,8 @@ def t_cancel_task(agent, a):
       (f"Canceled: {reason}", now(), tid))
     emit(t["owner"], "say", f"[hub] {tref(tid)} was canceled by your requester: {reason}. Stop working on it now.", task=tid)
     cancel_subtasks(tid, reason)
-    return f"{tref(tid)} is canceled."
+    left = case_left_open(case_id=t["duty_case"]) if t["duty_case"] else None
+    return f"{tref(tid)} is canceled." + (" " + case_left_open_text(left) if left else "")
 
 
 def end_holds(task_id):
@@ -3844,6 +3882,8 @@ def t_answer(agent, a):
                  (f"You went on with: {qu['assumed']} If this answer says otherwise, check what you already did on "
                   f"that reading before you continue (rule 9)." if qu["assumed"] else "Continue the task."),
                  task=qu["task"])
+    if t and t["state"] in TERMINAL:
+        return f"Answered Q-{qid}. {tref(t['id'])} is already {t['state']}, so no session of it reads this answer."
     if qu["assumed"]:
         return (f"Answered Q-{qid}. {qu['asker']} did not wait for you: it went on with \"{qu['assumed']}\", so your "
                 f"answer may be correcting work already done. It reads the answer in the session of "
@@ -10978,6 +11018,30 @@ def duty_after_deliver(t, agent, outcome):
     duty_close(c, "handled", agent, f"Closed with the result of {tref(t['id'])}.")
 
 
+CASE_LEFT_OPEN = ("SELECT c.*, (SELECT id FROM tasks WHERE duty_case=c.id ORDER BY id DESC LIMIT 1) last_task "
+                  "FROM duty_cases c WHERE c.state='open' AND EXISTS (SELECT 1 FROM tasks WHERE duty_case=c.id) "
+                  f"AND NOT EXISTS (SELECT 1 FROM tasks WHERE duty_case=c.id AND {OPEN_TASK})")
+
+
+def case_left_open(duty_id=None, case_id=None):
+    """The oldest open case of this duty (or this one case) that had work and has none any more: every task of it
+    ended, and none closed it. Only a completed result closes a case by itself (duty_after_deliver), so a failed,
+    rejected or canceled one leaves it open -- and one key has at most one open case, so its watch then starts
+    nothing for that key: the duty stops reacting to the very event it exists for. A case that never had a task is
+    the manager working its own duty in its session, and is not this."""
+    if case_id is None and duty_id is None:
+        return None
+    return q1(CASE_LEFT_OPEN + (" AND c.id=?" if case_id is not None else " AND c.responsibility=?")
+              + " ORDER BY c.id LIMIT 1", (case_id if case_id is not None else duty_id,))
+
+
+def case_left_open_text(c):
+    """What a case that its work left open costs, and the two ways out, for whoever can close it."""
+    return (f"{cref(c)} is still open and no task works it, so its watch starts nothing for the key '{c['key']}' "
+            f"until the case is closed: close it with close_case once you know what came of it, or give its work "
+            f"again with create_task case_id=\"{cref(c)}\".")
+
+
 def duty_marker(r, t0):
     """Why a duty is not in order, the first reason that applies, or (None, None). The sweep writes it: no AI turn."""
     if r["state"] != "active":
@@ -10989,6 +11053,11 @@ def duty_marker(r, t0):
                                     f"{t['paused_reason'] or 'no reason given'}.")
     if not live:
         return "no_watch", "This duty has no watch, so no event reaches its agent."
+    left = case_left_open(r["id"])
+    if left:
+        last = q1("SELECT state FROM tasks WHERE id=?", (left["last_task"],))
+        return "case_left_open", (f"Its last task {tref(left['last_task'])} ended {last['state']}. "
+                                  + case_left_open_text(left))
     repeat = q1("SELECT * FROM duty_cases WHERE responsibility=? AND repeated=1 AND opened>? ORDER BY id DESC LIMIT 1",
                 (r["id"], t0 - DUTY_REPEAT_DAYS * 86400))
     if repeat:
@@ -13149,6 +13218,28 @@ def open_reports(to_agent=None, kinds=True):
     return q(f"SELECT * FROM reports WHERE {where} ORDER BY id", tuple(args))
 
 
+def report_for_manager(r):
+    """True when a report sent to a lead can no longer be decided by that lead, so that the manager decides it.
+
+    A lead decides its subtasks' reports in the session of their parent task, and in no other (decide_report). Once
+    that task has ended -- the lead delivered it, or its requester canceled it -- no such session will come, and an
+    agent that is no longer a lead holds no decide_report at all. Such a report used to wait for ever: the manager
+    was refused it as another agent's, the lead was refused it in its next task, and the owner's screen asked him to
+    have it decided. The manager is the authority over the whole fleet, so it is the one left to decide it."""
+    if r["to_agent"] == manager_name():
+        return False
+    if role_of(r["to_agent"]) != "lead":
+        return True
+    sub = q1("SELECT parent FROM tasks WHERE id=?", (r["from_task"],)) if r["from_task"] else None
+    parent = q1("SELECT state FROM tasks WHERE id=?", (sub["parent"],)) if sub and sub["parent"] else None
+    return parent is None or parent["state"] in TERMINAL
+
+
+def managers_reports():
+    """The open reports that the manager decides: its own, and the ones their lead can no longer decide."""
+    return [r for r in open_reports() if r["to_agent"] == manager_name() or report_for_manager(r)]
+
+
 def report_feedback(agent):
     """The decisions on this agent's own reports, for the tail of its next task start. This is the only thing that
     stops an agent filing noise: a report judged wrong comes back to the one who wrote it. It is a read and writes
@@ -13239,7 +13330,7 @@ def t_decide_report(agent, a):
     r = q1("SELECT * FROM reports WHERE id=?", (rid,))
     if not r:
         raise ToolError(f"There is no report {upref(rid)}.")
-    if r["to_agent"] != agent:
+    if r["to_agent"] != agent and not (agent == manager_name() and report_for_manager(r)):
         raise ToolError(f"{upref(rid)} was reported to {r['to_agent']}, not to you.")
     if r["collapsed_into"]:
         raise ToolError(f"{upref(rid)} says the same as {upref(r['collapsed_into'])}. Decide that one: this one takes "
@@ -13289,9 +13380,10 @@ def report_sweep(t0):
     rows = [r for r in open_reports(kinds=False) if t0 - r["created"] > REPORT_GRACE]
     if not sweep_news("report_sweep_sig", [str(r["id"]) for r in rows]):
         return
-    mine = [r for r in rows if r["to_agent"] == manager_name()]
-    theirs = [r for r in rows if r["to_agent"] != manager_name()]
-    lines = [report_line(r) for r in mine[:REPORT_SHOWN]]
+    mine = [r for r in rows if r["to_agent"] == manager_name() or report_for_manager(r)]
+    theirs = [r for r in rows if r["to_agent"] != manager_name() and not report_for_manager(r)]
+    lines = [report_line(r) + (f" -- sent to {r['to_agent']}, which can no longer decide it, so it is yours"
+                               if r["to_agent"] != manager_name() else "") for r in mine[:REPORT_SHOWN]]
     lines += [f"  {upref(r['id'])} waits with {r['to_agent']} ({clip(r['text'], 120)})" for r in theirs[:REPORT_SHOWN]]
     emit(manager_name(), "say", f"[hub] {len(rows)} report(s) wait for a decision:\n" + "\n".join(lines) +
          "\nDecide each of yours with decide_report: " + "; ".join(REPORT_DECISIONS) +
@@ -13826,18 +13918,24 @@ def resume_lines(t0):
             out.append(f"  and {len(tasks) - RESUME_ROWS * 2} more: see_team.")
     else:
         out.append("No task is open.")
-    waiting = q("SELECT * FROM tasks WHERE state IN ('completed','failed','rejected') AND accepted IS NULL ORDER BY id")
+    # Only what this session can act on. These two read every agent's work, so a lead's unchecked subtask and a
+    # question asked of a lead stood here as the manager's to do, check_result and answer refused both as another
+    # agent's, and a question whose task had ended -- or that its asker went on from with a default -- stood here
+    # for ever, with "answer." after it.
+    waiting = q("SELECT * FROM tasks WHERE state IN ('completed','failed','rejected') AND accepted IS NULL "
+                "AND COALESCE(requester, ?)=? ORDER BY id", (manager_name(), manager_name()))
     if waiting:
         out.append("Results waiting for your check: " + ", ".join(f"{tref(t['id'])} ({t['owner']}, {t['state']})"
                                                                   for t in waiting[:RESUME_ROWS * 2])
                    + (f" and {len(waiting) - RESUME_ROWS * 2} more" if len(waiting) > RESUME_ROWS * 2 else "")
                    + ". check_result.")
-    asks = q("SELECT * FROM questions WHERE answer IS NULL ORDER BY id")
+    asks = q(f"SELECT * FROM questions WHERE answer IS NULL AND assumed IS NULL AND COALESCE(requester, ?)=? "
+             f"AND task IN (SELECT id FROM tasks WHERE {OPEN_TASK}) ORDER BY id", (manager_name(), manager_name()))
     if asks:
         out.append("Open questions: " + "; ".join(f"Q-{r['id']} from {r['asker']}: {clip(r['text'], 90)}"
                                                   for r in asks[:RESUME_ROWS])
                    + (f"; and {len(asks) - RESUME_ROWS} more" if len(asks) > RESUME_ROWS else "") + ". answer.")
-    reports = open_reports(manager_name())
+    reports = managers_reports()
     if reports:
         out.append(f"Reports waiting for your decision ({len(reports)}):")
         out += [report_line(r) for r in reports[:RESUME_ROWS]]
@@ -14112,8 +14210,10 @@ TOOLS = [
         "goal": {"type": "string", "description": "G-<id> of the goal this task belongs to. Write the goal down "
                                                   "with update_goal first: any other text is a plain label, and "
                                                   "the task's session is then told nothing about the goal"},
-        "case_id": {"type": "string", "description": "The duty case this task is work of, when the owner or a "
-                                                     "duty names one. Use that exact value on every task of it"},
+        "case_id": {"type": "string", "description": "The duty case this task is work of, as R-<id>/C-<id>: an "
+                                                     "open case of a duty you may read, whose work you give to this "
+                                                     "agent. Use that exact value on every task of it; a completed "
+                                                     "result closes the case"},
         "follows": {"type": "string", "description": "Earlier task id, for example T-3"},
         "step": {"type": "integer", "description": "The number of the step of goal's plan that this task is one "
                                                    "part of, when one piece of work is split across agents"},
@@ -14857,7 +14957,10 @@ def overview_text():
         out.append("  none")
     out.append("")
     out.append("RESULTS WAITING FOR YOUR CHECK")
-    rows = q("SELECT * FROM tasks WHERE state IN ('completed','failed','rejected') AND accepted IS NULL ORDER BY id")
+    # The manager's own: a lead checks its subtasks in the session of their parent, and check_result refuses the
+    # manager any task it did not request.
+    rows = q("SELECT * FROM tasks WHERE state IN ('completed','failed','rejected') AND accepted IS NULL "
+             "AND COALESCE(requester, ?)=? ORDER BY id", (manager_name(), manager_name()))
     for t in rows:
         out.append(f"  {tref(t['id'])} [{t['state']}] {t['title']} by {t['owner']}: {t['what']} "
                    f"Output: {t['where_'] or '-'}. Checked: {t['how'] or '-'}")
@@ -14867,9 +14970,14 @@ def overview_text():
         out.append("  none")
     out.append("")
     out.append("OPEN QUESTIONS")
-    rows = q("SELECT * FROM questions WHERE answer IS NULL ORDER BY id")
+    # A question of a task that has ended waits for nothing, and stood here for ever.
+    rows = q(f"SELECT * FROM questions WHERE answer IS NULL AND task IN (SELECT id FROM tasks WHERE {OPEN_TASK}) "
+             f"ORDER BY id")
     for r in rows:
-        out.append(f"  Q-{r['id']} from {r['asker']} on {tref(r['task'])}, waiting {ago(r['asked'])}: {r['text']}" +
+        out.append(f"  Q-{r['id']} from {r['asker']} on {tref(r['task'])}, waiting {ago(r['asked'])}"
+                   + (f", asked of {r['requester']}, which answers it"
+                      if r["requester"] not in (None, manager_name()) else "")
+                   + f": {r['text']}" +
                    (f" NOT WAITING: it goes on with \"{r['assumed']}\". Answer only if that is wrong."
                     if r["assumed"] else "") +
                    (f" {access_route(r['asker'], r['access'], r['requester'], r['access_level'])}"
@@ -17111,7 +17219,8 @@ def tick():
         # Unanswered questions: nudge the requester. A question asked with a default is not chased: its task is not
         # waiting, its message already said "answer only if that is wrong", and chasing it would turn the cheap way
         # of asking into the noisy one.
-        for r in q("SELECT * FROM questions WHERE answer IS NULL AND nudged=0 AND assumed IS NULL"):
+        for r in q(f"SELECT * FROM questions WHERE answer IS NULL AND nudged=0 AND assumed IS NULL "
+                   f"AND task IN (SELECT id FROM tasks WHERE {OPEN_TASK})"):     # an ended task waits for nothing
             if t0 - r["asked"] > CFG["question_wait"]:
                 q("UPDATE questions SET nudged=1 WHERE id=?", (r["id"],))
                 emit(r["requester"], "say", f"[hub] Question Q-{r['id']} from {r['asker']} has waited "
@@ -21127,7 +21236,8 @@ def health_view():
              agent=manager_name())
     waiting = reports_waiting(t0)
     if waiting:
-        oldest, leads = waiting[0], {r["to_agent"] for r in waiting if r["to_agent"] != manager_name()}
+        oldest, leads = waiting[0], {r["to_agent"] for r in waiting if r["to_agent"] != manager_name()
+                                     and not report_for_manager(r)}
         warn("reports_undecided",
              f"{len(waiting)} report(s) from your agents have waited more than "
              f"{int(REPORT_OWNER_WAIT // 3600)} hours for a decision. The oldest is {upref(oldest['id'])} from "
@@ -25626,6 +25736,11 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                     if r["kind"] == "say" and worker and (not t or t["state"] in TERMINAL):
                         continue        # a worker reads only in a task session: none for this message any more
+                    if r["kind"] == "say" and extra.get("steer") and t and extra.get("attempt", 1) != t["attempt"]:
+                        # A steer is bound to its attempt (1.4) and read_messages never gives it to a later one. It
+                        # stayed pending all the same, so the helper told the new session of it again and again, up
+                        # to every 15 minutes for the life of the task, and each time a model turn read nothing.
+                        continue
                     if r["kind"] == "check" and not q1("SELECT id FROM machine_checks WHERE id=? AND state='requested'",
                                                          (extra.get("check"),)):
                         continue
@@ -27015,6 +27130,12 @@ class Handler(BaseHTTPRequestHandler):
                 if t["state"] in TERMINAL:
                     raise ToolError("STOP: task is closed.")
             except ToolError as e:
+                # The task moved on while this waited: it ended, or a new session replaced one that was lost at its
+                # prompt. Nobody can use a decision now, so the prompt ends here and the task no longer waits on it.
+                # It used to stay input-required on P-<id> for the rest of its life, and its silence was never nudged.
+                q("UPDATE prompts SET decision='expired', decided=? WHERE id=? AND decision IS NULL", (now(), pid))
+                q("UPDATE tasks SET state='working', waiting_on=NULL WHERE id=? AND state='input-required' "
+                  "AND waiting_on=?", (tid, f"P-{pid}"))
                 return reply("deny", str(e))
             row = q1("SELECT decision, reason FROM prompts WHERE id=?", (pid,))
             if not row["decision"]:
@@ -27148,6 +27269,19 @@ def leak_scan():
     return found
 
 
+def settle_stopped_calls():
+    """The calls that were waiting when the hub last stopped are gone: say so in the records, at the start.
+
+    A permission prompt is answered through the hook call that waits for it, so with the call gone the prompt is
+    expired -- and its task waits on it no more. That second half was missing: the task stayed input-required on a
+    prompt nothing could answer, so its silence was never nudged and every list said it waited on P-<id> for the
+    rest of its life. A question is different: it is still asked, and its answer still reaches the task."""
+    q("UPDATE questions SET waiting=0")
+    q("UPDATE prompts SET decision='expired', decided=? WHERE decision IS NULL", (now(),))
+    q("UPDATE tasks SET state='working', waiting_on=NULL WHERE state='input-required' AND waiting_on LIKE 'P-%'")
+    q("UPDATE jobs SET ok=0, result='the hub restarted', finished=? WHERE finished IS NULL", (now(),))
+
+
 def main():
     global DB
     # Before the parser, because an update run calls this on the *released* code and must get the same two words
@@ -27223,10 +27357,7 @@ def main():
     # test hub with its own --db never writes in ~/.fleet
     CFG["chat_apps_dir"] = os.path.expanduser(args.chat_apps or os.path.join(os.path.dirname(db_path), "chat-apps"))
     ensure_bridge_key()
-    # calls that were waiting when the hub last stopped are gone: say so in the records
-    q("UPDATE questions SET waiting=0")
-    q("UPDATE prompts SET decision='expired', decided=? WHERE decision IS NULL", (now(),))
-    q("UPDATE jobs SET ok=0, result='the hub restarted', finished=? WHERE finished IS NULL", (now(),))
+    settle_stopped_calls()
     settle_pings()
     # The heartbeat starts here and not at the first complete pass (tick_heartbeat), so that a hub whose very first
     # pass raises -- a bad row is there before the timers are -- is visible on the owner's screen after TICK_WARN
