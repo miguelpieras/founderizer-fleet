@@ -371,13 +371,25 @@ which writes it, reads it back and answers a salted fingerprint. No value passes
 hub, a helper or an agent, and the host's line in `authorized_keys` lets that key run
 `place.py` with the owner's places and nothing else.
 
-**On the vault's machine, nothing.** A Linux broker takes the stock `/usr/bin/ssh`
-and makes its own key, `/var/lib/fleet-vault/place_ed25519`, once at its start, with
-the `ssh-keygen` beside it. It takes a `vault.py` with the `place` operation, which a
-release brings (see "When a release changes vault.py"). Check: the machine row shows
-`security.vault.places: true` and its `place_key`, and `journalctl -u fleet-vault`
-has no line "no targets". Only a machine whose `ssh` is somewhere else names it in
-`/etc/fleet-vault/vault.json`; that key stays an override and nothing else.
+**On the vault's machine, nothing to set.** A Linux broker takes the stock
+`/usr/bin/ssh` and makes its own key, `/var/lib/fleet-vault/place_ed25519`, once at
+its start, with the `ssh-keygen` beside it. Nothing names that `ssh` anywhere; only a
+machine whose one is somewhere else writes it in `/etc/fleet-vault/vault.json`, where
+it stays an override and nothing else.
+
+**But the broker has to be running a `vault.py` with the `place` operation**, and that
+is not the same thing as the machine being up to date. The broker runs a root-owned
+copy outside every checkout, which a release does not touch: only
+`/usr/local/sbin/fleet-vault-program` brings it across, and only an installer run puts
+that command there (see "When a release changes vault.py"). **A machine installed
+before that command exists has no way to get a new `vault.py` at all**, so its vault
+reaches no target however current the machine looks. Its own server service says so
+every ten minutes — "The server needs /usr/local/sbin/fleet-vault-program from the
+Fleet installer; run the join line again on <name>" — and running the join line again
+is the whole fix: it puts the command in place, brings the broker onto the release's
+`vault.py`, and every release after that catches the broker up by itself. Check: the
+machine row shows `security.vault.places: true` and its `place_key`, and
+`journalctl -u fleet-vault` has no line "no targets".
 
 **In Founderizer, the Targets page.** A target is its kind (`env` or `k8s`), where it
 is (the absolute path of the `.env` file, or `NAMESPACE/SECRET`), the machine whose
