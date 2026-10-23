@@ -550,6 +550,13 @@ class Collector:
         if screen_command:
             self.data.setdefault("screen", {"tokens": None, "limits": None})
 
+    def account_again(self):
+        """Read the account at the next scan, whatever the poll clock says. This machine signed in to another
+        account, and until it reads itself again every reader of this reading — the owner's card above all — is
+        shown the address of the account he has just left (the owner, 23 October 2026: he signed the manager in to
+        another account, pasted the code, and the card kept the old address for the rest of the poll)."""
+        self.last_poll = 0
+
     def collect(self):
         if self.screen_command:
             try:

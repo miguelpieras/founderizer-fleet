@@ -2548,6 +2548,7 @@ class Helper:
             deadline = time.monotonic() + LOGIN_DONE_WAIT
             while time.monotonic() < deadline:
                 if self.signed_in(runtime):
+                    self.account_changed()
                     self.restart_after_login()
                     return report("done", detail=f"{label} is signed in on this machine.")
                 time.sleep(5)
@@ -2635,6 +2636,14 @@ class Helper:
         self.fresh_at, self.manager_due, self.manager_fresh = time.monotonic(), True, True
         self.say(f"manager: {why}, so its session starts again on a new conversation with the hub's brief")
         return True
+    def account_changed(self):
+        """**A sign-in is an account change, and the app says so only from a reading.** The address on the owner's
+        machine card is the account of this machine's own last usage reading, and the collector takes one every
+        five minutes — so a sign-in that works leaves the account he signed out of on that card until the clock
+        comes round, with nothing to say which of the two it is showing (the owner, 23 October 2026). The reading
+        itself is the collector's: this only brings it forward to its next scan."""
+        if getattr(self, "collector", None):
+            self.collector.account_again()
 
     def restart_after_login(self):
         """A session that started before this machine had a credential is sitting at the provider's own sign-in
@@ -3706,6 +3715,7 @@ def cmd_run(args):
                           lambda payload: http("POST", f"/helper/usage/{agent}", payload, timeout=5),
                           screen_command=conf.get("screen_command"), local=local_model(conf),
                           previous=next(iter(conf.get("runtime_policies") or {}), None))   # owner feature runtime_switch
+    h.collector = collector         # a sign-in on this machine makes it read the account again (account_changed)
     threading.Thread(target=collector.run, name="usage-collector", daemon=True).start()
     h.lifecycle = Lifecycle(KIT, agent, conf, h.post_status,
                             busy=lambda: any(re.fullmatch(r"T-\d+", w) for w in h.look()) or h.outside > 0 or
