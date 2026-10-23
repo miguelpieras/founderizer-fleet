@@ -6234,15 +6234,18 @@ def place_host_row(machine, host, port, user):
 
 def place_setup_state(team, machine, host, port, user, names, key, source):
     """What the host of this group of targets runs: `none` (no line of ours there yet), `current` (it ran the line
-    that these targets ask for, with this place.py) or `old` (it ran one, and the targets or the helper moved on).
+    that these targets ask for, with this place.py), `old` (it ran one, and the targets or the helper moved on) or
+    `unknown` (the vault of that machine has no key for targets now, so there is no line to compare it with).
 
     The host is not asked: this is what the line itself reported when it ran there, which is all a hub can know about
     a host it never connects to."""
     row = place_host_row(machine, host, port, user)
     if row is None:
         return {"state": "none", "at": None}
-    want = hashlib.sha256(setup_line(team, names, key, machine).encode()).hexdigest() if key else None
-    current = want is not None and row["line_sha256"] == want and (source is None or row["program_sha256"] == source)
+    if not key:
+        return {"state": "unknown", "at": row["updated"]}
+    want = hashlib.sha256(setup_line(team, names, key, machine).encode()).hexdigest()
+    current = row["line_sha256"] == want and (source is None or row["program_sha256"] == source)
     return {"state": "current" if current else "old", "at": row["updated"]}
 
 
@@ -6293,7 +6296,7 @@ def place_plan(src, body):
     open, so a line that failed half way through can be run again."""
     t0 = now()
     row = place_code_row(src, body["code"], t0)
-    team, _, _ = team_view(kit_revision())
+    team, _, _ = team_view(kit_revision(fresh=True))    # a target saved a moment ago is in the line this host gets
     names = place_group(team, row["machine"], row["host"], row["port"], row["user"])
     if not names:
         raise Refusal(409, "The targets of this host are gone. Make a new line in Founderizer: Targets, Add server.")
