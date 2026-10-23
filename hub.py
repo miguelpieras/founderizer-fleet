@@ -13378,10 +13378,13 @@ def report_sweep(t0):
         return
     kv_set("report_sweep_at", t0)
     rows = [r for r in open_reports(kinds=False) if t0 - r["created"] > REPORT_GRACE]
-    if not sweep_news("report_sweep_sig", [str(r["id"]) for r in rows]):
+    passed = {r["id"] for r in rows if report_for_manager(r)}
+    # A report that its lead can no longer decide is news the moment it becomes the manager's, although it was in the
+    # set before, as the lead's: so it is a new item of the set then, and the manager hears it at the next sweep.
+    if not sweep_news("report_sweep_sig", [str(r["id"]) + ("m" if r["id"] in passed else "") for r in rows]):
         return
-    mine = [r for r in rows if r["to_agent"] == manager_name() or report_for_manager(r)]
-    theirs = [r for r in rows if r["to_agent"] != manager_name() and not report_for_manager(r)]
+    mine = [r for r in rows if r["to_agent"] == manager_name() or r["id"] in passed]
+    theirs = [r for r in rows if r["to_agent"] != manager_name() and r["id"] not in passed]
     lines = [report_line(r) + (f" -- sent to {r['to_agent']}, which can no longer decide it, so it is yours"
                                if r["to_agent"] != manager_name() else "") for r in mine[:REPORT_SHOWN]]
     lines += [f"  {upref(r['id'])} waits with {r['to_agent']} ({clip(r['text'], 120)})" for r in theirs[:REPORT_SHOWN]]
