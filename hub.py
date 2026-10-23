@@ -21004,29 +21004,45 @@ def health_view():
     # installers put in place for it (`hubsetup.vault_program_script`), which fetches the program from the
     # configuration ref itself and restarts the broker. So this warning is no longer the fleet's way of telling
     # the owner to paste a command per release: it is what says that the catch-up could not happen, which is why
-    # the fix line is to run that same command by hand and read what it says. The cases it covers: a machine with
-    # a broker and no server service, a machine whose installers are older than that root command, no route to the
-    # ref, and a new program the broker did not come up on, which keeps the one that was serving.
+    # the fix line is to run that same command by hand and read what it says -- and, where the command is not
+    # there at all, the installer step that puts it there. The cases it covers: a machine with a broker and no
+    # server service, a machine whose installers are older than that root command, no route to the ref, and a new
+    # program the broker did not come up on, which keeps the one that was serving.
     #
     # A machine that is stale or behind is left out: it has not taken the release at all, its own warning already
     # carries that, and two lines for one cause say less than one.
     want = vault_source(desired)
     held = {m["machine"] for m in machines if m["stale"] or m["update"]["state"] != "current"}
+    hub_ip = hub_address()[0]
+    # This hub's own configuration ref, which the step below fetches the broker's program from. A hub with no
+    # address of its own in team.json can name none, and says so rather than printing a broken git URL.
+    config_ref = f"git://{hub_ip}/fleet-pilot.git" if hub_ip else "<this hub's configuration ref>"
     for machine, broker in (broker_programs(t0).items() if want else ()):
         if machine in held or broker["source"] == want:
             continue
+        # The second step, and why it is here. On exactly the machines whose installers are older than that root
+        # command, the command is not there -- which is *why* their broker is behind -- so a fix line that names
+        # only the command sends the owner to a missing file and says nothing about the one cause that never
+        # clears by itself. `hubsetup.py agent-helper` is the step both installers already run for it: it puts the
+        # command in place, it writes nothing when the three files are the ones this version writes, and the
+        # machine's own server service brings the broker across within ten minutes of it. The join line cannot
+        # stand here: `new_join_code` refuses a name the fleet already has, so a machine already in the fleet gets
+        # no fresh one, and the script would redo apt, the firewall and POST /join with `set -eu` stopping it
+        # before this step. Only the two arguments the hub knows are named -- the machine's service user from
+        # `servers` and this hub's own configuration ref -- and never the checkout, whose path is not the same on
+        # every machine of a fleet.
+        user = ((TEAM.get("servers") or {}).get(machine) or {}).get("user")
+        step = (f"python3 hubsetup.py agent-helper --repo {config_ref}"
+                + (f" --user {user}" if user else "") + ", in that machine's checkout")
         warn("vault_behind",
              f"The vault broker on {machine} does not run the vault.py of revision {desired[:12]}, which is the "
              f"revision that machine reports. That machine brings its own broker onto a release within ten "
              f"minutes of taking it, so a broker still behind means it could not: it has no server service, it "
              f"cannot reach this hub's configuration ref, or the broker did not come up on the new program and "
              f"kept the one that was serving. A machine whose installers are older than that root command has it "
-             f"nowhere yet, and its join line, run again, puts it in place and brings the broker up to date.",
-             # One command, no path and no argument, so it is the same line on every machine: the pasted
-             # `install` line it replaces named a checkout, and a path that is wrong on this fleet's machines
-             # reads as the fleet telling the owner to run something broken.
-             f"On {machine}, as root: /usr/local/sbin/fleet-vault-program. It says what it did or what stopped "
-             f"it; `journalctl -u fleet-vault -n 30` holds the rest.",
+             f"nowhere yet, and that is the one cause that does not clear by itself. "
+             f"`journalctl -u fleet-vault -n 30` on that machine says which cause it is.",
+             f"On {machine}, as root: /usr/local/sbin/fleet-vault-program. If it is not there, {step}.",
              agent=broker["agent"])
     flag = manager_warning()
     if flag:
@@ -21885,12 +21901,22 @@ def restart_hub_soon(pinned, reached, always=False):
 
 def release_sweep(t0):
     """The automatic poll, unless the owner turned it off. A fleet with no entitlement is not polled either: our
-    side refuses a fleet that carries none, so asking would only reach the network to be told no."""
+    side refuses a fleet that carries none, so asking would only reach the network to be told no.
+
+    **The gate is the sweep's own key, and that is the whole point of `releases_swept`.** This sweep is the only
+    thing that ever applies a release by itself, and it reaches `start_release_work` only past the gate. While the
+    gate read the key that *every* poll writes (`releases_checked`, which is what `release_view` shows the owner as
+    `last_check.at`), the owner's own Check now postponed the automatic update by up to RELEASE_POLL, and anything
+    that checked more often than that stopped it for ever -- pressing Check now while waiting for a release is the
+    one thing an owner does most. On this fleet 2026.11.27 is still `verified` and unapplied with later releases
+    gone past it, and 2026.11.32 had to be forced through by hand. So the two readings are two keys:
+    `releases_checked` is when the channel was last asked, by anybody, and `releases_swept` is when this sweep last
+    asked, which is all the gate is about."""
     if not releases_automatic() or not entitlement_token():
         return
-    if t0 - float(kv_get("releases_checked") or 0) < RELEASE_POLL:
+    if t0 - float(kv_get("releases_swept") or 0) < RELEASE_POLL:
         return
-    kv_set("releases_checked", t0)       # a channel that hangs is not polled again at every tick
+    kv_set("releases_swept", t0)         # a channel that hangs is not polled again at every tick
     try:
         start_release_work(True, automatic=True)
     except Refusal:

@@ -272,23 +272,35 @@ this command is the trust in that ref.
 Each machine does this within ten minutes of taking a release, so after a release
 that changed `vault.py` the owner runs nothing.
 
-**A machine installed before this needs its join line run once.** The root command
-is written by the installers, and nothing in the fleet can put a new root-owned file
-in place by itself. So on a machine whose broker was installed earlier, run that
-machine's join line again (Founderizer, Servers, the line it shows) once: it puts
-the command in place and brings the broker up to date in the same run. Every release
-after that is automatic.
+**A machine installed before this needs one installer step run once.** The root
+command is written by the installers, and nothing in the fleet can put a new
+root-owned file in place by itself. So on a machine whose broker was installed
+earlier, as root in that machine's checkout:
+
+```bash
+python3 hubsetup.py agent-helper --user <the service user> --repo <the hub's config ref>
+```
+
+`--check` first says what it would write. That is the step both installers already
+run; it writes nothing when the three files are already the ones that version writes,
+and the machine's own server service brings the broker across within ten minutes of
+it. Every release after that is automatic.
+
+**Not the join line.** A machine already in the fleet can get no fresh one: the hub
+refuses a join code for a name it already has, and the script would redo apt, the
+firewall and `POST /join`, with `set -eu` stopping it before the two steps that
+matter.
 
 **The warning is now about the machine that could not.** The broker's `status`
 answers `source`, the SHA-256 of the program it runs, the helper sends it to the hub
 as `security.vault.broker_source`, and `/ui/health` raises one `vault_behind`
 warning for each machine whose broker differs from the hub's own `vault.py`. A
 warning that stays is one of four things: the machine has a broker and no server
-service, its installers are older than that root command (run its join line again),
-it cannot reach the hub's configuration ref, or the broker did not come up on the
-new program and kept the one that was serving. The `fix` is to run the command above
-by hand on that machine and read what it says; `journalctl -u fleet-vault -n 30`
-holds the rest. Running the join line again also does it, and needs no path either.
+service, its installers are older than that root command, it cannot reach the hub's
+configuration ref, or the broker did not come up on the new program and kept the one
+that was serving. The `fix` names the command above and, after it, the `agent-helper`
+step for a machine that does not have it; `journalctl -u fleet-vault -n 30` says
+which of the four it is.
 
 The checksum is read once, when the broker starts, so a copy installed under a
 broker that was not restarted does not clear the warning — the running code is
@@ -385,9 +397,10 @@ that command there (see "When a release changes vault.py"). **A machine installe
 before that command exists has no way to get a new `vault.py` at all**, so its vault
 reaches no target however current the machine looks. Its own server service says so
 every ten minutes — "The server needs /usr/local/sbin/fleet-vault-program from the
-Fleet installer; run the join line again on <name>" — and running the join line again
-is the whole fix: it puts the command in place, brings the broker onto the release's
-`vault.py`, and every release after that catches the broker up by itself. Check: the
+Fleet installer; run the join line again on <name>" — and the `agent-helper` step
+above is the whole fix: it puts the command in place, the machine brings its broker
+onto the release's `vault.py` within ten minutes, and every release after that
+catches the broker up by itself. Check: the
 machine row shows `security.vault.places: true` and its `place_key`, and
 `journalctl -u fleet-vault` has no line "no targets".
 
