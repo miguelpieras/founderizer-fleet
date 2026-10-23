@@ -358,6 +358,104 @@ try:
 except Exception as owner_mcp_problem:       # a missing file or a changed shape is a failure, never a silent pass
     check("the owner's MCP server can be checked against the owner API", False, repr(owner_mcp_problem))
 
+# 0b what a root command of a machine may be given (hubsetup.sudoers_text and the scripts it names)
+#
+# A machine's service user holds a few rights with root, and each one is meant to be a single mechanical act. The
+# privilege in such a right is not the command, it is the argument: a root command that takes a path the caller
+# chooses installs whatever that caller wrote, and the caller here is a user that runs the fleet's own code. Both of
+# the fleet's instances of that shipped before anybody looked -- the repair line that read vault.py out of an
+# agent's own checkout, and a rule naming a command with no argument list, which sudoers reads as "with any
+# arguments the caller chooses" (sudoers(5)).
+#
+# So: every root right either takes no argument at all, or the command it names checks the one argument it takes
+# against a closed pattern before it does anything. test_agent_users.Sudoers pins the two rules this fleet has
+# today as text; this is the rule for a root right nobody has written yet, and it is here because selftest.py is
+# what a release runs -- a lane that adds one fails the release until it has decided whether the caller can steer
+# it. Source only: no hub, no network, nothing started, and no file of this machine is read.
+#
+# A guard that cannot fail is no guard, so each branch below was made to fail once before it shipped, by running
+# this block against a mutated `sudoers_text` and mutated scripts: a root command the table does not know, a
+# wildcard argument, a rule with no argument list at all (which sudoers reads as "any"), that rule together with a
+# script that installs `$1`, a helper with its pattern check deleted, a pattern that matches a path, an effect
+# before the check, and a `""` rule whose script no longer refuses an argument. All eight were caught. The last
+# two shapes are this fleet's own history: the repair line that read `vault.py` out of an agent's checkout, and
+# the rule that named the vault command with no argument list.
+
+try:
+    import hubsetup
+
+    # Each root command of a machine, with the text that installs it. A `(root)` rule naming a command this table
+    # does not know fails below: a new root right must be looked at, never skipped.
+    ROOT_SCRIPTS = {hubsetup.HELPER: hubsetup.helper_script(),
+                    hubsetup.VAULT_UPDATE: hubsetup.vault_program_script("git://100.64.0.1/fleet-pilot.git")}
+    # What a line may do before the argument has been checked: say something, refuse, or set the shell up.
+    PRELUDE = ("#", "set", "test", "exit", "echo", "printf", "umask", "trap", ":")
+
+    def root_grants(user="fleet"):
+        """Every `(root)` right of `sudoers_text`, as (the command's path, its argument list as sudoers has it)."""
+        out = []
+        for line in hubsetup.sudoers_text(user).splitlines():
+            if not line or line.startswith("#") or "(root)" not in line:
+                continue
+            spec = line.split("NOPASSWD:", 1)[1].strip().split(None, 1)
+            out.append((spec[0], spec[1].strip() if len(spec) > 1 else ""))
+        return out
+
+    def argument_check(script):
+        """The line of a script that matches its one argument against a closed pattern, with that pattern: a
+        whole-line `grep -qx`, which is the only form the fleet uses. (None, None) when there is none."""
+        for line in script.splitlines():
+            if "$1" not in line or not re.search(r"grep -qxE?\s", line):
+                continue
+            pattern = re.search(r"""grep -qxE?\s+(['"])(.*?)\1""", line)
+            return line, pattern.group(2) if pattern else None
+        return None, None
+
+    grants = root_grants()
+    check("every root right of a machine is a command this check knows",
+          {path for path, _ in grants} == set(ROOT_SCRIPTS),
+          f"the sudoers file grants {sorted(path for path, _ in grants)}, this check knows "
+          f"{sorted(ROOT_SCRIPTS)}")
+    check("no root right of a machine takes a wildcard argument",
+          not [path for path, args in grants if "*" in args],
+          f"a wildcard lets the caller choose: {[p for p, a in grants if '*' in a]}")
+
+    steerable, unchecked, late, pathlike, reads_one = [], [], [], [], []
+    for path, args in grants:
+        script = ROOT_SCRIPTS.get(path)
+        if script is None:
+            continue                                    # the first check above is the one that says so
+        if args == '""':
+            # sudoers lets it be run with no arguments at all; the script must say the same, and read none.
+            if 'test "$#" = 0' not in script:
+                steerable.append(f"{path}: the rule pins no argument and the script does not refuse one")
+            if "$1" in script:
+                reads_one.append(f"{path}: the rule pins no argument and the script reads one")
+            continue
+        if args:
+            continue                # an enumerated literal argument list: sudoers itself closes the set
+        line, pattern = argument_check(script)
+        if line is None:
+            unchecked.append(f"{path}: any argument the caller chooses, and the script checks none")
+            continue
+        if pattern is None or "/" in pattern:
+            pathlike.append(f"{path}: its argument may be a path ({pattern!r})")
+        before = script.splitlines()[:script.splitlines().index(line)]
+        if any("$1" in one for one in before):
+            late.append(f"{path}: it reads its argument before it checks it")
+        if [one for one in before if one.strip() and not one.strip().startswith(PRELUDE)]:
+            late.append(f"{path}: it acts before it checks its argument "
+                        f"({[o.strip()[:40] for o in before if o.strip() and not o.strip().startswith(PRELUDE)]})")
+
+    check("a root right that takes an argument checks it against a closed pattern", not unchecked,
+          "; ".join(unchecked))
+    check("a root right that takes no argument refuses one", not (steerable + reads_one),
+          "; ".join(steerable + reads_one))
+    check("a root command checks its argument before it does anything", not late, "; ".join(late))
+    check("no root command takes a path from its caller", not pathlike, "; ".join(pathlike))
+except Exception as root_rights_problem:     # a changed shape is a failure, never a silent pass
+    check("the root rights of a machine can be checked", False, repr(root_rights_problem))
+
 # 1 handshake and roles
 code, headers, resp = rpc("manager", "initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "sim-cli", "version": "9.9"}})
 check("initialize answers with the requested version", code == 200 and resp["result"]["protocolVersion"] == "2025-06-18")
