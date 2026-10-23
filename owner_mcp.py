@@ -532,7 +532,7 @@ def grant_access(args):
 
 def save_target(args):
     """`POST /ui/targets/save`: one target of the owner's, or delete true to remove it, which also ends every hold of
-    it. No value: a target is a place on a server, its address and its pinned host key."""
+    it. No value: a target is a place on a server and its address. Its host key comes from `add_target_server`."""
     body = {"name": args.get("name"), "target": None if args.get("delete") is True else args.get("target")}
     return _team_command("/ui/targets/save", body, f"the target {args.get('name')}", args)
 
@@ -811,6 +811,27 @@ def add_machine(args):
                      "verify: its lines are in the output above.")
 
 
+def add_target_server(args):
+    """`POST /ui/targets/server`: the one-time line that sets the host of a group of targets up, as `add_machine`
+    gives the line that puts a machine in the fleet. With `ssh_user` this server also runs that line there, over the
+    owner's own SSH, so a host becomes a working target with nothing pasted anywhere."""
+    body = {k: args.get(k) for k in ("machine", "host", "port", "user")}
+    receipt = command("/ui/targets/server", body, "the host setup line", args.get("request_id"))
+    line = receipt.get("line")
+    if not args.get("ssh_user"):
+        return dict(receipt, next="Run the line above on that host as root, or call add_target_server again with "
+                                  "ssh_user and this server runs it. The code works once and for 30 minutes.")
+    if not line:
+        raise Refused("this request was sent before, so the hub gives no code again. Send add_target_server with a "
+                      "new request_id to make a new line.")
+    host, user = args["host"], args["ssh_user"]
+    root = sudo_prefix(ssh(host, user, "id -un; id -u"))
+    done = ssh(host, user, root + "sh -c " + shlex.quote(line), timeout=1800)
+    return dict(receipt, line=None, setup={"exit": done["exit"], "out": done["out"], "error": done["error"]},
+                next="Read targets with fleet_read: the host's row says whether its line is current, and test_target "
+                     "then checks the place end to end without writing.")
+
+
 # ---- the tools
 
 
@@ -1001,17 +1022,27 @@ def tools():
         tool("save_target", "Define one target for keys, change it, or remove it with delete true: one variable "
                             "of an env file (kind env, where = its absolute path) or one key of a Kubernetes Secret "
                             "(kind k8s, where = NAMESPACE/SECRET, with k8s {api, ca, token} as paths on its host), on "
-                            "a host that the vault of machine reaches over SSH as user, with the host's own public "
-                            "key pinned in host_key. names limits the variables it takes, note tells the agents what "
+                            "a host that the vault of machine reaches over SSH as user. Leave host_key out: "
+                            "add_target_server pins the host's own key. names limits the variables it takes, note "
+                            "tells the agents what "
                             "restarts the application, then is a command the host runs after a change. An agent "
                             "that holds target:<name> (grant_access) then puts a key there with place_secret, and "
                             "never sees it. fleet_read(page=\"targets\") gives the one line each host's "
                             "authorized_keys file needs.",
              {"name": S["text"],
-              "target": {"type": "object", "description": "title, kind, where, machine, host, port, user, host_key, "
-                                                          "and optionally names, note, then and k8s. No value of a "
-                                                          "key is ever part of it."},
+              "target": {"type": "object", "description": "title, kind, where, machine, host, port, user, and "
+                                                          "optionally host_key, names, note, then and k8s. No value "
+                                                          "of a key is ever part of it."},
               "delete": S["bool"], **rid}, ("name",), save_target),
+        tool("add_target_server", "Set the host of a target up: the hub's one-time line, which installs the place "
+                                  "helper there, gives that vault's key the one line of the user's authorized_keys "
+                                  "file, and reports the host's own key, so nothing is pasted and no host key is "
+                                  "typed. Name the host as its targets do (machine, host, port, user). With ssh_user "
+                                  "this server also runs the line there over the owner's own SSH. Run it again when "
+                                  "a target is added on that host: it replaces its own line.",
+             {"machine": S["text"], "host": S["text"], "port": {"type": "integer"}, "user": S["text"],
+              "ssh_user": S["text"], **rid},
+             ("machine", "host", "port", "user"), add_target_server),
         tool("test_target", "Check one target end to end without writing: its machine's vault connects with its own "
                             "key and the host says whether the place can be written. The outcome is in "
                             "fleet_read(page=\"targets\"), under the target's placements.",

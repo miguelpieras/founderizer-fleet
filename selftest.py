@@ -876,6 +876,18 @@ check("a target written by hand in another form is named, so the Targets page sa
 check("the targets of one line of a host's authorized_keys file share one cluster", "must be the same" in
       targets_refused(targets={"keys": KEYS, "more-keys": dict(KEYS, where="content/other",
                                                               k8s=dict(KEYS["k8s"], api="https://10.0.0.2:6443"))}))
+# Owner feature target_servers: the owner types no host key, so a target is saved without one and the line that sets
+# its host up pins it (POST /place/done). Until then nothing reaches that host: no vault can know which host it is.
+NEW_ENV = {k: v for k, v in APP_ENV.items() if k != "host_key"}
+check("a target is saved with no host key, because one line pins it",
+      hubmod.target_entry("app-env", NEW_ENV, TEAM_T) == NEW_ENV and
+      targets_refused(targets={"app-env": NEW_ENV}) == "")
+check("...and nothing is placed into it until that line has run",
+      "not set up yet" in hubmod.place_unset("app-env", NEW_ENV) and NEW_ENV["host"] in
+      hubmod.place_unset("app-env", NEW_ENV))
+check("the one line that sets a host up is for one group of targets: one vault, one host, one port, one user",
+      hubmod.place_group(TEAM_T, "vps", APP_ENV["host"], APP_ENV["port"], "app") == ["app-env"] and
+      hubmod.place_group(TEAM_T, "vps", APP_ENV["host"], APP_ENV["port"], "root") == [])
 
 
 def host_line(names):

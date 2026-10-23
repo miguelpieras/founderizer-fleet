@@ -323,6 +323,17 @@ CREATE TABLE IF NOT EXISTS placements(id INTEGER PRIMARY KEY, agent TEXT NOT NUL
   result TEXT);
 CREATE UNIQUE INDEX IF NOT EXISTS placement_request ON placements(agent, request_id);
 CREATE INDEX IF NOT EXISTS placement_of ON placements(target, id);
+-- Owner feature target_servers: one short-lived code for the one line that sets a target's host up (POST
+-- /ui/targets/server). The hub keeps only its SHA-256, as for a join code, and the group of targets it is for: one
+-- vault, one host, one port, one user. `place_hosts` is what that line left behind on the host: the SHA-256 of the
+-- authorized_keys line it wrote and of the place.py it installed, so the page can say whether the host is still the
+-- one the owner's targets ask for. Neither holds a key or a value.
+CREATE TABLE IF NOT EXISTS place_codes(id INTEGER PRIMARY KEY, sha256 TEXT NOT NULL, machine TEXT NOT NULL,
+  host TEXT NOT NULL, port INTEGER NOT NULL, user TEXT NOT NULL, created REAL NOT NULL, expires REAL NOT NULL,
+  used REAL, canceled REAL, address TEXT);
+CREATE TABLE IF NOT EXISTS place_hosts(machine TEXT NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL,
+  user TEXT NOT NULL, line_sha256 TEXT NOT NULL, program_sha256 TEXT, address TEXT, updated REAL NOT NULL,
+  PRIMARY KEY(machine, host, port, user));
 
 """
 EVENT_CAP = 5000                                    # thread records kept per task attempt
@@ -622,7 +633,7 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "releases", "entitlement", "agent_signin", "github_app", "need_options", "restore",
                "manager_start", "agent_notes", "edit_in_place", "machine_access", "push",
                "attachment_knowledge", "asking_and_waiting", "account_limits", "secret_requests",
-               "secret_deliveries", "secret_targets"]
+               "secret_deliveries", "secret_targets", "target_servers"]
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 
 
@@ -6006,11 +6017,15 @@ def target_entry(name, entry, team):
         raise ValueError(f"target {name}: port is the port of that host's SSH server")
     if not (isinstance(user, str) and TARGET_USER.fullmatch(user)):
         raise ValueError(f"target {name}: user is the user on that host who owns what it writes")
-    if not host_key_valid(key):
+    # No host key until the host is set up: the one line that sets it up reads the host's own key there and reports
+    # it (POST /place/done), so the owner never pastes one. A target without it is refused every placement.
+    if key is not None and not host_key_valid(key):
         raise ValueError(f"target {name}: host_key is that host's own public SSH key, its type and its key as "
                          f"/etc/ssh/ssh_host_ed25519_key.pub has them, without the name at the end")
     out = {"title": title, "kind": kind, "where": where, "machine": machine, "host": host, "port": port,
-           "user": user, "host_key": key}
+           "user": user}
+    if key is not None:
+        out["host_key"] = key
     names = entry.get("names")
     if names is not None:
         if not (isinstance(names, list) and 1 <= len(names) <= 32 and len(set(map(str, names))) == len(names)
@@ -6154,6 +6169,179 @@ PLACE_LACKS = {"no_broker_access": "no agent of it has broker access",
 def place_lacks(machine, missing):
     """Why the vault of this machine cannot reach targets now, in words."""
     return f"the vault of {machine} cannot reach targets now: " + "; ".join(PLACE_LACKS.get(c, c) for c in missing)
+
+
+def place_unset(name, t):
+    """Why a target with no pinned host key gets nothing: its host has not run its setup line yet."""
+    return (f"The host of the target {name} is not set up yet: nothing has pinned the key of {t['host']}, so no "
+            f"vault can know that it is talking to that host. One line on the host does it: Targets, Add server.")
+
+
+# ---------------------------------------------------------------- the one line that sets a target's host up
+#
+# Owner feature target_servers. A target's host runs one helper (place.py) as the forced command of one SSH key, and
+# the fleet needs three things there: that helper, the line of the user's authorized_keys file that lets the vault's
+# own key run it and nothing else, and the host's own public key pinned here, so the vault knows which host it is
+# talking to. All three were pasted root commands, a page of them per host (WORKER-INSTALL.md), and the host key was
+# typed into the app by hand off a `cat` of the host's .pub file.
+#
+# They are one line now, in the shape a machine joins the fleet with (`join_line`): the owner presses Add server on
+# the host's row, the hub mints a code that works for 30 minutes, and the line is
+#
+#     curl -fsS http://<hub>/place | FLEET_PLACE=<code> sh
+#
+# `place.sh` runs as root on that host and does exactly those three things: it asks the hub what this host's line is
+# (POST /place/plan), installs the place.py the hub serves after checking it against the SHA-256 the hub gave, makes
+# sure the user is there with a login shell, writes the line into that user's authorized_keys file, then reads
+# /etc/ssh/ssh_host_ed25519_key.pub and reports it (POST /place/done). The code opens that one host's setup and
+# nothing else: no secret goes near it, and no value of a key leaves the vault either way.
+#
+# A code is for one group of targets -- one vault, one host, one port, one user -- because that is what one line of an
+# authorized_keys file serves (`target_groups`). The line is run again when the owner adds a second target on that
+# host: the script replaces its own line, so the host is brought up to date instead of collecting lines.
+PLACE_JOIN_LIFE = 1800              # seconds a host's setup code works, as a join code does
+PLACE_JOIN_CODE = re.compile(r"[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{12}")     # LINK_ALPHABET: 12 characters, 60 bits
+PLACE_SETUP_MAX = 4096              # bytes of one call of place.sh
+
+
+def place_group(team, machine, host, port, user):
+    """The names of the targets that one line of a host's authorized_keys file serves, or [] for no such group."""
+    return target_groups(team).get((machine, host, port, user), [])
+
+
+def place_setup_line(team, names, machine):
+    """(the line of the host's authorized_keys file for these targets, the carrier), or a Conflict that says what the
+    vault of that machine still lacks: the line names that vault's own key, so the vault must have one first."""
+    carrier, key, missing = place_carrier(machine)
+    if not carrier:
+        raise Conflict(as_sentence(place_lacks(machine, missing)), missing=missing)
+    return setup_line(team, names, key, machine), carrier
+
+
+def place_source():
+    """(the place.py of this hub's kit, its SHA-256), or (None, None) when the hub cannot read it."""
+    try:
+        with open(os.path.join(kit_dir(), "place.py"), "rb") as f:
+            data = f.read()
+    except OSError:
+        return None, None
+    return data, hashlib.sha256(data).hexdigest()
+
+
+def place_host_row(machine, host, port, user):
+    return q1("SELECT * FROM place_hosts WHERE machine=? AND host=? AND port=? AND user=?", (machine, host, port, user))
+
+
+def place_setup_state(team, machine, host, port, user, names, key, source):
+    """What the host of this group of targets runs: `none` (no line of ours there yet), `current` (it ran the line
+    that these targets ask for, with this place.py) or `old` (it ran one, and the targets or the helper moved on).
+
+    The host is not asked: this is what the line itself reported when it ran there, which is all a hub can know about
+    a host it never connects to."""
+    row = place_host_row(machine, host, port, user)
+    if row is None:
+        return {"state": "none", "at": None}
+    want = hashlib.sha256(setup_line(team, names, key, machine).encode()).hexdigest() if key else None
+    current = want is not None and row["line_sha256"] == want and (source is None or row["program_sha256"] == source)
+    return {"state": "current" if current else "old", "at": row["updated"]}
+
+
+def new_place_code(team, machine, host, port, user):
+    """POST /ui/targets/server: a code for the one line that sets this host up, for 30 minutes. The hub keeps only its
+    SHA-256, and a new code for the same host cancels the open one."""
+    names = place_group(team, machine, host, port, user)
+    if not names:
+        raise Refusal(404, "No target of yours is on that host, reached by that vault as that user.")
+    place_setup_line(team, names, machine)      # the vault needs its key before the line can name it
+    t0 = now()
+    raw = "".join(secrets.choice(LINK_ALPHABET) for _ in range(12))
+    with transaction():
+        DB.execute("UPDATE place_codes SET canceled=? WHERE used IS NULL AND canceled IS NULL AND machine=? AND "
+                   "host=? AND port=? AND user=?", (t0, machine, host, port, user))
+        DB.execute("INSERT INTO place_codes(sha256,machine,host,port,user,created,expires) VALUES(?,?,?,?,?,?,?)",
+                   (hashlib.sha256(raw.encode()).hexdigest(), machine, host, port, user, t0, t0 + PLACE_JOIN_LIFE))
+    log("owner", f"made a setup code for the host of {', '.join(names)} ({user}@{host})")
+    code = "-".join(raw[i:i + 4] for i in (0, 4, 8))
+    ip, hub_port = hub_address()
+    return {"machine": machine, "host": host, "port": port, "user": user, "targets": names,
+            "expires_at": t0 + PLACE_JOIN_LIFE, "code": code,
+            "line": f"curl -fsS http://{ip}:{hub_port}/place | FLEET_PLACE={code} sh"}
+
+
+def place_code_row(src, code, t0):
+    """The open row of this setup code, or a Refusal. Wrong codes from one address are counted as a join's are, and
+    the code never stands in a URL or a log."""
+    q("DELETE FROM join_failures WHERE ts<=?", (t0 - JOIN_WINDOW,))
+    if q1("SELECT COUNT(*) n FROM join_failures WHERE address=?", (src,))["n"] >= JOIN_TRIES:
+        raise Refusal(429, "Too many wrong codes from this address. Wait 10 minutes, then try again.")
+    raw = re.sub(r"[\s-]", "", str(code or "")).upper()
+    row = q1("SELECT * FROM place_codes WHERE sha256=? ORDER BY id DESC LIMIT 1",
+             (hashlib.sha256(raw.encode()).hexdigest(),)) if PLACE_JOIN_CODE.fullmatch(raw) else None
+    if row is None:
+        ins("INSERT INTO join_failures(address,ts) VALUES(?,?)", (src, t0))
+        log("hub", f"REFUSED a host setup from {src}: not a setup code")
+        raise Refusal(403, "This code is not valid. Copy the line again from Founderizer: Targets, Add server.")
+    if row["canceled"] is not None:
+        raise Refusal(410, "A newer line replaced this code. Copy the newest line from Founderizer.")
+    if row["expires"] <= t0:
+        raise Refusal(410, "This code expired. Make a new line in Founderizer: Targets, Add server.")
+    return row
+
+
+def place_plan(src, body):
+    """POST /place/plan, inside LOCK: what the line has to do on this host. It changes nothing and leaves the code
+    open, so a line that failed half way through can be run again."""
+    t0 = now()
+    row = place_code_row(src, body["code"], t0)
+    team, _, _ = team_view(kit_revision())
+    names = place_group(team, row["machine"], row["host"], row["port"], row["user"])
+    if not names:
+        raise Refusal(409, "The targets of this host are gone. Make a new line in Founderizer: Targets, Add server.")
+    line, carrier = place_setup_line(team, names, row["machine"])
+    _, source = place_source()
+    if source is None:
+        raise Refusal(503, "This hub cannot read its own place.py, so it cannot say what to install.")
+    ip, port = hub_address()
+    log("hub", f"gave {src} the setup of the host of {', '.join(names)} ({row['user']}@{row['host']})")
+    return {"user": row["user"], "line": line, "targets": names, "program": PLACE_PROGRAM, "sha256": source,
+            "helper": f"http://{ip}:{port}/place/helper", "machine": row["machine"], "carrier": carrier}
+
+
+def place_done(src, body):
+    """POST /place/done, inside LOCK: the line did its work on the host. It pins the host's own public key on every
+    target of the group -- so the owner never types one -- and keeps what the host now runs, so the page can say
+    whether that is still what the targets ask for. The code is used up here and not before: every step up to this
+    one can be run again."""
+    t0 = now()
+    row = place_code_row(src, body["code"], t0)
+    if row["used"] is not None:
+        raise Refusal(410, "This line already set this host up. Make a new line in Founderizer: Targets, Add server.")
+    machine, host, port, user = row["machine"], row["host"], row["port"], row["user"]
+    key = body["host_key"]
+
+    def change(team):
+        if not place_group(team, machine, host, port, user):
+            raise Refusal(409, "The targets of this host are gone. Nothing was pinned.")
+        changed = False
+        for name in place_group(team, machine, host, port, user):
+            if team["targets"][name].get("host_key") != key:
+                team["targets"][name]["host_key"] = key
+                changed = True
+        return changed
+    result = save_integration(None, change, f"The host {user}@{host} ran its setup line", by="hub")
+    names = place_group(TEAM, machine, host, port, user)
+    with transaction():
+        DB.execute("UPDATE place_codes SET used=?, address=? WHERE id=?", (t0, src, row["id"]))
+        DB.execute("INSERT INTO place_hosts(machine,host,port,user,line_sha256,program_sha256,address,updated) "
+                   "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(machine,host,port,user) DO UPDATE SET "
+                   "line_sha256=excluded.line_sha256, program_sha256=excluded.program_sha256, "
+                   "address=excluded.address, updated=excluded.updated",
+                   (machine, host, port, user, body["line_sha256"], body["program_sha256"], src, t0))
+    log("hub", f"the host {user}@{host} ran its setup line for {', '.join(names)} from {src}")
+    emit(manager_name(), "say", f"[hub] The host {user}@{host} is set up for the target"
+         f"{'s' if len(names) > 1 else ''} {', '.join(names)}: its own key is pinned, and the vault of {machine} may "
+         f"run the place helper there. An agent that holds one of those targets can put a key into it now.")
+    return {"targets": names, "pinned": result["changed"]}
 
 
 def placement_state(row):
@@ -6318,6 +6506,9 @@ def place_args(agent, a):
     check = a.get("check", False)
     if not isinstance(check, bool):
         raise ToolError("check is true (only read what the target holds) or false (place the key).")
+    if not t.get("host_key"):
+        raise ToolError(place_unset(name, t) + " Nothing was written. Ask your requester: that is the host's setup, "
+                        "not this task's.")
     return request.lower(), name, t, login, var, "check" if check else "place"
 
 
@@ -6374,32 +6565,30 @@ def t_place_secret(agent, a):
 
 def targets_view(team, t0=None):
     """GET /ui/targets: each target with who holds it, whether its machine's vault reaches targets now and its newest
-    placements; each machine's vault key for targets; and one line of a host's authorized_keys file for each group of
-    targets, which the owner (or an agent that may change that host) puts there once. No value."""
+    placements; each machine's vault key for targets; and one host of targets for each group, with what the line that
+    sets it up left there and the line of its authorized_keys file, for a host that is set up by hand. No value."""
     t0 = t0 or now()
     machines = {}
     for m in sorted({a.get("machine") for a in team["agents"].values()
                      if a.get("role") in ("worker", "lead") and a.get("machine")}):
         carrier, key, missing = place_carrier(m, t0)
         machines[m] = {"machine": m, "carrier": carrier, "public_key": key, "missing": missing}
+    _, source = place_source()
     lines = []
     for (machine, host, port, user), names in sorted(target_groups(team).items()):
         key = (machines.get(machine) or {}).get("public_key")
         lines.append({"machine": machine, "host": host, "port": port, "user": user, "targets": names,
                       "command": forced_command(team, names),
+                      "setup": place_setup_state(team, machine, host, port, user, names, key, source),
+                      "pinned": all(targets(team)[n].get("host_key") for n in names),
                       "line": setup_line(team, names, key, machine) if key else None})
     out = []
     for name, t in sorted(targets(team).items()):
         rows = q("SELECT * FROM placements WHERE target=? ORDER BY id DESC LIMIT ?", (name, PLACE_KEPT))
         out.append(dict(t, name=name, holders=[h["agent"] for h in resource_holders("target", name, team)],
                         grant=(team.get("resources") or {}).get(f"target:{name}"),
-                        ready=bool((machines.get(t["machine"]) or {}).get("carrier")),
+                        ready=bool((machines.get(t["machine"]) or {}).get("carrier")) and bool(t.get("host_key")),
                         placements=[placement_view(r) for r in rows]))
-    try:
-        with open(os.path.join(kit_dir(), "place.py"), "rb") as f:
-            source = hashlib.sha256(f.read()).hexdigest()
-    except OSError:
-        source = None
     return {"targets": out, "machines": list(machines.values()), "lines": lines,
             "kinds": [{"kind": k, "what": w} for k, w in TARGET_KINDS.items()], "limit": TARGET_LIMIT,
             "helper": {"program": PLACE_PROGRAM, "command": PLACE_HELPER, "source": "place.py", "sha256": source}}
@@ -6486,6 +6675,8 @@ def test_target(name, request_id):
     t = targets().get(name)
     if t is None:
         raise Refusal(404, "no such target")
+    if not t.get("host_key"):
+        raise Conflict(place_unset(name, t), missing=["host_not_set_up"])
     carrier, _, missing = place_carrier(t["machine"])
     if not carrier:
         raise Conflict(place_lacks(t["machine"], missing), missing=missing)
@@ -23589,6 +23780,75 @@ class Handler(BaseHTTPRequestHandler):
             return {"base_sha256": base, "name": name, "target": entry}
         return self.ui_command("targets/save", read, save_target)
 
+    def ui_target_server(self):
+        """POST /ui/targets/server (owner feature target_servers): the one line that sets the host of a group of
+        targets up. The code and the line are given once; a repeat of the request gives null for both."""
+        def read(data):
+            extra = sorted(set(data) - {"request_id", "db", "machine", "host", "port", "user"})
+            if extra:
+                raise ValueError(f"unknown field {extra[0]}")
+            machine, host, port, user = (data.get(k) for k in ("machine", "host", "port", "user"))
+            if not (isinstance(host, str) and TARGET_HOST.fullmatch(host)):
+                raise ValueError("host must be the SSH address of the host: a name or an IP address")
+            if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+                raise ValueError("port must be the port of that host's SSH server")
+            if not (isinstance(user, str) and TARGET_USER.fullmatch(user)):
+                raise ValueError("user must be the user on that host who owns what the helper writes")
+            if not (isinstance(machine, str) and machine in (TEAM.get("addresses") or {})):
+                raise ValueError("machine must be the machine whose vault reaches that host")
+            return {"machine": machine, "host": host, "port": port, "user": user}
+
+        def act(body):
+            return new_place_code(TEAM, body["machine"], body["host"], body["port"], body["user"])
+        return self.ui_command("targets/server", read, act,
+                               keep=lambda result: dict(result, code=None, line=None))
+
+    def place_script(self):
+        """GET /place (owner feature target_servers): the script that sets a target's host up, with this hub's address
+        in it. It holds no code and no secret, as GET /join does not."""
+        ip, port = hub_address()
+        data = git_blob(kit_revision(), "place.sh")
+        if data is None:
+            return self.send(404, "This hub has no target setup script.\n", "text/plain; charset=utf-8")
+        text = data.decode().replace("__FLEET_HUB__", f"http://{ip}:{port}")
+        return self.send(200, text, "text/plain; charset=utf-8", {"Cache-Control": "no-store"})
+
+    def place_helper(self):
+        """GET /place/helper (owner feature target_servers): the place helper that a target's host runs. The script
+        checks it against the SHA-256 that POST /place/plan gave, which is this hub's own reading of the same file."""
+        data, _ = place_source()
+        if data is None:
+            return self.send(404, "This hub cannot read its own place.py.\n", "text/plain; charset=utf-8")
+        return self.send(200, data.decode(), "text/plain; charset=utf-8", {"Cache-Control": "no-store"})
+
+    def place_setup(self, step):
+        """POST /place/plan and POST /place/done (owner feature target_servers): the two calls of the line that the
+        owner pastes on a target's host. The code goes in the body, never in a URL, and the hub logs the host and
+        never the code."""
+        if len(self.body()) > PLACE_SETUP_MAX:
+            return self.json(413, {"error": "the request is too large"})
+        data = self.form()
+        try:
+            if not isinstance(data, dict) or not isinstance(data.get("code"), str) or len(data["code"]) > 40:
+                raise ValueError("code must be the setup code of the line")
+            body = {"code": data["code"]}
+            if step == "done":
+                for field in ("line_sha256", "program_sha256"):
+                    if not (isinstance(data.get(field), str) and re.fullmatch(r"[0-9a-f]{64}", data[field])):
+                        raise ValueError(f"{field} must be a SHA-256")
+                    body[field] = data[field]
+                if not host_key_valid(data.get("host_key")):
+                    raise ValueError("host_key must be this host's own public SSH key, as its .pub file has it")
+                body["host_key"] = data["host_key"]
+        except ValueError as e:
+            return self.json(400, {"error": str(e)})
+        try:
+            with LOCK:
+                result = (place_plan if step == "plan" else place_done)(self.client_address[0], body)
+        except Refusal as e:
+            return self.json(e.status, dict(getattr(e, "extra", {}), error=str(e)))
+        return self.json(200, result)
+
     def ui_target_test(self):
         """POST /ui/targets/test (owner feature secret_targets): the vault of one target's machine connects and its
         host says whether the place can be written. Nothing is written; GET /ui/targets carries the outcome."""
@@ -25094,6 +25354,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_servers(query)
         if parts == ["join"]:
             return self.join_script()
+        if parts == ["place"]:                              # owner feature target_servers
+            return self.place_script()
+        if parts == ["place", "helper"]:
+            return self.place_helper()
         if len(parts) == 3 and parts[0] == "server" and parts[2] == "jobs":
             return self.server_jobs(parts[1])
         if parts == ["ui", "profiles"]:
@@ -25511,6 +25775,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_secret_deliver()
         if parts == ["ui", "targets", "save"]:
             return self.ui_target_save()
+        if parts == ["ui", "targets", "server"]:            # owner feature target_servers
+            return self.ui_target_server()
         if parts == ["ui", "targets", "test"]:
             return self.ui_target_test()
         if parts == ["ui", "team", "targets"]:
@@ -25584,6 +25850,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_server_prepare(parts[2])
         if parts == ["join"]:
             return self.join()
+        if parts[:1] == ["place"] and parts[1:] in (["plan"], ["done"]):     # owner feature target_servers
+            return self.place_setup(parts[1])
         if len(parts) == 3 and parts[0] == "server" and parts[2] == "status":
             return self.server_status(parts[1])
         if len(parts) == 3 and parts[0] == "server" and parts[2] == "signin":       # owner feature agent_signin

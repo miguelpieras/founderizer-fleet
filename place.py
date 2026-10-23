@@ -28,6 +28,12 @@ One line in authorized_keys for each machine whose vault writes here, for exampl
 
     command="/usr/bin/python3 /usr/local/lib/fleet-place/place.py --place app=env:/srv/app/shared/.env",restrict ssh-ed25519 AAAA... fleet-vault@vps
 
+Nobody writes that line by hand: the owner presses Add server on the target's row in Founderizer and runs the one
+line it gives as root on this host (`place.sh`, owner feature target_servers), which puts this program here against
+the hub's own checksum of it, writes that line, and tells the hub this host's own public key. Run it again to bring
+the host up to date; it replaces its own line instead of adding a second one. WORKER-INSTALL.md has the by-hand
+route for a host that cannot reach the hub.
+
 Run it as the owner of the file it writes (or as root): a file written by another user would change its owner, so
 that is refused.
 

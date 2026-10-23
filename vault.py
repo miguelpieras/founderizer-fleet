@@ -119,7 +119,8 @@ WRITE_KEYS = {"sdk", "sdk_sha256", "write_project"}
 STORE = 1                           # the format of the fleet's own store
 LOCAL = "local"                     # where an item of that store is: it holds one place and names no project
 REQUEST_KEY = "curl"                # optional (call_api): the curl program that sends a request; without it, none is sent
-PLACE_KEY = "ssh"                   # optional (place_secret): the ssh program that reaches a target; without it, none
+PLACE_KEY = "ssh"                   # optional (place_secret): the ssh program that reaches a target
+PLACE_SSH = "/usr/bin/ssh"          # the one it takes when the configuration names none: see with_places
 PLACE_FILE = "place_ed25519"        # the broker's own SSH key for targets, in its private state folder
 PLACE_LIMIT = 330                   # seconds of one placement: the helper's own command after a change gets 300
 PLACE_ANSWER = 65536                # bytes of the helper's answer
@@ -252,7 +253,8 @@ def load_config(path):
                          ", ".join(sorted(STORE_KEYS)) + " (the fleet's own) or all of " +
                          ", ".join(sorted(BITWARDEN_KEYS)) + " (a Bitwarden project), never both; for new logins in "
                          "Bitwarden also all of: " + ", ".join(sorted(WRITE_KEYS)) + "; and for API requests also: "
-                         + REQUEST_KEY + "; and for targets also: " + PLACE_KEY)
+                         + REQUEST_KEY + "; and to reach a target through another ssh than " + PLACE_SSH + ": "
+                         + PLACE_KEY)
     if "agent" in conf and (not isinstance(conf["agent"], str) or not AGENT_NAME.match(conf["agent"])):
         raise SystemExit("agent must be the Fleet name of the one agent whose vault this is, or be left out")
     if "region" in conf and conf["region"] not in ("eu", "us"):
@@ -1734,28 +1736,35 @@ def place_public(path):
 
 
 def with_places(conf):
-    """The configuration with the broker's target key (`_places`) when it names an ssh program that the worker's user
-    cannot change: the key is made once, in the state folder, by the ssh-keygen beside that program. Else the
-    configuration as it is, and the reason in the log: that broker writes to no target."""
-    if PLACE_KEY not in conf:
-        return conf
+    """The configuration with the broker's target key (`_places`): the key is made once, in the state folder, by the
+    ssh-keygen beside the ssh program that the worker's user cannot change. Else the configuration as it is, and the
+    reason in the log: that broker writes to no target.
+
+    **The ssh program is the stock one unless the configuration names another.** It used to be opt-in, and a machine
+    whose broker was installed before targets existed therefore reached none until the owner pasted the key into
+    `/etc/fleet-vault/vault.json` as root and restarted the broker -- one more pasted root command per machine, for a
+    field with one right answer. The key this makes opens nothing by itself: a host's `authorized_keys` file is what
+    lets it run one command there, so the owner's target is the authorization and this is only the program that
+    carries it. It also has to be this way round, because the line that sets a host up names this key, so the key
+    exists before the first target does."""
+    ssh = conf.get(PLACE_KEY) or PLACE_SSH
     try:
         try:
-            unchangeable(conf[PLACE_KEY], "The ssh program")
+            unchangeable(ssh, "The ssh program")
         except (SystemExit, OSError) as e:
-            raise Refused(str(e) if isinstance(e, SystemExit) else f"there is no ssh program at {conf[PLACE_KEY]}")
+            raise Refused(str(e) if isinstance(e, SystemExit) else f"there is no ssh program at {ssh}")
         key = os.path.join(state_folder(conf), PLACE_FILE)
         if not os.path.exists(key):
-            keygen = os.path.join(os.path.dirname(conf[PLACE_KEY]), "ssh-keygen")
+            keygen = os.path.join(os.path.dirname(ssh), "ssh-keygen")
             try:
                 unchangeable(keygen, "The ssh-keygen program")
             except (SystemExit, OSError):
-                raise Refused(f"there is no ssh-keygen beside {conf[PLACE_KEY]} to make the target key") from None
+                raise Refused(f"there is no ssh-keygen beside {ssh} to make the target key") from None
             r = run([keygen, "-q", "-t", "ed25519", "-N", "", "-C", "fleet-vault", "-f", key], None)
             if r is None or r.returncode != 0 or not os.path.exists(key):
                 raise Refused("the target key could not be made")
             os.chmod(key, 0o600)
-        return dict(conf, _places={"key": key, "public": place_public(key)})
+        return dict(conf, _places={"key": key, "public": place_public(key), "ssh": ssh})
     except Refused as e:
         log(f"no targets: {e}")
         return conf
@@ -1802,7 +1811,7 @@ def connect_target(conf, target, line):
         known = os.path.join(folder, "known_hosts")
         with open(known, "w", encoding="utf-8") as f:
             f.write(f"fleet-place {target['host_key']}\n")
-        argv = [conf[PLACE_KEY], "-F", "/dev/null", "-T", "-a", "-x", "-i", places["key"],
+        argv = [places["ssh"], "-F", "/dev/null", "-T", "-a", "-x", "-i", places["key"],
                 "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none", "-o", "BatchMode=yes",
                 "-o", "PreferredAuthentications=publickey", "-o", "StrictHostKeyChecking=yes",
                 "-o", f"UserKnownHostsFile={known}", "-o", "GlobalKnownHostsFile=/dev/null",
