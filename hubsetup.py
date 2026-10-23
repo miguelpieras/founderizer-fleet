@@ -457,16 +457,23 @@ def sudoers_text(service_user):
     and its only argument is checked against the agent users a fleet can have before a line of it runs.
     `fleet-vault-program` takes no argument at all and fetches what it installs itself. Neither takes a path, a
     value or a command from the caller, so neither is a way for this user to run code of its own as root -- which
-    is the one thing a second root right must not become."""
+    is the one thing a second root right must not become.
+
+    **The second rule says that in sudoers and not only in the program.** A command written with no arguments at
+    all may be run with any arguments the caller chooses (sudoers(5): "If no command line arguments are specified,
+    the user may run the command with any arguments they choose"), and `""` is how sudoers says "with no
+    arguments". The program refuses an argument itself as well, so the two layers say the same thing; this is the
+    one that holds whatever the program on the machine turns out to be."""
     return ("# Founderizer: hubsetup.py writes this file. Three rights for the user that runs this machine's\n"
             "# Founderizer services, and nothing else: the helper that makes one agent's OS user, as root; the\n"
             "# helper that brings this machine's vault broker onto the vault.py of the fleet's configuration ref,\n"
             "# as root; and any command as a member of the group %(group)s, which holds the agent users alone.\n"
             "# Each root command does one mechanical thing and takes nothing from the caller: the first takes one\n"
             "# agent user name, which it checks itself, and the second takes no argument and fetches what it\n"
-            "# installs itself. This user may not become root.\n"
+            "# installs itself. The empty argument list is sudoers saying \"with no arguments at all\"; a command\n"
+            "# written with none may be run with any. This user may not become root.\n"
             "%(user)s ALL=(root) NOPASSWD: %(helper)s\n"
-            "%(user)s ALL=(root) NOPASSWD: %(vault)s\n"
+            '%(user)s ALL=(root) NOPASSWD: %(vault)s ""\n'
             "%(user)s ALL=(%%%(group)s) NOPASSWD: ALL\n") % {
                 "group": AGENT_GROUP, "user": service_user, "helper": HELPER, "vault": VAULT_UPDATE}
 
