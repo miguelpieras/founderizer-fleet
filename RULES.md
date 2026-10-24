@@ -30,7 +30,7 @@ is far enough gone to change how you work, that line is there too, with the rese
 
 Every agent has `read_messages`. Call it at startup and whenever the helper signals new messages. The hub keeps each message until this tool reads it. A signal carries no task content. Task workers pass their own task id. Owner-chat sessions read without a task id and have only `read_messages`, `tell_owner`, `message_owner` and `message_agent`; messages from other agents arrive there too, with a header that names the sender; an unreplied chat stays available after a restart, with the same request UUID. If any fleet tool says STOP, because the context or attempt is stale or because the task is paused or stopped, stop immediately and wait for the next message.
 
-A worker also has ten, one more on a machine with a vault broker (`call_api`), one more when it holds a target (`place_secret`), and two more only when the owner allowed them (`create_login` and `save_key`):
+A worker also has ten, one more on a machine with a vault broker (`call_api`), and two more only when the owner allowed them (`create_login` and `save_key`):
 
 - `list_my_tasks`: your open tasks, each with the words of the goal it belongs to, the step of that goal's plan that it is for, and that goal's limits, when the manager linked it to one. That is why your task exists; what you have to do is still its "done when" line. Pass your task id to mark it started.
 - `report_progress`: one short note at each real step.
@@ -49,7 +49,6 @@ A worker also has ten, one more on a machine with a vault broker (`call_api`), o
 - `create_login`: have your machine's vault make and save a new login for an account that you open. It gives you the login's name.
 - `save_key`: have your machine's vault read a key that a service shows on a page in Chrome, and save it. You give the selector of the one field, never the key.
 - `call_api`: have your machine's vault send one HTTP request to the site of a saved login, with its key. You give the method, the path, the headers the service asks for and the body; never the key or the site.
-- `place_secret`: have the vault of a target's machine put one saved key into a target that the owner defined — one variable of a server's env file, or one key of a Kubernetes Secret. You give the target, the key's name and the variable; never the value.
 - `resolve_outcome`: after a pause or stop, record whether an action whose outcome is unknown took effect. Check first; never repeat the action to find out.
 - `see_earlier_work`: the work that came before this task, and your own finished work. The task it follows, what
   that one followed, and your own earlier attempts of this task: their result, their progress notes, their questions
@@ -178,13 +177,13 @@ give, ask for a tool that does that one thing with its rule inside it — one ac
 like a refund tool that checks the amount itself — and never for a wider key.
 
 - **The grantable pool.** For each thing that the owner already brought in — a secret or login, a GitHub repository, a
-  Google service, an MCP server, a target for keys — the owner sets one standing in the app: whether the manager may
+  Google service, an MCP server — the owner sets one standing in the app: whether the manager may
   give it, up to which level, and to whom (any worker or lead). Nothing is grantable until the owner says so.
   The manager reads the pool in `see_capacity`: each resource with its level, its audience, who holds it and who may be
   given it, and each agent's own line says what the manager may give that agent. A lead reads no pool, because
   `grant_access` is the manager's alone.
 - **One tool, `grant_access(agent, resource, level)`** (the manager only). The resource is `<kind>:<what>`:
-  `repo:acme/web`, `secret:bws://<uuid>`, `gmail:a@b.com`, `drive:a@b.com`, `tool:<MCP server>` or `target:<name>`. It
+  `repo:acme/web`, `secret:bws://<uuid>`, `gmail:a@b.com`, `drive:a@b.com` or `tool:<MCP server>`. It
   refuses anything that is not in the pool, any level above the one the owner allows, any agent outside the audience,
   and the manager itself. The level is part of what the owner grants, not a second gate. The agent gets the access in its next task
   session; a running session keeps what it started with.
@@ -207,7 +206,7 @@ like a refund tool that checks the amount itself — and never for a wider key.
   is visible without the owner having to look for it.
 - **A blocked task names what it needs.** A worker or a lead that cannot go on for want of access calls
   `ask_my_requester` with the thing itself in `needs_access`: `repo:acme/web`, `secret:bws://<uuid>`, `gmail:a@b.com`,
-  `drive:a@b.com`, `tool:<MCP server>` or `target:<name>`, the same name that `grant_access` takes. A thing you hold at
+  `drive:a@b.com` or `tool:<MCP server>`, the same name that `grant_access` takes. A thing you hold at
   a **lower level** than the work needs is access you do not have, so name that level in `needs_level`: a repository at
   `write` when the work must change a workflow file is an ask for the same repository at `deploy`. The hub reads the
   pool and the holders at that moment and tells your requester which of the three routes it is, in the words of its own
@@ -361,7 +360,6 @@ A login never travels as text. For passwords and keys this rule has no exception
 - **The request is yours to compose.** `headers` takes up to 16 headers of your own — a `Content-Type` when the body is not JSON (a form, for example `application/x-www-form-urlencoded`, which some services take and no other), an `Idempotency-Key`, an API version, anything the service asks for. Five are the vault's and are refused: `Host`, `Authorization`, `Content-Length`, `Transfer-Encoding` and `Connection`, because they say where the key goes, carry it, or frame the request on the connection. A body with no `Content-Type` of yours is sent as JSON, as before.
 - **For an action that moves money or that the service must not do twice, send the service's own idempotency header, and key it to the event and not to this call.** Your `request_id` protects this one call: the hub never sends it twice. It does not protect the same event coming back to you a second time — a watch that fires again, a case that was closed and opened again, a second duty on one payment — because that is a new call with a new `request_id`. So use the thing that names the event (the case key, the payment, the order), not the `request_id`: for a refund of `ch_1A2B`, `Idempotency-Key: refund:ch_1A2B` makes the service itself refuse the second one, whatever happened on our side.
 - If `call_api` says that the outcome is not known, the request can have arrived. It is never sent again, also not with the same `request_id`. Check the service first (a `GET` request is permitted), record what you found with `resolve_outcome`, and only then send a new request with a new `request_id`.
-- **A key that an application on a server reads goes there with `place_secret`, never by your hands.** The owner defines each place once, as a target: one variable of a server's env file, or one key of a Kubernetes Secret, which the vault of one machine reaches over SSH with a key of its own that the host lets do that one thing. The target is the approval: if you hold it (`target:<name>`) and the key, call `place_secret` with the target, the key's name and the variable (an API key has its own), and the vault sends the value, the host writes it and reads it back, and the hub checks that it is the owner's value. You never see it, and you never write a key into a file, a server's settings or a cluster yourself, whatever access you hold there. Placing again is safe: a key that is there already changes nothing. So when the outcome is not known, place it again with a new `request_id`, and the answer says what the target holds; `check=true` only reads that. The application reads a new value when it starts again: the target's note says how, and that start is your normal deploy or restart. For a place that is not a target yet, ask your requester with `needs_access="target:<name>"` or say which place it is: only the owner defines one.
 - If the tool says the vault refused, you are not allowed that login. Do not look for another way. Ask your requester.
 - Never go looking for a password or key yourself: not in the vault, not in a file, not on a page. Never put one in a task, a note, a question, a result, a file, a command or a commit.
 - A one-time code that dies within minutes is the only thing you may pass on as plain text.

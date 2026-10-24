@@ -306,8 +306,6 @@ PAGES = {
     "responsibility": ("/ui/responsibilities/{id}", "one duty with its cases, newest first"),
     "goal": ("/ui/goals/{id}", "one goal with its recorded spending and its history"),
     "resources": ("/ui/resources", "the grantable pool: each resource, the owner's standing for it, who holds it"),
-    "targets": ("/ui/targets", "the owner's targets for keys: who holds each, whether its machine's vault reaches it, "
-                               "the authorized_keys line of each host and the newest placements"),
     "profiles": ("/ui/profiles", "every agent's profile at the hub revision"),
     "knowledge": ("/ui/knowledge", "one owner knowledge file with its text (give path)"),
     "people": ("/ui/people", "the people the owner added, their roles and handles, and the unknown senders"),
@@ -488,7 +486,7 @@ def with_revision(route, read, fields, what):
     return run
 
 
-GRANTS = {"repo": "/ui/team/repos", "tool": "/ui/team/tools", "target": "/ui/team/targets", "secret": "/ui/secrets/grant",
+GRANTS = {"repo": "/ui/team/repos", "tool": "/ui/team/tools", "secret": "/ui/secrets/grant",
           "drive": "/ui/team/google", "gmail": "/ui/team/google"}
 
 
@@ -516,25 +514,11 @@ def grant_access(args):
         names = {line["agent"]: "use" for line in held["lines"] if what in (line.get("tools") or [])}
         held_now = _one_moved_map(names, agent, level)
         return _team_command("/ui/team/tools", {"tool": what, "agents": sorted(held_now)}, what_for, args)
-    if kind == "target":
-        page = get("/ui/targets", "the targets").data or {}
-        found = next((t for t in page.get("targets") or [] if t.get("name") == what), None)
-        if found is None:
-            raise Refused(f"There is no target {what}. Read fleet_read(page=\"targets\") for the ones there are.")
-        held_now = _one_moved_map({n: "use" for n in found.get("holders") or []}, agent, level)
-        return _team_command("/ui/team/targets", {"target": what, "agents": sorted(held_now)}, what_for, args)
     access = {line["agent"]: (line.get("google") or {})[kind]["level"]
               for line in held["lines"]
               if ((line.get("google") or {}).get(kind) or {}).get("account") == what}
     return _one_moved(access, agent, level, "/ui/team/google", {"account": what, "service": kind}, "access",
                       what_for, args)
-
-
-def save_target(args):
-    """`POST /ui/targets/save`: one target of the owner's, or delete true to remove it, which also ends every hold of
-    it. No value: a target is a place on a server and its address. Its host key comes from `add_target_server`."""
-    body = {"name": args.get("name"), "target": None if args.get("delete") is True else args.get("target")}
-    return _team_command("/ui/targets/save", body, f"the target {args.get('name')}", args)
 
 
 def _one_moved_map(held_now, agent, level):
@@ -811,27 +795,6 @@ def add_machine(args):
                      "verify: its lines are in the output above.")
 
 
-def add_target_server(args):
-    """`POST /ui/targets/server`: the one-time line that sets the host of a group of targets up, as `add_machine`
-    gives the line that puts a machine in the fleet. With `ssh_user` this server also runs that line there, over the
-    owner's own SSH, so a host becomes a working target with nothing pasted anywhere."""
-    body = {k: args.get(k) for k in ("machine", "host", "port", "user")}
-    receipt = command("/ui/targets/server", body, "the host setup line", args.get("request_id"))
-    line = receipt.get("line")
-    if not args.get("ssh_user"):
-        return dict(receipt, next="Run the line above on that host as root, or call add_target_server again with "
-                                  "ssh_user and this server runs it. The code works once and for 30 minutes.")
-    if not line:
-        raise Refused("this request was sent before, so the hub gives no code again. Send add_target_server with a "
-                      "new request_id to make a new line.")
-    host, user = args["host"], args["ssh_user"]
-    root = sudo_prefix(ssh(host, user, "id -un; id -u"))
-    done = ssh(host, user, root + "sh -c " + shlex.quote(line), timeout=1800)
-    return dict(receipt, line=None, setup={"exit": done["exit"], "out": done["out"], "error": done["error"]},
-                next="Read targets with fleet_read: the host's row says whether its line is current, and test_target "
-                     "then checks the place end to end without writing.")
-
-
 # ---- the tools
 
 
@@ -1007,8 +970,7 @@ def tools():
         tool("grant_access", "Give one agent a resource the fleet already holds, or end that hold with level null: "
                              "repo:<owner/name> read|write|deploy (deploy also runs its workflows), "
                              "secret:bws://<uuid> use|read, drive:<email> "
-                             "read|write|write_shared, gmail:<email> read|write|send, tool:<name> use, "
-                             "target:<name> use (place_secret puts a key there). The grant is "
+                             "read|write|write_shared, gmail:<email> read|write|send, tool:<name> use. The grant is "
                              "the authorization: the agent then does what that access allows, and the hub records "
                              "who gave what to whom.",
              {"resource": S["text"], "agent": S["text"], "level": S["level"], **rid},
@@ -1019,35 +981,6 @@ def tools():
              {"resource": S["text"], "max": {"type": ["string", "null"]},
               "to": {"type": "string", "enum": ["workers"]}, **rid},
              ("resource",), share_resource),
-        tool("save_target", "Define one target for keys, change it, or remove it with delete true: one variable "
-                            "of an env file (kind env, where = its absolute path) or one key of a Kubernetes Secret "
-                            "(kind k8s, where = NAMESPACE/SECRET, with k8s {api, ca, token} as paths on its host), on "
-                            "a host that the vault of machine reaches over SSH as user. Leave host_key out: "
-                            "add_target_server pins the host's own key. names limits the variables it takes, note "
-                            "tells the agents what "
-                            "restarts the application, then is a command the host runs after a change. An agent "
-                            "that holds target:<name> (grant_access) then puts a key there with place_secret, and "
-                            "never sees it. fleet_read(page=\"targets\") gives the one line each host's "
-                            "authorized_keys file needs.",
-             {"name": S["text"],
-              "target": {"type": "object", "description": "title, kind, where, machine, host, port, user, and "
-                                                          "optionally host_key, names, note, then and k8s. No value "
-                                                          "of a key is ever part of it."},
-              "delete": S["bool"], **rid}, ("name",), save_target),
-        tool("add_target_server", "Set the host of a target up: the hub's one-time line, which installs the place "
-                                  "helper there, gives that vault's key the one line of the user's authorized_keys "
-                                  "file, and reports the host's own key, so nothing is pasted and no host key is "
-                                  "typed. Name the host as its targets do (machine, host, port, user). With ssh_user "
-                                  "this server also runs the line there over the owner's own SSH. Run it again when "
-                                  "a target is added on that host: it replaces its own line.",
-             {"machine": S["text"], "host": S["text"], "port": {"type": "integer"}, "user": S["text"],
-              "ssh_user": S["text"], **rid},
-             ("machine", "host", "port", "user"), add_target_server),
-        tool("test_target", "Check one target end to end without writing: its machine's vault connects with its own "
-                            "key and the host says whether the place can be written. The outcome is in "
-                            "fleet_read(page=\"targets\"), under the target's placements.",
-             {"name": S["text"], **rid}, ("name",),
-             plain("/ui/targets/test", ("name",), "the test of this target")),
         tool("take_resource", "End one agent's hold of one resource, whoever gave it.",
              {"resource": S["text"], "agent": S["text"], **rid}, ("resource", "agent"),
              plain("/ui/resources/take", ("resource", "agent"), "the end of this hold")),

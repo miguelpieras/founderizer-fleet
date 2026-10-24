@@ -251,7 +251,7 @@ def env_prefix(agent, window, values):
 
 
 ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,59}")         # an API key's variable name (owner feature secrets)
-PLACE_PUBLIC = re.compile(r"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}")   # a vault's key for targets
+PLACE_PUBLIC = re.compile(r"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}")   # a vault's key for servers
 # The names that the start of a session sets or that its runtime reads itself; the hub refuses them for an API key.
 ENV_RESERVED = re.compile(r"(?:FLEET|BWS|LD|DYLD|ANTHROPIC|CLAUDE|CODEX|XAI)_[A-Z0-9_]*|PATH|HOME|SHELL|USER|LOGNAME|"
                           r"TMPDIR|TERM|PWD|IFS|ENV|BASH_ENV|ZDOTDIR|NODE_OPTIONS|PYTHONPATH|PYTHONHOME")
@@ -1954,7 +1954,6 @@ class Helper:
         self.conversation_seen = {}     # {C-<id>: when this helper first saw that window} (retire_conversations)
         self.outside, self.outside_lock = 0, threading.Lock()      # checks and login jobs that run now
         self.requests = {}              # call_api: {job: task} of the requests that run now, each in its own thread
-        self.placing = set()            # place_secret: the placements that run now, each in its own thread
         self.screen_attempts = {}       # {task: (attempt, told)} of the runners (app_server_task) that this helper started
         self.start_waits = {}           # {event id: (seconds, monotonic time of the next try)} of failed task events
         if self.worker:
@@ -2409,8 +2408,6 @@ class Helper:
             self.request_job(task, extra)
         elif kind == "deposit":
             self.deposit(extra)
-        elif kind == "place":
-            self.place_job(extra)
         elif kind == "control":
             self.control(task, extra)
         elif kind == "manager_start":
@@ -3624,50 +3621,6 @@ class Helper:
             raise Refused(f"the hub did not take the outcome of delivery {number}")
         self.say(f"delivery {number}: {'saved' if ok else 'refused: ' + text[:120]}")
 
-    def place_job(self, extra):
-        """place_secret: this machine's vault writes one stored key into a target that the owner defined, or checks
-        what the target holds, for a job of the hub's (owner feature secret_targets). The helper passes only the job's
-        number: the vault takes the key, the variable and the target from the hub's confirmation, and nothing of the
-        value passes this process. It runs in a thread of its own, as a request does, because a target can take
-        minutes (its host may restart a service after the change), and no Fleet update restarts the helper until the
-        report is sent. An event that comes again while its placement runs starts nothing."""
-        number = extra.get("placement")
-        if not isinstance(number, int) or isinstance(number, bool) or number < 1:
-            raise Refused("a placement without its number")
-        with self.outside_lock:
-            if number in self.placing:
-                return
-        self.begin_outside()
-        with self.outside_lock:
-            self.placing.add(number)
-        threading.Thread(target=self.place_thread, args=(number,), daemon=True, name=f"place-{number}").start()
-
-    def place_thread(self, number):
-        try:
-            try:
-                report = do_place(self.agent, number)
-            except Unknown as e:        # the target can have written it
-                report = {"ok": False, "unknown": True, "text": str(e)[:300]}
-            except Refused as e:        # the vault proved that nothing was written, or it was never asked
-                report = {"ok": False, "text": str(e)[:300]}
-            except Exception as e:      # never pass details on; after the vault was asked, an error proves nothing
-                report = {"ok": False, "unknown": True, "text": f"the helper hit an error ({type(e).__name__})"}
-            took = False
-            for pause in (0, 2, 5, 15):     # the vault keeps no answer: a report lost here cannot be had again
-                time.sleep(pause)
-                try:
-                    code, _ = http("POST", f"/helper/place/{self.agent}/{number}", report, timeout=15)
-                except Exception:
-                    continue
-                if code in (200, 409):      # 409: the hub has an outcome of this placement already
-                    took = True
-                    break
-            self.say(f"placement {number}: " + (report.get("text") or "done") + ("" if took else "; the hub took no report"))
-        finally:
-            with self.outside_lock:
-                self.placing.discard(number)
-            self.end_outside()
-
     def login_job(self, kind, task, extra):
         """A sign-in or a handover an agent asked for. It happens here, outside the agent's session."""
         login, to = str(extra.get("login") or ""), str(extra.get("to") or "")
@@ -4218,7 +4171,7 @@ def broker_job_request(agent, request, timeout=90):
 
 
 SAVES = {"create": "creates", "capture": "captures"}     # the vault operations that save an item, and their status field
-NO_ANSWER_IS_UNKNOWN = set(SAVES) | {"request", "place"}     # after one of these went to the vault, silence proves nothing
+NO_ANSWER_IS_UNKNOWN = set(SAVES) | {"request"}          # after one of these went to the vault, silence proves nothing
 REPLY_LIMIT = 1 << 20           # bytes of one vault answer: a request's answer has a body
 
 
@@ -4254,16 +4207,15 @@ def vault_call(request, timeout=90):
     except (OSError, ValueError):
         if sent and request.get("op") in NO_ANSWER_IS_UNKNOWN:      # it can have reached the vault: no answer proves nothing
             raise Unknown("this machine's vault broker gave no answer for the " +
-                          {"request": "request", "place": "placement"}.get(request.get("op"), "new login")) from None
+                          ("request" if request.get("op") == "request" else "new login")) from None
         raise Refused("this machine's vault broker did not answer; ask your requester") from None
     if not isinstance(reply, dict) or reply.get("ok") is not True:
         error = reply.get("error") if isinstance(reply, dict) else None
         if isinstance(reply, dict) and reply.get("unknown") is True:
             raise Unknown("the vault could not confirm the outcome" + (f": {error}" if isinstance(error, str) else ""))
-        if request.get("op") in ("request", "place") and not (isinstance(reply, dict) and reply.get("ok") is False):
-            # call_api and place_secret: only the vault's own refusal (ok: false) proves that nothing went out
-            raise Unknown("this machine's vault broker gave no clear answer for the " +
-                          ("request" if request.get("op") == "request" else "placement"))
+        if request.get("op") == "request" and not (isinstance(reply, dict) and reply.get("ok") is False):
+            # call_api: only the vault's own refusal (ok: false) proves that nothing went out
+            raise Unknown("this machine's vault broker gave no clear answer for the request")
         raise Refused("the vault broker refused" + (f": {error}" if isinstance(error, str) else ""))
     return reply
 
@@ -4344,7 +4296,7 @@ def vault_status(agent):
               "captures": (status.get("captures") is True) if status else None,     # save_key
               "requests": (status.get("requests") is True) if status else None,     # call_api
               "deposits": (status.get("deposits") is True) if status else None,     # a delivered secret of the owner's
-              "places": (status.get("places") is True) if status else None,         # place_secret: writes to targets
+              "places": (status.get("places") is True) if status else None,         # vault.py place: unused now
               "place_key": status.get("place_key") if status and isinstance(status.get("place_key"), str)
               and PLACE_PUBLIC.fullmatch(status["place_key"]) else None,
               "broker_recipient": recipient if isinstance(recipient, str) else None,
@@ -4847,39 +4799,6 @@ def do_request(agent, job):
     if done.get("truncated") is True:
         report["truncated"] = True
     return report
-
-
-PLACE_WAIT = 360            # seconds that a placement may take in the vault: its target's own command gets 300
-
-
-def do_place(agent, number):
-    """place_secret: have this machine's vault write one stored key into a target, or check the target, for a job of
-    the hub's. Returns the report for the hub, in words that hold no value. Refused: nothing was written. Unknown: the
-    target can have written it, and placing it again is safe."""
-    if vault_mode(agent) != "broker":
-        raise Refused("a key is placed only by this machine's vault broker, and this agent has no broker access")
-    status = broker_status()
-    if not (status and status.get("callers") is True and status.get("places") is True) or not load_agent_key(agent):
-        raise Refused("this machine's vault cannot reach a target")
-    try:
-        done = broker_job_request(agent, {"op": "place", "job": broker_job(agent, number)}, timeout=PLACE_WAIT)
-    except Refused as e:        # the vault's words about the target are the outcome, without vault_call's preface
-        text = str(e)
-        for preface in ("the vault broker refused: ", "the vault could not confirm the outcome: "):
-            if text.startswith(preface):
-                raise type(e)(text[len(preface):]) from None
-        raise
-    if done.get("unknown") is True:
-        raise Unknown(str(done.get("error") or "the target can have written it")[:300])
-    if done.get("job") != number or done.get("op") not in ("place", "check"):
-        raise Unknown("the vault gave no outcome for the placement")
-    if done["op"] == "check":
-        text = ("the target can be written" if done.get("writable") else "the target cannot be written") \
-            if "writable" in done else ("the target holds it" if done.get("present") else "the target does not hold it")
-    else:
-        text = {"new": "written", "same": "it was there already", "replaced": "written in the place of the old "
-                "value"}.get(done.get("was"), "written")
-    return {"ok": True, "text": text}
 
 
 def do_handover(name, agent, to, task="", job=None):

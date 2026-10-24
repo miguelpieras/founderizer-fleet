@@ -134,9 +134,8 @@ would read as an empty fleet instead of as a mistake.
 | `check_machine` / `update_machine` | `/ui/machines/<a>/check`, `/update` | Take a reading now; update Fleet when idle. |
 | `check_mcp_server` | `/ui/mcp/check` | Does this MCP server answer? Asked before it is saved, and of a machine for a `command` server. Writes nothing. |
 | `save_mcp_server` | `/ui/team/mcp` | Add one of the owner's own MCP servers, change it, or remove it. An agent loads it only once it also holds `tool:<name>`. |
-| `grant_access` | `/ui/team/repos`, `/ui/team/tools`, `/ui/team/targets`, `/ui/team/google`, `/ui/secrets/grant` | One agent's hold of one resource, as `<kind>:<what>` and a level. |
+| `grant_access` | `/ui/team/repos`, `/ui/team/tools`, `/ui/team/google`, `/ui/secrets/grant` | One agent's hold of one resource, as `<kind>:<what>` and a level. |
 | `share_resource` / `take_resource` | `/ui/resources`, `/ui/resources/take` | The pool's standing; and end one hold. |
-| `save_target` / `add_target_server` / `test_target` | `/ui/targets/save`, `/ui/targets/server`, `/ui/targets/test` | Define, change or remove one target for keys (a variable of a server's env file, or a key of a Kubernetes Secret); set its host up with the hub's one-time line, which installs the place helper there, writes the one `authorized_keys` line and pins the host's own key, and which this server runs over SSH when you give it `ssh_user`; and check the target end to end without writing. An agent that holds `target:<name>` puts a key there with `place_secret` and never sees it. |
 | `save_account` | `/ui/team/accounts` | One runtime account: its provider and the owner's title for it. |
 | `save_login` | `/ui/team/logins` | The owner's title for one vault login, by its `bws://` reference. The label only. |
 | `machine_access` | `/ui/team/access` | How the fleet reaches a machine: its SSH user, port, Screen Sharing. |
