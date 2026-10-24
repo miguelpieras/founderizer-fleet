@@ -2408,6 +2408,8 @@ class Helper:
             self.request_job(task, extra)
         elif kind == "deposit":
             self.deposit(extra)
+        elif kind == "withdraw":
+            self.withdraw(extra)
         elif kind == "control":
             self.control(task, extra)
         elif kind == "manager_start":
@@ -3621,6 +3623,28 @@ class Helper:
             raise Refused(f"the hub did not take the outcome of delivery {number}")
         self.say(f"delivery {number}: {'saved' if ok else 'refused: ' + text[:120]}")
 
+    def withdraw(self, extra):
+        """A secret that the hub delivered into this machine's vault and that no agent here holds any more (owner
+        feature central_vault). The helper passes only the withdrawal's number: the broker asks the hub which secret
+        it names and removes it from its own store, and only an item that was delivered there. The outcome goes back
+        to the hub; if the hub cannot be told, the event stays pending and the next poll asks again, which is the
+        same removal."""
+        number = extra.get("withdraw")
+        if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+            raise Refused("a withdrawal without its number")
+        try:
+            reply = broker_job_request(self.agent, {"op": "withdraw", "job": number}, timeout=60)
+            ok, text = True, "Removed from this machine's vault." if reply.get("removed") == "removed" else \
+                "This machine's vault did not have it."
+        except Refused as e:
+            ok, text = False, str(e)[:300]
+        except Exception as e:          # never pass details on: they could hold a value
+            ok, text = False, f"the helper hit an error ({type(e).__name__})"
+        code, _ = http("POST", f"/helper/withdraw/{self.agent}/{number}", {"ok": ok, "text": text})
+        if code != 200:
+            raise Refused(f"the hub did not take the outcome of withdrawal {number}")
+        self.say(f"withdrawal {number}: {'removed' if ok else 'refused: ' + text[:120]}")
+
     def login_job(self, kind, task, extra):
         """A sign-in or a handover an agent asked for. It happens here, outside the agent's session."""
         login, to = str(extra.get("login") or ""), str(extra.get("to") or "")
@@ -4296,6 +4320,7 @@ def vault_status(agent):
               "captures": (status.get("captures") is True) if status else None,     # save_key
               "requests": (status.get("requests") is True) if status else None,     # call_api
               "deposits": (status.get("deposits") is True) if status else None,     # a delivered secret of the owner's
+              "withdrawals": (status.get("withdrawals") is True) if status else None,   # and taking one back
               "places": (status.get("places") is True) if status else None,         # vault.py place: unused now
               "place_key": status.get("place_key") if status and isinstance(status.get("place_key"), str)
               and PLACE_PUBLIC.fullmatch(status["place_key"]) else None,

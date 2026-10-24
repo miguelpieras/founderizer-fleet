@@ -311,6 +311,12 @@ CREATE TABLE IF NOT EXISTS deposits(id INTEGER PRIMARY KEY, login TEXT NOT NULL,
   agent TEXT NOT NULL, recipient TEXT NOT NULL, sha256 TEXT NOT NULL, ciphertext TEXT, request_id TEXT NOT NULL,
   created REAL NOT NULL, released REAL, verified REAL, finished REAL, ok INTEGER, result TEXT);
 CREATE INDEX IF NOT EXISTS deposit_of ON deposits(login, machine, id);
+-- Owner feature central_vault: one secret that no agent of a machine holds any more, which the hub asks that
+-- machine's vault to take out of its own store. The reconciler makes one only for a secret the central vault holds
+-- and the hub delivered there. It names a reference, never a value.
+CREATE TABLE IF NOT EXISTS withdrawals(id INTEGER PRIMARY KEY, login TEXT NOT NULL, machine TEXT NOT NULL,
+  agent TEXT NOT NULL, created REAL NOT NULL, released REAL, finished REAL, ok INTEGER, result TEXT);
+CREATE INDEX IF NOT EXISTS withdrawal_of ON withdrawals(login, machine, id);
 -- Unused since 24 October 2026, when Targets left the hub (the owner rejected them): nothing writes or reads the
 -- three tables below any more. They stay as they are, with whatever a hub already holds in them, so that no database
 -- changes its shape. `placements` was one key that a machine's vault placed into a target of the owner's, or one
@@ -631,6 +637,8 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "attachment_knowledge", "asking_and_waiting", "account_limits", "secret_requests",
                "secret_deliveries"]
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
+# One name is not here because it is not always true: central_vault, which ui_features() adds only while the central
+# vault answers (central_ok).
 
 
 OWNER_DEVICE_LIMIT = 4          # the owner's own devices (MOBILE-APP.md): the phone, and three more
@@ -989,7 +997,7 @@ def mobile_state(generation):
                                                         f"ORDER BY id DESC LIMIT {MOBILE_TASKS}")]
     needs = [need_view(r) for r in q("SELECT * FROM needs WHERE answer IS NULL ORDER BY id")]
     return {"schema_version": 1, "db": generation, "time": now(), "manager_flag": kv_get("mgr_flag"),
-            "manager_warning": manager_warning(), "ui_features": list(UI_FEATURES),
+            "manager_warning": manager_warning(), "ui_features": ui_features(),
             "agents": [mobile_agent(name, config) for name, config in agents().items()],
             "needs": needs, "tasks": tasks, "recent": list(reversed(recent)),
             "holds": [dict(r) for r in q("SELECT * FROM holds WHERE released IS NULL ORDER BY id")],
@@ -1084,7 +1092,7 @@ def filed_under(agent, kind, task):
 
 def emit(agent, kind, text, task=None, extra=None):
     """Queue a message for one agent's helper. Kinds: task, say, chat, stop, control, signin, handover, create,
-    capture, request, deposit, notify, mcp_program, manager_start."""
+    capture, request, deposit, withdraw, notify, mcp_program, manager_start."""
     return ins(EVENT, (agent, kind, filed_under(agent, kind, task), str(text), now(), json.dumps(extra or {})))
 
 
@@ -5996,6 +6004,9 @@ def finish_deposit(row, ok, text, t0=None):
         said = f"[hub] {name} ({row['login']}) is now in the vault of {row['machine']}" + \
             (f", where {', '.join(holders)} hold{'s' if len(holders) == 1 else ''} it: a task session that starts "
              f"from now on has it." if holders else ".")
+    elif row["request_id"].startswith(CENTRAL_REQUEST):     # the reconciler's own: it tries again by itself
+        said = f"[hub] {name} ({row['login']}) did not reach the vault of {row['machine']}: {text} The hub " \
+               f"sends it again from the central vault in {CENTRAL_RETRY // 3600} hours."
     else:
         said = f"[hub] {name} ({row['login']}) did not reach the vault of {row['machine']}: {text} The owner " \
                f"delivers it again from the Secrets page of Founderizer."
@@ -6013,6 +6024,469 @@ def expire_deposits(t0):
                if store_key(TEAM, r["machine"]) != r["recipient"] else None)
         if why:
             finish_deposit(r, False, why, t0)
+
+
+# ---------------------------------------------------------------- the central vault (owner feature central_vault)
+#
+# The owner, 24 October 2026: one central vault on the hub's server holds every secret, and each server's vault gets
+# only the secrets its agents hold grants for. It is a service of its own, with a user of its own, and the hub's user
+# can neither read its files nor replace its program (HUB-INSTALL.md, "The central vault"). It trusts the hub as a
+# machine's broker does, except where one call would give everything away: it seals a copy only to a server key the
+# owner signed (a pin), and its backup only to a recovery key the owner signed. So a hub that is broken into cannot
+# add a server of its own and pull every secret in one call.
+#
+# The hub reads its status, passes the owner's own commands through (intake, pin, recovery), and reconciles: each
+# pinned machine's vault gets the secrets its agents hold and the central vault has, sealed there to that pin and
+# carried by the deliveries above, and gives back the ones nobody there holds any more. Its socket is never asked
+# under LOCK, which every other request needs while one call can take CENTRAL_WAIT seconds (central_call).
+CENTRAL_SOCKET = "/run/fleet-vault-central/vault.sock"     # the default of CFG["central_vault"]
+CENTRAL_WAIT = 10               # seconds one call to the central vault may take
+CENTRAL_READ_EVERY = 60         # seconds between two reads of its status
+CENTRAL_FRESH = 300             # an ok status older than this is not served: central_vault leaves ui_features
+CENTRAL_PASS_EVERY = 60         # seconds between two passes of the reconciler, unless something asks for one sooner
+CENTRAL_RETRY = 6 * 3600        # a delivery or a withdrawal that failed waits this long before the reconciler tries again
+CENTRAL_BATCH = 16              # sealed copies in one pass; the next pass, one tick later, goes on with the rest
+CENTRAL_ANSWER_MAX = 64 * 1024 * 1024      # bytes of one answer: an export carries the whole store
+CENTRAL_REQUEST = "central:"    # the request_id of a delivery the reconciler made: "central:<uuid4>"
+CENTRAL_MEMBER = "vault/central.json"      # the central vault's export in a copy of the fleet (backup_bundle)
+WITHDRAW_WAIT = DEPOSIT_WAIT    # seconds a withdrawal waits for its machine before it is dropped
+CENTRAL_START = {"status": None, "read_at": None, "tried_at": 0.0, "error": None, "due": False, "grants": None,
+                 "passed_at": 0.0, "said": None}
+CENTRAL = dict(CENTRAL_START)   # what the timers last read, in this process only; CENTRAL_LOCK guards it
+CENTRAL_LOCK = threading.Lock()     # held only to read or write CENTRAL: nothing that takes LOCK runs under it
+
+
+def central_call(op, fields=None):
+    """One request to the central vault: one JSON line out, one line in, at most CENTRAL_WAIT seconds.
+
+    Never under LOCK, which every other request needs while this one waits: it raises at once when its caller holds
+    it, so a call put in the wrong place fails in its first test instead of stalling the hub in production. A socket
+    that is missing, closed to the hub's user or silent is a Refusal(503); the vault's own refusal is a Refusal(409)
+    with its one sentence, which never holds a value."""
+    import socket
+    if LOCK._is_owned():
+        raise RuntimeError("the central vault is asked while LOCK is held: ask it before or after, never under it")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(CENTRAL_WAIT)
+            s.connect(CFG.get("central_vault") or CENTRAL_SOCKET)
+            s.sendall((json.dumps(dict(fields or {}, v=2, op=op)) + "\n").encode())
+            data = bytearray()          # an export is one line as long as the store file: megabytes
+            while not data.endswith(b"\n"):
+                chunk = s.recv(1 << 20)
+                if not chunk:
+                    break
+                data += chunk
+                if len(data) > CENTRAL_ANSWER_MAX:
+                    raise ValueError("the answer is too long")
+        answer = json.loads(bytes(data))
+    except (FileNotFoundError, ConnectionRefusedError):
+        raise Refusal(503, "no central vault answers on this hub") from None
+    except PermissionError:
+        raise Refusal(503, "the hub's user may not open the central vault's socket") from None
+    except socket.timeout:
+        raise Refusal(503, f"the central vault did not answer in {CENTRAL_WAIT} seconds") from None
+    except (OSError, ValueError):
+        raise Refusal(503, "the central vault gave no answer the hub can read") from None
+    if not isinstance(answer, dict):
+        raise Refusal(503, "the central vault gave no answer the hub can read")
+    if answer.get("ok") is not True:
+        said = answer.get("error")
+        if not (isinstance(said, str) and 0 < len(said) <= 300 and "\n" not in said) or secret_hit(said):
+            said = "it gave no reason the hub can pass on"
+        raise Refusal(409, f"the central vault refused: {said}")
+    return answer
+
+
+def central_ok(t0=None):
+    """True while the last status read of the central vault was ok and is younger than CENTRAL_FRESH."""
+    with CENTRAL_LOCK:
+        status, at, error = CENTRAL["status"], CENTRAL["read_at"], CENTRAL["error"]
+    return status is not None and error is None and at is not None and (t0 or now()) - at < CENTRAL_FRESH
+
+
+def ui_features():
+    """The owner features this hub serves now: UI_FEATURES, and central_vault only while central_ok()."""
+    return list(UI_FEATURES) + (["central_vault"] if central_ok() else [])
+
+
+def central_due():
+    """The next pass reads the status again and reconciles at once: the central vault or the fleet just changed."""
+    with CENTRAL_LOCK:
+        CENTRAL["due"] = True
+
+
+def central_pins(status):
+    """{machine: recipient} of a status answer's pins, the well-formed ones only."""
+    out = {}
+    for machine, pin in ((status or {}).get("pins") or {}).items():
+        recipient = pin.get("recipient") if isinstance(pin, dict) else None
+        if isinstance(machine, str) and isinstance(recipient, str) and AGE_RECIPIENT.fullmatch(recipient):
+            out[machine] = recipient
+    return out
+
+
+def central_read(t0=None):
+    """Read the central vault's status and keep it. An ok answer is kept with its time; otherwise the one sentence
+    that says why is kept, and the last ok answer stays with its own time, so the owner sees how old it is. A vault
+    that is not central, or that serves another fleet, is not one this hub uses. Never under LOCK."""
+    t0 = t0 or now()
+    try:
+        answer = central_call("status")
+        if answer.get("central") is not True or not isinstance(answer.get("pins"), dict):
+            raise Refusal(503, "the vault on this socket is not a central vault")
+        fleet = fleet_id()
+        if answer.get("fleet") != fleet:
+            raise Refusal(409, f"the central vault here serves another fleet, and this hub is fleet {fleet}")
+    except Refusal as e:
+        with CENTRAL_LOCK:
+            CENTRAL.update(tried_at=t0, error=str(e))
+        return None
+    with CENTRAL_LOCK:
+        CENTRAL.update(status=answer, read_at=t0, tried_at=t0, error=None)
+    return answer
+
+
+def central_said(text):
+    """A problem of the reconciler, in the log once, and again only when it changes: a pass runs every minute."""
+    with CENTRAL_LOCK:
+        if CENTRAL["said"] == text:
+            return
+        CENTRAL["said"] = text
+    log("hub", text)
+
+
+def central_grants():
+    """What the reconciler reads of team.json, as one value: when it changes (a grant, a machine, the catalog), the
+    next pass runs at once instead of within the minute."""
+    return json.dumps([sorted(logins()), sorted((name, a.get("machine"), a.get("vault"), sorted(secret_grants(name)))
+                                                for name, a in agents().items())])
+
+
+def newest_holding(machine, ref):
+    """(the newest delivery, the newest withdrawal) of one secret on one machine, or None for each. read_row, because
+    the reconciler reads these under LOCK next to its own writes."""
+    return (read_row("SELECT * FROM deposits WHERE login=? AND machine=? ORDER BY id DESC LIMIT 1", (ref, machine)),
+            read_row("SELECT * FROM withdrawals WHERE login=? AND machine=? ORDER BY id DESC LIMIT 1", (ref, machine)))
+
+
+def vault_holds(d, w):
+    """(held, waiting) of one secret on one machine by the hub's own records, from its newest delivery d and newest
+    withdrawal w there: held when that delivery ended ok and no withdrawal made after it ended ok, waiting while
+    either of them is open. A secret that is being taken out is still held, and waiting."""
+    held = d is not None and d["ok"] == 1 and not (w is not None and w["ok"] == 1 and w["created"] > d["created"])
+    return held, (d is not None and d["finished"] is None) or (w is not None and w["finished"] is None)
+
+
+def central_holdings():
+    """{(machine, ref): (newest delivery, newest withdrawal)} of every secret the hub's records place on a machine."""
+    out = {}
+    for r in read_rows("SELECT * FROM deposits WHERE id IN (SELECT MAX(id) FROM deposits GROUP BY login, machine)"):
+        out[(r["machine"], r["login"])] = (r, None)
+    for r in read_rows("SELECT * FROM withdrawals WHERE id IN (SELECT MAX(id) FROM withdrawals GROUP BY login, "
+                       "machine)"):
+        out[(r["machine"], r["login"])] = (out.get((r["machine"], r["login"]), (None, None))[0], r)
+    return out
+
+
+def central_held():
+    """{machine: [refs]} that each machine's vault holds by the hub's own records (vault_holds)."""
+    out = {}
+    for (machine, ref), (d, w) in central_holdings().items():
+        if vault_holds(d, w)[0]:
+            out.setdefault(machine, []).append(ref)
+    return {machine: sorted(refs) for machine, refs in sorted(out.items())}
+
+
+def can_withdraw(carrier, t0=None):
+    """True when this carrier's helper carries a withdrawal (secret_withdrawals) and its machine's broker takes one
+    (its status says withdrawals: true). A broker's program is a root-owned copy that no release brings up to date, so
+    a new helper beside an old broker would only collect the broker's refusals."""
+    report = broker_report(carrier, t0) or {}
+    return "secret_withdrawals" in (report.get("features") or []) and report.get("withdrawals") is True
+
+
+def central_plan(pins, inventory, t0):
+    """What one pass of the reconciler does: ([(machine, ref, carrier)] to seal and deliver, [(machine, ref, carrier)]
+    to withdraw). It writes nothing; called with LOCK held.
+
+    Only a machine with a carrier (deposit_machines) whose central pin is its broker's key takes part: one without a
+    pin (not_pinned) or with another key pinned (pin_mismatch) is left out, and vault_view says why. There the vault
+    should hold what its agents hold and the central vault has, and gets each of those it does not hold and does not
+    wait for. What it holds that none of its agents holds goes back, but only a secret the central vault holds: one it
+    lacks came from somewhere else, and nothing here takes that away. What failed lately waits CENTRAL_RETRY first,
+    unless it was sealed to another key than the pin of now. A secret that is not in the catalog is not sent, because
+    the carrier's vault would refuse it (helper_deposit), and it is not taken back either while an agent holds it."""
+    holdings, catalog, deliver, withdraw = central_holdings(), logins(), [], []
+    for name, m in sorted(deposit_machines(None, t0).items()):
+        pin = pins.get(name)
+        if not m["carrier"] or not pin or pin != m["recipient"]:
+            continue
+        desired = {ref for agent in m["agents"] for ref in secret_grants(agent) if ref in inventory}
+        withdraws = can_withdraw(m["carrier"], t0)
+        for ref in sorted(desired | {ref for machine, ref in holdings if machine == name}):
+            d, w = holdings.get((name, ref), (None, None))
+            held, waiting = vault_holds(d, w)
+            if waiting:
+                continue
+            if ref in desired and not held:
+                if ref in catalog and not (d is not None and d["ok"] == 0 and d["recipient"] == pin
+                                           and t0 - d["finished"] < CENTRAL_RETRY):
+                    deliver.append((name, ref, m["carrier"]))
+            elif held and ref not in desired and ref in inventory and withdraws:
+                if not (w is not None and w["ok"] == 0 and w["created"] > d["created"]
+                        and t0 - w["finished"] < CENTRAL_RETRY):
+                    withdraw.append((name, ref, m["carrier"]))
+    return deliver, withdraw
+
+
+def central_sealed(answer, ref, machine, pin):
+    """The copy in a seal answer, checked as a copy from the owner's app is (POST /ui/secrets/deliver): for this
+    secret and this machine, sealed to its pin, an armored age file with the checksum it names, and no registered
+    value in plain text."""
+    text = sealed_copy(answer.get("ciphertext"))
+    if text is None or text != answer.get("ciphertext") or str(answer.get("login") or "").lower() != ref \
+            or answer.get("machine") != machine or answer.get("recipient") != pin \
+            or hashlib.sha256(text.encode()).hexdigest() != answer.get("sha256"):
+        raise Refusal(502, "its sealed copy is not the one the hub asked for")
+    if secret_hit(text):
+        raise Refusal(422, "its sealed copy holds a registered value in plain text")
+    return text
+
+
+def central_deliver(machine, ref, text, pin, t0):
+    """One sealed copy of the central vault's into a delivery, as deliver_secret makes one for a copy of the owner's
+    app, if the machine still takes it now: a carrier, the pin still its broker's key, the secret still in the catalog
+    and held by one of its agents, and nothing of it held or waiting there. The seal came from the socket outside
+    LOCK, so each of those is read again here. Called with LOCK held; returns the delivery's id, or None."""
+    m, entry = deposit_machines(None, t0).get(machine), logins().get(ref)
+    if not m or not m["carrier"] or m["recipient"] != pin or entry is None or \
+            ref not in {one for agent in m["agents"] for one in secret_grants(agent)} or \
+            any(vault_holds(*newest_holding(machine, ref))):
+        return None
+    with transaction():
+        did = DB.execute("INSERT INTO deposits(login,machine,agent,recipient,sha256,ciphertext,request_id,created) "
+                         "VALUES(?,?,?,?,?,?,?,?)", (ref, machine, m["carrier"], pin,
+                                                     hashlib.sha256(text.encode()).hexdigest(), text,
+                                                     CENTRAL_REQUEST + str(uuid.uuid4()), t0)).lastrowid
+        event_rows([(m["carrier"], "deposit", None, f"deliver {entry.get('env') or entry['title']} into this "
+                                                    f"machine's vault", {"deposit": did, "login": ref})], t0)
+    log("hub", f"sealed {ref} for the vault of {machine} from the central vault ({m['carrier']} carries it)")
+    return did
+
+
+def central_withdraw(plan, t0):
+    """The withdrawals of one pass and the event of each to its carrier, in one transaction. Called with LOCK held;
+    returns their ids."""
+    catalog, events, made = logins(), [], []
+    with transaction():
+        for machine, ref, carrier in plan:
+            wid = DB.execute("INSERT INTO withdrawals(login,machine,agent,created) VALUES(?,?,?,?)",
+                             (ref, machine, carrier, t0)).lastrowid
+            entry = catalog.get(ref) or {}
+            events.append((carrier, "withdraw", None, f"take {entry.get('env') or entry.get('title') or ref} out of "
+                                                      f"this machine's vault", {"withdraw": wid, "login": ref}))
+            made.append(wid)
+        event_rows(events, t0)
+    for machine, ref, carrier in plan:
+        log("hub", f"asked the vault of {machine} to give back {ref}, which no agent there holds ({carrier} carries "
+                   f"it)")
+    return made
+
+
+def central_reconcile(t0=None):
+    """One pass of the reconciler, while the central status is ok. Never under LOCK: the inventory and each sealed
+    copy come from the central vault's socket, and the rows go in under LOCK between those calls, each checked again
+    there. At most CENTRAL_BATCH copies a pass, and the next pass goes on with the rest. Returns {"delivered": [ids
+    of deliveries], "withdrawn": [ids of withdrawals]}."""
+    t0 = t0 or now()
+    with CENTRAL_LOCK:
+        pins = central_pins(CENTRAL["status"])
+    listed = central_call("inventory").get("logins")
+    inventory = {ref.lower() for ref in (listed if isinstance(listed, list) else [])
+                 if isinstance(ref, str) and BWS_REF.fullmatch(ref)}
+    with LOCK:
+        deliver, withdraw = central_plan(pins, inventory, t0)
+        withdrawn = central_withdraw(withdraw, t0) if withdraw else []
+    delivered = []
+    for machine, ref, _carrier in deliver[:CENTRAL_BATCH]:
+        try:
+            text = central_sealed(central_call("seal", {"login": ref, "machine": machine}), ref, machine,
+                                  pins[machine])
+        except Refusal as e:
+            central_said(f"the central vault did not seal {ref} for the vault of {machine}: {e}")
+            continue
+        with LOCK:
+            did = central_deliver(machine, ref, text, pins[machine], t0)
+        if did:
+            delivered.append(did)
+    if len(deliver) > CENTRAL_BATCH:
+        central_due()
+    return {"delivered": delivered, "withdrawn": withdrawn}
+
+
+def central_sweep(t0=None):
+    """The central vault's part of the timers (central_timer): its status at most every CENTRAL_READ_EVERY seconds,
+    and a pass of the reconciler at most every CENTRAL_PASS_EVERY seconds, or at once when a grant, a machine or the
+    catalog changed or an owner command asked for one (central_due). Never under LOCK. Returns what the pass did, or
+    None when none ran."""
+    t0 = t0 or now()
+    with CENTRAL_LOCK:
+        due, CENTRAL["due"] = CENTRAL["due"], False
+        read = due or t0 - CENTRAL["tried_at"] >= CENTRAL_READ_EVERY
+    if read:
+        central_read(t0)
+    if not central_ok(t0):
+        return None
+    grants = central_grants()
+    with CENTRAL_LOCK:
+        if not (due or grants != CENTRAL["grants"] or t0 - CENTRAL["passed_at"] >= CENTRAL_PASS_EVERY):
+            return None
+        CENTRAL.update(grants=grants, passed_at=t0)
+    try:
+        return central_reconcile(t0)
+    except Refusal as e:
+        central_said(f"the central vault's reconciler stopped: {e}")
+        return None
+
+
+def central_timer():
+    """The central vault's own thread beside the timers: a slow answer of its socket (CENTRAL_WAIT) holds up no other
+    timer, and nothing here runs under LOCK."""
+    while True:
+        time.sleep(CFG["tick"])
+        try:
+            central_sweep()
+        except Exception:
+            traceback.print_exc()
+
+
+def vault_view(t0=None):
+    """GET /ui/vault: this fleet's id and the hub's own kit, which the owner's app needs before any central vault
+    exists (it installs one with <kit>/hubsetup.py and signs its statements with the fleet id); the central vault as
+    the timers last read it; each machine with a worker or a lead, with its central pin and what keeps the reconciler
+    from it; and what each machine's vault holds by the hub's own records. No call to the vault and never a value.
+    Called with LOCK held."""
+    t0 = t0 or now()
+    with CENTRAL_LOCK:
+        status, read_at, error = CENTRAL["status"], CENTRAL["read_at"], CENTRAL["error"]
+    pins, machines = central_pins(status), []
+    for name, m in sorted(deposit_machines(None, t0).items()):
+        key, pinned = store_key(TEAM, name), pins.get(name)
+        missing = list(m["missing"])
+        if status is not None:
+            missing += ["not_pinned"] if not pinned else ["pin_mismatch"] if pinned != key else []
+        machines.append({"machine": name, "carrier": m["carrier"], "broker_recipient": key, "pinned": pinned,
+                         "matches": pinned is not None and pinned == key, "missing": missing})
+    held = dict({m["machine"]: [] for m in machines}, **central_held())
+    return {"fleet": fleet_id(), "kit": os.path.dirname(os.path.abspath(__file__)), "central": status,
+            "read_at": read_at, "error": error, "machines": machines, "held": held}
+
+
+def central_intake(ref, text):
+    """POST /ui/vault/intake's call: the secret's title and kind from the catalog, the salts and the fingerprints the
+    owner's vault registered under its reference (POST /ui/secrets/add), and the copy the owner's app sealed to the
+    central vault's own key. The central vault keeps the value only when its fingerprints are those. Never under
+    LOCK."""
+    entry = logins().get(ref)
+    if entry is None:
+        raise Refusal(404, "no such secret: its hub step (POST /ui/secrets/add) comes first")
+    labels = {kind: fingerprint_label(ref, kind) for kind in ("password", "totp")}
+    prints = [{"kind": kind, "hash": r["hash"], "len": r["len"]} for kind, label in labels.items()
+              for r in q("SELECT hash, len FROM secrets WHERE label=? ORDER BY id", (label,))]
+    if not prints:
+        raise Refusal(409, "the owner's vault registered no fingerprint of this secret, so the central vault could "
+                           "not tell that it holds his value: POST /ui/secrets/add with its fingerprints comes first")
+    answer = central_call("intake", {"login": ref, "title": entry["title"], "item": entry.get("kind") or "login",
+                                     "ciphertext": text, "fingerprints": prints,
+                                     "salts": {kind: fingerprint_salt(label) for kind, label in labels.items()}})
+    if answer.get("saved") not in ("new", "same") or str(answer.get("login") or "").lower() != ref:
+        raise Refusal(502, "the central vault's answer is not about this secret")
+    return answer
+
+
+CENTRAL_STATEMENT_MAX = 2000    # characters of one signed statement (pin, unpin or recovery)
+CENTRAL_SIGNATURE = re.compile(r"[A-Za-z0-9+/]{8,200}={0,2}")      # base64 of a DER signature: about 96 characters
+
+
+def statement_kind(statement):
+    """The kind of one of the owner's signed statements, pin, unpin or recovery, or None. It is the one field the hub
+    reads: the central vault checks the signature and everything else."""
+    try:
+        kind = json.loads(statement).get("kind")
+    except (ValueError, AttributeError, TypeError):
+        return None
+    return kind if kind in ("pin", "unpin", "recovery") else None
+
+
+def central_statement(body):
+    """POST /ui/vault/pin and /recovery: the owner's signed statement and its signature, as they came, to the central
+    vault's op of the statement's own kind. The hub keeps no copy of the owner's key. Never under LOCK."""
+    kind = statement_kind(body["statement"])
+    return dict(central_call(kind, {"statement": body["statement"], "signature": body["signature"]}), kind=kind)
+
+
+def withdrawal_waiting(wid, agent):
+    """The withdrawal that this agent's helper carries, while it waits, or None."""
+    row = q1("SELECT * FROM withdrawals WHERE id=? AND agent=?", (wid, agent))
+    return row if row and not row["finished"] else None
+
+
+def finish_withdrawal(row, ok, text, t0=None):
+    """End one withdrawal and tell the manager quietly, as finish_deposit does: it comes with his next read and wakes
+    nobody. One that failed is asked again after CENTRAL_RETRY, as long as nobody there holds the secret."""
+    t0 = t0 or now()
+    q("UPDATE withdrawals SET ok=?, result=?, finished=? WHERE id=?", (1 if ok else 0, text, t0, row["id"]))
+    entry = logins().get(row["login"]) or {}
+    name = f"The API key {entry['env']}" if entry.get("env") else f"The login {entry.get('title') or row['login']}"
+    if ok:
+        said = f"[hub] {name} ({row['login']}) is out of the vault of {row['machine']}: no agent there holds it any more."
+    else:
+        said = f"[hub] {name} ({row['login']}) is still in the vault of {row['machine']}, which no agent there holds: " \
+               f"{text} The hub asks again in {CENTRAL_RETRY // 3600} hours."
+    emit(manager_name(), "say", said, extra={"quiet": True})
+    log(row["agent"], f"withdrawal {row['id']} of {row['login']} from {row['machine']}: "
+                      f"{'done' if ok else 'failed: ' + text}")
+
+
+def expire_withdrawals(t0):
+    """A withdrawal that its machine did not take in WITHDRAW_WAIT is dropped, and so is one whose carrier lost its
+    broker access: no broker could take it any more."""
+    for r in q("SELECT * FROM withdrawals WHERE finished IS NULL"):
+        why = ("Its machine did not take it in a week." if t0 - r["created"] > WITHDRAW_WAIT else
+               f"{r['agent']} has no broker access any more." if agents().get(r["agent"], {}).get("vault") != "broker"
+               else None)
+        if why:
+            finish_withdrawal(r, False, why, t0)
+
+
+def central_backup():
+    """(the export, the manifest's entry): the central vault's export for a copy of this fleet and what the manifest
+    says of it, or None and the one line that says why not. The export is the store as it is on disk and the store's
+    key sealed to the owner's recovery key, so only his recovery code in the app opens it, and the hub never does.
+    Asked only of a central vault that answers now and holds a recovery key. Never under LOCK (ui_backup).
+
+    The sealed key is scanned for a registered value as every sealed copy is; the store is not, because it is an age
+    file of megabytes, and secret_hit hashes a window at each character of it for each registered value."""
+    if not central_ok():
+        return None, {"in": None, "vault": False, "why": "no central vault answered this hub when this copy was made"}
+    with CENTRAL_LOCK:
+        status = CENTRAL["status"] or {}
+    if not status.get("recovery"):
+        return None, {"in": None, "vault": True,
+                      "why": "the central vault holds no recovery key, so its store is not in this copy"}
+    try:
+        answer = central_call("export")
+        if answer.get("v") != 1 or not all(isinstance(answer.get(k), str) for k in ("store", "key", "recovery")) \
+                or not answer["store"].startswith("-----BEGIN AGE ENCRYPTED FILE-----") \
+                or sealed_copy(answer["key"]) is None:
+            raise Refusal(502, "its export is not one the hub can carry")
+        if secret_hit(answer["key"]):
+            raise Refusal(422, "its export holds a registered value in plain text")
+    except Refusal as e:
+        return None, {"in": None, "vault": True, "why": f"the central vault gave no copy of its store: {e}"}
+    return answer, {"in": CENTRAL_MEMBER, "vault": True, "items": answer.get("items"),
+                    "recovery": answer["recovery"], "store_recipient": answer.get("store_recipient")}
 
 
 def unanswered_owner_message(agent):
@@ -16584,6 +17058,7 @@ def tick():
             integrity_check(t0)
             expire_handovers(t0)
             expire_deposits(t0)             # owner feature secret_deliveries: a copy no vault can take any more
+            expire_withdrawals(t0)          # owner feature central_vault: a withdrawal no vault can take any more
             settle_checks(t0)
             attachment_sweep(t0)            # owner feature attachments: the files that the hub may let go
             release_sweep(t0)               # owner feature releases: the automatic poll, when the owner opted in
@@ -17551,10 +18026,11 @@ def validate_status(data):
                  "captures": _optional(vault.get("captures"), bool),                                # save_key
                  "requests": _optional(vault.get("requests"), bool),                                # call_api
                  "deposits": _optional(vault.get("deposits"), bool),        # owner feature secret_deliveries
+                 "withdrawals": _optional(vault.get("withdrawals"), bool),  # owner feature central_vault
                  "places": _optional(vault.get("places"), bool),            # vault.py `place`: unused here
                  "place_key": place_key, "broker_source": source}
     features = data.get("features") or []
-    # 32: a helper names each feature it has (lifecycle.FEATURES), fourteen of them (fifteen with secret_places, which
+    # 32: a helper names each feature it has (lifecycle.FEATURES), fifteen of them (sixteen with secret_places, which
     # a helper from before 24 October 2026 still names), and a report with one name too many is refused whole, which
     # would take the machine's broker and its deliveries with it.
     if not isinstance(features, list) or len(features) > 32 or \
@@ -20067,11 +20543,29 @@ def hub_only_notes(found):
     return said, steps
 
 
+def central_notes(entry):
+    """RESTORE.md's words about the central vault: (an item for "What is in it", a paragraph for "What is NOT in it",
+    the claim that no key is in the copy). A hub with no central vault says nothing of one."""
+    import textwrap
+    entry, claim = entry or {}, "**There is no password, no token and no key anywhere in this copy**"
+    if entry.get("in"):
+        return (textwrap.fill(f"- `{CENTRAL_MEMBER}`: your central vault's store and its key, both sealed. The key is "
+                              f"sealed to your recovery key, so only your recovery code opens it, in the Founderizer "
+                              f"app. The hub never opens it, and neither does anybody who has this file and not that "
+                              f"code.", 110, subsequent_indent="  ") + "\n", "",
+                "**There is no password, no token and no key in this copy that opens without your recovery code**")
+    if entry.get("vault"):
+        return ("", textwrap.fill(f"**Your central vault.** Its store is not in this copy: {entry.get('why')}. The "
+                                  f"secrets in it are on the hub machine and nowhere else.", 110) + "\n\n", claim)
+    return "", "", claim
+
+
 def restore_notes(manifest):
     """RESTORE.md, written into the copy itself, because the day somebody reads it is the day the hub is gone."""
     holders = "".join(f"- {name} on {one['machine']} ({one['mode']}): {one['recipient'] or 'no recipient recorded'}\n"
                       for name, one in sorted(manifest["vault"].items())) or "- none\n"
     elsewhere, reconnect = hub_only_notes(manifest.get("hub_only") or {})
+    central_in, central_out, no_key = central_notes(manifest.get("central_vault"))
     return f"""# This is one copy of your fleet
 
 Made {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(manifest['made_at']))} by your own hub,
@@ -20084,7 +20578,7 @@ fleet {manifest['fleet_id']}, at revision {(manifest['revision'] or 'unknown')[:
 - `{BACKUP_CONFIG}`: your own configuration — `team.json`, each agent's profile, and your own knowledge. These
   live only in the hub machine's checkout, so they go with that disk.
 - `{BACKUP_MANIFEST}`: what is in this copy, with the SHA-256 of each file.
-
+{central_in}
 ## What is NOT in it
 
 Two kinds of thing: what no copy can carry, and what this one leaves out on purpose. Both are below, and both
@@ -20098,9 +20592,9 @@ which nobody ever saw. The machines that hold one:
 {holders}
 Keep anything you cannot afford to lose in your own password manager as well.
 
-{elsewhere}
+{central_out}{elsewhere}
 
-**There is no password, no token and no key anywhere in this copy**, and that is what makes it a thing you can
+{no_key}, and that is what makes it a thing you can
 keep where you keep your own files. Every secret in the records is a salt and a hash; `team.json` holds names —
 a repository, an account, a server — and a name opens nothing. A copy carrying a live GitHub key would be a
 different object, and it would need somewhere to hide.
@@ -20140,11 +20634,16 @@ A copy nobody has ever put back is not a copy. Try it once on a spare machine be
 """
 
 
-def backup_bundle():
+def backup_bundle(central=None):
     """One copy of this fleet for the owner's own machine, as a zip: the database, the owner's configuration, a
-    manifest and RESTORE.md. Call it under LOCK; nothing is written on the hub machine."""
+    manifest and RESTORE.md, and the central vault's sealed store when it gave one. Call it under LOCK; nothing is
+    written on the hub machine. central: what central_backup() gave, asked before LOCK was taken, because the central
+    vault's socket is never asked under it; without it, the copy says that the central vault was not asked."""
     import io
     import zipfile
+    export, entry = central or (None, {"in": None, "vault": False, "why": "the central vault was not asked for this "
+                                                                          "copy"})
+    member = json.dumps(export, indent=2, sort_keys=True).encode() if export else None
     fleet = fleet_id()          # before the records are read: it is made on first use, and the copy needs it in
     records = DB.serialize()    # the records themselves — a restore reads it from there and not from the manifest
     config = owner_files()
@@ -20157,15 +20656,21 @@ def backup_bundle():
                 # What the last six-hourly check said about these records. A copy of a corrupt database is worth
                 # taking and is not worth trusting, and a restore refuses one, so the copy says which it is.
                 "integrity": kv_get("integrity"),
+                # Owner feature central_vault: whether this copy carries the central vault's sealed store, and if
+                # not, why, in one line (central_backup). Public keys and a count, never a value.
+                "central_vault": entry,
                 "files": {BACKUP_DB: {"bytes": len(records), "sha256": hashlib.sha256(records).hexdigest()},
                           **{BACKUP_CONFIG + path: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
-                             for path, data in config.items()}}}
+                             for path, data in config.items()},
+                          **({CENTRAL_MEMBER: {"bytes": len(member), "sha256": hashlib.sha256(member).hexdigest()}}
+                             if member else {})}}
     notes = restore_notes(manifest).encode()
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, data in [(BACKUP_MANIFEST, json.dumps(manifest, indent=2, sort_keys=True).encode()),
                            ("RESTORE.md", notes), (BACKUP_DB, records),
-                           *((BACKUP_CONFIG + path, data) for path, data in config.items())]:
+                           *((BACKUP_CONFIG + path, data) for path, data in config.items()),
+                           *([(CENTRAL_MEMBER, member)] if member else [])]:
             info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))   # the copy of one hour ago, byte for byte
             info.compress_type = zipfile.ZIP_DEFLATED
             zf.writestr(info, data)
@@ -20173,9 +20678,10 @@ def backup_bundle():
 
 
 def read_bundle(data):
-    """A copy, read and checked: {manifest, records, config}. It refuses anything it cannot stand behind, because
-    what comes next replaces a fleet. Nothing here trusts a name or a size in the zip: every member is read and
-    its SHA-256 is compared with the manifest's."""
+    """A copy, read and checked: {manifest, records, config, central}. It refuses anything it cannot stand behind,
+    because what comes next replaces a fleet. Nothing here trusts a name or a size in the zip: every member is read
+    and its SHA-256 is compared with the manifest's. central is the central vault's sealed store (CENTRAL_MEMBER) as
+    the copy carries it, or None: it is never a file a restore writes, and the hub never opens it."""
     import io
     import zipfile
     with contextlib.ExitStack() as stack:
@@ -20195,15 +20701,15 @@ def read_bundle(data):
             raise Refusal(422, f"this copy does not list its own {BACKUP_DB}")
         read = {}
         for name, says in listed.items():
-            if name != BACKUP_DB and not (name.startswith(BACKUP_CONFIG) and
-                                          CONFIG_FILES.match(name[len(BACKUP_CONFIG):])):
+            if name not in (BACKUP_DB, CENTRAL_MEMBER) and not (name.startswith(BACKUP_CONFIG) and
+                                                                 CONFIG_FILES.match(name[len(BACKUP_CONFIG):])):
                 raise Refusal(422, f"this copy carries {name}, which is not a file a restore may write")
             if name not in names:
                 raise Refusal(422, f"this copy lists {name} and does not carry it")
             read[name] = zf.read(name)
             if not isinstance(says, dict) or hashlib.sha256(read[name]).hexdigest() != says.get("sha256"):
                 raise Refusal(422, f"{name} in this copy is not the file its own manifest describes")
-    records = read.pop(BACKUP_DB)
+    records, central = read.pop(BACKUP_DB), read.pop(CENTRAL_MEMBER, None)
     check = sqlite3.connect(":memory:")
     try:
         check.deserialize(records)
@@ -20218,7 +20724,7 @@ def read_bundle(data):
         raise Refusal(422, f"the records in this copy cannot be opened: {e}") from None
     finally:
         check.close()
-    return {"manifest": manifest, "records": records,
+    return {"manifest": manifest, "records": records, "central": central,
             "config": {name[len(BACKUP_CONFIG):]: data for name, data in read.items()}}
 
 
@@ -21772,7 +22278,7 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             result = {"schema_version": 1, "db": kv_get("db_id"), "time": now(), "manager_flag": kv_get("mgr_flag"),
                       "manager_warning": manager_warning(),
-                      "ui_features": list(UI_FEATURES)}
+                      "ui_features": ui_features()}
             for table, key in (("tasks", "tasks"), ("notes", "notes"),
                                ("prompts", "permissions"), ("holds", "holds"), ("outcomes", "outcomes")):
                 result[key] = [dict(r) for r in q(f"SELECT * FROM {table} ORDER BY id")]
@@ -22359,8 +22865,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(409, {"error": "hub generation changed; refresh state"})
         if not backups_enabled():
             return self.json(403, {"error": "owner backups are turned off on this hub"})
+        central = central_backup()          # owner feature central_vault: its socket is never asked under LOCK
         with LOCK:
-            data, manifest = backup_bundle()
+            data, manifest = backup_bundle(central)
         if len(data) > BACKUP_MAX:
             return self.json(413, {"error": "the copy is larger than 256 MiB; take it on the hub machine"})
         digest, t0 = hashlib.sha256(data).hexdigest(), now()
@@ -23289,6 +23796,88 @@ class Handler(BaseHTTPRequestHandler):
             return {"login": self.login_reference(data.get("login")), "agent": data["agent"], "grant": data["grant"]}
         return self.ui_command("secrets/grant", read, save_grant)
 
+    def ui_vault(self, query):
+        """GET /ui/vault (owner feature central_vault; served without it too, because the app needs `fleet` and `kit`
+        to install a central vault at all): what vault_view says. It reads what the timers read and never asks the
+        central vault itself."""
+        if not self.ui_allowed():
+            return
+        if query.get("db") != kv_get("db_id"):
+            return self.json(409, {"error": "hub generation changed; refresh state"})
+        with LOCK:
+            view = vault_view()
+        return self.json(200, dict(view, db=kv_get("db_id")), {"Cache-Control": "no-store"})
+
+    def ui_vault_intake(self):
+        """POST /ui/vault/intake (owner feature central_vault): one secret of the catalog, sealed in the owner's app to
+        the central vault's own key, into the central vault (central_intake). The receipt is {login, saved}. The
+        command record keeps the copy's checksum and never the copy, as POST /ui/secrets/deliver does."""
+        copy = {}
+
+        def read(data):
+            extra = sorted(set(data) - {"request_id", "db", "login", "ciphertext"})
+            if extra:
+                raise ValueError(f"unknown field {extra[0]}")
+            text = sealed_copy(data.get("ciphertext"))
+            if text is None:
+                raise ValueError(f"ciphertext is an armored age file sealed to an X25519 key, of at most "
+                                 f"{DEPOSIT_COPY_MAX} characters")
+            if secret_hit(text):
+                raise Refusal(422, "the copy holds a registered value in plain text")
+            copy["text"] = text
+            return {"login": self.login_reference(data.get("login")),
+                    "sha256": hashlib.sha256(text.encode()).hexdigest()}
+
+        def act(body, answer):
+            central_due()           # the next pass delivers it to the machines whose agents hold it
+            log("owner", f"put {body['login']} into the central vault ({answer['saved']})")
+            return {"login": body["login"], "saved": answer["saved"]}
+        return self.ui_command("vault/intake", read, act, limit=DEPOSIT_COPY_MAX + 8192,
+                               outside=lambda body: central_intake(body["login"], copy["text"]))
+
+    def ui_vault_pin(self):
+        """POST /ui/vault/pin (owner feature central_vault): the owner's signed statement that pins one machine's
+        vault key, or unpins it, with its signature, as they came, to the central vault (central_statement)."""
+        def read(data):
+            extra = sorted(set(data) - {"request_id", "db", "statement", "signature"})
+            if extra:
+                raise ValueError(f"unknown field {extra[0]}")
+            return self.signed_statement(data, ("pin", "unpin"))
+        return self.ui_command("vault/pin", read, self.signed_receipt, outside=central_statement)
+
+    def ui_vault_recovery(self):
+        """POST /ui/vault/recovery (owner feature central_vault): the owner's signed statement of the recovery key that
+        the central vault seals its backup to, with its signature, as they came (central_statement)."""
+        def read(data):
+            extra = sorted(set(data) - {"request_id", "db", "statement", "signature"})
+            if extra:
+                raise ValueError(f"unknown field {extra[0]}")
+            return self.signed_statement(data, ("recovery",))
+        return self.ui_command("vault/recovery", read, self.signed_receipt, outside=central_statement)
+
+    @staticmethod
+    def signed_statement(data, kinds):
+        """The body of POST /ui/vault/pin and /recovery: a statement of one of these kinds and its signature, as they
+        came. The hub reads the statement's kind and nothing else of either."""
+        statement, signature = data.get("statement"), data.get("signature")
+        if not (isinstance(statement, str) and 0 < len(statement) <= CENTRAL_STATEMENT_MAX) or \
+                statement_kind(statement) not in kinds:
+            raise ValueError(f"statement is the owner's signed statement of kind {' or '.join(kinds)}, as text of at "
+                             f"most {CENTRAL_STATEMENT_MAX} characters")
+        if not (isinstance(signature, str) and CENTRAL_SIGNATURE.fullmatch(signature)):
+            raise ValueError("signature is the base64 of the statement's DER signature")
+        return {"statement": statement, "signature": signature}
+
+    @staticmethod
+    def signed_receipt(body, answer):
+        """The receipt of a statement the central vault took: its kind, its machine and its key where it has them, and
+        what the vault did (saved: new, same, replaced or removed). The next pass reads the pins again."""
+        central_due()
+        log("owner", f"the central vault took a {answer['kind']} statement"
+                     + (f" for {answer['machine']}" if isinstance(answer.get("machine"), str) else "")
+                     + f" ({answer.get('saved')})")
+        return {k: answer[k] for k in ("kind", "machine", "recipient", "saved") if k in answer}
+
     def ui_capacity(self, query):
         """Who can take work now: suitability, availability per runtime account, shared accounts."""
         if not self.ui_allowed():
@@ -23599,10 +24188,14 @@ class Handler(BaseHTTPRequestHandler):
                                          next=events[-1]["id"] if events else after, more=len(rows) > limit)),
                          {"Cache-Control": "no-store"})
 
-    def ui_command(self, route, read, act, limit=65536, keep=None):
+    def ui_command(self, route, read, act, limit=65536, keep=None, outside=None):
         """Owner task controls. The same UUID, generation and client rules as owner messages.
         An exact repeat returns the first result; a refused command leaves no record. keep(result): what the hub keeps
         of a result that must not be stored whole (a link code); a repeat returns that.
+
+        outside(body): a call that must not run under LOCK, which is the central vault's socket (central_call). It
+        runs after the claim, with LOCK released, and act then takes its answer under LOCK: act(body, answer). A
+        Refusal from either leaves no record, as one from act always did, and a command without it runs as before.
 
         act() is not a database write alone: it commits team.json, it reaches a helper, it fetches a page. So it
         cannot join the transaction that keeps the receipt, and the receipt used to be written after it with a
@@ -23650,17 +24243,32 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(200, dict(json.loads(old["result"]), replayed=True))
             ins("INSERT INTO ui_controls(request_id,route,body,client,created,result) VALUES(?,?,?,?,?,'')",
                 (request_id, route, canonical, client, now()))
+            if outside is None:
+                try:
+                    result = act(body)
+                except Refusal as e:        # checked before any write of its own, so it leaves no record
+                    q("DELETE FROM ui_controls WHERE request_id=?", (request_id,))
+                    return self.json(e.status, dict(getattr(e, "extra", {}), error=str(e)))
+                result = self.ui_command_kept(route, request_id, client, keep, result)
+        if outside is not None:
             try:
-                result = act(body)
-            except Refusal as e:        # checked before any write of its own, so it leaves no record
+                answer = outside(body)
+                with LOCK:
+                    result = self.ui_command_kept(route, request_id, client, keep, act(body, answer))
+            except Refusal as e:
                 q("DELETE FROM ui_controls WHERE request_id=?", (request_id,))
                 return self.json(e.status, dict(getattr(e, "extra", {}), error=str(e)))
-            result = dict(result, ok=True, request_id=request_id, client=client, replayed=False)
-            with transaction():
-                DB.execute("UPDATE ui_controls SET result=? WHERE request_id=?",
-                           (json.dumps(keep(result) if keep else result), request_id))
-                log_row("owner", f"UI {route} {request_id} accepted")
         return self.json(200, result)
+
+    @staticmethod
+    def ui_command_kept(route, request_id, client, keep, result):
+        """The receipt of an owner command that was carried out, filled into its claim. Called with LOCK held."""
+        result = dict(result, ok=True, request_id=request_id, client=client, replayed=False)
+        with transaction():
+            DB.execute("UPDATE ui_controls SET result=? WHERE request_id=?",
+                       (json.dumps(keep(result) if keep else result), request_id))
+            log_row("owner", f"UI {route} {request_id} accepted")
+        return result
 
     def ui_control(self, task_id):
         def read(data):
@@ -24734,6 +25342,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_secret_salts(query)
         if parts == ["ui", "secrets", "machines"]:
             return self.ui_secret_machines(query)
+        if parts == ["ui", "vault"]:
+            return self.ui_vault(query)
         if parts == ["ui", "backup"]:
             return self.ui_backup(query)
         if len(parts) == 3 and parts[:2] == ["ui", "goals"] and re.fullmatch(r"[1-9][0-9]*", parts[2]):
@@ -24969,6 +25579,8 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                     if r["kind"] == "deposit" and not deposit_waiting(extra.get("deposit"), agent):
                         continue        # owner feature secret_deliveries: a delivery that ended carries nothing
+                    if r["kind"] == "withdraw" and not withdrawal_waiting(extra.get("withdraw"), agent):
+                        continue        # owner feature central_vault: a withdrawal that ended carries nothing
                     if r["kind"] == "place":
                         continue        # Targets left the hub (24 October 2026): a placement from before asks nobody
                     keep.append(r)
@@ -24998,10 +25610,12 @@ class Handler(BaseHTTPRequestHandler):
             # and never redo a sign-in or handover whose asker has stopped waiting
             asked = {r["id"] for r in q("SELECT id FROM jobs WHERE finished IS NULL")}
             carried = {r["id"] for r in q("SELECT id FROM deposits WHERE finished IS NULL")}
+            taken = {r["id"] for r in q("SELECT id FROM withdrawals WHERE finished IS NULL")}
             rows = [r for r in rows if not (r["kind"] == "task" and r["task"] in done)
                     and not (r["kind"] in ("signin", "handover", "create", "capture", "request")
                              and json.loads(r["extra"] or "{}").get("job") not in asked)
                     and not (r["kind"] == "deposit" and json.loads(r["extra"] or "{}").get("deposit") not in carried)
+                    and not (r["kind"] == "withdraw" and json.loads(r["extra"] or "{}").get("withdraw") not in taken)
                     and r["kind"] != "place"]       # Targets left the hub: a placement from before asks nobody
         self.json(200, {"last": last, "db": kv_get("db_id"),
                         "events": [{"id": r["id"], "kind": r["kind"], "task": tref(r["task"]) if r["task"] else None,
@@ -25133,6 +25747,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_secret_grant()
         if parts == ["ui", "secrets", "deliver"]:
             return self.ui_secret_deliver()
+        if parts == ["ui", "vault", "intake"]:
+            return self.ui_vault_intake()
+        if parts == ["ui", "vault", "pin"]:
+            return self.ui_vault_pin()
+        if parts == ["ui", "vault", "recovery"]:
+            return self.ui_vault_recovery()
         if parts == ["ui", "team", "accounts"]:
             return self.ui_team_account()
         if parts == ["ui", "team", "repos"]:
@@ -25238,6 +25858,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.helper_job_done(parts[2], parts[3])
         if parts[:2] == ["helper", "deposit"] and len(parts) == 4 and re.fullmatch(r"[1-9][0-9]{0,17}", parts[3]):
             return self.helper_deposit_done(parts[2], int(parts[3]))
+        if parts[:2] == ["helper", "withdraw"] and len(parts) == 4 and re.fullmatch(r"[1-9][0-9]{0,17}", parts[3]):
+            return self.helper_withdraw_done(parts[2], int(parts[3]))
         if parts[:2] == ["helper", "conversations"] and len(parts) == 5 and parts[4] == "start" and \
                 re.fullmatch(r"[1-9][0-9]*", parts[3]):
             return self.helper_conversation_start(parts[2], int(parts[3]))
@@ -25766,12 +26388,15 @@ class Handler(BaseHTTPRequestHandler):
         f = self.form()
         job, kind = f.get("job"), f.get("kind")
         if not isinstance(job, int) or isinstance(job, bool) or kind not in ("signin", "handover", "probe", "create",
-                                                                              "capture", "request", "deposit"):
-            return self.json(400, {"error": "job and kind (signin, handover, probe, create, capture, request or "
-                                            "deposit) are required"})
+                                                                              "capture", "request", "deposit",
+                                                                              "withdraw"):
+            return self.json(400, {"error": "job and kind (signin, handover, probe, create, capture, request, "
+                                            "deposit or withdraw) are required"})
         with LOCK:
             if kind == "deposit":           # owner feature secret_deliveries: job is the delivery's number
                 return self.helper_deposit(agent, job)
+            if kind == "withdraw":          # owner feature central_vault: job is the withdrawal's number
+                return self.helper_withdraw(agent, job)
             row = q1("SELECT * FROM jobs WHERE id=? AND agent=?", (job, agent))
             if not row or row["kind"] != kind:
                 return self.json(404, {"error": f"no such {kind} job for this agent"})
@@ -25866,6 +26491,44 @@ class Handler(BaseHTTPRequestHandler):
                                "ciphertext": row["ciphertext"],
                                "fingerprint_salts": {k: fingerprint_salt(fingerprint_label(row["login"], k))
                                                      for k in ("password", "totp")}})
+
+    def helper_withdraw(self, agent, wid):
+        """The vault asks which secret a withdrawal that this agent's helper carries names (owner feature
+        central_vault), and gets its reference and nothing else. It can ask again while the withdrawal waits: a
+        removal of what is not there is the same removal. Called with LOCK held."""
+        row = withdrawal_waiting(wid, agent)
+        if not row:
+            return self.json(404, {"error": "no such withdrawal waits for this agent"})
+        if agents()[agent].get("vault") != "broker":
+            return self.json(409, {"error": "this agent has no broker access"})
+        if not row["released"]:
+            q("UPDATE withdrawals SET released=? WHERE id=?", (now(), wid))
+        log(agent, f"vault took withdrawal {wid} of {row['login']}")
+        return self.json(200, {"ok": True, "job": wid, "kind": "withdraw", "login": row["login"]})
+
+    def helper_withdraw_done(self, agent, wid):
+        """POST /helper/withdraw/<agent>/<id>: the helper reports what came of a withdrawal that it carried, removed
+        (or not there), or why not, and the manager is told with his next read (finish_withdrawal)."""
+        if agent not in agents():
+            return self.json(404, {"error": "unknown agent"})
+        if not self.allowed(agent):
+            return
+        if len(self.body()) > 4096:
+            return self.json(413, {"error": "a withdrawal report is at most 4 KiB"})
+        f = self.form()
+        text = " ".join(CONTROL.sub(" ", str(f.get("text") or "")).split())[:DEPOSIT_RESULT_MAX]
+        ok = f.get("ok") is True
+        if secret_hit(text):
+            log(agent, "BLOCKED a withdrawal report that contained a login")
+            text = "The helper's report was blocked because it contained a login."
+        with LOCK:
+            row = withdrawal_waiting(wid, agent)
+            if not row:
+                return self.json(409, {"error": "no such withdrawal waits for this agent"})
+            if ok and not row["released"]:
+                ok, text = False, "The vault reported a removal that the hub did not see it ask for."
+            finish_withdrawal(row, ok, (text or "Removed.") if ok else (text or "The vault did not remove it."))
+        return self.json(200, {"ok": True})
 
     def helper_vault_create(self, agent, row):
         """The vault asks before it makes a login (create_login) or reads a key from a page (save_key: kind capture,
@@ -26432,6 +27095,7 @@ def main():
                request_wait=args.request_wait,
                stop_after=args.stop_after, offline_after=args.offline_after, tick=args.tick)
     CFG["team_path"] = os.path.abspath(args.team)
+    CFG["central_vault"] = CENTRAL_SOCKET       # owner feature central_vault: its socket, which hubsetup.py makes
     with open(args.team, encoding="utf-8") as f:
         TEAM.update(json.load(f))
     # The file the hub starts with has passed no check of its own: it is read, never validated. So read the rules
@@ -26481,6 +27145,7 @@ def main():
     # writes this key nowhere and is asked nothing.
     kv_set("tick_ok", now())
     threading.Thread(target=timers, daemon=True).start()
+    threading.Thread(target=central_timer, name="central-vault", daemon=True).start()
     threading.Thread(target=knowledge_refresher, name="knowledge-pages", daemon=True).start()
     threading.Thread(target=ping_sender, name="pings", daemon=True).start()
     server = ThreadingHTTPServer((host, port), Handler)

@@ -44,12 +44,25 @@ With the fleet's own store, a Linux broker also takes a key or a login that the 
 Mac (deposit): the app seals the value to this broker's pinned key, the hub carries the sealed copy, and the broker
 opens it, has the hub compare the value's fingerprints with the owner's, and saves it under the same reference.
 
+With the fleet's own store, a Linux broker also gives such a delivered secret back (withdraw) when no agent of its
+machine holds it any more: the hub names the reference for one confirmed job, and the broker removes the item only when
+its store says that the owner's vault delivered it, never a login that the owner saved there himself or that this
+vault made.
+
 With an ssh program in its configuration, a Linux broker also writes one stored key into a target that the owner
 defined (place): an application's .env file or a Kubernetes Secret on another host. It connects with its own SSH key,
 which it makes once in its state folder and which the target host allows only the place helper (place.py), checks the
 host key that the owner pinned, and sends the value on that connection's standard input. The helper answers with a
 salted fingerprint of what it reads back, which the broker and then the hub compare with the value's own. The hub names
 the key, the variable and the target for one confirmed job; the broker takes nothing of that from its caller.
+
+With `"central": true` in its configuration, the same program is the fleet's **central vault** on the hub's server:
+one store that holds every secret of the fleet, which answers only the hub's user, never calls the hub and needs no
+network. It takes a value that the owner sealed to its key in his app (intake), and it seals a copy of a value only to
+a machine key that the owner signed (pin, unpin, seal), and its backup only to a recovery key that the owner signed
+(recovery, export). The owner signs with an ECDSA P-256 key of his Mac and the vault verifies every statement itself,
+so a hub that is broken into cannot add a machine of its own and pull every secret in one call. It runs as its own
+user (CENTRAL_UNIT), and only root installs or updates it (`hubsetup.py central-vault`): no release reaches it.
 
 Run a copy that the worker's user cannot change (root-owned, outside the worker's checkout), with a root-owned
 configuration, Bitwarden settings and programs, because an agent can change every file in its own checkout:
@@ -61,7 +74,9 @@ configuration, Bitwarden settings and programs, because an agent can change ever
         --title "<name>" < login.json                            (the owner's own login; the value on standard input)
     python3 /usr/local/lib/fleet-vault/vault.py sdk-install --config /etc/fleet-vault/vault.json \\
         --manifest <folder>/vault-sdk.json --project <Bitwarden project UUID>   (as root; Bitwarden's write setup)
-Protocol 2: one JSON line in, one JSON line out, on a Unix socket. See UI-API.md, "Vault isolation (V3)".
+    python3 vault.py unit --central --config /etc/fleet-vault-central/vault.json --group <the hub user's group>
+Protocol 2: one JSON line in, one JSON line out, on a Unix socket. See UI-API.md, "Vault isolation (V3)", and for the
+central vault "the central vault (central_vault)".
 Standard library only; Python 3.9+.
 """
 # This is the one Fleet file that a release never delivers. The broker runs a root-owned copy at
@@ -123,7 +138,10 @@ STORE_KEYS = {"store", "store_key"}
 BITWARDEN_KEYS = {"region", "token_file", "bws", "bws_config"}
 AGENT_NAME = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
 CALLER_KEY = re.compile(r"[A-Za-z0-9_-]{43}")          # an agent key (owner API 1.12): 256 bits, base64url
-OPERATIONS = ("status", "signin", "handover", "probe", "create", "request", "cancel", "read", "deposit", "place")
+# The central vault's own operations, beside status: a central vault serves only these, and a machine's broker none.
+CENTRAL_OPERATIONS = ("intake", "pin", "unpin", "recovery", "seal", "inventory", "export")
+OPERATIONS = ("status", "signin", "handover", "probe", "create", "request", "cancel", "read", "deposit", "place",
+              "withdraw") + CENTRAL_OPERATIONS
 ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,59}")         # read: the variable name of an API key, as the hub checks it
 READS = 32                  # read: the most values that one session gets
 # The write setup (create_login): all three keys or none. sdk: the installed library; sdk_sha256: its checksum;
@@ -211,6 +229,23 @@ SECRET_REF = re.compile(r"bws://([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F
 SEALED_REF = re.compile(r"sealed:(\d{1,9})")
 RECIPIENT = re.compile(r"age1[0-9a-z]{58}")
 ARMOR = "-----BEGIN AGE ENCRYPTED FILE-----"
+DELIVERED = "delivered from the owner's vault"      # a deposit's note: only an item with it is withdrawn
+# The central vault (`"central": true`): exactly these keys. No hub, because it never calls one; no worker_uid or
+# worker_group, because only the hub's user asks it; no Bitwarden, curl, ssh or write key, because it does none of that.
+CENTRAL_KEYS = {"central", "hub_uid", "fleet", "owner_keys", "age", "age_key", "store", "store_key", "socket", "state"}
+FLEET_ID = re.compile(r"[0-9a-f]{16}")              # the hub's fleet_id()
+OWNER_KEYS = 8                                      # the most owner keys that may sign
+MACHINE = re.compile(r"[a-z][a-z0-9-]{0,62}")       # a machine of a pin
+STATE = 1                                           # the format of the central vault's state file
+# The fields of each statement that the owner signs: all of them, and no other.
+STATEMENTS = {"pin": {"v", "kind", "fleet", "machine", "recipient", "at"},
+              "unpin": {"v", "kind", "fleet", "machine", "at"},
+              "recovery": {"v", "kind", "fleet", "recipient", "at"}}
+COPY_MAX = 16384            # characters of one sealed copy that the owner gives, as the hub's DEPOSIT_COPY_MAX
+CENTRAL_LINE = 65536        # bytes of one request line to the central vault: an intake carries a sealed copy
+CENTRAL_USER = "fleet-vault-central"
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     """A redirect is an answer, never a second request: a caller's key must not go to another place."""
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -254,6 +289,8 @@ def load_config(path):
     unchangeable(path, "The vault configuration")
     with open(path, encoding="utf-8") as f:
         conf = json.load(f)
+    if isinstance(conf, dict) and "central" in conf:        # the central vault's own form; every other one as before
+        return central_config(conf)
     given = set(conf) if isinstance(conf, dict) else set()
     stores = [group for group in (STORE_KEYS, BITWARDEN_KEYS) if given & group]
     if not isinstance(conf, dict) or given - KEYS - CALLER_KEYS - STORE_KEYS - BITWARDEN_KEYS - WRITE_KEYS \
@@ -375,7 +412,12 @@ def admitted(conf, uid):
     """May this user ask the broker: the one worker user of the configuration (worker_uid), or any user of the group
     of this machine's agent users (worker_group). The socket's own mode already limits callers to that group, and
     this reads the same boundary again by user, so a renamed or added agent user reaches the broker with no change
-    to the configuration and no user of another group reaches it through a group it shares with one."""
+    to the configuration and no user of another group reaches it through a group it shares with one.
+
+    The central vault answers one user only: the hub's (hub_uid). The socket's group is the hub user's group, so this
+    is what keeps out any other user of that group."""
+    if conf.get("central") is True:
+        return uid == conf.get("hub_uid")
     if conf.get("worker_uid") is not None and uid == conf["worker_uid"]:
         return True
     group = conf.get("worker_group")
@@ -719,9 +761,32 @@ def deposit(conf, number):
         reason = data.get("error") if isinstance(data, dict) else None
         raise Refused("the hub did not confirm this value" + (f": {reason}" if isinstance(reason, str) else ""))
     saved = store.put(m.group(1).lower(), title, json.dumps(value, sort_keys=True, separators=(",", ":"),
-                                                            ensure_ascii=False), "delivered from the owner's vault")
+                                                            ensure_ascii=False), DELIVERED)
     log(f"deposit job={number}: {ref.lower()} {saved}")
     return {"ok": True, "v": PROTOCOL, "deposit": number, "login": ref.lower(), "saved": saved}
+
+
+def withdraw(conf, number):
+    """withdraw (helper feature secret_withdrawals): remove from this machine's own store one secret that the owner's
+    vault delivered here and that no agent of this machine holds any more. The helper names only the job; the hub
+    names the reference. Only an item that a deposit saved is removed: a login that the owner saved here himself, or
+    that this vault made, is refused, because the hub's catalog is not where it came from. "absent" when the store
+    has no such item, so a withdrawal that is asked again ends the same way."""
+    if backend(conf) != "store":
+        raise Refused("this machine's vault opens a Bitwarden project, so it holds no delivered secret")
+    store = LocalStore(conf)            # a store that does not open refuses before the hub's job is used
+    code, data = hub(conf, "POST", f"/helper/vault/{conf['agent']}", {"job": number, "kind": "withdraw"})
+    if code != 200 or not isinstance(data, dict) or data.get("ok") is not True or data.get("job") != number \
+            or data.get("kind") != "withdraw":
+        reason = data.get("error") if isinstance(data, dict) else None
+        raise Refused("the hub did not confirm this withdrawal" + (f": {reason}" if isinstance(reason, str) else ""))
+    ref = data.get("login")
+    m = SECRET_REF.fullmatch(ref) if isinstance(ref, str) else None
+    if not m:
+        raise Refused("the hub named no valid login for this withdrawal")
+    removed = store.remove(m.group(1).lower(), DELIVERED)
+    log(f"withdraw job={number}: {ref.lower()} {removed}")
+    return {"ok": True, "v": PROTOCOL, "withdrawal": number, "login": ref.lower(), "removed": removed}
 
 
 def probe_one(conf, ref, token):
@@ -909,6 +974,25 @@ class LocalStore:
         finally:
             os.close(fd)
         return "new"
+
+    def remove(self, sid, note):
+        """Remove the item with this id when its note is exactly `note` (withdraw): "removed", or "absent" when the
+        store holds no such item. An item with another note is refused and stays. The note is read and the item
+        removed under the store's lock, so no save comes between them."""
+        if canonical_id(sid) != sid:
+            raise Refused("the vault store needs the id of an item")
+        fd = self.locked()
+        try:
+            items = self.opened()
+            if sid not in items:
+                return "absent"
+            if items[sid]["note"] != note:
+                raise Refused("this login was not delivered here, so it is not removed")
+            del items[sid]
+            self.keep(items)
+        finally:
+            os.close(fd)
+        return "removed"
 
     def item(self, sid):
         """One item of the store: {id, key (its name), value, note}."""
@@ -1979,6 +2063,381 @@ def place_sent(conf, number, op, target, name, salt, value, line):
                 **({"verified": data["verified"]} if isinstance(data.get("verified"), bool) else {}))
 
 
+# ---------------------------------------------------------------- the owner's signature (central vault)
+#
+# The central vault seals a copy only to a machine key that the owner signed, and its backup only to a recovery key
+# that the owner signed, so that a hub that is broken into cannot add a machine of its own. The owner's key is an ECDSA
+# P-256 key of his Mac (CryptoKit), and the standard library has no ECDSA, so its verification is here, in plain
+# Python, and nothing else of it: no key is made and nothing is signed. Every value that it reads is public -- the
+# statement, the signature and the owner's public key -- so it needs no protection against timing.
+
+# NIST P-256 (FIPS 186-4 D.1.2.3; SEC 2 secp256r1): the curve y^2 = x^3 + a*x + b over the field of the prime p, and
+# its base point G of the prime order n. The cofactor is 1: every point of the curve but infinity has the order n.
+P256_P = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff
+P256_A = P256_P - 3
+P256_B = 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b
+P256_G = (0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296,
+          0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5)
+P256_N = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551
+
+
+def on_curve(point):
+    """A point (x, y) of P-256: two numbers of the field that solve the curve's equation."""
+    x, y = point
+    return 0 <= x < P256_P and 0 <= y < P256_P and (y * y - x * x * x - P256_A * x - P256_B) % P256_P == 0
+
+
+def point_add(one, two):
+    """The sum of two points of the curve, in affine coordinates. None is the point at infinity."""
+    if one is None:
+        return two
+    if two is None:
+        return one
+    (x1, y1), (x2, y2) = one, two
+    if x1 == x2:
+        if (y1 + y2) % P256_P == 0:         # a point and its negative (and P-256 has no point with y = 0)
+            return None
+        slope = (3 * x1 * x1 + P256_A) * pow(2 * y1, -1, P256_P) % P256_P          # one point twice: the tangent
+    else:
+        slope = (y2 - y1) * pow((x2 - x1) % P256_P, -1, P256_P) % P256_P          # two points: the line through them
+    x3 = (slope * slope - x1 - x2) % P256_P
+    return x3, (slope * (x1 - x3) - y1) % P256_P
+
+
+def point_times(k, point):
+    """k times a point of the curve: double and add, from the highest bit of k."""
+    result = None
+    for bit in bin(k)[2:]:
+        result = point_add(result, result)
+        if bit == "1":
+            result = point_add(result, point)
+    return result
+
+
+def ecdsa_verified(point, digest, r, s):
+    """True when (r, s) is an ECDSA signature by the public key `point` over this SHA-256 digest (FIPS 186-4 6.4.2).
+    r and s must both be in 1..n-1. There is no low-s rule: CryptoKit makes either s, and both are valid."""
+    if not (1 <= r < P256_N and 1 <= s < P256_N):
+        return False
+    e = int.from_bytes(digest, "big")   # SHA-256 is exactly as long as n (256 bits), so all of it is used
+    w = pow(s, -1, P256_N)
+    found = point_add(point_times(e * w % P256_N, P256_G), point_times(r * w % P256_N, point))
+    return found is not None and found[0] % P256_N == r
+
+
+def der_signature(raw):
+    """(r, s) of a signature in DER, read strictly: one SEQUENCE of two INTEGERs, each positive and in its shortest
+    form, and nothing after it. None for anything else. A P-256 signature is at most 72 bytes, so every length in it
+    has its one-byte form, and a longer form is refused as not the shortest."""
+    if len(raw) < 2 or raw[0] != 0x30 or raw[1] >= 0x80 or raw[1] != len(raw) - 2:
+        return None
+    body, numbers = raw[2:], []
+    for _ in range(2):
+        if len(body) < 3 or body[0] != 0x02 or body[1] >= 0x80 or not 1 <= body[1] <= len(body) - 2:
+            return None
+        size, number = body[1], body[2:2 + body[1]]
+        if number[0] & 0x80 or (size > 1 and number[0] == 0 and not number[1] & 0x80):
+            return None                 # a negative number, or a zero byte in front that the number does not need
+        numbers.append(int.from_bytes(number, "big"))
+        body = body[2 + size:]
+    if body or not all(numbers):        # more after the two numbers, or a number that is zero
+        return None
+    return numbers[0], numbers[1]
+
+
+def owner_key(text):
+    """The point of one owner key: the standard base64, padded, of 65 bytes 04 || X || Y (CryptoKit's
+    x963Representation), which must be a point of the curve. ValueError for anything else. The cofactor is 1, so a
+    point of the curve needs no other check of its order."""
+    if not isinstance(text, str):
+        raise ValueError("not an owner key")
+    raw = base64.b64decode(text, validate=True)
+    if base64.b64encode(raw).decode() != text or len(raw) != 65 or raw[0] != 4:
+        raise ValueError("not an owner key")
+    point = int.from_bytes(raw[1:33], "big"), int.from_bytes(raw[33:], "big")
+    if not on_curve(point):
+        raise ValueError("not an owner key")
+    return point
+
+
+def owner_signed(conf, statement, signature):
+    """True when one of the owner's keys signed exactly these statement bytes (UTF-8): signature is the standard
+    base64, padded, of the DER form (CryptoKit's derRepresentation), over SHA-256 of the statement."""
+    try:
+        raw = base64.b64decode(signature, validate=True)
+        digest = hashlib.sha256(statement.encode("utf-8")).digest()
+    except ValueError:                  # also a UnicodeError: a text that is not UTF-8 was signed by nobody
+        return False
+    found = der_signature(raw) if base64.b64encode(raw).decode() == signature else None
+    if found is None:
+        return False
+    for text in conf["owner_keys"]:
+        try:
+            if ecdsa_verified(owner_key(text), digest, *found):
+                return True
+        except ValueError:              # load_config refused such a key; this reads them again for one request
+            continue
+    return False
+
+
+def canonical(value):
+    """The one text of a JSON value that the vault and the owner's app both sign."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def owner_statement(conf, req, kind):
+    """The owner's statement of this kind ({v, kind, fleet, at, and its machine, its recipient or both}), after its
+    form, its fleet and its signature. The statement must be the canonical text of what it holds, so the vault checks
+    the very bytes that the app signed; and it must name this fleet, so a statement of another fleet is no use here."""
+    statement, signature = req.get("statement"), req.get("signature")
+    if not isinstance(statement, str) or not isinstance(signature, str):
+        raise Refused("a signed statement needs its statement and its signature")
+    try:
+        said = json.loads(statement)
+    except (ValueError, RecursionError):
+        said = None
+    if not isinstance(said, dict) or canonical(said) != statement:
+        raise Refused("the statement is not in its canonical form")
+    if set(said) != STATEMENTS[kind] or said["kind"] != kind or type(said["v"]) is not int or said["v"] != 1 \
+            or type(said["at"]) is not int or said["at"] < 0 or not isinstance(said["fleet"], str) \
+            or not all(isinstance(said.get(k, ""), str) for k in ("machine", "recipient")) \
+            or ("machine" in said and not MACHINE.fullmatch(said["machine"])) \
+            or ("recipient" in said and not RECIPIENT.fullmatch(said["recipient"])):
+        raise Refused(f"the statement is not a valid {kind} statement")
+    if said["fleet"] != conf["fleet"]:
+        raise Refused("the statement is for another fleet")
+    if not owner_signed(conf, statement, signature):
+        raise Refused("the statement does not carry a valid signature of the owner")
+    return said
+
+
+# ---------------------------------------------------------------- the central vault
+
+def central_config(conf):
+    """A central vault's configuration (load_config): its own keys and no other."""
+    if conf.get("central") is not True or set(conf) != CENTRAL_KEYS:
+        raise SystemExit("A central vault's configuration needs exactly: " + ", ".join(sorted(CENTRAL_KEYS)) +
+                         ", with central true; no hub, no worker_uid or worker_group, no agent, no Bitwarden key and "
+                         "no curl, ssh or write key")
+    uid = conf["hub_uid"]
+    if not isinstance(uid, int) or isinstance(uid, bool) or uid < 0 or uid == os.getuid():
+        raise SystemExit("hub_uid must be the user ID of the hub's user, never the vault user's")
+    if not isinstance(conf["fleet"], str) or not FLEET_ID.fullmatch(conf["fleet"]):
+        raise SystemExit("fleet must be the fleet's ID: 16 lowercase hex characters")
+    keys = conf["owner_keys"]
+    if not isinstance(keys, list) or not 1 <= len(keys) <= OWNER_KEYS:
+        raise SystemExit(f"owner_keys must list 1 to {OWNER_KEYS} public keys of the owner")
+    for text in keys:
+        try:
+            owner_key(text)
+        except ValueError:
+            raise SystemExit("each of owner_keys must be the base64 of an uncompressed P-256 public key (65 bytes: "
+                             "04, X, Y) that is a point of the curve") from None
+    for key in ("age", "age_key", "store", "store_key", "socket", "state"):
+        if not isinstance(conf[key], str) or not os.path.isabs(conf[key]):
+            raise SystemExit(f"{key} must be an absolute path")
+    unchangeable(conf["age"], "The age program")
+    return conf
+
+
+def kept_record(record, unpinned=False):
+    """One record of the state: {recipient, at}. An unpin keeps its machine's record with no recipient."""
+    return isinstance(record, dict) and set(record) == {"recipient", "at"} and type(record["at"]) is int and (
+        isinstance(record["recipient"], str) and RECIPIENT.fullmatch(record["recipient"]) is not None
+        or unpinned and record["recipient"] is None)
+
+
+def central_state(conf):
+    """The owner's signed records, read again for every request: {"v": 1, "pins": {machine: {recipient, at}},
+    "recovery": {recipient, at} or None}. An unpin keeps its machine's record, with no recipient, so a pin of that
+    machine that is older than the unpin, which the hub could send again, is refused as old. No file is no record."""
+    if not os.path.lexists(conf["state"]):
+        return {"v": STATE, "pins": {}, "recovery": None}
+    try:
+        data = json.loads(read_private(conf["state"], "state"))
+        good = isinstance(data, dict) and set(data) == {"v", "pins", "recovery"} and data["v"] == STATE \
+            and isinstance(data["pins"], dict) \
+            and all(MACHINE.fullmatch(m) and kept_record(x, unpinned=True) for m, x in data["pins"].items()) \
+            and (data["recovery"] is None or kept_record(data["recovery"]))
+    except ValueError:
+        good = False
+    if not good:
+        raise Refused("the central vault's state cannot be read")
+    return data
+
+
+def keep_state(conf, state):
+    """Write the central vault's state whole: a new file of mode 600, made complete beside the old one and then put in
+    its place, as the store is kept."""
+    path, temp = conf["state"], conf["state"] + ".new"
+    try:
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            os.fchmod(f.fileno(), 0o600)        # also when a file of an earlier failure was there
+            f.write(json.dumps(state, sort_keys=True))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp, path)
+    except OSError:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise Refused("the central vault's state could not be saved, so nothing changed") from None
+    try:
+        sync_folder(os.path.dirname(os.path.abspath(path)))
+    except OSError:
+        pass                            # the new state is already in its place: this is no failure of the save
+
+
+def pins(state):
+    """The machines that have a key the owner signed now, and that key: the records of unpins are left out."""
+    return {m: dict(x) for m, x in sorted(state["pins"].items()) if x["recipient"]}
+
+
+def central_status(conf):
+    """What the hub reads of the central vault: its keys, the owner's records and how many items it holds. Never a
+    value and never a title."""
+    state, store = central_state(conf), LocalStore(conf)
+    return {"ok": True, "v": PROTOCOL, "central": True, "recipient": public_key(conf["age_key"], "key"),
+            "store_recipient": store.recipient, "fleet": conf["fleet"], "owner_keys": len(conf["owner_keys"]),
+            "pins": pins(state), "recovery": state["recovery"]["recipient"] if state["recovery"] else None,
+            "items": len(store.opened()), "source": conf.get("_source")}
+
+
+def fingerprint_list(items):
+    """The fingerprints that the owner registered under one reference, of the form that fingerprints() makes: {kind,
+    hash (64 lowercase hex), len}. A reference that was registered more than once has more than one value's rows."""
+    return isinstance(items, list) and len(items) <= 32 and all(
+        isinstance(x, dict) and set(x) == {"kind", "hash", "len"} and x["kind"] in ("password", "totp")
+        and isinstance(x["hash"], str) and re.fullmatch(r"[0-9a-f]{64}", x["hash"]) is not None
+        and type(x["len"]) is int for x in items)
+
+
+def intake(conf, req):
+    """intake: save in the central store one value that the owner sealed to this vault's key in his app. The hub
+    gives the salts and the fingerprints that the owner registered under that reference, and the value is saved only
+    when each of its own fingerprints is one of those, and its password's is there when the owner registered one: the
+    rule of a deposit (the hub's helper_deposit_check), so the hub cannot put another value under a name that the
+    owner gave. It is saved under the same reference, and another value under it is refused, as a deposit is."""
+    ref, title, item, text, salts, given = (req.get(k) for k in ("login", "title", "item", "ciphertext", "salts",
+                                                                 "fingerprints"))
+    m = SECRET_REF.fullmatch(ref) if isinstance(ref, str) else None
+    if not (m and plain_line(title, 200) and item in ("login", "api_key") and isinstance(text, str)
+            and ARMOR in text and len(text) <= COPY_MAX and isinstance(salts, dict)
+            and all(re.fullmatch(r"[0-9a-f]{32}", str(salts.get(k))) for k in ("password", "totp"))
+            and fingerprint_list(given)):
+        raise Refused("the intake request is not valid")
+    store = LocalStore(conf)
+    read_private(conf["age_key"], "key")            # owner and mode are checked before age reads it
+    r = run([conf["age"], "-d", "-i", conf["age_key"]], text)
+    if r is None or r.returncode != 0:
+        raise Refused("the owner's copy cannot be opened with the central vault's key")
+    value = delivered(r.stdout, item)
+    mine = {(x["kind"], x["hash"], x["len"]) for x in fingerprints(value, salts)}
+    registered = {(x["kind"], x["hash"], x["len"]) for x in given}
+    if not (mine <= registered and (all(k[0] != "password" for k in registered)
+                                    or any(k[0] == "password" for k in mine))):
+        raise Refused("the value does not match what the owner registered")
+    saved = store.put(m.group(1).lower(), title, canonical(value), "taken from the owner")
+    log(f"intake: {ref.lower()} {saved}")
+    return {"ok": True, "login": ref.lower(), "saved": saved}
+
+
+def central_signed(conf, req, kind):
+    """pin, unpin and recovery: keep one statement that the owner signed. A statement must be newer (its `at`) than
+    the record of its machine, or of the recovery key, so an old one cannot be sent again; the exact statement of the
+    record answers "same", so a retry is no error. A pin's key is what seal locks a copy to, and the recovery key is
+    what export locks the store's key to."""
+    said = owner_statement(conf, req, kind)
+    state = central_state(conf)
+    new = {"recipient": said.get("recipient"), "at": said["at"]}       # an unpin keeps its time, with no recipient
+    old = state["recovery"] if kind == "recovery" else state["pins"].get(said["machine"])
+    if old == new:          # the same record is the same statement: its v, kind, fleet and machine are fixed
+        saved = "same"
+    elif old is not None and new["at"] <= old["at"]:
+        raise Refused("the vault holds a statement that is as new or newer, so nothing changed")
+    else:
+        saved = "removed" if kind == "unpin" else "replaced" if old and old["recipient"] else "new"
+        if kind == "recovery":
+            state["recovery"] = new
+        else:
+            state["pins"][said["machine"]] = new
+        keep_state(conf, state)
+    log(f"{kind} statement of the owner: {saved}")
+    answer = {"ok": True, "kind": kind, "saved": saved}
+    answer.update({k: said[k] for k in ("machine", "recipient") if k in said})
+    return answer
+
+
+def seal(conf, req):
+    """seal: one stored value, locked to the key that the owner pinned for one machine, for the hub to carry to that
+    machine's broker (a deposit). Nothing is sealed to a machine without a pin, and a copy that holds a value in plain
+    is not given."""
+    ref, machine = req.get("login"), req.get("machine")
+    m = SECRET_REF.fullmatch(ref) if isinstance(ref, str) else None
+    if not (m and isinstance(machine, str) and MACHINE.fullmatch(machine)):
+        raise Refused("a seal request needs a login and a machine")
+    pin = pins(central_state(conf)).get(machine)
+    if not pin:
+        raise Refused("the owner has not pinned a key for this machine, so nothing is sealed for it")
+    found = LocalStore(conf).opened().get(m.group(1).lower())
+    if not found:
+        raise Refused("the central vault has no such login")
+    r = run([conf["age"], "-a", "-r", pin["recipient"]], found["value"])
+    if r is None or r.returncode != 0 or ARMOR not in r.stdout:
+        raise Refused("the login could not be sealed for this machine")
+    if any(value in r.stdout for value in plain_values(found["value"])):
+        raise Refused("the sealed copy was not locked, so it is not given")
+    log(f"seal: {ref.lower()} for {machine}")
+    return {"ok": True, "login": ref.lower(), "machine": machine, "recipient": pin["recipient"], "title": found["key"],
+            "ciphertext": r.stdout, "sha256": hashlib.sha256(r.stdout.encode("utf-8")).hexdigest()}
+
+
+def export(conf):
+    """export: the backup of the central store. The store file as it is (it holds no value in plain), and the store's
+    key locked to the recovery key that the owner signed, so only the owner's recovery code opens the two. Nothing is
+    exported without that key."""
+    recovery = central_state(conf)["recovery"]
+    if not recovery:
+        raise Refused("the owner has not signed a recovery key, so nothing is exported")
+    store = LocalStore(conf)
+    fd = store.locked()                 # the file and its count are of one store: no save comes between them
+    try:
+        text = read_private(conf["store"], "store")
+        items = store.opened()
+    finally:
+        os.close(fd)
+    key = read_private(conf["store_key"], "store key")
+    r = run([conf["age"], "-a", "-r", recovery["recipient"]], key)
+    if r is None or r.returncode != 0 or ARMOR not in r.stdout:
+        raise Refused("the store's key could not be locked to the recovery key, so nothing is exported")
+    secret = [line.strip() for line in key.splitlines() if line.strip() and not line.startswith("#")]
+    if any(len(line) >= 8 and line in r.stdout for line in secret):
+        raise Refused("the store's key was not locked, so nothing is exported")
+    log(f"export: {len(items)} item(s), for the recovery key")
+    return {"ok": True, "v": 1, "made_at": time.time(), "items": len(items), "store_recipient": store.recipient,
+            "recovery": recovery["recipient"], "store": text, "key": r.stdout}
+
+
+def central(conf, req):
+    """One request to the central vault (handle): its own operations and status, and nothing of a machine's broker."""
+    op = req.get("op")
+    if op == "status":
+        return central_status(conf)
+    if op == "intake":
+        return intake(conf, req)
+    if op in ("pin", "unpin", "recovery"):
+        return central_signed(conf, req, op)
+    if op == "seal":
+        return seal(conf, req)
+    if op == "inventory":
+        return {"ok": True, "logins": sorted("bws://" + sid for sid in LocalStore(conf).opened())}
+    if op == "export":
+        return export(conf)
+    raise Refused("unknown operation")
+
+
 def caller(req):
     """The calling agent and its key (shared broker callers): both or neither. The key is used for the hub calls of
     this request only: never stored, logged or answered."""
@@ -1992,7 +2451,8 @@ def caller(req):
 
 def handle(conf, line, uid):
     if not admitted(conf, uid):
-        raise Refused("only an agent user of this machine may ask this broker")
+        raise Refused("only the hub's user may ask the central vault" if conf.get("central") is True else
+                      "only an agent user of this machine may ask this broker")
     try:
         req = json.loads(line)
     except ValueError:
@@ -2000,6 +2460,10 @@ def handle(conf, line, uid):
     if not isinstance(req, dict) or req.get("v") != PROTOCOL:
         raise Refused("unsupported protocol version")
     op = req.get("op")
+    if conf.get("central") is True:     # the central vault serves its own operations and nothing of a machine's broker,
+        return central(conf, req)
+    if op in CENTRAL_OPERATIONS:        # and a machine's broker none of the central vault's
+        raise Refused("unknown operation")
     if op == "status":
         status = {"ok": True, "v": PROTOCOL, "agent": conf.get("agent"), "store": "user", "backend": backend(conf),
                   "user": pwd.getpwuid(os.getuid()).pw_name, "recipient": recipient(conf), "callers": True,
@@ -2008,8 +2472,9 @@ def handle(conf, line, uid):
             status["creates"] = True
         if conf.get("_requests") is not None:       # only with a curl program: this broker can send a request
             status["requests"] = True
-        if backend(conf) == "store":                # the fleet's own store takes a secret the owner delivers
+        if backend(conf) == "store":                # the fleet's own store takes a secret the owner delivers,
             status["deposits"] = True
+            status["withdrawals"] = True            # and gives it back when no agent of the machine holds it
         if conf.get("_places") is not None:         # only with an ssh program: this broker writes to targets
             status["places"] = True
             status["place_key"] = conf["_places"]["public"]
@@ -2042,6 +2507,13 @@ def handle(conf, line, uid):
         if not isinstance(job, int) or isinstance(job, bool) or job < 1:
             raise Refused("a deposit needs the number of its delivery")
         return deposit(conf, job)
+    if op == "withdraw":
+        job = req.get("job")
+        if not who:
+            raise Refused("a withdrawal needs the caller fields")
+        if not isinstance(job, int) or isinstance(job, bool) or job < 1:
+            raise Refused("a withdrawal needs the number of its job")
+        return withdraw(conf, job)
     if op == "place":
         job = req.get("job")
         if not who:
@@ -2141,7 +2613,10 @@ class Broker:
         # One request works at a time, as before. Only a request's wait for its curl child is outside this lock, so
         # that a cancel and a status are served meanwhile.
         self.lock, self.room = threading.Lock(), threading.BoundedSemaphore(SERVED)
-        self.conf = with_source(with_places(with_requests(with_writes(conf), self.lock)))
+        if conf.get("central") is True:     # the central vault makes no login, sends no request and has no target key
+            self.conf = with_source(conf)
+        else:
+            self.conf = with_source(with_places(with_requests(with_writes(conf), self.lock)))
         self.conf, self.sock = dict(self.conf, _lock=self.lock), None
 
     def open(self):
@@ -2182,7 +2657,7 @@ class Broker:
         conn.settimeout(10)
         what = "request"
         try:
-            line = read_line(conn)
+            line = read_line(conn, CENTRAL_LINE) if self.conf.get("central") is True else read_line(conn)
             try:
                 req = json.loads(line) if line.strip() else {}
             except ValueError:
@@ -2352,15 +2827,20 @@ def owned_by(path, info, mode):
         os.chown(path, info.pw_uid, info.pw_gid)
 
 
-def store_init(config, user, keygen="age-keygen"):
+def store_init(config, user=None, keygen="age-keygen"):
     """The fleet's own store, in one operation (as root): the store key and an empty store in the broker's state
     folder, owned by the vault user and readable by no one else. **Safe to run again**: a key or a store that is
     there is kept, because a new key would leave every saved value unreadable. It reads no value and writes no
-    configuration: the configuration already names both files. Returns what it made."""
+    configuration: the configuration already names both files. Returns what it made.
+
+    For a central vault it also makes the vault's own key (age_key), to which the owner seals a new value, and keeps
+    that one too when it is there. With no user named, the user is the one that the service runs as: fleet-vault, or
+    fleet-vault-central for a central vault."""
     conf = load_config(config)
     if backend(conf) != "store":
         raise SystemExit("This broker's configuration names a Bitwarden project. Name store and store_key instead, "
                          "and no Bitwarden key, to use the fleet's own store.")
+    user = user or (CENTRAL_USER if conf.get("central") is True else "fleet-vault")
     try:
         info = pwd.getpwnam(user)
     except KeyError:
@@ -2371,6 +2851,9 @@ def store_init(config, user, keygen="age-keygen"):
     folder, key, store = state_folder(conf), conf["store_key"], conf["store"]
     if os.path.dirname(os.path.abspath(key)) != folder:
         raise SystemExit(f"store_key must be in the broker's state folder ({folder}).")
+    central = conf.get("central") is True
+    if central and any(os.path.dirname(os.path.abspath(conf[k])) != folder for k in ("age_key", "state")):
+        raise SystemExit(f"age_key and state must be in the central vault's state folder ({folder}).")
     made = []
     if not os.path.isdir(folder):
         os.makedirs(folder, mode=0o700)
@@ -2388,6 +2871,18 @@ def store_init(config, user, keygen="age-keygen"):
         m = re.search(r"^# public key: (age1[0-9a-z]{58})$", f.read(), re.M)
     if not m:
         raise SystemExit(f"The store key file has no public key line: {key}")
+    own = None
+    if central:
+        if not os.path.exists(conf["age_key"]):
+            r = run([keygen, "-o", conf["age_key"]], None)
+            if r is None or r.returncode != 0 or not os.path.exists(conf["age_key"]):
+                raise SystemExit("The central vault's key could not be made. Is age-keygen installed?")
+            made.append("age_key")
+        owned_by(conf["age_key"], info, 0o600)
+        with open(conf["age_key"], encoding="utf-8") as f:
+            own = re.search(r"^# public key: (age1[0-9a-z]{58})$", f.read(), re.M)
+        if not own:
+            raise SystemExit(f"The central vault's key file has no public key line: {conf['age_key']}")
     if not os.path.exists(store):
         r = run([conf["age"], "-a", "-r", m.group(1)], json.dumps({"v": STORE, "items": {}}, sort_keys=True))
         if r is None or r.returncode != 0 or ARMOR not in r.stdout:
@@ -2399,7 +2894,8 @@ def store_init(config, user, keygen="age-keygen"):
             os.fsync(f.fileno())
         made.append("store")
     owned_by(store, info, 0o600)
-    return {"store": store, "store_key": key, "user": user, "made": made, "public_key": m.group(1)}
+    return dict({"store": store, "store_key": key, "user": user, "made": made, "public_key": m.group(1)},
+                **({"age_key": conf["age_key"], "recipient": own.group(1)} if central else {}))
 
 
 def store_item(text):
@@ -2475,6 +2971,36 @@ Restart=on-failure
 WantedBy=multi-user.target
 """
 
+# The central vault's service (`unit --central`): its own user, the hub user's group for the socket, and no network
+# at all. The program is the root-owned copy that `hubsetup.py central-vault` installs, wherever this one runs from.
+CENTRAL_UNIT = """[Unit]
+Description=Fleet central vault (seals a secret only to a key that the owner signed)
+
+[Service]
+User={user}
+Group={group}
+ExecStart=/usr/bin/python3 /usr/local/lib/fleet-vault-central/vault.py serve --config {config}
+RuntimeDirectory=fleet-vault-central
+RuntimeDirectoryMode=0750
+StateDirectory=fleet-vault-central
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+LimitCORE=0
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+"""
+
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
@@ -2483,12 +3009,15 @@ def main(argv=None):
     p.add_argument("--config", required=True)
     p = sub.add_parser("unit", help="Print the systemd unit for this broker")
     p.add_argument("--config", required=True)
-    p.add_argument("--user", default="fleet-vault")
-    p.add_argument("--group", required=True, help="the worker's group: it may open the socket")
+    p.add_argument("--user", help="the vault user; default: fleet-vault, and always " + CENTRAL_USER + " for --central")
+    p.add_argument("--group", required=True, help="the worker's group, or with --central the hub user's group: it may "
+                                                  "open the socket")
+    p.add_argument("--central", action="store_true", help="the unit of the central vault on the hub's server")
     p = sub.add_parser("store-init", help="The fleet's own store, as root: make the store key and an empty store "
                                           "that only the vault user can read. Safe to run again")
     p.add_argument("--config", required=True)
-    p.add_argument("--user", default="fleet-vault", help="the vault user: it owns the key and the store")
+    p.add_argument("--user", help="the vault user: it owns the key and the store; default: fleet-vault, and "
+                                  + CENTRAL_USER + " for a central vault")
     p.add_argument("--keygen", default="age-keygen", help="the age-keygen program; default: the one on the PATH")
     p = sub.add_parser("store-put", help="Save one login or key of the owner's in the fleet's own store, as the "
                                          "vault user: the item as JSON on standard input, and its name comes back")
@@ -2531,14 +3060,23 @@ def main(argv=None):
         return 0
     if args.cmd == "unit":
         with open(args.config, encoding="utf-8") as f:
-            agent = json.load(f).get("agent") or "the agents of this machine"
-        print(UNIT.format(agent=agent, user=args.user, group=args.group, config=args.config,
+            said = json.load(f)
+        if args.central != (said.get("central") is True):      # the unit and the configuration are of one kind
+            raise SystemExit("unit --central is for a central vault's configuration, and only for one.")
+        if args.central:
+            if args.user not in (None, CENTRAL_USER):
+                raise SystemExit(f"The central vault runs as {CENTRAL_USER}.")
+            print(CENTRAL_UNIT.format(user=CENTRAL_USER, group=args.group, config=args.config), end="")
+            return 0
+        agent = said.get("agent") or "the agents of this machine"
+        print(UNIT.format(agent=agent, user=args.user or "fleet-vault", group=args.group, config=args.config,
                           script=os.path.abspath(__file__)), end="")
         return 0
     unchangeable(os.path.realpath(__file__), "The vault broker program")     # never the worker's checkout
     conf = load_config(args.config)
     broker = Broker(conf).open()
-    log(f"vault broker for {conf.get('agent') or 'the agents of this machine'} on {conf['socket']}")
+    log(f"central vault on {conf['socket']}" if conf.get("central") is True else
+        f"vault broker for {conf.get('agent') or 'the agents of this machine'} on {conf['socket']}")
     broker.serve()
     return 0
 

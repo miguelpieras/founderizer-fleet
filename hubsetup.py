@@ -24,6 +24,10 @@ Standard library only, and it reads no credential of a model provider.
     python3 hubsetup.py check --address IP [--port N] [--kit PATH]
                                                     the end checks on this machine: selftest.py and GET /health
     python3 hubsetup.py fleet-id [--db PATH]        this fleet's own id in the hub's key store, made once
+    python3 hubsetup.py central-vault --owner-key KEY [--hub-user fleet] [--fleet ID]
+                                                    as root on the hub's machine: the central vault, its own user and
+                                                    service, which the hub's user can ask and neither read nor replace;
+                                                    a second run with a newer kit is how it is updated
 
 Why the claim exists. The owner is a Tailscale address and no token (hub.py `allowed("owner")`), so a hub with the
 wrong `addresses.owner` serves the owner's pages to the wrong machine, and one with none serves them to nobody. The
@@ -40,6 +44,7 @@ a vault entry. The customer signs in to their own account in their own session; 
 says that the manager holds no credential of ours.
 """
 import argparse
+import base64
 import hashlib
 import http.server
 import json
@@ -95,6 +100,14 @@ HELPER = "/usr/local/sbin/fleet-agent-user"         # one of the two root comman
 VAULT_UPDATE = "/usr/local/sbin/fleet-vault-program"    # the other: the broker's program, and nothing else
 SUDOERS = "/etc/sudoers.d/fleet-agents"             # what that service may do, and nothing more
 EXPORT_OK = "git-daemon-export-ok"                  # git daemon serves a repository only when this file is in it
+CENTRAL_USER = "fleet-vault-central"                # the central vault's own user: no login, no shell, no home
+CENTRAL_SERVICE = "fleet-vault-central"
+CENTRAL_LIB = "/usr/local/lib/fleet-vault-central"  # its program, root-owned 644, outside every checkout
+CENTRAL_CONF_DIR = "/etc/fleet-vault-central"
+CENTRAL_CONF = CENTRAL_CONF_DIR + "/vault.json"     # root with mode 644, and no secret in it
+CENTRAL_STATE = "/var/lib/fleet-vault-central"      # its key, the store's key, the store and the pins: its user alone
+CENTRAL_UNIT = "/etc/systemd/system/fleet-vault-central.service"
+FLEET_ID = re.compile(r"[0-9a-f]{16}")              # hub.fleet_id(): sixteen lowercase hex characters
 PRIVATE = re.compile(r"100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.(?:[0-9]{1,3})\.(?:[0-9]{1,3})$")
 
 
@@ -779,6 +792,241 @@ def keep_fleet_id(db=None):
         hub.DB = kept
 
 
+# ---------------------------------------------------------------- the central vault (owner feature central_vault)
+#
+# One vault on the hub's machine that holds every secret of the fleet, as a service of its own user. The hub's user
+# may ask it over its socket and can neither read its files nor replace its program, and it seals a copy only to a
+# machine key, and its backup only to a recovery key, that the owner signed with the key named here. So this is a
+# root step, run by the owner (his app does it over his own SSH), and a second run with a newer kit is how the vault
+# is updated: there is no sudoers line and no root helper that lets the hub's user install or change it.
+
+def owner_public_key(value):
+    """The owner's public key as his app gives it: the base64 of a 65-byte uncompressed P-256 point (0x04, X, Y).
+    Only its shape is checked here; the central vault refuses to start with a point that is not on the curve."""
+    try:
+        raw = base64.b64decode(value or "", validate=True)
+    except (ValueError, TypeError):
+        raw = b""
+    if len(raw) != 65 or raw[0] != 4 or base64.b64encode(raw).decode() != value:
+        raise Stop("--owner-key is the base64 of the owner's 65-byte P-256 public key, as his app gives it.")
+    return value
+
+
+def hub_account(user):
+    """{uid, group, home} of the hub's own user: the central vault admits that uid alone, and its socket belongs to
+    that user's primary group."""
+    import grp
+    import pwd
+    try:
+        info = pwd.getpwnam(user)
+    except KeyError:
+        raise Stop(f"there is no user {user} on this machine: name the user the hub runs as with --hub-user.") from None
+    if info.pw_uid == 0:
+        raise Stop("the hub never runs as root, so root cannot be the one user the central vault answers.")
+    try:
+        group = grp.getgrgid(info.pw_gid).gr_name
+    except KeyError:
+        group = str(info.pw_gid)
+    return {"uid": info.pw_uid, "group": group, "home": info.pw_dir}
+
+
+def hub_fleet(db):
+    """This fleet's id as the hub keeps it (hub.fleet_id), read and never written: this runs as root, and a write
+    could leave a file of root's beside the hub's own records."""
+    if not os.path.exists(db):
+        raise Stop(f"the hub keeps no records in {db}, so this fleet's id is not known here: give it with --fleet.")
+    try:
+        con = sqlite3.connect(pathlib.Path(db).resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+        try:
+            row = con.execute("SELECT v FROM kv WHERE k='fleet_id'").fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error as e:
+        raise Stop(f"this fleet's id could not be read from {db}: {e}. Give it with --fleet.") from None
+    if not row or not FLEET_ID.fullmatch(str(row[0] or "")):
+        raise Stop("the hub has made no fleet id yet: run `python3 hubsetup.py fleet-id` as the hub's user, or give "
+                   "it with --fleet.")
+    return row[0]
+
+
+def central_config(hub_uid, fleet, owner_key):
+    """The central vault's configuration (vault.py, central mode), which holds no secret: the one uid it answers, the
+    fleet each signed statement must name, the owner's public key, and where its files are. owner_keys is the key
+    of this run and nothing else, so a run from a new Mac replaces the key of a lost one: root on the hub's machine
+    is the owner's own authority, and the key files themselves are never replaced (central_install)."""
+    return {"central": True, "hub_uid": hub_uid, "fleet": fleet, "owner_keys": [owner_key], "age": "/usr/bin/age",
+            "age_key": CENTRAL_STATE + "/age.key", "store": CENTRAL_STATE + "/store.age",
+            "store_key": CENTRAL_STATE + "/store.key", "socket": hub.CENTRAL_SOCKET,
+            "state": CENTRAL_STATE + "/central.json"}
+
+
+def central_reading():
+    """The shell that reads the central vault, so that a second run changes nothing. It names no key's content."""
+    return ("id -u %(u)s >/dev/null 2>&1 && echo user=yes || echo user=no\n"
+            "command -v age >/dev/null 2>&1 && echo age=yes || echo age=no\n"
+            "command -v age-keygen >/dev/null 2>&1 && echo keygen=yes || echo keygen=no\n"
+            "echo program=$(sha256sum %(lib)s/vault.py 2>/dev/null | cut -d' ' -f1)\n"
+            "for f in age.key store.key store.age; do test -s %(state)s/$f && echo $f=yes || echo $f=no; done\n"
+            "echo active=$(systemctl is-active %(svc)s 2>/dev/null || true)\n"
+            "echo restarts=$(systemctl show -p NRestarts --value %(svc)s 2>/dev/null || echo unknown)\n") % {
+                "u": CENTRAL_USER, "lib": CENTRAL_LIB, "state": CENTRAL_STATE, "svc": CENTRAL_SERVICE}
+
+
+def central_user_script():
+    """The central vault's user and folders, each line safe to run again. Its state folder is made here, because its
+    own key goes in before the service first starts."""
+    return ("id -u %(u)s >/dev/null 2>&1 || useradd --system --home-dir %(state)s --shell /usr/sbin/nologin %(u)s\n"
+            "install -d -o root -g root -m 755 %(lib)s %(conf)s\n"
+            "install -d -o %(u)s -g %(u)s -m 700 %(state)s\n") % {
+                "u": CENTRAL_USER, "lib": CENTRAL_LIB, "conf": CENTRAL_CONF_DIR, "state": CENTRAL_STATE}
+
+
+def central_key_script():
+    """The central vault's own key, which owners seal new values to, made once. A key that is there is kept: a new
+    one would leave every copy sealed to the old one unreadable."""
+    return ("umask 077\n"
+            "test -s %(key)s || age-keygen -o %(key)s >/dev/null 2>&1\n"
+            "chown %(u)s:%(u)s %(key)s\n"
+            "chmod 600 %(key)s\n") % {"u": CENTRAL_USER, "key": CENTRAL_STATE + "/age.key"}
+
+
+def central_unit_text(run, group):
+    """The central vault's service, as its own installed program prints it (vault.py unit --central). Reading it
+    changes nothing."""
+    code, unit, err = run(f"python3 {CENTRAL_LIB}/vault.py unit --central --config {CENTRAL_CONF} "
+                          f"--group {shlex.quote(group)}")
+    if code != 0 or f"User={CENTRAL_USER}" not in unit or \
+            f"ExecStart=/usr/bin/python3 {CENTRAL_LIB}/vault.py serve" not in unit:
+        raise Stop("this kit's vault.py does not print the central vault's service (vault.py unit --central), so it "
+                   "is older than the central vault: " + (err or unit or "no output").strip()[-300:])
+    return unit if unit.endswith("\n") else unit + "\n"
+
+
+# Asked as the hub's user, because the central vault answers that uid alone: one status line, and nothing that a key
+# file holds. The socket's path is its one argument.
+CENTRAL_ASK = ("import socket, sys\n"
+               "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+               "s.settimeout(10)\n"
+               "s.connect(sys.argv[1])\n"
+               "s.sendall(b'{\"v\": 2, \"op\": \"status\"}\\n')\n"
+               "data = b''\n"
+               "while not data.endswith(b'\\n'):\n"
+               "    chunk = s.recv(65536)\n"
+               "    if not chunk:\n"
+               "        break\n"
+               "    data += chunk\n"
+               "sys.stdout.write(data.decode())\n")
+
+
+def central_status(run, hub_user, fleet):
+    """The central vault's own status, asked over its socket as the hub's user: {recipient, store_recipient, fleet},
+    its public keys only."""
+    code, out, err = run(f"runuser -u {shlex.quote(hub_user)} -- python3 -c {shlex.quote(CENTRAL_ASK)} "
+                         f"{hub.CENTRAL_SOCKET}", timeout=60)
+    try:
+        answer = json.loads(out.strip().splitlines()[-1]) if code == 0 and out.strip() else None
+    except ValueError:
+        answer = None
+    if not isinstance(answer, dict) or answer.get("ok") is not True or answer.get("central") is not True:
+        said = answer.get("error") if isinstance(answer, dict) and isinstance(answer.get("error"), str) else \
+            (err or out or "no answer").strip()[-200:]
+        raise Stop(f"the central vault does not answer the hub's user {hub_user} on {hub.CENTRAL_SOCKET}: {said}")
+    if answer.get("fleet") != fleet:
+        raise Stop(f"the central vault answers for another fleet than {fleet}.")
+    keys = (answer.get("recipient"), answer.get("store_recipient"))
+    if not all(isinstance(k, str) and hub.AGE_RECIPIENT.fullmatch(k) for k in keys):
+        raise Stop("the central vault's status gives no public key.")
+    return {"recipient": keys[0], "store_recipient": keys[1], "fleet": fleet}
+
+
+def central_install(owner_key, hub_user="fleet", fleet=None, kit=None, run=None, read=None, account=None, db=None):
+    """The central vault on the hub's machine, as root (HUB-INSTALL.md, "The central vault"): age, its own user, the
+    kit's vault.py as a root-owned program, its configuration, its own key, the store's key and the empty store, its
+    service, and then its status, asked as the hub's user.
+
+    Safe to run again, and that is how it is updated: each step reads first, the service is restarted only when
+    something changed, and a key, a store or a state file that is there is never replaced (age-keygen behind
+    `test -s`, and `vault.py store-init`, which keeps what it finds). The configuration is written whole on every run
+    that changes it, with this run's owner key as the only one (central_config). The fleet id is the one given, else
+    the hub's own (hub_fleet). Returns {"state": "made"|"there", "recipient", "store_recipient", "fleet"}: public
+    keys only, because nothing here reads or prints a key file."""
+    run = run or _shell
+    read = read or (lambda path: pathlib.Path(path).read_text(encoding="utf-8"))
+    kit, key = kit or KIT, owner_public_key(owner_key)
+    who = (account or hub_account)(hub_user)
+    fleet = fleet or hub_fleet(db or os.path.join(who["home"], ".fleet", "pilot.db"))
+    if not FLEET_ID.fullmatch(fleet):
+        raise Stop("--fleet is this fleet's id: sixteen lowercase hex characters, as GET /ui/vault gives it.")
+    try:
+        program = hashlib.sha256(pathlib.Path(kit, "vault.py").read_bytes()).hexdigest()
+    except OSError:
+        raise Stop(f"{os.path.join(kit, 'vault.py')} is not readable, so the central vault cannot be installed.") from None
+    conf = central_config(who["uid"], fleet, key)
+    before = kv(run(central_reading())[1])
+    try:
+        current = json.loads(read(CENTRAL_CONF))
+    except (OSError, ValueError):
+        current = None
+    try:
+        unit_now = read(CENTRAL_UNIT)
+    except OSError:
+        unit_now = None
+    if all(before.get(k) == "yes" for k in ("user", "age", "keygen", "age.key", "store.key", "store.age")) and \
+            before.get("program") == program and current == conf and before.get("active") == "active" and \
+            unit_now and central_unit_text(run, who["group"]) == unit_now:
+        say(f"the central vault is in place already, kept by {CENTRAL_USER}: only {hub_user} may ask it")
+        return dict(central_status(run, hub_user, fleet), state="there")
+    for script, what in ((central_user_script(), f"the user {CENTRAL_USER} and the central vault's folders"),
+                         (AGE_INSTALL if before.get("age") != "yes" or before.get("keygen") != "yes" else "",
+                          "the age program, which locks the store and every sealed copy"),
+                         (central_key_script(), "the central vault's own key")):
+        if not script:
+            continue
+        code, out, err = run(script, timeout=900)
+        if code != 0:
+            raise Stop(f"{what} could not be put in place: {(err or out).strip()[-300:]}")
+    folder = tempfile.mkdtemp(prefix="fleet-vault-central-")
+    try:
+        one = os.path.join(folder, "vault.json")
+        with open(one, "w", encoding="utf-8") as f:
+            f.write(json.dumps(conf, indent=2) + "\n")
+        # The program first: store-init and unit run from the installed copy, which no checkout can change.
+        code, out, err = run("install -o root -g root -m 644 %s %s/vault.py\n"
+                             "install -o root -g root -m 644 %s %s\n"
+                             % (shlex.quote(os.path.join(kit, "vault.py")), CENTRAL_LIB, shlex.quote(one), CENTRAL_CONF))
+        if code != 0:
+            raise Stop(f"the central vault's program and configuration could not be installed: "
+                       f"{(err or out).strip()[-300:]}")
+        code, out, err = run(f"python3 {CENTRAL_LIB}/vault.py store-init --config {CENTRAL_CONF} --user {CENTRAL_USER}",
+                             timeout=300)
+        if code != 0:
+            raise Stop(f"the central vault's store could not be made: {(err or out).strip()[-300:]}")
+        two = os.path.join(folder, CENTRAL_SERVICE + ".service")
+        with open(two, "w", encoding="utf-8") as f:
+            f.write(central_unit_text(run, who["group"]))
+        # A restart and not `enable --now` alone: a running vault reads a new program or a new owner key only when
+        # it starts again. The restart counter is zeroed first, so what is read after it is this start's.
+        code, out, err = run("install -o root -g root -m 644 %s %s\nsystemctl daemon-reload\n"
+                             "systemctl enable %s >/dev/null 2>&1\n"
+                             "systemctl reset-failed %s >/dev/null 2>&1 || true\n"
+                             "systemctl restart %s\nsleep %d\n"
+                             % (shlex.quote(two), CENTRAL_UNIT, CENTRAL_SERVICE, CENTRAL_SERVICE, CENTRAL_SERVICE,
+                                VAULT_SETTLE), timeout=300)
+        if code != 0:
+            raise Stop(f"the central vault's service could not be started: {(err or out).strip()[-300:]}")
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    after = kv(run(central_reading())[1])
+    if after.get("active") != "active" or after.get("restarts") not in ("0", "unknown"):
+        raise Stop(f"the central vault is {after.get('active') or 'not running'} {VAULT_SETTLE} seconds after its "
+                   f"install. Read `journalctl -u {CENTRAL_SERVICE} -n 30` on this machine: a vault that refuses its "
+                   f"own configuration says so on its first line.")
+    done = central_status(run, hub_user, fleet)
+    say(f"the central vault runs as {CENTRAL_USER}, and only {hub_user} may ask it; its public key is "
+        f"{done['recipient']}")
+    return dict(done, state="made")
+
+
 def write_team(path, team):
     """Write team.json, after hub.validate_team has taken it. Atomic: a run that stops leaves the old file."""
     try:
@@ -1122,6 +1370,27 @@ def cmd_fleet_id(args):
     keep_fleet_id(args.db)
 
 
+def cmd_central_vault(args):
+    """central-vault, as root on the hub's machine. The owner's app runs it over his SSH and reads its last line on
+    standard output, which is always one JSON object: {"ok": true, "recipient", "store_recipient", "fleet"}, or
+    {"ok": false, "error": "<one sentence>"} with a non-zero exit. Every line before it is progress."""
+    try:
+        if platform.system() != "Linux":
+            raise Stop("the central vault runs on the hub's Linux server, and this machine is not one.")
+        if os.geteuid() != 0:
+            raise Stop("run it as root on the hub's machine: sudo python3 hubsetup.py central-vault --owner-key <key>")
+        done = central_install(args.owner_key, hub_user=args.hub_user, fleet=args.fleet)
+    except Stop as e:
+        print(json.dumps({"ok": False, "error": str(e)}), flush=True)
+        raise
+    except Exception as e:          # never a trace on the last line: the app reads it as the answer
+        print(json.dumps({"ok": False, "error": f"the central vault could not be installed ({type(e).__name__})."}),
+              flush=True)
+        raise Stop(f"the central vault could not be installed ({type(e).__name__}).") from None
+    print(json.dumps({"ok": True, "recipient": done["recipient"], "store_recipient": done["store_recipient"],
+                      "fleet": done["fleet"]}), flush=True)
+
+
 def cmd_check(args):
     ok, last = selftest(args.kit)
     say(f"selftest.py: {last}")
@@ -1164,6 +1433,11 @@ def main(argv=None):
     fid = sub.add_parser("fleet-id")
     fid.add_argument("--db", default=DB_PATH, help="the hub's own records; the default is where hub.py keeps them")
     fid.set_defaults(fn=cmd_fleet_id)
+    cv = sub.add_parser("central-vault")
+    cv.add_argument("--owner-key", required=True, help="the owner's public key, as his app gives it (base64)")
+    cv.add_argument("--hub-user", default="fleet", help="the user the hub runs as: the one the central vault answers")
+    cv.add_argument("--fleet", help="this fleet's id; default: the one in the hub's own records")
+    cv.set_defaults(fn=cmd_central_vault)
     one = sub.add_parser("repository")
     for what, why in (("tree", "the copy of Founderizer that this installer runs from"),
                       ("bare", "the bare repository that every machine of this fleet fetches from"),

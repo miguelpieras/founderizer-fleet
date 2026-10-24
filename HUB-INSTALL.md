@@ -338,6 +338,47 @@ the checkout and the service of an agent that was added since.
   This keeps the repository, the records (`~fleet/.fleet/pilot.db`), the outputs, each
   agent's own checkout and its runtime sign-in.
 
+## The central vault
+
+One vault on the hub's machine holds every secret of the fleet, and each server's vault gets
+only the secrets its agents hold (UI-API.md, version 1.44). It is not a step of the line
+above. It is one root command, which the owner's app runs over the owner's own SSH, or
+which you run on the hub's machine as root:
+
+```sh
+sudo python3 ~fleet/fleet-pilot/hubsetup.py central-vault --owner-key <the key the app gives>
+```
+
+`--hub-user` names the user the hub runs as (default `fleet`), and `--fleet` the fleet's id
+(default: the one in the hub's own records, read and never written). It makes:
+
+- the user `fleet-vault-central`: a system user with no login and no shell;
+- `/usr/local/lib/fleet-vault-central/vault.py`: the kit's `vault.py`, owned by root,
+  mode 644;
+- `/etc/fleet-vault-central/vault.json`: its configuration, owned by root, mode 644, with
+  no secret in it: the hub's uid, the fleet's id and the owner's public key;
+- in `/var/lib/fleet-vault-central/` (mode 700, its user alone): its own key, which the
+  owner's app seals new values to, the store's key, the store, and the pins it keeps;
+- `fleet-vault-central.service`, which runs it as its own user with the hub user's group,
+  so the socket `/run/fleet-vault-central/vault.sock` (mode 660) opens to the hub and to
+  nobody else, and the vault answers the hub's uid alone. It has no network.
+
+Then it asks the vault for its status as the hub's user, and its last line is one JSON
+object: `{"ok": true, "recipient", "store_recipient", "fleet"}`, or `{"ok": false,
+"error"}` with a non-zero exit. It never prints a key file.
+
+**Running it again is how it is updated**, from a newer kit: each step reads first, the
+service starts again only when something changed, and a key, the store or the pins that are
+there are never replaced. The owner's key is the one exception: each run writes the key it
+is given as the only one, so a run from a new Mac replaces the key of a lost one. Root on
+this machine is the owner's own authority, and that is why this is a root step.
+
+**The hub's user can neither read it nor replace its code.** Its files belong to root or
+to its own user, and there is no sudoers line and no root helper for it: the hub asks its
+socket, and that is all it can do. The vault seals a copy only to a machine key the owner
+signed, and its backup only to a recovery key the owner signed, so a hub that is broken into
+cannot add a machine of its own and take every secret in one call.
+
 ## Not part of this installer
 
 - **Worker push keys.** A worker that pushes its task output needs the hub's separate
