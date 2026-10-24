@@ -1115,10 +1115,11 @@ def waiting_say_rows(agent, task_id):
     in_transaction("waiting_say_rows")
     if role_of(agent) not in ("worker", "lead"):
         return
-    t0, ended = now(), ",".join("?" * len(TERMINAL))
-    for e in read_rows(f"SELECT id, extra FROM events WHERE agent=? AND kind='say' AND read_at IS NULL AND "
-                       f"json_extract(extra, '$.duty') IS NOT NULL AND (task IS NULL OR task IN "
-                       f"(SELECT id FROM tasks WHERE state IN ({ended})))", (agent, *TERMINAL)):
+    t0 = now()
+    # Under no task only: a task that ends before its session read the notice gives it back (unfile_notices), so
+    # this is one read of the event_task index and not a look at every ended task's messages at each session start.
+    for e in read_rows("SELECT id, extra FROM events WHERE task IS NULL AND kind='say' AND agent=? AND "
+                       "read_at IS NULL AND json_extract(extra, '$.duty') IS NOT NULL", (agent,)):
         x = json.loads(e["extra"])
         r = read_row("SELECT * FROM responsibilities WHERE id=?", (x["duty"],))
         if not r or r["agent"] != agent or r["state"] == "retired":
@@ -3483,14 +3484,17 @@ def t_deliver_result(agent, a):
                         f"Check or cancel them first.")
     # Rule 3: whoever gave a task checks its result. check_result reaches a subtask only from this session, so a
     # result left unchecked here could never be checked by anybody again.
-    unchecked = q("SELECT id FROM tasks WHERE parent=? AND state IN ('completed','failed','rejected') "
-                  "AND accepted IS NULL ORDER BY id", (tid,))
+    unchecked = [r for r in q("SELECT id, owner FROM tasks WHERE parent=? AND state IN ('completed','failed','rejected') "
+                              "AND accepted IS NULL ORDER BY id", (tid,))
+                 if role_of(agent) == "lead" and authority(agent, r["owner"], "task")[0]]
+    # (one whose agent left its team, or a lead that became a worker, may check none of them: it is not held to it)
     if unchecked:
         raise ToolError(f"{tref(tid)} has subtask results that you have not checked: "
                         f"{', '.join(tref(r['id']) for r in unchecked)}. Check each with check_result first: after "
                         f"you deliver, nobody can.")
     q("UPDATE tasks SET state=?, outcome=?, what=?, where_=?, how=?, delivered=?, waiting_on=NULL WHERE id=?",
       (outcome, outcome, what, where, how, now(), tid))
+    unfile_notices(tid)
     q("UPDATE attempts SET ended=? WHERE task=? AND attempt=?", (now(), tid, t["attempt"]))
     end_holds(tid)
     activity(tid, "deliver_result")
@@ -3585,6 +3589,7 @@ def cancel_subtasks(task_id, reason):
         stop_for_cancel(sub)
         q("UPDATE tasks SET state='canceled', outcome='canceled', what=?, delivered=?, waiting_on=NULL WHERE id=?",
           (f"Canceled with its parent {tref(task_id)}: {reason}", now(), sub["id"]))
+        unfile_notices(sub["id"])
         emit(sub["owner"], "say", f"[hub] {tref(sub['id'])} was canceled because its parent {tref(task_id)} was canceled: "
              f"{reason}. Stop working on it now.", task=sub["id"])
         cancel_subtasks(sub["id"], reason)
@@ -3867,6 +3872,7 @@ def t_cancel_task(agent, a):
     stop_for_cancel(t)
     q("UPDATE tasks SET state='canceled', outcome='canceled', what=?, delivered=?, waiting_on=NULL WHERE id=?",
       (f"Canceled: {reason}", now(), tid))
+    unfile_notices(tid)
     emit(t["owner"], "say", f"[hub] {tref(tid)} was canceled by your requester: {reason}. Stop working on it now.", task=tid)
     cancel_subtasks(tid, reason)
     left = case_left_open(case_id=t["duty_case"]) if t["duty_case"] else None
@@ -10744,10 +10750,21 @@ def duty_save(body, by, t0, duty_id=None, command=None):
         moved = old is not None and old["agent"] != r["agent"]
         told = [(manager_name(), "say", None, new_duty_text(r, by, old), None)] \
             if old is None or by != manager_name() else []
-        if (old is None or moved) and r["agent"] != manager_name():
-            # One notice of a duty waits at a time: an older one that nobody read says what is no longer so.
+        if old is None or moved:
+            # One notice of a duty waits at a time, filed under a task or not: an older one that nobody read says
+            # what is no longer so -- also when the manager is the new holder, which gets none of its own.
             DB.execute("UPDATE events SET read_at=? WHERE kind='say' AND read_at IS NULL AND "
                        "json_extract(extra, '$.duty')=?", (t0, r["id"]))
+        else:
+            # New words for the same holder: the notice that still waits for its read says them.
+            for e in read_rows("SELECT id, extra FROM events WHERE kind='say' AND read_at IS NULL AND "
+                               "json_extract(extra, '$.duty')=?", (r["id"],)):
+                x = json.loads(e["extra"])
+                DB.execute("UPDATE events SET text=? WHERE id=?",
+                           (new_duty_text(r, x.get("by") or manager_name(),
+                                          {"agent": x["from"]} if x.get("from") else None) + DUTY_NOTICE_HOLDER,
+                            e["id"]))
+        if (old is None or moved) and r["agent"] != manager_name():
             told.append((r["agent"], "say", None, new_duty_text(r, by, old) + DUTY_NOTICE_HOLDER,
                          {"duty": r["id"], "by": by, "from": old["agent"] if moved else None}))
         event_rows(told, t0)
@@ -10761,6 +10778,16 @@ def duty_save(body, by, t0, duty_id=None, command=None):
                     pause_trigger(w["id"], by, f"{rref(r['id'])} moved to {r['agent']}; this rule of "
                                                f"{old['agent']} watched it.", t0)
                 DB.execute("UPDATE triggers SET responsibility=NULL, watch=NULL WHERE id=?", (w["id"],))
+            # Its open tasks of the duty go on, and what they were told to do for it -- open a case for each event
+            # -- no longer holds: open_case refuses an agent that does not hold the duty. So each is told, in its own
+            # session, what still is its to do and where an event of the duty goes now.
+            event_rows([(old["agent"], "say", x["id"],
+                         f"[hub] {rref(r['id'])} moved to {r['agent']}: it is no longer yours. Finish what this task "
+                         f"already does for it (a case of it that this task works you may still record and close), "
+                         f"and open no new case of it: an event of it that you find goes up with report_up, kind "
+                         f"someone_elses_duty.", None)
+                        for x in read_rows(f"SELECT id FROM tasks WHERE owner=? AND responsibility=? AND {OPEN_TASK}",
+                                           (old["agent"], r["id"]))], t0)
     return duty_row(new_id)
 
 
@@ -17158,10 +17185,22 @@ def reminder_sweep(t0):
 
 
 def waits_on_parts(task_id):
-    """True when this task has an open subtask. A lead that waits for its team is quiet on purpose, and a subtask's
-    own silence already comes to it (filed_under): before, the lead was nudged at three minutes and its requester
-    told at six that it was silent, about a lead doing what RULES.md tells it to do."""
-    return bool(q1(f"SELECT 1 FROM tasks WHERE parent=? AND {OPEN_TASK} LIMIT 1", (task_id,)))
+    """True when this task has an open subtask and none of them waits on it. A lead that waits for its team is quiet
+    on purpose, and a subtask's own silence already comes to it (filed_under): before, the lead was nudged at three
+    minutes and its requester told at six that it was silent, about a lead doing what RULES.md tells it to do.
+
+    A subtask that is input-required waits on the lead itself -- its question or its permission prompt is the lead's
+    to answer -- and nothing measures that subtask's silence. So then the lead's own silence counts again, or a lead
+    that never answers would reach nobody above it."""
+    parts = q(f"SELECT state FROM tasks WHERE parent=? AND {OPEN_TASK}", (task_id,))
+    return bool(parts) and all(p["state"] != "input-required" for p in parts)
+
+
+def unfile_notices(task_id):
+    """A task that ended gives back the duty notice its session never read, so the next task session reads it
+    (waiting_say_rows). Committing: its callers end a task with q()."""
+    q("UPDATE events SET task=NULL WHERE task=? AND kind='say' AND read_at IS NULL AND "
+      "json_extract(extra, '$.duty') IS NOT NULL", (task_id,))
 
 
 def came_back(task_id, t0):
@@ -26186,8 +26225,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 test = int(f["test"])
                 case_id = str(f["id"])
-                if test not in range(1,15) or not re.fullmatch(r"[A-Za-z0-9_-]+", case_id):
-                    raise ValueError()
+                if test not in range(1,15) or not re.fullmatch(r"[A-Za-z0-9_-]+", case_id) or CASE_REF.match(case_id):
+                    raise ValueError()      # C-5 would be read as a duty's case (create_task case_id)
                 ins("INSERT INTO cases(id,test,created,expected) VALUES(?,?,?,?)", (case_id, test, now(), json.dumps(f.get("expected",{}))))
             except (KeyError, ValueError, sqlite3.IntegrityError):
                 return self.json(400, {"error":"invalid or duplicate case"})
