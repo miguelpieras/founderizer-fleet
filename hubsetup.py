@@ -668,10 +668,12 @@ def vault_install(kit=None, hub_address=None, user=VAULT_USER, group=AGENT_GROUP
     read = read or (lambda path: pathlib.Path(path).read_text(encoding="utf-8"))
     kit = kit or KIT
     if system and system != "Linux":
-        # A Mac's vault is the signed Fleet Vault.app in the owner's login session, which the app installs and
-        # updates. Nothing of this program runs there, and a file written for it would be read by no process.
-        say(f"this machine runs {system}, whose vault is the signed Fleet Vault app that Founderizer installs "
-            f"itself, so there is nothing to set up here")
+        # A Mac's vault is the signed Fleet Vault.app in the user's login session: the app repository's
+        # Vault/install.py installs it once as root, with a root updater that puts each newer signed vault of the
+        # release channel in place by itself (Vault/update.zsh). Nothing of this program runs there, and a file
+        # written for it would be read by no process.
+        say(f"this machine runs {system}, whose vault is the signed Fleet Vault app with its own installer and "
+            f"updater, so there is nothing to set up here")
         return {"state": "there", "store": None, "recipient": None, "active": None}
     if not hub_address:
         raise Stop("the vault broker needs the hub's address, which the installer reads from this machine's join.")

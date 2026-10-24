@@ -178,8 +178,10 @@ To undo on one machine: `systemctl disable --now fleet-vault`, and set `"vault":
 would leave every value it holds unreadable.
 
 A Mac has no `vault.py` broker. Its vault is the signed `Fleet Vault.app`, started by
-the LaunchAgent `com.agentfleet.vault` in the owner's login session, and the app
-installs and updates it. It holds the fleet's own store too; see the next section.
+the LaunchAgent `com.agentfleet.vault` in the user's login session. The app
+repository's `Vault/install.py` installs it once as root, with a root updater that
+puts each newer signed vault in place by itself. It holds the fleet's own store too;
+see the next section.
 
 ## Vault broker (macOS)
 
@@ -202,7 +204,20 @@ rotating one does not orphan the other's values.
 Install it from the app repository (`miguelpieras/agents`), with the signed build:
 
 ```sh
-sudo python3 app/Vault/install.py --app "<build>/Fleet Vault.app" --user <mac user> --agent <agent> --hub http://100.80.1.2:8765 --store
+sudo python3 app/Vault/install.py --app "<build>/Fleet Vault.app" --user <mac user> --agent <agent> --hub http://100.80.1.2:8765 --store --fleet <fleet id>
+```
+
+**It updates itself.** The install also puts the vault's updater there: the root daemon
+`com.agentfleet.vault.update` runs `/Library/Application Support/Fleet Vault/update.zsh`
+at load and every hour. Each app release carries the signed vault inside the app, and
+the updater takes it from the release channel (with the fleet's id, `entitlement.fleet`
+of `GET /ui/releases`), checks it as the installer checks a build, puts it in place only
+when its build number is higher, and starts the vault again; its log is `update.log`
+beside it. A Mac whose vault was installed before the updater gets it alone, with no
+change to the app or its configuration:
+
+```sh
+sudo python3 app/Vault/install.py --updater-only --fleet <fleet id>
 ```
 
 Nothing else is needed: the helper makes the store key, the handover key and an empty

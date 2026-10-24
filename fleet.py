@@ -4021,8 +4021,13 @@ def cmd_check(args):
                  "set vault_recipient for this agent to the broker's public key")
             # This machine's server service brings the broker onto the vault.py of its own checkout by itself,
             # with the one root command the installers put in place for it; by hand it is that same command, which
-            # takes no argument (WORKER-INSTALL.md, "When a release changes vault.py").
-            catch_up = ("update Fleet Vault with the Founderizer app" if sys.platform == "darwin" else
+            # takes no argument (WORKER-INSTALL.md, "When a release changes vault.py"). A Mac's vault is the signed
+            # Fleet Vault app, which its own root updater replaces within the hour of an app release that carries a
+            # newer one; a Mac set up before that updater gets it once, as root (WORKER-INSTALL.md, "Vault broker
+            # (macOS)").
+            catch_up = ("Fleet Vault's updater puts the newer vault in place within the hour; a Mac without it, as "
+                        "root: python3 app/Vault/install.py --updater-only --fleet <fleet id> (WORKER-INSTALL.md, "
+                        "\"Vault broker (macOS)\")" if sys.platform == "darwin" else
                         "as root: /usr/local/sbin/fleet-vault-program (WORKER-INSTALL.md, \"When a release "
                         "changes vault.py\")")
             if store == "store":            # owner feature secret_deliveries: the owner's keys reach this store,
