@@ -349,13 +349,17 @@ reads as before. Its record of saves, `/var/lib/fleet-vault/creates.json`, stays
 
 ### API requests on a Linux broker (`call_api`): the curl program
 
-A broker sends no API request until its configuration names a curl program. This
-step adds no token and no grant: a request uses a login that the agent already
-has (UI-API.md, "`call_api`", part 7). It needs root. An update of the broker
-program alone leaves requests off.
+A broker sends no API request until its configuration names a curl program. **The
+install names it**: `hubsetup.py vault` adds `"curl": "/usr/bin/curl"` to
+`/etc/fleet-vault/vault.json`, where the base packages of `join.sh` put curl, so a
+machine that joins can send requests and nobody runs a step by hand. A curl path
+that is there already is kept. This adds no token and no grant: a request uses a
+login that the agent already has (UI-API.md, "`call_api`", part 7).
 
-Add one key to `/etc/fleet-vault/vault.json` (owner root, mode 644), with the path of
-a curl program that root owns and that the worker cannot change, and restart:
+**A broker set up by an older installer has no curl key**, and no release adds one: a
+release changes the broker program and never its configuration, so an update of the
+program alone leaves requests off. Add the one key once, as root, with the path of a
+curl program that root owns and that the worker cannot change, and restart:
 
 ```bash
 ls -l /usr/bin/curl                                  # owner root, not writable by others
@@ -369,7 +373,8 @@ Check: the machine row shows `security.vault.requests: true`, and the broker mad
 answer and no key). `KillMode=control-group` is the default of the unit that
 `vault.py unit` prints: with it, a restart of the broker also ends a curl child that
 runs, so no request goes on without its broker. To undo: remove the key and
-restart; the broker then sends no requests, and `requests.json` stays.
+restart; the broker then sends no requests, and `requests.json` stays. A later run
+of `hubsetup.py vault` adds the key again.
 
 ### Keys into a server or a cluster (`place_secret`): targets
 

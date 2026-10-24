@@ -616,6 +616,11 @@ def vault_config(hub_address, group=AGENT_GROUP, before=None):
     if not conf:
         conf = {"hub": hub_address, "store": VAULT_STATE + "/store.age", "store_key": VAULT_STATE + "/store.key",
                 "age_key": VAULT_STATE + "/age.key", "socket": VAULT_SOCKET, "age": "/usr/bin/age"}
+    # The curl program that the broker sends an agent's API request with (call_api). A broker whose configuration
+    # names none sends no request, so every call_api of its machine is refused (broker_without_requests). join.sh's
+    # base packages put curl at this path; one that is missing, or that an agent could change, stops the broker at
+    # its start, as such an age does. Added once, and a path that is there is kept.
+    conf.setdefault("curl", "/usr/bin/curl")
     conf["worker_group"] = group
     # The ssh client that the broker writes a key into a target with (place_secret, owner feature secret_targets).
     # A broker whose machine has none says so in its log and writes to no target; nothing else changes.
