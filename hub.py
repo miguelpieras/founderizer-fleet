@@ -405,7 +405,7 @@ def in_transaction(what):
     either way. The comment that says "inside the caller's transaction" does not hold that, so this does: the next
     caller written outside one reads this exception instead of getting a row that is sometimes there.
 
-    Guarded: keep_command, event_rows, dispatch_check, resource_record, log_row, duty_new_case,
+    Guarded: keep_command, event_rows, waiting_say_rows, dispatch_check, resource_record, log_row, duty_new_case,
     memory_from_work, came_back, and the row writers of the six crash windows — record_outcome_rows, stop_request_rows,
     request_unknown_rows, duty_history_row, duty_watch_rows, duty_review_rows, trigger_create_rows,
     trigger_edit_rows and trigger_state_rows. Each of those has a committing twin for the callers that have no
@@ -1098,6 +1098,20 @@ def event_rows(rows, t0):
     in_transaction("event_rows")
     for agent, kind, task, text, extra in rows:
         DB.execute(EVENT, (agent, kind, task, str(text), t0, json.dumps(extra or {})))
+
+
+def waiting_say_rows(agent, task_id):
+    """Inside the transaction that starts a task session of `agent`: the messages for it that wait under no task,
+    filed under that task, so that the session reads them with its first read_messages.
+
+    A worker or a lead reads only in a task session, and only the messages of that task: the delivery and
+    read_messages both filter by task. So a message the hub could file under no task was never read at all. The one
+    such message is the notice that gives a worker or a lead a duty (duty_save), and the holder never learned of its
+    duty that way. It is not typed into a session that is already running another task; it waits for the next one."""
+    in_transaction("waiting_say_rows")
+    if role_of(agent) in ("worker", "lead"):
+        DB.execute("UPDATE events SET task=? WHERE agent=? AND kind='say' AND task IS NULL AND read_at IS NULL",
+                   (task_id, agent))
 
 
 # A "say" that wakes nobody. Every signal is one more turn of a standing session over its whole context, so a message
@@ -1964,6 +1978,7 @@ def attempt_rows(t, reason, event, t0, counted=False):
     DB.execute("UPDATE attempts SET ended=COALESCE(ended,?) WHERE task=? AND attempt=?", (t0, t["id"], t["attempt"]))
     DB.execute("INSERT INTO attempts(task,attempt,created,reason) VALUES(?,?,?,?)", (t["id"], t["attempt"] + 1, t0, reason))
     event_rows([event], t0)
+    waiting_say_rows(t["owner"], t["id"])
 
 
 def new_attempt(t, reason, note="", counted=False):
@@ -3770,6 +3785,7 @@ def admit_task(requester, f, trigger_id=None, trigger_run=None):
                 start_text(f["owner"], tid) + warm_follows(f["follows"]) + report_feedback(f["owner"]), t0,
                 json.dumps({"needs": f["needs"], "resume": False, "attempt": 1,
                             "generation": generation[0] if generation else None})))
+    waiting_say_rows(f["owner"], tid)
     return tid
 
 
@@ -10681,8 +10697,8 @@ def duty_save(body, by, t0, duty_id=None, command=None):
             duty_review_rows(old["agent"], by, t0, left_review)
         if old is None:                         # the message names the watches this transaction has just written
             told = [(manager_name(), "say", None, new_duty_text(r, by), None)]
-            if r["agent"] != manager_name():
-                told.append((r["agent"], "say", None, new_duty_text(r, by), None))
+            if r["agent"] != manager_name():        # it waits for the holder's next task session (waiting_say_rows)
+                told.append((r["agent"], "say", None, new_duty_text(r, by) + DUTY_NOTICE_HOLDER, None))
             event_rows(told, t0)
     return duty_row(new_id)
 
@@ -10757,6 +10773,12 @@ def duty_review_rows(agent, by, t0, plan):
     made = trigger_create_rows(body, by, t0, created_by=manager_name())
     DB.execute("UPDATE triggers SET watch='review' WHERE id=?", (made,))
     return made
+
+
+# The holder reads its notice in the session of a task it was given for something else, so it says what to do there.
+DUTY_NOTICE_HOLDER = ("\nYou read this in the session of a task: do the task of that session. This duty's own work "
+                      "comes as tasks of its own and in your daily review, and an event of it that you meet in other "
+                      "work you open with open_case. see_responsibilities shows the duty.")
 
 
 def new_duty_text(r, by):
