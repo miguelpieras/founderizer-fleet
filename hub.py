@@ -10695,11 +10695,16 @@ def duty_save(body, by, t0, duty_id=None, command=None):
         duty_review_rows(r["agent"], by, t0, review)
         if old and old["agent"] != r["agent"]:  # the agent it left keeps no daily review for a duty it lost
             duty_review_rows(old["agent"], by, t0, left_review)
-        if old is None:                         # the message names the watches this transaction has just written
-            told = [(manager_name(), "say", None, new_duty_text(r, by), None)]
-            if r["agent"] != manager_name():        # it waits for the holder's next task session (waiting_say_rows)
-                told.append((r["agent"], "say", None, new_duty_text(r, by) + DUTY_NOTICE_HOLDER, None))
-            event_rows(told, t0)
+        # The message names the watches this transaction has just written. A new duty and a moved one tell their
+        # holder, which reads it in its next task session (waiting_say_rows): a move used to tell nobody, so the
+        # agent that now answers for the duty learned of it from its first case. The manager is told of each new
+        # duty, and of each change that it did not make itself -- a lead's (RESPONSIBILITIES.md, item 8).
+        moved = old is not None and old["agent"] != r["agent"]
+        told = [(manager_name(), "say", None, new_duty_text(r, by, old), None)] \
+            if old is None or by != manager_name() else []
+        if (old is None or moved) and r["agent"] != manager_name():
+            told.append((r["agent"], "say", None, new_duty_text(r, by, old) + DUTY_NOTICE_HOLDER, None))
+        event_rows(told, t0)
     return duty_row(new_id)
 
 
@@ -10781,9 +10786,14 @@ DUTY_NOTICE_HOLDER = ("\nYou read this in the session of a task: do the task of 
                       "work you open with open_case. see_responsibilities shows the duty.")
 
 
-def new_duty_text(r, by):
+def new_duty_text(r, by, old=None):
+    """The message that says a duty exists: a new one, or, with `old` (its row before the change), one that moved to
+    another holder or whose words changed."""
     rules = ", ".join(f"{t['watch'] or 'clock'} rule {t['id']}" for t in duty_watches_read(r["id"])) or "none yet"
-    return (f"[duty {rref(r['id'])}] New duty for {r['agent']}, from {by}:\n{r['text']}\n"
+    head = (f"New duty for {r['agent']}, from {by}" if old is None else
+            f"{by} gave {rref(r['id'])} to {r['agent']}; {old['agent']} held it until now" if old["agent"] != r["agent"]
+            else f"{by} changed {rref(r['id'])} of {r['agent']}")
+    return (f"[duty {rref(r['id'])}] {head}:\n{r['text']}\n"
             + f"Watches: {rules}.\n"
             f"{r['agent']} acts alone inside this duty and asks only when the duty does not cover a step. The "
             f"manager sees every duty, case and marker with see_responsibilities, and keeps them in order.")
