@@ -1101,17 +1101,32 @@ def event_rows(rows, t0):
 
 
 def waiting_say_rows(agent, task_id):
-    """Inside the transaction that starts a task session of `agent`: the messages for it that wait under no task,
-    filed under that task, so that the session reads them with its first read_messages.
+    """Inside the transaction that starts a task session of `agent`: the notice of a duty that waits for it, filed
+    under that task, so that the session reads it with its first read_messages.
 
     A worker or a lead reads only in a task session, and only the messages of that task: the delivery and
-    read_messages both filter by task. So a message the hub could file under no task was never read at all. The one
-    such message is the notice that gives a worker or a lead a duty (duty_save), and the holder never learned of its
-    duty that way. It is not typed into a session that is already running another task; it waits for the next one."""
+    read_messages both filter by task. So the notice that gives one of them a duty (duty_save), which belongs to no
+    task, was never read. It is not typed into a session already running another task; it waits for the next one,
+    and a notice whose task ended before its read waits again. Its words are the duty's as it stands now, and a duty
+    that this agent no longer holds, or that was retired, needs no notice at all.
+
+    Only a duty's notice: any other message written under no task was written for nobody's task, and a task session
+    must not read it -- the board's answer to a person's question was one."""
     in_transaction("waiting_say_rows")
-    if role_of(agent) in ("worker", "lead"):
-        DB.execute("UPDATE events SET task=? WHERE agent=? AND kind='say' AND task IS NULL AND read_at IS NULL",
-                   (task_id, agent))
+    if role_of(agent) not in ("worker", "lead"):
+        return
+    t0, ended = now(), ",".join("?" * len(TERMINAL))
+    for e in read_rows(f"SELECT id, extra FROM events WHERE agent=? AND kind='say' AND read_at IS NULL AND "
+                       f"json_extract(extra, '$.duty') IS NOT NULL AND (task IS NULL OR task IN "
+                       f"(SELECT id FROM tasks WHERE state IN ({ended})))", (agent, *TERMINAL)):
+        x = json.loads(e["extra"])
+        r = read_row("SELECT * FROM responsibilities WHERE id=?", (x["duty"],))
+        if not r or r["agent"] != agent or r["state"] == "retired":
+            DB.execute("UPDATE events SET read_at=? WHERE id=?", (t0, e["id"]))       # nothing to tell any more
+            continue
+        text = new_duty_text(r, x.get("by") or manager_name(),
+                             {"agent": x["from"]} if x.get("from") else None) + DUTY_NOTICE_HOLDER
+        DB.execute("UPDATE events SET task=?, text=? WHERE id=?", (task_id, text, e["id"]))
 
 
 # A "say" that wakes nobody. Every signal is one more turn of a standing session over its whole context, so a message
@@ -1466,6 +1481,10 @@ def migrate():
         "CREATE UNIQUE INDEX IF NOT EXISTS sealed_job ON sealed(job) WHERE job IS NOT NULL",
         "CREATE UNIQUE INDEX IF NOT EXISTS jobs_request ON jobs(agent, request_id) WHERE request_id IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS event_task ON events(task, kind)",          # owner API 1.12: desktop_busy
+        # The tasks of a duty's case and the subtasks of a task, which the timers ask about on every pass
+        # (case_left_open in duty_sweep, waits_on_parts in the silence loop). Both are migrated columns, so here.
+        "CREATE INDEX IF NOT EXISTS task_duty_case ON tasks(duty_case) WHERE duty_case IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS task_parent ON tasks(parent) WHERE parent IS NOT NULL",
         # asking_and_waiting: parked() asks it of one task on every pass of the silence loop and of liveness. Here
         # and not in SCHEMA, because SCHEMA runs first and an existing database has no reminders.task yet.
         "CREATE INDEX IF NOT EXISTS reminder_task ON reminders(task, done) WHERE task IS NOT NULL",
@@ -2610,8 +2629,8 @@ def resume_held(lim, t0):
     when it does not. The new attempt is not counted, so a reset never spends one of the three session restarts."""
     done = []
     for t in q("SELECT * FROM tasks WHERE owner=? AND state='working' ORDER BY id", (lim["agent"],)):
-        if active_hold(t["id"]) or (t["last_activity"] or 0) >= lim["until"]:
-            continue
+        if active_hold(t["id"]) or parked(t["id"]) or (t["last_activity"] or 0) >= lim["until"]:
+            continue            # a parked task comes back at the time its own agent named (reminder_sweep)
         text = (f"Your usage limit has reset. Continue {tref(t['id'])}. First check what was already done (rule 9): "
                 f"never repeat an outside action that already happened.")
         if session_alive(lim["agent"], t["id"]):
@@ -3377,8 +3396,14 @@ def t_ask_my_requester(agent, a):
         # that refused here (a new session replaced this one meanwhile) left waiting at 1, and the answer reached
         # nobody: answer() sends no message to an asker it thinks is still inside its call.
         q("UPDATE questions SET waiting=0 WHERE id=?", (qid,))
-        ended = fence(agent, tid)["state"]
         row = q1("SELECT answer FROM questions WHERE id=?", (qid,))
+        try:
+            ended = fence(agent, tid)["state"]
+        except ToolError:
+            if row["answer"] is not None:   # answered inside this wait, which no session reads: the new one does
+                emit(agent, "say", f"[hub] Answer to your question Q-{qid} on {tref(tid)}: {row['answer']} -- "
+                                   f"Continue the task.", task=tid)
+            raise
         if row["answer"] is not None:
             return f"Answer from {t['requester']}: {row['answer']}"
         if active_hold(tid):
@@ -3456,6 +3481,14 @@ def t_deliver_result(agent, a):
     if left:
         raise ToolError(f"{tref(tid)} still has open subtasks: {', '.join(tref(r['id']) for r in left)}. "
                         f"Check or cancel them first.")
+    # Rule 3: whoever gave a task checks its result. check_result reaches a subtask only from this session, so a
+    # result left unchecked here could never be checked by anybody again.
+    unchecked = q("SELECT id FROM tasks WHERE parent=? AND state IN ('completed','failed','rejected') "
+                  "AND accepted IS NULL ORDER BY id", (tid,))
+    if unchecked:
+        raise ToolError(f"{tref(tid)} has subtask results that you have not checked: "
+                        f"{', '.join(tref(r['id']) for r in unchecked)}. Check each with check_result first: after "
+                        f"you deliver, nobody can.")
     q("UPDATE tasks SET state=?, outcome=?, what=?, where_=?, how=?, delivered=?, waiting_on=NULL WHERE id=?",
       (outcome, outcome, what, where, how, now(), tid))
     q("UPDATE attempts SET ended=? WHERE task=? AND attempt=?", (now(), tid, t["attempt"]))
@@ -3889,7 +3922,14 @@ def t_answer(agent, a):
         # Only the question the task actually waits on releases it. Answering one of two open questions used to set
         # the task working whichever one it was, so answering a question it was not waiting on let a paused session
         # be told to continue -- and a question asked with a default is never the one a task waits on at all.
-        if t and t["state"] == "input-required" and t["waiting_on"] == f"Q-{qid}":
+        # A question on the session's own screen writes "its screen" over Q-<id> (helper_dialog), and the move after
+        # it clears even that, so the task can no longer say which question holds it. Then the last blocking one
+        # answered is the one: before, the task stayed input-required for good, and nothing nudged it.
+        waits = t["waiting_on"] if t else None
+        if t and t["state"] == "input-required" and (waits == f"Q-{qid}" or (
+                waits in (None, "its screen") and not qu["assumed"] and not q1(
+                    "SELECT 1 FROM questions WHERE task=? AND id<>? AND answer IS NULL AND assumed IS NULL LIMIT 1",
+                    (t["id"], qid)))):
             q("UPDATE tasks SET state='working', waiting_on=NULL WHERE id=?", (t["id"],))
         activity(qu["task"])
         if not qu["waiting"]:
@@ -10294,7 +10334,7 @@ def t_read_attachment(agent, a):
 # open case. A case closes only when each required close-out step has a record or a stated reason.
 
 DUTY_REF = re.compile(r"(?i)^\s*R-?(\d+)\s*$")
-CASE_REF = re.compile(r"(?i)^\s*(?:R-?\d+\s*/\s*)?C-?(\d+)\s*$")
+CASE_REF = re.compile(r"(?i)^\s*(?:R-?(\d+)\s*/\s*)?C-?(\d+)\s*$")
 DUTY_ACTIONS = {"pause": ("active",), "resume": ("paused",), "retire": ("active", "paused"), "reopen": ("retired",)}
 DUTY_STATE = {"pause": "paused", "resume": "active", "retire": "retired", "reopen": "active"}
 DUTY_WATCHES = ("check", "clock")   # the kinds that the owner and the manager write for a duty
@@ -10406,9 +10446,11 @@ def case_ref(value):
     m = CASE_REF.match(str(value or ""))
     if not m:
         raise ToolError(f"'{value}' is not a case id. Use the form R-1/C-3.")
-    c = case_row(int(m.group(1)))
+    c = case_row(int(m.group(2)))
     if not c:
-        raise ToolError(f"There is no case C-{m.group(1)}.")
+        raise ToolError(f"There is no case C-{m.group(2)}.")
+    if m.group(1) and int(m.group(1)) != c["responsibility"]:     # R-2/C-1 named another duty than C-1's own
+        raise ToolError(f"C-{c['id']} is a case of R-{c['responsibility']}, not of R-{m.group(1)}: {cref(c)}.")
     return c
 
 
@@ -10703,8 +10745,22 @@ def duty_save(body, by, t0, duty_id=None, command=None):
         told = [(manager_name(), "say", None, new_duty_text(r, by, old), None)] \
             if old is None or by != manager_name() else []
         if (old is None or moved) and r["agent"] != manager_name():
-            told.append((r["agent"], "say", None, new_duty_text(r, by, old) + DUTY_NOTICE_HOLDER, None))
+            # One notice of a duty waits at a time: an older one that nobody read says what is no longer so.
+            DB.execute("UPDATE events SET read_at=? WHERE kind='say' AND read_at IS NULL AND "
+                       "json_extract(extra, '$.duty')=?", (t0, r["id"]))
+            told.append((r["agent"], "say", None, new_duty_text(r, by, old) + DUTY_NOTICE_HOLDER,
+                         {"duty": r["id"], "by": by, "from": old["agent"] if moved else None}))
         event_rows(told, t0)
+        if moved:
+            # A rule that the agent it left attached watched with that agent's own tools, and it woke that agent for
+            # a duty that is no longer its own: every case it opened was refused. It stops being a watch of the
+            # duty and stops, with the reason on it; the new holder builds its own.
+            for w in read_rows("SELECT id, state FROM triggers WHERE responsibility=? AND watch=? AND agent=?",
+                               (r["id"], DUTY_OWN, old["agent"])):
+                if w["state"] == "active":
+                    pause_trigger(w["id"], by, f"{rref(r['id'])} moved to {r['agent']}; this rule of "
+                                               f"{old['agent']} watched it.", t0)
+                DB.execute("UPDATE triggers SET responsibility=NULL, watch=NULL WHERE id=?", (w["id"],))
     return duty_row(new_id)
 
 
@@ -10819,6 +10875,9 @@ def duty_state_change(r, action, by, note="", command=None, receipt=None):
             "SELECT id FROM duty_cases WHERE responsibility=? AND state='open' ORDER BY id", (r["id"],))]
         DB.execute("UPDATE responsibilities SET state=?, revision=revision+1, updated=?, marker_kind=NULL, "
                    "marker_since=NULL, marker_detail=NULL WHERE id=?", (DUTY_STATE[action], t0, r["id"]))
+        if action == "retire":          # its notice that nobody read gives a duty that is gone
+            DB.execute("UPDATE events SET read_at=? WHERE kind='say' AND read_at IS NULL AND "
+                       "json_extract(extra, '$.duty')=?", (t0, r["id"]))
         duty_history_row(r["id"], by, action, note, t0)
         for row in duty_watches_read(r["id"]):
             try:
@@ -10997,7 +11056,7 @@ def duty_new_case(r, key, title, source, by, t0):
     in_transaction("duty_new_case")
     old = DB.execute(DUTY_REPEAT_CASE, duty_repeat_args(r["id"], key, t0)).fetchone()
     if old:                 # the verdict of the loop, and the hub works it out: no agent asserts this about itself
-        memory_contradicted(r["id"], key, r["agent"], t0)
+        memory_contradicted(r["id"], key, t0)
     return DB.execute("INSERT INTO duty_cases(responsibility,key,title,source,state,opened,by,repeated) "
                       "VALUES(?,?,?,?,'open',?,?,?)",
                       (r["id"], key, title[:200], source, t0, by, 1 if old else 0)).lastrowid
@@ -11352,11 +11411,18 @@ def t_open_case(agent, a):
     return text
 
 
+def case_worker(agent, c):
+    """True when `agent` owns an open task of this case. Whoever does a case's work records its steps and may end
+    it, though the duty is another agent's: the manager gives a case's work to the agent that suits it (create_task
+    case_id), and a duty can move to another holder while a task of its case still runs."""
+    return bool(q1(f"SELECT 1 FROM tasks WHERE duty_case=? AND owner=? AND {OPEN_TASK} LIMIT 1", (c["id"], agent)))
+
+
 def t_record_step(agent, a):
     """One record of a case: one real step of the work, in one line, under a short label of the agent's own."""
     c = case_ref(a.get("case"))
     r = duty_row(c["responsibility"])
-    if not duty_read_allowed(agent, r):
+    if not duty_read_allowed(agent, r) and not case_worker(agent, c):
         raise ToolError(f"{cref(c)} is not a case of your duties.")
     if c["state"] != "open":
         raise ToolError(f"{cref(c)} is closed. A closed case keeps its records; a new event is a new case.")
@@ -11391,7 +11457,7 @@ def t_close_case(agent, a):
     """End one case: handled, no_action or failed."""
     c = case_ref(a.get("case"))
     r = duty_row(c["responsibility"])
-    if not duty_read_allowed(agent, r):
+    if not duty_read_allowed(agent, r) and not case_worker(agent, c):
         raise ToolError(f"{cref(c)} is not a case of your duties.")
     outcome = str(a.get("outcome") or "").strip().lower()
     if outcome not in DUTY_OUTCOMES:
@@ -11408,7 +11474,11 @@ def t_close_case(agent, a):
         return stored["text"]
     if c["state"] != "open":
         raise ToolError(f"{cref(c)} is already closed ({c['outcome']}). A new event is a new case.")
-    left = q(f"SELECT id FROM tasks WHERE duty_case=? AND {OPEN_TASK} ORDER BY id", (c["id"],))
+    # The task of the session that closes it ends with its own delivery, so it is no open task in the way: a case
+    # task is told to close its case, and was refused for its own task, so only "handled" could ever be recorded.
+    own = parse_task(a["task_id"]) if a.get("task_id") not in (None, "") else None
+    left = [x for x in q(f"SELECT id, owner FROM tasks WHERE duty_case=? AND {OPEN_TASK} ORDER BY id", (c["id"],))
+            if not (x["id"] == own and x["owner"] == agent)]
     if left:
         raise ToolError(f"{cref(c)} still has open tasks: {', '.join(tref(t['id']) for t in left)}. Deliver or cancel "
                         f"them first.")
@@ -12288,16 +12358,19 @@ def memory_from_work(agent, text, prevents, about, t0, task=None, responsibility
     return mid
 
 
-def memory_contradicted(duty_id, key, agent, t0):
+def memory_contradicted(duty_id, key, t0):
     """Inside the caller's transaction: the key of a case came back, so every lesson that claimed to prevent it was
     wrong, or right and never acted on. The hub counts; it never drops. Which of the two it was is a judgement about
-    words the hub cannot read, so the agent's own review decides (owner direction, 19 October 2026)."""
+    words the hub cannot read, so the agent's own review decides (owner direction, 19 October 2026).
+
+    Every lesson, whoever wrote it: the agent that did a case's work need not hold the duty (create_task case_id, a
+    duty that moved), and its lesson was promised this judgement and then never judged."""
     marked = [mref(m["id"]) for m in
-              read_rows("SELECT id FROM memories WHERE agent=? AND responsibility=? AND prevents_key=? "
-                        "AND dropped IS NULL", (agent, duty_id, key))]
+              read_rows("SELECT id FROM memories WHERE responsibility=? AND prevents_key=? AND dropped IS NULL",
+                        (duty_id, key))]
     if marked:
-        DB.execute("UPDATE memories SET contradicted=contradicted+1, contradicted_at=? WHERE agent=? AND "
-                   "responsibility=? AND prevents_key=? AND dropped IS NULL", (t0, agent, duty_id, key))
+        DB.execute("UPDATE memories SET contradicted=contradicted+1, contradicted_at=? WHERE responsibility=? AND "
+                   "prevents_key=? AND dropped IS NULL", (t0, duty_id, key))
     return marked
 
 
@@ -13830,8 +13903,9 @@ def tasks_stuck(t0):
                     f"may be signed out, or its session may be failing to start")
         elif t["state"] == "working":
             quiet = t0 - max(t["last_activity"] or t["created"], limit_ended(t["owner"]), STARTED)
-            if quiet <= STUCK_SILENT or busy_in_a_call(t, t0):
-                continue        # the fourth kind of quiet on purpose: one call of its own that has not finished
+            if quiet <= STUCK_SILENT or busy_in_a_call(t, t0) or waits_on_parts(t["id"]):
+                continue        # the fourth kind of quiet on purpose: one call of its own that has not finished,
+                                # and the fifth: a lead that waits for its open subtasks
             since = t0 - quiet
             says = f"has been silent for {ago(since)} with no call of its session open"
         else:
@@ -15021,9 +15095,12 @@ def overview_text():
         out.append("  none")
     out.append("")
     out.append("PERMISSION PROMPTS WAITING")
-    rows = q("SELECT * FROM prompts WHERE decision IS NULL ORDER BY id")
+    rows = q("SELECT p.*, t.requester FROM prompts p LEFT JOIN tasks t ON t.id=p.task WHERE p.decision IS NULL "
+             "ORDER BY p.id")
     for r in rows:
-        out.append(f"  P-{r['id']} from {r['agent']} on {tref(r['task'])}: {r['tool']}: {r['input']}")
+        out.append(f"  P-{r['id']} from {r['agent']} on {tref(r['task'])}"
+                   + (f", for {r['requester']} to decide" if r["requester"] not in (None, manager_name()) else "")
+                   + f": {r['tool']}: {r['input']}")
     if not rows:
         out.append("  none")
     out.append("")
@@ -17080,6 +17157,13 @@ def reminder_sweep(t0):
         log("hub", f"reminder R-{r['id']} delivered to {agent}")
 
 
+def waits_on_parts(task_id):
+    """True when this task has an open subtask. A lead that waits for its team is quiet on purpose, and a subtask's
+    own silence already comes to it (filed_under): before, the lead was nudged at three minutes and its requester
+    told at six that it was silent, about a lead doing what RULES.md tells it to do."""
+    return bool(q1(f"SELECT 1 FROM tasks WHERE parent=? AND {OPEN_TASK} LIMIT 1", (task_id,)))
+
+
 def came_back(task_id, t0):
     """Inside the caller's transaction: the silence clock of a task the hub has just brought back starts now. The
     work was quiet because its own agent said when to come back to it, so the quiet before this moment is not
@@ -17215,7 +17299,7 @@ def tick():
         # STARTED is in the measure because the hub's own restart is not a task's silence: without it one outage
         # made every healthy task look silent at the first tick (both rungs, five seconds apart).
         for t in q("SELECT * FROM tasks WHERE state='working'"):
-            if active_hold(t["id"]) or active_limit(t["owner"]) or parked(t["id"]):
+            if active_hold(t["id"]) or active_limit(t["owner"]) or parked(t["id"]) or waits_on_parts(t["id"]):
                 continue
             quiet = t0 - max(t["last_activity"] or t["created"], limit_ended(t["owner"]), STARTED)
             # The second rung is measured from the first nudge and not from the same quiet time: after a hub outage
@@ -26143,6 +26227,14 @@ class Handler(BaseHTTPRequestHandler):
                 log("owner", "BLOCKED an answer that contained a login")
             elif row and answer and row["answer"] is None and row["kind"] == "secret":
                 log("owner", f"REFUSED an answer in words to the secret request N-{nid}")      # never the words
+            elif row and answer and row["answer"] is None and row["conversation"] and \
+                    q1("SELECT 1 FROM conversations WHERE id=?", (row["conversation"],)):
+                # A question of a person's conversation: the answer goes back there, as owner_message_rows sends it.
+                # As a message to the agent it went to no window, because it belongs to no task.
+                with transaction():
+                    DB.execute("UPDATE needs SET answer=?, answered=?, chosen=? WHERE id=?", (answer, now(), chosen, nid))
+                    conversation_answer(row, answer, now())
+                log("owner", f"answered N-{nid} in C-{row['conversation']}")
             elif row and answer and row["answer"] is None:
                 q("UPDATE needs SET answer=?, answered=?, chosen=? WHERE id=?", (answer, now(), chosen, nid))
                 emit(row["by"], "say", f"[owner] Answer to Needs-you N-{nid} ({row['title']}): {answer}")
@@ -27168,9 +27260,20 @@ class Handler(BaseHTTPRequestHandler):
                 # The task moved on while this waited: it ended, or a new session replaced one that was lost at its
                 # prompt. Nobody can use a decision now, so the prompt ends here and the task no longer waits on it.
                 # It used to stay input-required on P-<id> for the rest of its life, and its silence was never nudged.
-                q("UPDATE prompts SET decision='expired', decided=? WHERE id=? AND decision IS NULL", (now(), pid))
+                # A decision given meanwhile reached nobody, and its decider was told it was given: so it hears that
+                # it was not. The reason also keeps a later decision from being passed to the new session, which
+                # never asked (late_permission_word).
+                gone = q1("SELECT decision FROM prompts WHERE id=?", (pid,))["decision"]
+                q("UPDATE prompts SET decision=COALESCE(decision, 'expired'), decided=COALESCE(decided, ?), "
+                  "reason=COALESCE(NULLIF(reason, ''), ?) WHERE id=?",
+                  (now(), "The session that asked was replaced before a decision reached it, so it did not run.", pid))
                 q("UPDATE tasks SET state='working', waiting_on=NULL WHERE id=? AND state='input-required' "
                   "AND waiting_on=?", (tid, f"P-{pid}"))
+                still = q1("SELECT state FROM tasks WHERE id=?", (tid,))
+                if gone and still and still["state"] not in TERMINAL:
+                    emit(requester, "say", f"[hub] Your {gone} on P-{pid} reached no session: the session of "
+                         f"{tref(tid)} that asked was replaced before it came, so {tool} did not run. The new session "
+                         f"asks again if it needs it.", task=tid)
                 return reply("deny", str(e))
             row = q1("SELECT decision, reason FROM prompts WHERE id=?", (pid,))
             if not row["decision"]:
@@ -27314,7 +27417,18 @@ def settle_stopped_calls():
     q("UPDATE questions SET waiting=0")
     q("UPDATE prompts SET decision='expired', decided=? WHERE decision IS NULL", (now(),))
     q("UPDATE tasks SET state='working', waiting_on=NULL WHERE state='input-required' AND waiting_on LIKE 'P-%'")
-    q("UPDATE jobs SET ok=0, result='the hub restarted', finished=? WHERE finished IS NULL", (now(),))
+    # A request or a login that the vault had taken can have taken effect while the hub was down. It used to be
+    # finished as not done, the vault's own report of it was refused, and the agent was free to send it again with a
+    # new request_id -- a payment twice. Its outcome is unknown instead, as when its helper does not answer in time:
+    # the job stays open, the vault's report is still taken, and a request gets the unknown outcome that gates a
+    # second send. A job with an unknown outcome already stays as it is. Only what the vault never took is not done.
+    for job in q("SELECT * FROM jobs WHERE finished IS NULL AND unknown IS NULL AND released IS NOT NULL "
+                 "AND kind='request'"):
+        request_unknown(job, "the hub restarted while the vault had this request.")
+    q("UPDATE jobs SET unknown=?, result=? WHERE finished IS NULL AND unknown IS NULL AND released IS NOT NULL "
+      "AND kind IN ('create','capture')", (now(), "the hub restarted while the vault had this item."))
+    q("UPDATE jobs SET ok=0, result='the hub restarted', finished=? WHERE finished IS NULL AND unknown IS NULL",
+      (now(),))
 
 
 def main():
