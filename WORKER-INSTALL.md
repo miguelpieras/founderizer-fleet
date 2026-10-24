@@ -369,8 +369,9 @@ systemctl restart fleet-vault
 ```
 
 Check: the machine row shows `security.vault.requests: true`, and the broker made
-`/var/lib/fleet-vault/requests.json` (its record of started requests; it has no
-answer and no key). `KillMode=control-group` is the default of the unit that
+`/var/lib/fleet-vault/requests.json.lock` at its start. `requests.json`, its record
+of started requests (no answer and no key), comes with the first request.
+`KillMode=control-group` is the default of the unit that
 `vault.py unit` prints: with it, a restart of the broker also ends a curl child that
 runs, so no request goes on without its broker. To undo: remove the key and
 restart; the broker then sends no requests, and `requests.json` stays. A later run
