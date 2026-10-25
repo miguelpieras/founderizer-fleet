@@ -17136,9 +17136,15 @@ def tick():
                 and row["alive_ts"] > switch_ended(mgr):
             kind = "down"
             flag = "The manager session is not running. Start it again."
+        # Signed out, it can do nothing, so its silence, a question on its screen, a stopped session or an old limit
+        # only show what that looks like, and the sign-in is the step (the owner, 25 October 2026). A switch keeps
+        # its own words below.
+        if not local_model(agents()[mgr]) and signed_in_now(mgr, agents()[mgr].get("runtime")) is False:
+            kind = "signed_out"
+            flag = "The manager is not signed in."
         # Its runtime switch waits for the new session: no reader yet, so neither down nor silent. A usage limit or a
         # question of the new session still shows, and a switch that does not finish becomes a warning of its own.
-        if manager_held(mgr) and kind in (None, "silent", "down"):
+        if manager_held(mgr) and kind in (None, "silent", "down", "signed_out"):
             since, runtime = float(kv_get("switching:" + mgr)), agents()[mgr].get("runtime")
             if t0 - since > SWITCH_STALL:
                 kind = "switch_stalled"
@@ -21210,6 +21216,7 @@ def health_view():
         # own screen, a silence, a switch that has not finished — are put right where its session is.
         warn("manager_" + flag["kind"], kv_get("mgr_flag"),
              f"Start the session of {manager_name().capitalize()} again." if flag["kind"] == "down" else
+             f"Open {manager_name().capitalize()} and sign it in." if flag["kind"] == "signed_out" else
              f"Open {manager_name().capitalize()}, where its session and its machine are.", agent=manager_name())
     # An allowance that is gone, or will be gone before it resets. One line per provider account and not per agent,
     # because the allowance belongs to the account and several agents can share one.
@@ -22488,6 +22495,9 @@ class Handler(BaseHTTPRequestHandler):
                     (config["reports_to"] if config.get("reports_to") in agents() else manager_name()),
                     direct_chat=owner_chat(config),
                     local_model=local_model(config),
+                    # What its machine last said about its own provider, so the app shows a signed-out agent its
+                    # sign-in in place of its chat: null when the reading is old or a local model needs none.
+                    signed_in=None if local_model(config) else signed_in_now(name, config["runtime"]),
                     limit=dict(since=lim["since"], until=lim["until"], reset_known=bool(lim["reset_known"]),
                                task=lim["task"]) if lim else None, **(dict(row) if row else
                     dict(last_seen=None, alive=None, alive_ts=None, client=None, client_seen=None))))
