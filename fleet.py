@@ -206,11 +206,16 @@ def ensure_session(session):
 
 
 def launch_words(start):
-    """The program and its arguments in a window's start command: without tmux's quotes, the credential prefix
-    (owner API 1.12: ". FILE && rm -f FILE && exec "), env and its NAME=value words."""
+    """The program and its arguments in a window's start command: without tmux's quotes, the folder it goes into first
+    ("cd DIR && ", in_checkout), the credential prefix (owner API 1.12: ". FILE && rm -f FILE && exec "), env and its
+    NAME=value words."""
     words = shlex.split(start)
     if len(words) == 1:
         words = shlex.split(words[0])       # tmux shows a command given as one string inside quotes
+    if words[:1] == ["cd"] and words[2:3] == ["&&"]:
+        words = words[3:]                   # the checkout that the window goes into first (in_checkout)
+        if words[:1] == ["exec"]:
+            words = words[1:]
     if words[:1] == ["."] and words[2:5] == ["&&", "rm", "-f"] and words[6:8] == ["&&", "exec"]:
         words = words[8:]
     if words[:1] == ["env"]:
@@ -315,6 +320,21 @@ CODEX_APPROVE = "-c " + shlex.quote('mcp_servers.fleet.default_tools_approval_mo
 CODEX_NO_UPDATE_CHECK = ["-c", "check_for_update_on_startup=false"]
 
 
+def in_checkout(command):
+    """A window's start command that goes into this agent's checkout itself before anything else runs.
+
+    tmux's own `-c` is not enough. tmux 3.8 starts a new window in the server's own folder whenever that folder was
+    deleted, whatever `-c` says (measured on the owner's Mac Studio, 25 October 2026): its tmux server had started in
+    the checkout of the agent's earlier name, the rename took that folder away, and every window after it started in a
+    folder that no longer existed. Claude Code then stops at once ("The current working directory was deleted"), so
+    the agent's first owner chat never began. A cd in the command does not depend on the server.
+
+    The program still replaces the shell, as tmux's own start of one command does: every start command of this helper
+    is one program, behind its credential prefix (". FILE && rm -f FILE && exec "), a cd of its own, or an exec."""
+    head = "" if command.startswith((". ", "cd ", "exec ")) else "exec "
+    return f"cd {shlex.quote(KIT)} && {head}{command}"
+
+
 def start_window(session, name, command, options=None):
     """Start a window. options: {window option: value} that tmux sets in the same command as the start, so that the
     window never runs without them (the standing manager window's @fleet_session, its link to its conversation).
@@ -322,7 +342,7 @@ def start_window(session, name, command, options=None):
     or not, and that caller reads which. Task and chat windows go on as before, without that check."""
     then = [a for option, value in (options or {}).items()
             for a in (";", "set-option", "-w", "-t", f"{session}:={name}", option, value)]
-    started = tmux("new-window", "-d", "-t", session + ":", "-n", name, "-c", KIT, command, *then, check=True)
+    started = tmux("new-window", "-d", "-t", session + ":", "-n", name, "-c", KIT, in_checkout(command), *then, check=True)
     if options and started.returncode == 124:
         raise subprocess.CalledProcessError(124, ["tmux", "new-window"], "", "timed out")
     tmux("set-option", "-w", "-t", f"{session}:={name}", "automatic-rename", "off")
@@ -345,6 +365,7 @@ WORKING = re.compile(r"\besc to interrupt\b", re.I)                     # a turn
 # that doubles from RESIGNAL_FIRST up to RESIGNAL_MAX seconds: every signal is one more model turn over the whole
 # context of that session, and until 22 October 2026 it came every 20 seconds for as long as one message waited.
 SIGNAL_GAP = 20
+CHAT_RESTART = 60           # seconds between two new owner chats whose windows ended before their conversation began
 RESIGNAL_FIRST = 60
 RESIGNAL_MAX = 900
 # The standing sessions, which read their messages once more at the end of each turn: nothing is typed into them while
@@ -2041,34 +2062,42 @@ class Helper:
 
     def chat_resume(self, generation):
         """The conversation to continue when the owner chat of this generation starts again (a Codex thread or a
-        Claude session), or None for a new one: no record, another generation's chat (its route is closed), or a
-        runtime without chats. Each runtime has its own record (owner feature runtime_switch), so a conversation never
-        continues on the other runtime. A record of this generation whose conversation is not found, or a record that
-        cannot be read, stops the start: the chat event stays pending and the record stays, so that the conversation is
-        never replaced without notice."""
+        Claude session), or None for a new one: no record, another generation's chat (its route is closed), a runtime
+        without chats, or a record whose conversation cannot be continued.
+
+        **A record never stops a chat.** The owner, 25 October 2026, after Ivy's first chat window ended before its
+        conversation began and every later start was refused for a conversation that had never existed: "fix ... a
+        chat record that blocks every later chat". A conversation that is not found (a window that ended before its
+        first turn, a checkout that moved with a rename, a file that was removed) and a record that cannot be read are
+        not continued: the helper says which conversation it leaves, and a new chat starts with the hub's recap of what
+        was said, which is what takes the place of a session's own memory (chat_recap). Its start writes a new record."""
         runtime = self.conf.get("runtime")
         if runtime not in MANAGER_RUNTIMES:
             return None
         try:
             record = load_chat_record(self.agent, runtime)
-            if not record or record.get("generation") != generation:
-                return None
-            thread = chat_thread(record) if runtime == "codex" else \
-                record["session"] if claude_chat_file(record.get("session")) else None
-            if thread is None:
-                raise Refused(f"the owner chat cannot continue: its conversation "
-                              f"{record.get('session') or record.get('marker')} is not found. Nothing starts and the "
-                              f"record stays: restore the conversation, or remove {chat_record_file(self.agent, runtime)} "
-                              f"to start a new one")
         except Refused as e:
-            last = getattr(self, "chat_problem", (None, 0.0))
-            if last[0] != str(e) or time.monotonic() - last[1] > 300:
-                self.chat_problem = (str(e), time.monotonic())
-                self.say(f"owner-chat: {e}")
-            raise
+            self.say_chat(f"{e}; a new chat starts with the hub's recap")
+            return None
+        if not record or record.get("generation") != generation:
+            return None
+        thread = chat_thread(record) if runtime == "codex" else \
+            record.get("session") if claude_chat_file(record.get("session")) else None
+        if thread is None:
+            self.say_chat(f"its conversation {record.get('session') or record.get('marker')} is not found; a new chat "
+                          f"starts with the hub's recap")
+            return None
         if not record.get("session"):
             save_chat_record(self.agent, dict(record, session=thread), runtime)
         return thread
+
+    def say_chat(self, text):
+        """A word about the owner chat's record: the same words at most every five minutes, because the event that
+        meets it comes back at every poll."""
+        last = getattr(self, "chat_problem", (None, 0.0))
+        if last[0] != text or time.monotonic() - last[1] > 300:
+            self.chat_problem = (text, time.monotonic())
+            self.say(f"owner-chat: {text}")
 
     def start_manager(self):
         """True while the standing Manager must still start; False once it runs. A concurrent start or an unknown
@@ -2296,7 +2325,15 @@ class Helper:
                     tmux("kill-window", "-t", f"{self.session}:={window}", check=True)
             if window not in self.look():
                 runtime = self.conf.get("runtime")
-                resume = self.chat_resume(extra["generation"])      # first: a chat that cannot continue gets no credential
+                resume = self.chat_resume(extra["generation"])      # first: the conversation it continues, if any
+                # **One new chat a minute while its starts keep ending.** A chat whose window ended before its
+                # conversation began starts again, but not at every poll: each start asks the hub for a credential and
+                # starts the runtime, and a window that cannot run would otherwise do both every two seconds. A chat
+                # with a conversation to continue starts at once.
+                last = self.__dict__.get("chat_started")
+                if resume is None and last and last[0] == extra["generation"] and time.monotonic() - last[1] < CHAT_RESTART:
+                    raise Refused("the owner chat ended before its conversation began; a new one starts a minute after "
+                                  "that start")
                 token = session_credential(self.agent, "chat", extra["generation"])
                 marker = None if resume or runtime not in MANAGER_RUNTIMES else str(uuid.uuid4())
                 # No conversation to continue here: a first chat, or the first after a runtime switch, because the
@@ -2307,6 +2344,7 @@ class Helper:
                                                 resume=resume, recap=recap,
                                                 env=session_env(self.agent, self.conf, "chat")),
                            1, extra["generation"])
+                self.chat_started = (extra["generation"], time.monotonic())
                 if marker:      # Codex finds its thread by the marker later; Claude starts with the marker as session id
                     save_chat_record(self.agent, {"generation": extra["generation"],
                                                   "marker": marker if runtime == "codex" else None,
