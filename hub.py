@@ -636,7 +636,7 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "releases", "entitlement", "agent_signin", "github_app", "need_options", "restore",
                "manager_start", "agent_notes", "edit_in_place", "machine_access", "push",
                "attachment_knowledge", "asking_and_waiting", "account_limits", "secret_requests",
-               "secret_deliveries", "agent_rename"]
+               "secret_deliveries", "agent_rename", "agent_memory"]
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # One name is not here because it is not always true: central_vault, which ui_features() adds only while the central
 # vault answers (central_ok).
@@ -11613,7 +11613,8 @@ def memory_read_allowed(actor, m):
     duty_read_allowed lets the manager read every duty, because a duty is work the manager gives and manages. A memory
     is not that: it is one agent's own working note, written for its own next session, and an agent that knows the
     manager reads its lessons writes for the manager instead of for itself. So this is narrower on purpose, and the
-    manager reads its own memories like every other agent."""
+    manager reads its own memories like every other agent. The owner is not an agent: he reads every agent's
+    standing lessons at GET /ui/memory/<agent> (memory_view), as he reads its notes."""
     return actor == m["agent"]
 
 
@@ -11677,6 +11678,37 @@ def memory_drop(m, by, reason, t0):
 def memory_count(agent, where="", args=()):
     """How many of an agent's lessons, counted in SQL. A lifetime store is never loaded to be counted."""
     return read_row(f"SELECT COUNT(*) n FROM memories WHERE agent=? {where}", (agent, *args))["n"]
+
+
+def memory_held_until(m):
+    """When a keyless lesson that the work bore out turns stale again unless it is borne out once more, or None.
+
+    memory_stale's own clock: a hold keeps a keyless lesson out of the review for MEMORY_KEYLESS_DAYS and no longer.
+    A lesson with a case key never turns stale, so its hold has no end; one never held has no hold."""
+    if not m["reinforced"] or m["prevents_key"]:
+        return None
+    return (m["reinforced_at"] or m["created"]) + MEMORY_KEYLESS_DAYS * 86400
+
+
+def memory_view(agent, t0=None):
+    """One agent's lessons that stand, for the owner's route (owner feature agent_memory, GET /ui/memory/<agent>).
+
+    The ones the agent's own recall reads with no argument and with stale=true: not forgotten, not folded into a
+    summary, not archived (MEMORY_ON_SHELF), newest first and never more than MEMORY_MOST, with how many there are.
+    Each carries the hub's own evidence and nothing judged — the counts are the hub's and the decision stays the
+    agent's. It writes nothing, not even `recalls`, which counts what the agent's own reading printed. Every text is
+    masked as it is read, as notes_view does: a login registered after a lesson was written was never masked by the
+    write."""
+    t0 = t0 if t0 is not None else now()
+    return {"agent": agent, "total": memory_count(agent, f"AND {MEMORY_ON_SHELF}"),
+            "lessons": [{"id": m["id"], "kind": m["kind"], "about": mask_secrets(m["about"]),
+                         "text": mask_secrets(m["text"]), "prevents": mask_secrets(m["prevents"]),
+                         "at": m["created"], "task": m["by_task"],
+                         "contradicted": m["contradicted"], "contradicted_at": m["contradicted_at"],
+                         "stale": memory_stale(m, t0), "held": m["reinforced"], "held_until": memory_held_until(m),
+                         "cost_minutes": m["cost_minutes"],
+                         "recheck": mask_secrets(m["recheck"]) if m["recheck"] else None}
+                        for m in memory_live(agent)]}
 
 
 def memory_prune(agent, t0, keep=None):
@@ -14268,9 +14300,10 @@ TOOLS = [
     # An agent's own memory (owner direction, 19 October 2026): what it learned, kept for its own next session.
     ("all", "remember", t_remember,
      "Keep one lesson that your next session needs: which approach failed and why, how the owner wants something "
-     "reported, which tool lies, who to ask, what you got wrong last time. It is yours alone — no other agent reads "
-     "it. about is a short tag of your own choosing (a product, a tool, a person, the fleet), and prevents says what "
-     "you expect this lesson to prevent, which is what makes it possible to show later that it was wrong. " +
+     "reported, which tool lies, who to ask, what you got wrong last time. It is yours — no other agent reads it, "
+     "and the owner reads it in the app. about is a short tag of your own choosing (a product, a tool, a person, "
+     "the fleet), and prevents says what you expect this lesson to prevent, which is what makes it possible to "
+     "show later that it was wrong. " +
      NOTES_RULE + " A durable fact about a product belongs in that product's own repository, where you have write "
      "access: keep the pointer here, not the copy. A fact with no repository (an account, a customer, a supplier) "
      "goes in a knowledge file with write_knowledge. Never a password or a key. When a lesson you already hold was "
@@ -24135,6 +24168,20 @@ class Handler(BaseHTTPRequestHandler):
             result = dict(notes_view(agent), db=generation)
         return self.json(200, scrub(result), {"Cache-Control": "no-store"})
 
+    def ui_memory(self, agent, query):
+        """GET /ui/memory/<agent> (owner feature agent_memory): one agent's lessons that stand, each with the hub's
+        own evidence. The agent writes these, not the owner, so there is no owner write; a read changes nothing."""
+        if not self.ui_allowed():
+            return
+        generation = kv_get("db_id")
+        if query.get("db") != generation:
+            return self.json(409, {"error": "hub generation changed; refresh state"})
+        with LOCK:
+            if agent not in agents():
+                return self.json(404, {"error": "no such agent"})
+            result = dict(memory_view(agent), db=generation)
+        return self.json(200, scrub(result), {"Cache-Control": "no-store"})
+
     def ui_responsibilities(self, query):
         """Every duty with its watches, its counters, its open cases and its marker (owner API 1.13)."""
         if not self.ui_allowed():
@@ -25518,6 +25565,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_resources(query)
         if len(parts) == 3 and parts[:2] == ["ui", "notes"] and AGENT_NAME.match(parts[2]):
             return self.ui_notes(parts[2], query)
+        if len(parts) == 3 and parts[:2] == ["ui", "memory"] and AGENT_NAME.match(parts[2]):
+            return self.ui_memory(parts[2], query)
         if parts == ["ui", "responsibilities"]:
             return self.ui_responsibilities(query)
         if len(parts) == 3 and parts[:2] == ["ui", "responsibilities"] and re.fullmatch(r"[1-9][0-9]*", parts[2]):
