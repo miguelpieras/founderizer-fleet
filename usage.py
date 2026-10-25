@@ -13,6 +13,7 @@ import re
 import selectors
 import sqlite3
 import subprocess
+import threading
 import time
 
 import lifecycle
@@ -535,6 +536,7 @@ class Collector:
         self.home = Path(home or Path.home())
         self.path = self.home / ".fleet" / ("usage-" + agent + ".json")
         self.data, self.last_poll = {"tokens": None, "limits": None}, 0
+        self.wake = threading.Event()   # account_again: scan now, not at the end of this wait
         try:
             cache = read_json(self.path)
             if cache["runtime"] != runtime:     # another runtime's numbers and poll time never stand for this one
@@ -554,8 +556,10 @@ class Collector:
         """Read the account at the next scan, whatever the poll clock says. This machine signed in to another
         account, and until it reads itself again every reader of this reading — the owner's card above all — is
         shown the address of the account he has just left (the owner, 23 October 2026: he signed the manager in to
-        another account, pasted the code, and the card kept the old address for the rest of the poll)."""
+        another account, pasted the code, and the card kept the old address for the rest of the poll). And the next
+        scan is now, not at the end of this one's wait (the owner, 25 October 2026: "it needs to be immediate")."""
         self.last_poll = 0
+        self.wake.set()
 
     def collect(self):
         if self.screen_command:
@@ -617,4 +621,5 @@ class Collector:
                 self.collect()
             except Exception:
                 pass  # Never print provider data, transcript text, or raw errors.
-            time.sleep(SCAN_SECONDS)
+            self.wake.wait(SCAN_SECONDS)
+            self.wake.clear()

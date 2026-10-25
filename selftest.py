@@ -799,6 +799,26 @@ code, _, text = owner_ui("/ui/secrets/deliver", {"login": STRIPE, "copies": [
 check("the hub takes a sealed copy and nothing else", code == 400 and "age file" in text, text)
 code, _, text = owner_ui("/ui/secrets/deliver", {"login": STRIPE, "value": "x", "copies": []}, base=hubS)
 check("...and no value beside it", code == 400 and "unknown field" in text, text)
+# Owner feature live_changes: the apps wait on GET /ui/wait and read the moment something they show changes (the owner,
+# 25 October 2026: "it needs to be immediate"). Last on this hub, so the write it makes moves no later check.
+state = json.loads(raw("GET", "/ui/state", base=hubS)[2])
+check("the hub offers live_changes, and /ui/state carries its token",
+      "live_changes" in state["ui_features"] and isinstance(state.get("token"), str), state.get("token"))
+started = time.monotonic()
+code, _, text = raw("GET", f"/ui/wait?db={state['db']}&since=another-boot.0.0&wait=10", base=hubS)
+check("a wait that names another boot answers at once", code == 200 and time.monotonic() - started < 5, text)
+woke = {}
+waiter = threading.Thread(target=lambda: woke.update(answer=raw(
+    "GET", f"/ui/wait?db={state['db']}&since={state['token']}&wait=20", base=hubS)))
+started = time.monotonic()
+waiter.start()
+time.sleep(0.5)
+tool("manager", "raise_needs_you", base=hubS, title="Live", why="a selftest check",
+     what_to_do="Nothing: this item is a selftest check.")
+waiter.join(25)
+answer = json.loads((woke.get("answer") or (0, {}, "{}"))[2] or "{}")
+check("a change the owner sees wakes a waiting app before its wait ends",
+      answer.get("token") not in (None, state["token"]) and time.monotonic() - started < 15, woke.get("answer"))
 procS.terminate()
 
 # 8 outbox, practice site, fingerprints, seatbelt

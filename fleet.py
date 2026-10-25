@@ -2042,6 +2042,8 @@ class Helper:
         self.manager_report_failed = None   # when the hub last did not take such a report (report_manager_bound)
         self.conversation_seen = {}     # {C-<id>: when this helper first saw that window} (retire_conversations)
         self.outside, self.outside_lock = 0, threading.Lock()      # checks and login jobs that run now
+        self.logins = set()             # the sign-ins that run now, by id (begin_signin)
+        self.loop_wake = threading.Event()      # ends the loop's pause, so an owner's request acts at once
         self.requests = {}              # call_api: {job: task} of the requests that run now, each in its own thread
         self.screen_attempts = {}       # {task: (attempt, told)} of the runners (app_server_task) that this helper started
         self.start_waits = {}           # {event id: (seconds, monotonic time of the next try)} of failed task events
@@ -2526,6 +2528,8 @@ class Helper:
             if self.conf.get("role") == "manager":
                 self.manager_due, self.manager_tried = True, None
                 self.say("manager: the owner asked for its session; it starts at this round")
+                if getattr(self, "loop_wake", None):
+                    self.loop_wake.set()        # this round, not after the loop's pause
         elif kind == "update":
             if getattr(self, "lifecycle", None):
                 self.lifecycle.request(extra)
@@ -2533,7 +2537,11 @@ class Helper:
             if getattr(self, "lifecycle", None):     # its own thread: a security scan can take seconds
                 threading.Thread(target=self.lifecycle.check, args=(extra,), daemon=True, name="machine-check").start()
         elif kind == "login":           # owner feature machine_signin: it waits for the owner, so its own thread
-            threading.Thread(target=self.runtime_login, args=(extra,), daemon=True, name="runtime-login").start()
+            if self.begin_signin(extra.get("login")):
+                threading.Thread(target=self.signin_thread, args=(extra,), daemon=True, name="runtime-login").start()
+        elif kind == "status_now":      # a server job changed this machine: the status now, not at the report clock
+            if getattr(self, "lifecycle", None):
+                self.lifecycle.report_soon()
         elif kind == "trigger_check":
             self.trigger_check(extra)
         elif kind == "mcp_program":
@@ -2624,6 +2632,9 @@ class Helper:
                 if self.signed_in(runtime):
                     return report("failed", detail=f"{label} did not sign out on this machine, so its account was "
                                                    f"not changed. Sign out there yourself, then sign in.")
+                # The reading that says it is signed out goes first: one taken during the sign-out, still signed in,
+                # can then never arrive after `starting` and close the new sign-in (end_signed_in_waits).
+                self.send_status()
                 report("starting", detail=f"{label} is signed out. The sign-in starts now.")
             # **The runtime's own first screen, and after the sign-out, not before it.** Signing Claude Code out
             # does not leave it signed out and ready: it puts its whole first run back, so the answers written
@@ -2668,20 +2679,32 @@ class Helper:
                 return report("failed", detail=detail + " Try again.")
             wants = runtime in LOGIN_WANTS_CODE
             report("needs_owner", url=url, shows_code=shown, wants_code=wants)
-            if wants and not self.await_login_code(lid, session):
+            typed = self.await_login_code(lid, session) if wants else True
+            if typed is not True:
+                self.send_status()          # whatever the owner did on the provider's page is the machine's to say
+                if typed is None:
+                    report("failed", detail="No code came back in 14 minutes. Start the sign-in again.")
                 return
             deadline = time.monotonic() + LOGIN_DONE_WAIT
             while time.monotonic() < deadline:
                 if self.signed_in(runtime):
                     self.account_changed()
                     self.restart_after_login()
-                    return report("done", detail=f"{label} is signed in on this machine.")
-                time.sleep(5)
+                    self.send_status()      # the machine's status first, then the end of the sign-in
+                    report("done", detail=f"{label} is signed in on this machine.")
+                    with contextlib.suppress(Exception):        # the model options follow the account, in a second
+                        self.lifecycle.read_models(force=True)  # report that nothing waits for
+                        self.lifecycle.report_soon()
+                    return
+                time.sleep(2)
+            self.send_status()
             report("failed", detail=f"{label} did not report itself signed in. Try again.")
         except Refused as e:
             self.say(f"sign-in L-{lid}: {e}")
         except Exception as e:          # never pass the detail on: the screen of that window could hold the code
             self.say(f"sign-in L-{lid}: the helper hit an error ({type(e).__name__})")
+            with contextlib.suppress(Exception):
+                self.send_status()
             try:
                 http("POST", f"/helper/login/{self.agent}/{lid}",
                      {"state": "failed", "detail": "The machine hit an error during the sign-in. Try again."})
@@ -2784,7 +2807,8 @@ class Helper:
 
     def await_login_code(self, lid, session):
         """Wait for the one code the owner pasted in the app, then type it into the sign-in window. True when it was
-        typed. The code lives in this call and nowhere else."""
+        typed, False when the hub ended the sign-in, None when no code came in time. The code lives in this call and
+        nowhere else. It looks every second, so his code reaches the machine as he sends it."""
         deadline = time.monotonic() + LOGIN_CODE_WAIT
         while time.monotonic() < deadline:
             status, data = http("GET", f"/helper/login/{self.agent}/{lid}")
@@ -2798,10 +2822,8 @@ class Helper:
                 finally:
                     del code
                 return True
-            time.sleep(2)
-        http("POST", f"/helper/login/{self.agent}/{lid}",
-             {"state": "failed", "detail": "No code came back in 14 minutes. Start the sign-in again."})
-        return False
+            time.sleep(1)
+        return None
 
     def signed_in(self, runtime):
         """What this machine's runtime says about itself now: the runtime's own status command, no AI turn."""
@@ -2851,6 +2873,46 @@ class Helper:
     def end_outside(self):
         with self.outside_lock:
             self.outside -= 1
+
+    def begin_signin(self, lid):
+        """A sign-in starts. It is outside work, so neither a Fleet update nor a round of runtime updates starts until
+        it ends (`busy` counts it), and a restart can never cut it in half. Unlike a check it takes no session gate:
+        a runtime-update round holds that gate for up to ten minutes, a new agent's first round included, and its
+        sign-in starts at once, as it always did. Only an update that is applying refuses it (Updating), and then the
+        event stays pending for the restarted helper. The update is marked under the same lock (Lifecycle.tick).
+        False when this sign-in runs already: its event came again because the acknowledgement was lost."""
+        lifecycle = getattr(self, "lifecycle", None)
+        with lifecycle.lock if lifecycle else contextlib.nullcontext():
+            if lifecycle and lifecycle.state == "updating":
+                raise Updating()
+            with self.outside_lock:
+                if lid in self.logins:
+                    return False
+                self.logins.add(lid)
+                self.outside += 1
+        return True
+
+    def signin_thread(self, extra):
+        try:
+            self.runtime_login(extra)
+        finally:
+            with self.outside_lock:
+                self.logins.discard(extra.get("login"))
+                self.outside -= 1
+
+    def send_status(self):
+        """The machine's status now, a fast one, before a sign-in says how it ended: that status is what tells the hub
+        and the app what the runtime is (`end_signed_in_waits`), and the report clock would send it up to five minutes
+        later — the owner pasted his code and his screen went back to the start of the sign-in (25 October 2026).
+        Three tries; after them the status thread tries again by itself."""
+        lifecycle = getattr(self, "lifecycle", None)
+        for _ in range(3):
+            try:
+                if lifecycle is None or lifecycle.report(fast=True):
+                    return
+            except Exception:
+                return          # a status that cannot go is no reason to fail the sign-in: the status thread sends it
+            time.sleep(1)
 
     def post_check(self, extra, result):
         """Send a check result. Without an answer, send the same body again, at most three times, until the claim
@@ -3826,7 +3888,8 @@ def cmd_run(args):
                             h.manager_lock is not None,     # no restart while a previous runtime's manager closes
                             vault=lambda: vault_status(agent), probe=lambda job: probe_logins(agent, job),
                             legacy=h.legacy_windows, switch=h.switch_state,
-                            runtimes_busy=h.runtimes_busy, say=h.say)       # it updates this user's runtimes
+                            runtimes_busy=h.runtimes_busy, say=h.say,       # it updates this user's runtimes
+                            slow_file=os.path.join(HOME, "slow-%s.json" % agent))
     threading.Thread(target=h.lifecycle.run_forever, name="machine-status", daemon=True).start()
     threading.Thread(target=h.tailer.run, name="thread-records", daemon=True).start()
     has_key, keyed, enrolled_at = False, False, 0.0
@@ -3853,7 +3916,8 @@ def cmd_run(args):
             if code != 200:
                 raise Refused(f"hub answered {code}")
             h.handle_events(data.get("events", []))
-            time.sleep(2)
+            h.loop_wake.wait(2)         # an owner's request that the next round serves ends it (manager_start)
+            h.loop_wake.clear()
         except (urllib.error.URLError, OSError, Refused) as e:
             print(f"hub unavailable ({type(e).__name__}); retry in 5 seconds", flush=True)
             time.sleep(5)

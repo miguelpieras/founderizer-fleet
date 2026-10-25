@@ -30,6 +30,7 @@ import urllib.parse
 import onboard      # the vendors' installers, which the runtime updates run (update_runtime)
 
 REPORT_EVERY = 300          # seconds between status reports when nothing changes
+RETRY_MAX = 30              # seconds at most between the tries of a status report that did not reach the hub
 OWNER_ONLY = re.compile(r"(?:^|/)(?:test_[^/]*|ui_fixture|selftest|verify|pilot|vault|place)\.py$")  # never loaded here
 TICK = 15                   # seconds between idle checks
 RESTART_GRACE = 120         # seconds this process may live on after it asked for its own restart
@@ -45,7 +46,8 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "mcp_program",          # it resolves a command MCP server's program for POST /ui/mcp/check
             "secret_deposits",      # it carries a sealed copy of the owner's into this machine's vault (deposit)
             "secret_withdrawals",   # it has this machine's vault take back a secret nobody here holds (withdraw)
-            "task_outputs"]         # it sends a delivered task's outputs folder to the hub (fleet.collect_outputs)
+            "task_outputs",         # it sends a delivered task's outputs folder to the hub (fleet.collect_outputs)
+            "status_now"]           # it reports at once when the hub asks (event status_now, report_soon)
 # ---------------------------------------------------------------- the runtimes
 #
 # What the fleet knows about a runtime is here, in one entry for each provider, and nowhere else. hub.py, fleet.py and
@@ -596,7 +598,7 @@ def follow_config_ref(kit, run=None):
 class Lifecycle:
     def __init__(self, kit, agent, conf, post, busy, restart=None, run=_run, clock=time.time,
                  platform_name=sys.platform, home=None, vault=None, probe=None, models=codex_model_list, legacy=None,
-                 switch=None, which=None, monotonic=time.monotonic, runtimes_busy=None, say=print):
+                 switch=None, which=None, monotonic=time.monotonic, runtimes_busy=None, say=print, slow_file=None):
         self.kit, self.agent, self.conf, self.post, self.busy = kit, agent, conf, post, busy
         # () -> True while a session of this OS user may be using a runtime: its updates wait for False
         # (update_runtimes). None: this process updates no runtime, as for the server service's readings.
@@ -636,6 +638,17 @@ class Lifecycle:
         self.tools_changed = False      # the hub says the standing session's tool list is not the current one
         self.restarting = None          # when this process asked for its own restart
         self.loaded = self.revision()   # the revision this process runs; the checkout can move ahead of it
+        # **No result waits for the report clock** (the owner, 25 October 2026: "it needs to be immediate"). What makes
+        # a report due wakes the status thread (report_soon, an update request), a report that failed is tried again
+        # within RETRY_MAX, and a report that something asked for is fast: it reuses the slow security reading.
+        self.wake = threading.Event()
+        self.soon = False               # a fast report is due now
+        self.retry_at = None            # when a report that failed is tried again (monotonic), and how many failed
+        self.failures = 0
+        self.reported_once = False
+        self.read_mono = None           # when the runtimes of the report being made were read (reading_age)
+        self.slow_file = slow_file      # where this helper keeps its slow reading for the next process of this boot
+        self.slow = self.load_slow()
 
     # ---- status
     def revision(self):
@@ -705,6 +718,58 @@ class Lifecycle:
             s["vault"] = None
         return s
 
+    def boot(self):
+        """This boot of the machine: a reading saved before a reboot says nothing about the machine now."""
+        if not hasattr(self, "_boot"):
+            self._boot = None
+            if self.platform == "darwin":
+                code, out, _ = self.run(["sysctl", "-n", "kern.bootsessionuuid"])
+                self._boot = (out.strip() or None) if code == 0 else None
+            else:
+                try:
+                    with open("/proc/sys/kernel/random/boot_id") as f:
+                        self._boot = f.read().strip() or None
+                except OSError:
+                    pass
+        return self._boot
+
+    def load_slow(self):
+        """The slow reading that an earlier process of this boot saved, while it is younger than REPORT_EVERY: the
+        first report of a restarted helper, after a settings change most often, is then a fast one too. The age is on
+        the monotonic clock, which every process of one boot shares."""
+        if not self.slow_file:
+            return None
+        try:
+            with open(self.slow_file) as f:
+                saved = json.load(f)
+            if saved["boot"] and saved["boot"] == self.boot() and 0 <= self.monotonic() - float(saved["at"]) < REPORT_EVERY:
+                return {"at": float(saved["at"]), "security": dict(saved["security"])}
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
+        return None
+
+    def security_reading(self, fast):
+        """security(), or for a fast report the last one while it is younger than REPORT_EVERY, with the vault read
+        now. On Linux the scan runs `apt-get -s upgrade`, which can take a minute."""
+        if fast and self.slow and 0 <= self.monotonic() - self.slow["at"] < REPORT_EVERY:
+            reading = dict(self.slow["security"])
+            try:
+                reading["vault"] = self.vault() if self.vault else None
+            except Exception:
+                reading["vault"] = None
+            return reading
+        reading = self.security()
+        self.slow = {"at": self.monotonic(), "security": {k: v for k, v in reading.items() if k != "vault"}}
+        if self.slow_file and self.boot():
+            try:
+                os.makedirs(os.path.dirname(self.slow_file), mode=0o700, exist_ok=True)
+                with open(self.slow_file + ".new", "w") as f:
+                    json.dump(dict(self.slow, boot=self.boot()), f)
+                os.replace(self.slow_file + ".new", self.slow_file)
+            except OSError:
+                pass            # the next full report saves it again
+        return reading
+
     def access(self):
         """Whether the machine's own SSH server (or Tailscale SSH) and Screen Sharing are on. No root needed."""
         def listening(port):
@@ -767,9 +832,10 @@ class Lifecycle:
                 pass
         return result
 
-    def collect(self):
+    def collect(self, fast=False):
         with self.lock:
             update = {"state": self.state, "detail": self.detail}
+        self.read_mono = self.monotonic()       # the runtimes are read from here on: the reading's age counts from it
         # owner feature runtime_switch: both runtimes that an owner can switch between, with the same status commands
         runtimes = {name: self.runtime(name) for name in SWITCH_RUNTIMES}
         self.remember_signed_in(runtimes)
@@ -779,7 +845,7 @@ class Lifecycle:
         for n, outcome in outcomes.items() if isinstance(outcomes, dict) else ():
             if n in said and isinstance(outcome, dict):     # its last update, by any helper of this user
                 said[n]["update"] = outcome
-        return {"revision": self.running(), "os": self.os_info(), "security": self.security(),
+        return {"revision": self.running(), "os": self.os_info(), "security": self.security_reading(fast),
                 "runtime": runtimes[name] if name in runtimes else self.runtime(),
                 "runtimes": said,
                 "access": dict(self.access(), user=pwd.getpwuid(os.getuid()).pw_name),
@@ -1009,21 +1075,33 @@ class Lifecycle:
                 if isinstance(r, dict) and isinstance(r.get("login"), str) and r["login"].startswith("bws://")
                 and r.get("state") in ("readable", "not_readable") and r.get("reason") in LOGIN_REASONS]
 
-    def report(self, check=None, probe_job=None):
+    def report(self, check=None, probe_job=None, fast=False):
         """Send the status. The status thread and the helper's loop both report; one at a time, each from its own
-        reading, so that an older reading never arrives after a newer one and stands at the hub until the next."""
+        reading, so that an older reading never arrives after a newer one and stands at the hub until the next.
+
+        fast: a report that something asked for (report_soon, a sign-in), which reuses the slow security reading. Every
+        report says how old its runtime reading is when it leaves (reading_age), so the hub dates it by when it was
+        taken. One that does not reach the hub is tried again within RETRY_MAX, fast, and only one that does moves the
+        report clock."""
         with self.report_lock:
-            self.last_report = self.monotonic()
             try:
                 if check:
                     self.read_models(force=True)    # a machine check reads the model options again
                     self.read_screen_models(force=True)
-                status = self.collect()
+                status = self.collect(fast=fast and not check)
                 if check:
                     status["check"] = check         # this report answers the owner's "check this machine"
                     status["verify"] = self.verify(status, probe_job)
+                status["reading_age"] = round(max(0.0, self.monotonic() - self.read_mono), 3)
                 code, data = self.post(status)
             except Exception:
+                code, data = None, None
+            if code == 200:
+                self.last_report, self.failures, self.retry_at = self.monotonic(), 0, None
+                self.reported_once = True
+            else:
+                self.failures += 1
+                self.retry_at = self.monotonic() + min(RETRY_MAX, 2 ** (self.failures - 1))
                 return False
         if code == 200 and isinstance(data, dict):
             # The standing manager session is running on a tool list this hub would no longer serve: its helper
@@ -1058,9 +1136,16 @@ class Lifecycle:
             self.report(check=check, probe_job=job if isinstance(job, int) and not isinstance(job, bool) else None)
 
     def request(self, extra):
-        """An update event from the hub: arm it and say so at once."""
+        """An update event from the hub: arm it, and wake the status thread, which says so and applies it at once when
+        this machine is idle — not at its next tick, and not in the helper's own loop."""
         self.arm((extra or {}).get("desired_revision"))
-        self.report()
+        self.report_soon()
+
+    def report_soon(self):
+        """A fast report now, from the status thread (event status_now, a sign-in, an update request). Requests that
+        come while one is made give one more, not one each."""
+        self.soon = True
+        self.wake.set()
 
     @contextlib.contextmanager
     def session_start(self):
@@ -1125,8 +1210,12 @@ class Lifecycle:
             self.restarting = None
             self.fail("Updated the checkout, but the helper did not restart. Restart its service to load it.")
             self.gate.release()
-        if self.monotonic() - self.last_report >= REPORT_EVERY:
-            self.report()
+        if self.soon or (self.retry_at is not None and self.monotonic() >= self.retry_at):
+            self.soon = False
+            self.report(fast=True)
+        elif self.retry_at is None and self.monotonic() - self.last_report >= REPORT_EVERY:
+            # A new process's first report takes the slow reading an earlier one of this boot saved (load_slow).
+            self.report(fast=not self.reported_once)
         self.start_runtime_updates()
         with self.lock:
             ready = self.state == "waiting_idle"
@@ -1135,7 +1224,13 @@ class Lifecycle:
             return                      # nothing to do, or a session is starting: try at the next tick
         restarted = False
         try:
-            if not self.busy():         # checked while no session can start
+            # Checked while no session can start, and with the update marked under the same lock that a sign-in
+            # checks it with (Helper.begin_signin), so none can start between this check and the update.
+            with self.lock:
+                idle = not self.busy()
+                if idle:
+                    self.state, self.detail = "updating", "Updating Fleet while idle."
+            if idle:
                 restarted = self.apply(desired)
         except Exception as e:
             self.fail("The update stopped: %s." % type(e).__name__)
@@ -1151,7 +1246,9 @@ class Lifecycle:
                 self.tick()
             except Exception:
                 pass
-            time.sleep(TICK)
+            wait = TICK if self.retry_at is None else max(0.0, min(TICK, self.retry_at - self.monotonic()))
+            self.wake.wait(wait)        # report_soon and an update request end it at once
+            self.wake.clear()
 
     # ---- runtime updates (the owner, 22 October 2026: "they should probably update themselves too, right?")
     def start_runtime_updates(self):

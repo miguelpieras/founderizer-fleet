@@ -20,6 +20,7 @@ private (Tailscale) network.
 """
 import argparse
 import base64
+import collections
 import contextlib
 import functools
 import hashlib
@@ -351,7 +352,7 @@ UUID_TEXT = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 def q(sql, args=()):
     with LOCK:
         rows = DB.execute(sql, args).fetchall()
-        DB.commit()
+        commit()
         return rows
 
 
@@ -363,7 +364,7 @@ def q1(sql, args=()):
 def ins(sql, args=()):
     with LOCK:
         cur = DB.execute(sql, args)
-        DB.commit()
+        commit()
         return cur.lastrowid
 
 
@@ -392,12 +393,98 @@ def transaction():
         TX.open = getattr(TX, "open", 0) + 1
         try:
             yield
-            DB.commit()
+            commit()
         except BaseException:
-            DB.rollback()
+            rollback()
             raise
         finally:
             TX.open -= 1
+
+
+# ---------------------------------------------------------------- the apps' change signal (owner feature live_changes)
+#
+# The owner, 25 October 2026: "it needs to be immediate". The apps wait on GET /ui/wait and read the moment the hub
+# answers, instead of finding out on a clock. Every commit that changed a row counts one change in the area of the
+# code that made it: `state` by default, so a write nobody classified wakes the apps (an extra wake costs one read,
+# a missed one is the delay this exists to end); `activity` for what moves all the time while agents work, which the
+# apps read on their own clock; `quiet` for what changes nothing the owner sees. Only `state` wakes a waiter.
+CHANGES = threading.Condition()
+CHANGE = {"boot": uuid.uuid4().hex[:8], "state": 0, "activity": 0, "base": None}
+CHANGE_TIMES = collections.deque(maxlen=4096)       # (time, area) of the newest changes, for /ui/health
+CHANGE_WAITS = [0]                                   # GET /ui/wait requests that wait now
+AREA = threading.local()
+WAIT_MAX = 20                   # seconds a GET /ui/wait may wait
+WAIT_GATHER = 0.25              # seconds it waits after a change, for the rest of that burst: one action, several commits
+
+
+@contextlib.contextmanager
+def area(name):
+    """The writes inside count as `name`: "state", "activity" or "quiet". The innermost one decides."""
+    before = getattr(AREA, "name", "state")
+    AREA.name = name
+    try:
+        yield
+    finally:
+        AREA.name = before
+
+
+def changed(name="state"):
+    """One change: `state` wakes every waiter, `activity` only moves the token."""
+    with CHANGES:
+        CHANGE[name] += 1
+        CHANGE_TIMES.append((now(), name))
+        if name == "state":
+            CHANGES.notify_all()
+
+
+def counted():
+    """After a commit, which every writer makes holding LOCK: one change in the writer's area if it changed a row."""
+    total = getattr(DB, "total_changes", None)
+    if total is None or total == CHANGE["base"]:
+        return
+    first, CHANGE["base"] = CHANGE["base"] is None, total
+    name = getattr(AREA, "name", "state")
+    if not first and name != "quiet":
+        changed(name)
+
+
+def commit():
+    """DB.commit(), counted: every write commits through here, transaction() or committed()."""
+    DB.commit()
+    counted()
+
+
+def rollback():
+    """DB.rollback(): what it undid is no change."""
+    DB.rollback()
+    CHANGE["base"] = getattr(DB, "total_changes", None)
+
+
+@contextlib.contextmanager
+def committed():
+    """`with DB:`, counted: one commit, or a rollback on an error."""
+    try:
+        with DB:
+            yield
+    except BaseException:
+        CHANGE["base"] = getattr(DB, "total_changes", None)
+        raise
+    counted()
+
+
+def change_token():
+    """`<boot>.<state>.<activity>`: a waiter wakes when the boot or the state part differs from what it has."""
+    with CHANGES:
+        return f"{CHANGE['boot']}.{CHANGE['state']}.{CHANGE['activity']}"
+
+
+def change_counts(t0=None):
+    """For /ui/health: the changes of the last minute by area, and the waits open now."""
+    t0 = t0 or now()
+    with CHANGES:
+        recent = [name for at, name in CHANGE_TIMES if t0 - at <= 60]
+        return {"state_per_minute": recent.count("state"), "activity_per_minute": recent.count("activity"),
+                "waiting": CHANGE_WAITS[0]}
 
 
 def in_transaction(what):
@@ -426,11 +513,18 @@ def kv_get(k, default=None):
     return row["v"] if row else default
 
 
+# Times the hub keeps for itself, which no screen of the owner's shows: their writes are quiet (live_changes).
+QUIET_KEYS = ("tick_ok", "releases_swept", "bridge_seen")
+
+
 def kv_set(k, v):
-    if v is None:
-        q("DELETE FROM kv WHERE k=?", (k,))
-    else:
-        q("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, str(v)))
+    """Writes only a value that differs, so a key rewritten with what it holds is no change for the apps."""
+    with area("quiet") if k in QUIET_KEYS or k.endswith("_sweep_at") else contextlib.nullcontext():
+        if v is None:
+            q("DELETE FROM kv WHERE k=?", (k,))
+        else:
+            q("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v WHERE kv.v IS NOT excluded.v",
+              (k, str(v)))
 
 
 def now():
@@ -468,7 +562,9 @@ def log_row(agent, what):
 
 
 def log(agent, what):
-    ins(LOG, (now(), agent, what[:400]))
+    """One line of the hub's log. Only the board and the manager's resume read it, never an app: activity."""
+    with area("activity"):
+        ins(LOG, (now(), agent, what[:400]))
 
 
 def agents():
@@ -636,7 +732,7 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "releases", "entitlement", "agent_signin", "github_app", "need_options", "restore",
                "manager_start", "agent_notes", "edit_in_place", "machine_access", "push",
                "attachment_knowledge", "asking_and_waiting", "account_limits", "secret_requests",
-               "secret_deliveries", "agent_rename", "agent_memory"]
+               "secret_deliveries", "agent_rename", "agent_memory", "live_changes"]
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # One name is not here because it is not always true: central_vault, which ui_features() adds only while the central
 # vault answers (central_ok).
@@ -681,8 +777,9 @@ def device_key_matches(device, token):
 def device_contact(device, auth):
     """One device reached the hub: when, and what the hub answered (an `auth` code, or None when it passed). It is
     not proof of a read: `last_seen` stays the time of a request that the hub accepted."""
-    q("INSERT INTO owner_device_contacts(device,ts,auth) VALUES(?,?,?) ON CONFLICT(device) DO UPDATE SET "
-      "ts=excluded.ts, auth=excluded.auth", (device, now(), auth))
+    with area("quiet"):
+        q("INSERT INTO owner_device_contacts(device,ts,auth) VALUES(?,?,?) ON CONFLICT(device) DO UPDATE SET "
+          "ts=excluded.ts, auth=excluded.auth", (device, now(), auth))
 
 
 def device_may(path, method):
@@ -1069,9 +1166,10 @@ def know(agent):
 
 
 def touch(agent):
-    """The agent's helper just checked in."""
+    """The agent's helper just checked in. Quiet: an agent going online or offline is counted by the tick."""
     know(agent)
-    q("UPDATE agents SET last_seen=? WHERE name=?", (now(), agent))
+    with area("quiet"):
+        q("UPDATE agents SET last_seen=? WHERE name=?", (now(), agent))
 
 
 def when(ts):
@@ -6272,10 +6370,16 @@ def central_read(t0=None):
             raise Refusal(409, f"the central vault here serves another fleet, and this hub is fleet {fleet}")
     except Refusal as e:
         with CENTRAL_LOCK:
+            news = CENTRAL["error"] != str(e)
             CENTRAL.update(tried_at=t0, error=str(e))
+        if news:
+            changed()           # the vault's own words reach the owner's screens at once (live_changes)
         return None
     with CENTRAL_LOCK:
+        news = CENTRAL["status"] != answer or CENTRAL["error"] is not None
         CENTRAL.update(status=answer, read_at=t0, tried_at=t0, error=None)
+    if news:
+        changed()
     return answer
 
 
@@ -8292,12 +8396,12 @@ def record_session_tokens(agent, rows):
     if not rows:
         return
     t0 = now()
-    with LOCK:
+    with area("activity"), LOCK:
         DB.executemany("INSERT INTO session_tokens(agent,session_id,total,last_activity,reported) VALUES(?,?,?,?,?) "
                        "ON CONFLICT(agent,session_id) DO UPDATE SET total=excluded.total, "
                        "last_activity=excluded.last_activity, reported=excluded.reported",
                        [(agent, r["session_id"], r["total"], r["last_activity"], t0) for r in rows])
-        DB.commit()
+        commit()
 
 
 def goal_tokens(goal_id):
@@ -9142,6 +9246,7 @@ def commit_kit_file(path, data, message, more=None, author=None, allow=None):
     if git_kit("fetch", "-q", "origin", timeout=60)[0] != 0 or git_kit("merge", "-q", "--ff-only", commit)[0] != 0:
         raise Refusal(500, f"{path} is in origin as {commit[:12]}, but the hub checkout did not fast-forward")
     kit_revision(fresh=True)
+    changed()                   # a profile, a knowledge file or team.json: not in the database (live_changes)
     return commit
 
 
@@ -9383,6 +9488,7 @@ def google_access(email, service):
         with GOOGLE_LOCK:
             GOOGLE["tokens"].pop(email, None)
             GOOGLE["problems"][email] = GOOGLE_PROBLEM
+        changed()
         log("hub", f"Google refused the saved access of {email} (invalid_grant)")
         raise ToolError(f"Google refused the saved access of {email}. The owner must connect it again. Ask your "
                         f"requester.") from None
@@ -11562,7 +11668,7 @@ def memory_search_probe():
     try:
         DB.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(text, prevents, about, "
                    "content='memories', content_rowid='id', tokenize='unicode61')")
-        DB.commit()
+        commit()
         MEMORY_FTS[0] = True
     except sqlite3.Error as e:
         log("hub", f"memory search runs without FTS5 on this machine: {e}")
@@ -14870,17 +14976,20 @@ def call_tool(agent, name, args, context=None):
                 # guard refuses a login that is registered at the moment of the write; this catches the ones
                 # registered after it, which is every login the owner added since.
                 text = mask_secrets(text)
-                ins("INSERT INTO calls(ts,agent,task,attempt,name,args,ok,detail) VALUES(?,?,?,?,?,?,1,?)",
-                    (now(), agent, tid, attempt, name,
-                     "[blocked]" if secret_hit(json.dumps(args)) else json.dumps(args),
-                     text[:GOOGLE_CALL_KEEP] if name in GOOGLE_READS else text))
+                with area("activity"):
+                    ins("INSERT INTO calls(ts,agent,task,attempt,name,args,ok,detail) VALUES(?,?,?,?,?,?,1,?)",
+                        (now(), agent, tid, attempt, name,
+                         "[blocked]" if secret_hit(json.dumps(args)) else json.dumps(args),
+                         text[:GOOGLE_CALL_KEEP] if name in GOOGLE_READS else text))
                 return text, False
         raise ToolError(f"You have no tool named {name}.")
     except ToolError as e:
         log(agent, f"{name} refused: {e}")
         said = mask_secrets(str(e))
-        ins("INSERT INTO calls(ts,agent,task,attempt,name,args,ok,detail) VALUES(?,?,?,?,?,?,0,?)",
-            (now(), agent, tid, attempt, name, "[blocked]" if secret_hit(json.dumps(args)) else json.dumps(args), said))
+        with area("activity"):
+            ins("INSERT INTO calls(ts,agent,task,attempt,name,args,ok,detail) VALUES(?,?,?,?,?,?,0,?)",
+                (now(), agent, tid, attempt, name, "[blocked]" if secret_hit(json.dumps(args)) else json.dumps(args),
+                 said))
         return said, True
     finally:
         CALL.context = None
@@ -16871,6 +16980,12 @@ def runtime_switch(name, team=None):
         missing.append("helper_status_unknown")
     if "runtime_switch" in features:
         target = (data.get("runtimes") or {}).get(to) or {}
+        # An install or a preparation of that runtime that ended done after this reading installed and signed it in
+        # (finished_sign_in): the reading that says so is on its way, and "Set up" must not show again meanwhile.
+        prepared = finished_sign_in(name, to, installed=True)
+        if st and prepared and prepared > st["reported"] - reading_age_of(data.get("reading_age")) and \
+                now() - prepared <= MACHINE_STALE:
+            target = dict(target, version=target.get("version") or "installed", signed_in=True)
         missing += (["runtime_not_installed"] if not target.get("version") else
                     ["runtime_not_signed_in"] if target.get("signed_in") is False else
                     ["runtime_sign_in_unknown"] if target.get("signed_in") is None else [])
@@ -17078,15 +17193,17 @@ def liveness(t0):
         else:
             path = None
         if path:
-            q("UPDATE tasks SET live_path=?, stalled_since=NULL, stalled_reason=NULL, stall_told=0 WHERE id=?", (path, tid))
+            q("UPDATE tasks SET live_path=?, stalled_since=NULL, stalled_reason=NULL, stall_told=0 WHERE id=? AND "
+              "(live_path IS NOT ? OR stalled_since IS NOT NULL OR stalled_reason IS NOT NULL OR IFNULL(stall_told, 0) != 0)",
+              (path, tid, path))
             if alive and t["missing_since"]:
                 q("UPDATE tasks SET missing_since=NULL WHERE id=?", (tid,))
             continue
         reason = ("its session is not running" if online else
                   f"{owner}'s helper has not checked in since {clock(row['last_seen'])}" if row and row["last_seen"]
                   else f"{owner}'s helper has never checked in")
-        q("UPDATE tasks SET live_path=NULL, stalled_since=COALESCE(stalled_since,?), stalled_reason=? WHERE id=?",
-          (t0, reason, tid))
+        q("UPDATE tasks SET live_path=NULL, stalled_since=COALESCE(stalled_since,?), stalled_reason=? WHERE id=? AND "
+          "(live_path IS NOT NULL OR stalled_since IS NULL OR stalled_reason IS NOT ?)", (t0, reason, tid, reason))
         if t["state"] == "submitted":
             continue        # the never-started nudge reports these
         if online:          # the session vanished: restart it, and only a young death spends one of the three
@@ -17153,6 +17270,89 @@ def offline_sweep(t0):
 # takes milliseconds and runs every CFG["tick"] (5) seconds, so this is twelve missed passes: late enough that a
 # long sweep of its own cannot raise it, early enough that the fleet has not been unattended for a working day.
 TICK_WARN = 60
+
+
+def manager_flag_update(t0):
+    """The manager's own warning (`mgr_flag`), which the hub tells the owner itself. The tick runs it, and so do the
+    moments its inputs change — the manager's status report and its window list — so the banner follows at once and
+    not at the next tick (live_changes)."""
+    mgr = manager_name()
+    if not mgr:
+        return
+    with LOCK:
+        # the one exception: the hub tells the owner itself when the manager is gone
+        kind, flag = None, None
+        # A quiet one wakes nobody, so it is not a message the manager left unread; a LATER_SAY is one from its wake.
+        pending = q1("SELECT MIN(created + COALESCE(json_extract(extra, '$.wake_after'), 0)) ts FROM events "
+                     "WHERE agent=? AND kind='say' AND read_at IS NULL AND (NOT COALESCE(json_extract(extra, "
+                     "'$.quiet'), 0) OR json_extract(extra, '$.wake_after') IS NOT NULL)", (mgr,))["ts"]
+        if pending and t0 - max(float(pending), limit_ended(mgr), switch_ended(mgr)) > CFG["manager_silence"]:
+            kind = "silent"
+            flag = (f"The manager has not acted on a message for {span(t0 - float(pending))}. "
+                    f"Open its session.")
+        lim = active_limit(mgr)
+        if lim:
+            kind = "limited"
+            flag = (f"The manager reached its usage limit. Its messages wait until {clock(lim['until'])}"
+                    + ("." if lim["reset_known"] else ", one hour after the limit was seen, because no reset time was given.")
+                    + " If its session shows the rate-limit menu, answer it on that machine. The helper never answers it.")
+        asks = kv_get("mgr_screen")
+        if asks and t0 - float(asks) < 90:
+            kind = "screen"
+            flag = "The manager's session shows a question on its own screen. Open its session and answer it."
+        row = q1("SELECT * FROM agents WHERE name=?", (mgr,))
+        # A window list from before the end of a switch can still lack the new session's window (switch_ended).
+        if row and row["alive_ts"] and t0 - row["alive_ts"] < 60 and "manager" not in (row["alive"] or "").split(",") \
+                and row["alive_ts"] > switch_ended(mgr):
+            kind = "down"
+            flag = "The manager session is not running. Start it again."
+        # Signed out, it can do nothing, so its silence, a question on its screen, a stopped session or an old limit
+        # only show what that looks like, and the sign-in is the step (the owner, 25 October 2026). A switch keeps
+        # its own words below.
+        if not local_model(agents()[mgr]) and signed_in_now(mgr, agents()[mgr].get("runtime")) is False:
+            kind = "signed_out"
+            flag = "The manager is not signed in."
+        # Its runtime switch waits for the new session: no reader yet, so neither down nor silent. A usage limit or a
+        # question of the new session still shows, and a switch that does not finish becomes a warning of its own.
+        if manager_held(mgr) and kind in (None, "silent", "down", "signed_out"):
+            since, runtime = float(kv_get("switching:" + mgr)), agents()[mgr].get("runtime")
+            if t0 - since > SWITCH_STALL:
+                kind = "switch_stalled"
+                flag = (f"The manager's switch to {runtime} has not finished for {span(t0 - since)}, and its messages "
+                        "wait. Open its session on its machine: the previous session can wait for an answer there, or "
+                        "the new one does not run. If its Fleet update failed, update its machine in Fleet.")
+            else:
+                kind = "switching"
+                flag = f"The manager switches to {runtime}. Its messages wait until its new session runs."
+        if kind != kv_get("mgr_flag_kind"):
+            kv_set("mgr_flag_kind", kind)
+            kv_set("mgr_flag", flag)
+            kv_set("mgr_flag_since", t0 if kind else None)      # one episode per kind (manager_warning)
+            # "switching" is the normal middle of a runtime switch the owner asked for himself, and it ends by
+            # itself; the event is switch_stalled. So it shows on the board, in /ui/health and on the phone, and it
+            # wakes nobody.
+            if flag and kind not in MANAGER_FLAG_QUIET:
+                emit("owner", "notify", f"Fleet hub: {flag}")
+                log("hub", f"told the owner: {flag}")
+        elif flag:
+            kv_set("mgr_flag", flag)        # keep the minutes current
+            if not kv_get("mgr_flag_since"):
+                kv_set("mgr_flag_since", t0)
+
+
+# The last of what turns with time alone: an agent's helper going quiet, and a machine reading going stale. No write
+# moves them, so the tick counts a change when either set does (live_changes).
+TICK_SEEN = {}
+
+
+def tick_changes(t0):
+    offline = tuple(sorted(r["name"] for r in q("SELECT name, last_seen FROM agents")
+                           if not r["last_seen"] or t0 - r["last_seen"] > CFG.get("offline_after", 90)))
+    stale = tuple(sorted(r["agent"] for r in q("SELECT agent, reported FROM machine_status")
+                         if t0 - r["reported"] > MACHINE_STALE))
+    if TICK_SEEN.get("last") not in (None, (offline, stale)):
+        changed()
+    TICK_SEEN["last"] = (offline, stale)
 
 
 def tick():
@@ -17244,64 +17444,8 @@ def tick():
             trigger_sweep(t0)
         except Exception:
             traceback.print_exc()           # a broken trigger must not stop the reminders and manager checks below
-        # the one exception: the hub tells the owner itself when the manager is gone
-        kind, flag = None, None
-        # A quiet one wakes nobody, so it is not a message the manager left unread; a LATER_SAY is one from its wake.
-        pending = q1("SELECT MIN(created + COALESCE(json_extract(extra, '$.wake_after'), 0)) ts FROM events "
-                     "WHERE agent=? AND kind='say' AND read_at IS NULL AND (NOT COALESCE(json_extract(extra, "
-                     "'$.quiet'), 0) OR json_extract(extra, '$.wake_after') IS NOT NULL)", (mgr,))["ts"]
-        if pending and t0 - max(float(pending), limit_ended(mgr), switch_ended(mgr)) > CFG["manager_silence"]:
-            kind = "silent"
-            flag = (f"The manager has not acted on a message for {span(t0 - float(pending))}. "
-                    f"Open its session.")
-        lim = active_limit(mgr)
-        if lim:
-            kind = "limited"
-            flag = (f"The manager reached its usage limit. Its messages wait until {clock(lim['until'])}"
-                    + ("." if lim["reset_known"] else ", one hour after the limit was seen, because no reset time was given.")
-                    + " If its session shows the rate-limit menu, answer it on that machine. The helper never answers it.")
-        asks = kv_get("mgr_screen")
-        if asks and t0 - float(asks) < 90:
-            kind = "screen"
-            flag = "The manager's session shows a question on its own screen. Open its session and answer it."
-        row = q1("SELECT * FROM agents WHERE name=?", (mgr,))
-        # A window list from before the end of a switch can still lack the new session's window (switch_ended).
-        if row and row["alive_ts"] and t0 - row["alive_ts"] < 60 and "manager" not in (row["alive"] or "").split(",") \
-                and row["alive_ts"] > switch_ended(mgr):
-            kind = "down"
-            flag = "The manager session is not running. Start it again."
-        # Signed out, it can do nothing, so its silence, a question on its screen, a stopped session or an old limit
-        # only show what that looks like, and the sign-in is the step (the owner, 25 October 2026). A switch keeps
-        # its own words below.
-        if not local_model(agents()[mgr]) and signed_in_now(mgr, agents()[mgr].get("runtime")) is False:
-            kind = "signed_out"
-            flag = "The manager is not signed in."
-        # Its runtime switch waits for the new session: no reader yet, so neither down nor silent. A usage limit or a
-        # question of the new session still shows, and a switch that does not finish becomes a warning of its own.
-        if manager_held(mgr) and kind in (None, "silent", "down", "signed_out"):
-            since, runtime = float(kv_get("switching:" + mgr)), agents()[mgr].get("runtime")
-            if t0 - since > SWITCH_STALL:
-                kind = "switch_stalled"
-                flag = (f"The manager's switch to {runtime} has not finished for {span(t0 - since)}, and its messages "
-                        "wait. Open its session on its machine: the previous session can wait for an answer there, or "
-                        "the new one does not run. If its Fleet update failed, update its machine in Fleet.")
-            else:
-                kind = "switching"
-                flag = f"The manager switches to {runtime}. Its messages wait until its new session runs."
-        if kind != kv_get("mgr_flag_kind"):
-            kv_set("mgr_flag_kind", kind)
-            kv_set("mgr_flag", flag)
-            kv_set("mgr_flag_since", t0 if kind else None)      # one episode per kind (manager_warning)
-            # "switching" is the normal middle of a runtime switch the owner asked for himself, and it ends by
-            # itself; the event is switch_stalled. So it shows on the board, in /ui/health and on the phone, and it
-            # wakes nobody.
-            if flag and kind not in MANAGER_FLAG_QUIET:
-                emit("owner", "notify", f"Fleet hub: {flag}")
-                log("hub", f"told the owner: {flag}")
-        elif flag:
-            kv_set("mgr_flag", flag)        # keep the minutes current
-            if not kv_get("mgr_flag_since"):
-                kv_set("mgr_flag_since", t0)
+        manager_flag_update(t0)
+        tick_changes(t0)
         # The last line of the pass, and the only thing that says the pass reached it (tick_heartbeat). The first
         # half of this function is deliberately unguarded -- reminder_sweep must run before the clocks, and a tick
         # that half-runs and says nothing is the thing being fixed, not a reason to wrap each section in a try. So
@@ -18163,6 +18307,17 @@ def runtime_update(value):
     return {"result": value["result"], "at": at, "detail": detail.strip()[:300]}
 
 
+READING_AGE_MAX = 120          # seconds a reading may be older than its report; a larger age is no reading's own
+
+
+def reading_age_of(value):
+    """The seconds between reading the runtimes and posting the report, as the helper measured them on its monotonic
+    clock. A missing or bad value is 0, so a reading of an older helper is dated at its arrival, as before."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        return 0.0
+    return float(min(max(value, 0.0), READING_AGE_MAX))
+
+
 def validate_status(data):
     """A helper's machine status report. Unknown fields are dropped; missing fields are null."""
     if not isinstance(data, dict):
@@ -18270,7 +18425,8 @@ def validate_status(data):
             "access": {"ssh": _optional(ways.get("ssh"), bool), "screen_sharing": _optional(ways.get("screen_sharing"), bool),
                        "user": user},
             "check": _optional(data.get("check"), int), "features": sorted(set(features)), "settings": settings,
-            "models": model_reading(data.get("models")), "verify": verify_items(data.get("verify"))}
+            "models": model_reading(data.get("models")), "verify": verify_items(data.get("verify")),
+            "reading_age": reading_age_of(data.get("reading_age"))}
 
 
 def validate_team(team):
@@ -18647,6 +18803,7 @@ def apply_team(new):
     for name in new["agents"]:
         know(name)
     kit_revision(fresh=True)
+    changed()                   # team.json is not in the database: its change is counted here (live_changes)
 
 
 def team_view(rev):
@@ -20118,6 +20275,7 @@ def mcp_access(name):
         if not isinstance(ends, (int, float)) or ends - now() <= MCP_REFRESH:
             with MCP_LOCK:
                 MCP["problems"][name] = MCP_ENDED
+            changed()
             raise Refusal(409, MCP_ENDED)
         return entry["access_token"], int(ends)
     print_name = hashlib.sha256(entry["refresh_token"].encode()).hexdigest()
@@ -20131,6 +20289,7 @@ def mcp_access(name):
     except mcp.McpError as e:
         with MCP_LOCK:
             MCP["problems"][name] = f"{mcp_why(e)}. Connect this server again."
+        changed()
         log("owner", f"the MCP server {name} refused the saved access: {mcp_why(e)}")
         raise Refusal(502, f"the MCP server {name} refused the saved access: {mcp_why(e)}") from None
     if got["refresh_token"] != entry["refresh_token"]:      # a server that rotates its refresh token
@@ -20144,7 +20303,8 @@ def mcp_access(name):
     with MCP_LOCK:
         MCP["tokens"][name] = {"access_token": got["access_token"], "expires_at": got["expires_at"],
                                "refresh_sha256": print_name}
-        MCP["problems"].pop(name, None)
+        if MCP["problems"].pop(name, None) is not None:
+            changed()
     return got["access_token"], got["expires_at"]
 
 
@@ -20371,7 +20531,8 @@ def save_mcp(body):
                 mcp_store(dict(saved, servers={k: v for k, v in saved["servers"].items() if k != name}))
             with MCP_LOCK:
                 MCP["tokens"].pop(name, None)
-                MCP["problems"].pop(name, None)
+                if MCP["problems"].pop(name, None) is not None:
+                    changed()
         emit(manager_name(), "say", f"[hub] The owner {what}. An agent gets it in its next task session.")
     return dict(result, name=name, deleted=deleting, server=None if deleting else entry)
 
@@ -20513,9 +20674,13 @@ def record_status(agent, data):
         q("UPDATE machine_checks SET state='completed', completed=?, detail=NULL, verify=?, revision=? "
           "WHERE id=? AND agent=? AND state='requested'", (now(), json.dumps(items), data.get("revision"), check, agent))
         q("UPDATE jobs SET finished=COALESCE(finished,?) WHERE agent=? AND kind='probe' AND finished IS NULL", (now(), agent))
-    q("INSERT INTO machine_status(agent,data,reported) VALUES(?,?,?) "
-      "ON CONFLICT(agent) DO UPDATE SET data=excluded.data, reported=excluded.reported", (agent, json.dumps(data), now()))
+    old = q1("SELECT data FROM machine_status WHERE agent=?", (agent,))
+    with area("state" if not old or untimed(json.loads(old["data"])) != untimed(data) else "activity"):
+        q("INSERT INTO machine_status(agent,data,reported) VALUES(?,?,?) "
+          "ON CONFLICT(agent) DO UPDATE SET data=excluded.data, reported=excluded.reported", (agent, json.dumps(data), now()))
     end_signed_in_waits(agent)          # a sign-in this report says is made is over, whatever is still waiting for it
+    if agent == manager_name():
+        manager_flag_update(now())      # the banner follows the manager's own report at once (live_changes)
     # The new runtime is loaded, nothing of the previous runtime's session is left, and a session of the new runtime
     # runs (manager_bound is not null). From now on only that session can read the manager's messages, and a question
     # on its screen, a failed start or a usage limit shows as for any manager session.
@@ -21547,7 +21712,13 @@ def last_login(agent):
 
 
 def signed_in_now(agent, runtime):
-    """What this machine last reported about that runtime: True, False or None when it has not said.
+    """Whether that runtime is signed in on the agent's machine: True, False or None when nothing recent says.
+
+    **The newest source decides, dated by when it was taken** (live_changes): the machine's reading, at the time it was
+    read (`machine_said`), or a sign-in of that runtime that ended done — the machine's own sign-in, or an install or
+    a preparation that signed it in (`finished_sign_in`) — which says signed in. Without the second, a sign-in that
+    worked read "not signed in" until the machine's next report, up to five minutes later, and the owner's setup went
+    back to its first page (25 October 2026). Nothing older than MACHINE_STALE counts, for the reason below.
 
     A reading older than MACHINE_STALE has not said: it is what that machine was, not what it is, and every other
     reader of machine_status already holds to that (`broker_report`, `switch_view`, `/ui/machines` `stale`). This
@@ -21556,11 +21727,51 @@ def signed_in_now(agent, runtime):
     "Claude Code is signed in on this machine. Its own sign-out comes first.", which is a dead end with the wrong
     reason on it. Unknown is the honest answer, and then the route refuses for the reason that is true or starts
     the sign-in."""
-    return machine_said(agent, runtime)[0]
+    said, read_at = machine_said(agent, runtime)
+    done = finished_sign_in(agent, runtime)
+    if done and done > (read_at or 0) and now() - done <= MACHINE_STALE:
+        return True
+    return said
+
+
+def finished_sign_in(agent, runtime, installed=False):
+    """When the newest sign-in of that runtime on the agent's machine ended done, or None: a sign-in job, or an
+    install or a preparation that ended done at its sign-in step, which the server service reaches only once the
+    runtime is installed and signed in (server.py sign_in_step). installed: only those, which also installed it."""
+    job = q1("SELECT MAX(updated) t FROM server_jobs WHERE agent=? AND runtime=? AND state='done' AND step='sign_in' "
+             "AND kind IN ('install','prepare')", (agent, runtime))["t"]
+    if installed:
+        return job
+    login = q1("SELECT MAX(updated) t FROM signin_jobs WHERE agent=? AND runtime=? AND state='done'",
+               (agent, runtime))["t"]
+    return max([t for t in (job, login) if t], default=None)
+
+
+def status_now(agent):
+    """Ask the agent's helper for its status now (event and helper feature status_now): a server job on its machine,
+    an install or a preparation, changed what its runtimes are, and its next report would come on its own clock, up to
+    five minutes later (live_changes). Only to a helper that knows the kind, and one at a time."""
+    st = q1("SELECT data FROM machine_status WHERE agent=?", (agent,))
+    if agent not in agents() or not st or "status_now" not in (json.loads(st["data"]).get("features") or []):
+        return
+    if not q1("SELECT id FROM events WHERE agent=? AND kind='status_now' AND helper_ack IS NULL", (agent,)):
+        emit(agent, "status_now", "Send this machine's status now.")
+
+
+def untimed(value):
+    """A reading without its times (`…_at` keys) and its age: what a report says, not when (live_changes). A report
+    that differs from the last one only there changes nothing the owner reads at once."""
+    if isinstance(value, dict):
+        return {k: untimed(v) for k, v in value.items() if not k.endswith("_at") and k != "reading_age"}
+    if isinstance(value, list):
+        return [untimed(v) for v in value]
+    return value
 
 
 def machine_said(agent, runtime):
-    """The same answer with the time of the reading it came from: (True/False/None, reported or None).
+    """The machine's own reading with the time it was taken: (True/False/None, read_at or None). read_at is the
+    report's arrival less the age its helper gave the reading (`reading_age`), so a reading that was taken before a
+    sign-in but arrived after it is older than that sign-in, as it is (live_changes).
 
     **The time is what keeps a replace alive.** A sign-in that begins while the runtime is signed in — the owner
     wants another account of the same provider — must not be closed by a reading taken before its sign-out, which
@@ -21570,10 +21781,11 @@ def machine_said(agent, runtime):
     if not row or now() - row["reported"] > MACHINE_STALE:
         return None, None
     data = json.loads(row["data"])
+    read_at = row["reported"] - reading_age_of(data.get("reading_age"))
     for where in (data.get("runtimes") or {}, {(data.get("runtime") or {}).get("name"): data.get("runtime") or {}}):
         if runtime in where and isinstance(where[runtime], dict):
-            return where[runtime].get("signed_in"), row["reported"]
-    return None, row["reported"]
+            return where[runtime].get("signed_in"), read_at
+    return None, read_at
 
 
 def end_signed_in_waits(agent, t0=None):
@@ -21770,6 +21982,19 @@ def login_for_machine(agent, lid):
     return {"stop": False, "state": row["state"], "runtime": row["runtime"], "code": code}
 
 
+def signed_in_view(agent, data):
+    """The reading's `runtime` and `runtimes` with `signed_in` as signed_in_now answers it, in the answer only: a
+    sign-in that ended after the reading says signed in, and the stored reading stays the machine's own."""
+    runtime, runtimes = data.get("runtime"), data.get("runtimes")
+    if runtime and runtime.get("name") and runtime.get("signed_in") is not True and \
+            signed_in_now(agent, runtime["name"]) is True:
+        runtime = dict(runtime, signed_in=True)
+    if isinstance(runtimes, dict):
+        runtimes = {n: dict(r, signed_in=True) if isinstance(r, dict) and r.get("signed_in") is not True and
+                    signed_in_now(agent, n) is True else r for n, r in runtimes.items()}
+    return runtime, runtimes
+
+
 def machine_rows():
     desired, t0 = kit_revision(), now()
     empty_security = {k: None for k in ("unattended_upgrades", "pending_security", "reboot_required", "firewall", "tailscale",
@@ -21792,18 +22017,19 @@ def machine_rows():
         access = {"ssh": {"user": ways["ssh_user"], "port": ways.get("ssh_port", 22), "available": seen.get("ssh")}
                   if ways.get("ssh_user") else None,
                   "screen_sharing": {"available": seen.get("screen_sharing")} if ways.get("screen_sharing") else None}
+        runtime_now, runtimes_now = signed_in_view(name, data)
         rows.append({"agent": name, "machine": a.get("machine"), "role": a.get("role"), "access": access,
                      "check": check_view(q1("SELECT * FROM machine_checks WHERE agent=? ORDER BY id DESC LIMIT 1", (name,))),
                      "address": TEAM.get("addresses", {}).get(a.get("machine")), "revision": rev, "update": update,
                      "security": data.get("security") or dict(empty_security),
-                     "runtime": data.get("runtime") or {"name": a.get("runtime"), "version": None, "signed_in": None},
+                     "runtime": runtime_now or {"name": a.get("runtime"), "version": None, "signed_in": None},
                      "os": data.get("os") or {"name": None, "kernel": None},
                      "features": data.get("features") or [],
                      "settings": dict(data["settings"], screen=data.get("screen_settings"),
                                       runtime=(data.get("runtime") or {}).get("name"))
                      if data.get("settings") is not None else None, "settings_pending": settings_pending(name),
                      "models": data.get("models"), "screen_models": data.get("screen_models"), "verify": verify_view(name),
-                     "runtimes": data.get("runtimes"), "other_runtime_windows": data.get("other_runtime_windows"),
+                     "runtimes": runtimes_now, "other_runtime_windows": data.get("other_runtime_windows"),
                      "owner_chat_bound": data.get("owner_chat_bound"), "manager_bound": data.get("manager_bound"),
                      "login": login_view(last_login(name)),       # owner feature machine_signin
                      "reported_at": st["reported"] if st else None,
@@ -22052,6 +22278,7 @@ def start_release_work(applying, automatic=False, fetch=None):
                                   args=(applying, automatic, fetch))
         _release["thread"], _release["applying"] = thread, bool(applying)       # before start: see release_applying
         thread.start()
+    changed()                   # a run that goes on is on the owner's Updates page at once (live_changes)
     return {"started": True, "applying": bool(applying), "automatic": bool(automatic),
             "revision": kit_revision(), "channel": release_channel()}
 
@@ -22343,7 +22570,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.contact(device, "device_key_mismatch", f"this is not {device}'s device key")
         if not device_may(self.path, self.command):
             return self.contact(device, "device_not_allowed", "this route is on the owner's Mac, not on a device")
-        q("UPDATE owner_devices SET last_seen=? WHERE device=?", (now(), device))
+        with area("quiet"):
+            q("UPDATE owner_devices SET last_seen=? WHERE device=?", (now(), device))
         device_contact(device, None)
         return True
 
@@ -22514,9 +22742,9 @@ class Handler(BaseHTTPRequestHandler):
                 row_id = DB.execute("INSERT INTO attachments(request_id,name,mime,size,sha256,created,client) "
                                     "VALUES(?,?,?,?,?,?,?)",
                                     (request_id, name, mime, len(data), digest, t0, client)).lastrowid
-                DB.commit()
+                commit()
             except sqlite3.IntegrityError:
-                DB.rollback()
+                rollback()
                 old = DB.execute("SELECT * FROM attachments WHERE request_id=?", (request_id,)).fetchone()
                 if not old or (old["sha256"], old["mime"], old["name"], old["client"]) != (digest, mime, name, client):
                     return self.json(409, {"error": "request_id was already used for another file"})
@@ -22610,7 +22838,9 @@ class Handler(BaseHTTPRequestHandler):
         if not self.ui_allowed():
             return
         with LOCK:
-            result = {"schema_version": 1, "db": kv_get("db_id"), "time": now(), "manager_flag": kv_get("mgr_flag"),
+            # Read under the same LOCK as the snapshot, which no write can join while it is built (live_changes).
+            result = {"schema_version": 1, "db": kv_get("db_id"), "time": now(), "token": change_token(),
+                      "manager_flag": kv_get("mgr_flag"),
                       "manager_warning": manager_warning(),
                       "ui_features": ui_features()}
             for table, key in (("tasks", "tasks"), ("notes", "notes"),
@@ -22944,8 +23174,10 @@ class Handler(BaseHTTPRequestHandler):
         reading = {k: data[k] for k in ("revision", "os", "security", "runtimes", "access")}
         if secret_hit(json.dumps(reading)):
             return self.json(422, {"error": "registered login refused"})
-        q("INSERT INTO server_status(server,data,reported) VALUES(?,?,?) ON CONFLICT(server) DO UPDATE SET "
-          "data=excluded.data, reported=excluded.reported", (name, json.dumps(reading), now()))
+        old = q1("SELECT data FROM server_status WHERE server=?", (name,))
+        with area("state" if not old or untimed(json.loads(old["data"])) != untimed(reading) else "activity"):
+            q("INSERT INTO server_status(server,data,reported) VALUES(?,?,?) ON CONFLICT(server) DO UPDATE SET "
+              "data=excluded.data, reported=excluded.reported", (name, json.dumps(reading), now()))
         return self.json(200, {"ok": True, "desired_revision": kit_revision()})
 
     def server_jobs(self, name):
@@ -23003,6 +23235,8 @@ class Handler(BaseHTTPRequestHandler):
                json.dumps(update["prompt"]) if update["prompt"] else None, now(), job))
         if update["state"] in ("done", "failed"):
             log("hub", f"server {name}: job {job} ({row['kind']} {row['agent']}) {update['state']}")
+            if row["kind"] in ("install", "prepare"):
+                status_now(row["agent"])
         return self.json(200, {"ok": True, "state": update["state"]})
 
     def ui_team_reload(self):
@@ -23195,8 +23429,34 @@ class Handler(BaseHTTPRequestHandler):
         if query.get("db") != generation:
             return self.json(409, {"error": "hub generation changed; refresh state"})
         with LOCK:
-            result = dict(health_view(), db=generation)
+            result = dict(health_view(), db=generation, changes=change_counts())
         return self.json(200, scrub(result), {"Cache-Control": "no-store"})
+
+    def ui_wait(self, query):
+        """GET /ui/wait?db=&since=&wait= (owner feature live_changes): answers when something the owner sees changed
+        since `since`, the token of /ui/state or of an earlier wait, or after `wait` seconds (at most WAIT_MAX) with
+        the token unchanged. Only its boot and its `state` part count, so a hub that restarted answers at once.
+        Nothing is held while it waits: not LOCK, and no row is written."""
+        if not self.ui_allowed():
+            return
+        generation = kv_get("db_id")
+        if query.get("db") != generation:
+            return self.json(409, {"error": "hub generation changed; refresh state"})
+        try:
+            wait = max(0.0, min(float(query.get("wait") or WAIT_MAX), WAIT_MAX))
+        except ValueError:
+            return self.json(400, {"db": generation, "error": "wait must be a number of seconds"})
+        boot, _, rest = str(query.get("since") or "").partition(".")
+        state = rest.partition(".")[0]
+        with CHANGES:
+            CHANGE_WAITS[0] += 1
+            try:
+                news = CHANGES.wait_for(lambda: boot != CHANGE["boot"] or state != str(CHANGE["state"]), timeout=wait)
+            finally:
+                CHANGE_WAITS[0] -= 1
+        if news and wait:
+            time.sleep(WAIT_GATHER)
+        return self.json(200, {"db": generation, "token": change_token()}, {"Cache-Control": "no-store"})
 
     def ui_backup(self, query):
         """One copy of this fleet for the owner's own machine: the records, the owner's own configuration, a
@@ -23716,7 +23976,8 @@ class Handler(BaseHTTPRequestHandler):
                 if got["refresh_token"]:
                     MCP["tokens"][name] = {"access_token": got["access_token"], "expires_at": got["expires_at"],
                                            "refresh_sha256": hashlib.sha256(got["refresh_token"].encode()).hexdigest()}
-                MCP["problems"].pop(name, None)
+                if MCP["problems"].pop(name, None) is not None:
+                    changed()
             log("owner", f"connected the MCP server {name}" + (" again" if replaced else "") +
                 (f" ({len(about['tools'])} tools)" if about.get("tools") else ""))
             emit(manager_name(), "say", f"[hub] The owner connected the MCP server {name}. An agent that has it gets "
@@ -23745,7 +24006,8 @@ class Handler(BaseHTTPRequestHandler):
                 mcp_store(dict(saved, servers={k: v for k, v in saved["servers"].items() if k != name}))
             with MCP_LOCK:
                 MCP["tokens"].pop(name, None)
-                MCP["problems"].pop(name, None)
+                if MCP["problems"].pop(name, None) is not None:
+                    changed()
             log("owner", f"disconnected the MCP server {name}")
             return {"name": name, "connected": False}
         return self.ui_command("mcp/disconnect", read, act)
@@ -23873,6 +24135,7 @@ class Handler(BaseHTTPRequestHandler):
             with GOOGLE_LOCK:
                 GOOGLE["tokens"].pop(email, None)
                 GOOGLE["problems"].pop(email, None)
+            changed()
             log("owner", f"connected the Google account {email}" + (" again" if replaced else ""))
             emit(manager_name(), "say", f"[hub] The owner connected the Google account {email}.")
             return {"email": email, "scopes": google_scopes(accounts[email]), "connected": True, "replaced": replaced}
@@ -24825,7 +25088,7 @@ class Handler(BaseHTTPRequestHandler):
             created = now()
             # The event, receipt, optional answer and the links of the files commit together. No helper ack claims
             # delivery.
-            with DB:
+            with committed():
                 # edit_in_place: an edit of a message that nothing has read is that message with other words, and
                 # not a correction under it. The question is asked here, inside the write, so a read_messages of
                 # the same moment wins and this edit falls back to a correction.
@@ -24995,7 +25258,10 @@ class Handler(BaseHTTPRequestHandler):
                                                       "error}"})
         with LOCK:
             t0 = now()
-            with transaction():
+            fields = ("state", "user", "name", "application_id", "error")
+            known = {r["account"]: tuple(r[k] for k in fields) for r in q("SELECT * FROM chat_status")}
+            news = any(a["id"] in chat_apps() and known.get(a["id"]) != tuple(a.get(k) for k in fields) for a in rows)
+            with area("state" if news else "quiet"), transaction():      # its time keeps moving, quietly
                 for a in rows:
                     if a["id"] in chat_apps():
                         DB.execute("INSERT INTO chat_status(account,state,user,name,application_id,error,at) "
@@ -25650,6 +25916,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.helper_trigger_code(parts[2], int(parts[3]), query)
         if parts == ["ui", "state"]:
             return self.ui_state()
+        if parts == ["ui", "wait"]:                     # owner feature live_changes
+            return self.ui_wait(query)
         if len(parts) == 3 and parts[:2] == ["ui", "attachments"]:
             return self.ui_attachment_file(parts[2], query)
         if len(parts) == 3 and parts[:2] == ["attachment", "file"]:
@@ -25868,7 +26136,16 @@ class Handler(BaseHTTPRequestHandler):
         wait = max(0, min(int(query.get("wait") or 25), 50))
         touch(agent)
         if "alive" in query:
-            q("UPDATE agents SET alive=?, alive_ts=? WHERE name=?", (query["alive"], now(), agent))
+            # The window list counts only when it changes; its time is quiet (live_changes). The manager's banner
+            # follows a change of its windows at once, not at the next tick.
+            with area("quiet"):
+                q("UPDATE agents SET alive_ts=? WHERE name=?", (now(), agent))
+            with LOCK:
+                moved = DB.execute("UPDATE agents SET alive=? WHERE name=? AND alive IS NOT ?",
+                                   (query["alive"], agent, query["alive"])).rowcount
+                commit()
+            if moved and agent == manager_name():
+                manager_flag_update(now())
         newest = q1("SELECT COALESCE(MAX(id),0) m FROM events")["m"]
         if after < 0:
             # The helper asks this before it starts the standing session, for the DB generation its credential and
@@ -25935,6 +26212,11 @@ class Handler(BaseHTTPRequestHandler):
                     if r["kind"] == "check" and not q1("SELECT id FROM machine_checks WHERE id=? AND state='requested'",
                                                          (extra.get("check"),)):
                         continue
+                    if r["kind"] == "login" and not q1(f"SELECT id FROM signin_jobs WHERE id=? AND {LOGIN_OPEN}",
+                                                         (extra.get("login"),)):
+                        # A sign-in that is over is never handed out again: a late "use another account" would sign
+                        # the runtime out first and learn only at its next step that the sign-in had ended.
+                        continue
                     if r["kind"] == "mcp_program" and not mcp_probe_waiting(extra.get("probe")):
                         continue        # owner feature mcp_program: the owner's check gave up, so this asks nobody
                     if r["kind"] == "outputs" and not outputs_waiting(extra.get("outputs"), agent):
@@ -25975,7 +26257,11 @@ class Handler(BaseHTTPRequestHandler):
             asked = {r["id"] for r in q("SELECT id FROM jobs WHERE finished IS NULL")}
             carried = {r["id"] for r in q("SELECT id FROM deposits WHERE finished IS NULL")}
             taken = {r["id"] for r in q("SELECT id FROM withdrawals WHERE finished IS NULL")}
+            # A sign-in whose job is over is never handed out again: a late "use another account" would sign the
+            # runtime out first and learn only at its next step that its sign-in had already ended (live_changes).
+            open_logins = {r["id"] for r in q(f"SELECT id FROM signin_jobs WHERE {LOGIN_OPEN}")}
             rows = [r for r in rows if not (r["kind"] == "task" and r["task"] in done)
+                    and not (r["kind"] == "login" and json.loads(r["extra"] or "{}").get("login") not in open_logins)
                     and not (r["kind"] in ("signin", "handover", "create", "capture", "request")
                              and json.loads(r["extra"] or "{}").get("job") not in asked)
                     and not (r["kind"] == "deposit" and json.loads(r["extra"] or "{}").get("deposit") not in carried)
@@ -26041,8 +26327,9 @@ class Handler(BaseHTTPRequestHandler):
                                         "until": float(kv_get("runtime_since:" + agent) or 0) or None}
                 elif stored:
                     data["previous"] = stored
-                q("INSERT INTO agent_usage(name,data) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET data=excluded.data",
-                  (agent, json.dumps(data)))
+                with area("activity"):         # a usage reading comes every 30 s: the apps read it on their clock
+                    q("INSERT INTO agent_usage(name,data) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET data=excluded.data",
+                      (agent, json.dumps(data)))
             return self.json(200, {"ok": True})
         if parts == ["ui", "messages"]:
             return self.ui_submit()
@@ -27148,7 +27435,7 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             last = q1("SELECT COALESCE(MAX(seq),0) m FROM thread_events WHERE task=? AND attempt=? AND session=?", key)["m"]
             count = q1("SELECT COUNT(*) n FROM thread_events WHERE task=? AND attempt=?", (tid, attempt))["n"]
-            with DB:
+            with area("activity"), committed():         # thread records: the apps read them on their own clock
                 for seq, ts, kind, data in records:
                     if seq <= last:
                         continue
@@ -27169,7 +27456,8 @@ class Handler(BaseHTTPRequestHandler):
             last = max([last] + [e["seq"] for e in events if isinstance(e, dict) and isinstance(e.get("seq"), int)
                                  and not isinstance(e["seq"], bool)])      # skipped records count as taken
             if stored and attempt == t["attempt"] and t["state"] not in TERMINAL:
-                activity(tid)
+                with area("activity"):
+                    activity(tid)
             for data in limits:
                 start_limit(agent, data["resets_at"], tid)
             if not failed and app_server_task(agents()[agent], t["needs"]) and attempt == t["attempt"]:
@@ -27412,7 +27700,9 @@ def rpc(agent, m, headers, context=None):
             headers["Mcp-Session-Id"] = uuid.uuid4().hex
             info = params.get("clientInfo") or {}
             client = " ".join(CONTROL.sub(" ", f"{info.get('name') or 'a client'} {info.get('version') or ''}").split())
-            q("UPDATE agents SET client=?, client_seen=? WHERE name=?", (client[:60], now(), agent))
+            q("UPDATE agents SET client=? WHERE name=? AND client IS NOT ?", (client[:60], agent, client[:60]))
+            with area("quiet"):
+                q("UPDATE agents SET client_seen=? WHERE name=?", (now(), agent))
             result = {"protocolVersion": want if want in SUPPORTED_PROTOCOLS else SUPPORTED_PROTOCOLS[1],
                       "capabilities": {"tools": {"listChanged": False}},
                       "serverInfo": {"name": "founderizer-hub", "version": "0.1"},
@@ -27433,7 +27723,8 @@ def rpc(agent, m, headers, context=None):
             if context is None and agents().get(agent, {}).get("role") == "manager":
                 kv_set("tools:" + agent, tool_contract(agent))
         elif method == "tools/call":
-            q("UPDATE agents SET client_seen=? WHERE name=? AND client IS NOT NULL", (now(), agent))
+            with area("quiet"):
+                q("UPDATE agents SET client_seen=? WHERE name=? AND client IS NOT NULL", (now(), agent))
             text, is_error = call_tool(agent, params.get("name"), params.get("arguments") or {}, context)
             result = {"content": [{"type": "text", "text": text}], "isError": is_error}
         elif method == "resources/list":

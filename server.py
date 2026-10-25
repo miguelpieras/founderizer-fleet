@@ -731,7 +731,7 @@ class Service:
         while self.clock() < deadline:
             if life.runtime(runtime)["signed_in"] is True:
                 return
-            self.sleep(5)
+            self.sleep(2)           # the owner's sign-in shows as soon as it is made (live_changes)
         raise StepFailed("sign_in", f"{LABELS[runtime]} did not sign in within 15 minutes. Try again in Fleet.")
 
     # ---- updates
