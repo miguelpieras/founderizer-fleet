@@ -157,8 +157,9 @@ installer's own step for it is step 11, and three things follow from it:
   `/home/fleet-<agent>/fleet-<agent>` on the configuration ref. So no agent pushes to
   the hub's bare repository through the filesystem any more — the manager could while it
   shared the hub's own user, and it is now in the same position as every other agent of
-  a fleet these installers make: fetch only ("Not part of this installer"). The hub
-  itself still commits the owner's own files.
+  a fleet these installers make: fetch only. The hub itself commits the owner's own
+  files, and each task's output, which the agent's helper sends to it when the agent
+  delivers (RULES.md, "Where work goes").
 - **`verify` reads each agent as its own user** (PRODUCT.md 4.1 keeps its check ids; a
   reading it cannot take warns), which is why the root helper of step 8 exists.
 
@@ -383,8 +384,8 @@ cannot add a machine of its own and take every secret in one call.
 
 - **Worker push keys.** None. The separate push listener (`fleet-git-push`, port 9419)
   was retired on 25 October 2026 at the owner's word, and the tailnet no longer admits
-  that port to the hub. A worker fetches but cannot push, and it reports its output in
-  its result instead.
+  that port to the hub. A worker fetches but cannot push: its helper sends a delivered
+  task's output to the hub on its usual port, and the hub commits it.
 - **A vault broker**, which an agent needs before it can use a saved login
   (WORKER-INSTALL.md, "Vault broker"). The hub itself needs none: the manager holds no
   credential. A joined machine's broker is installed by its own join line and brought onto

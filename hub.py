@@ -1093,7 +1093,7 @@ def filed_under(agent, kind, task):
 
 def emit(agent, kind, text, task=None, extra=None):
     """Queue a message for one agent's helper. Kinds: task, say, chat, stop, control, signin, handover, create,
-    capture, request, deposit, withdraw, notify, mcp_program, manager_start."""
+    capture, request, deposit, withdraw, notify, mcp_program, manager_start, outputs."""
     return ins(EVENT, (agent, kind, filed_under(agent, kind, task), str(text), now(), json.dumps(extra or {})))
 
 
@@ -3447,7 +3447,132 @@ def work_was_hard(t):
     return None
 
 
+# ---------------------------------------------------------------- task outputs (helper feature task_outputs)
+# The owner, 25 October 2026, when the worker push listener on port 9419 was retired: "when an agent delivers, its
+# helper sends the files of that task's outputs folder to the hub on port 8765, and the hub adds only those files to
+# config. No new port, key or screen." Every checkout is a clone over git://, which is fetch only, so this is how a
+# task's files reach the configuration ref. deliver_result asks the helper of the session for outputs/T-<id>/ and
+# waits for the files before the task closes, so the result that the requester reads names a commit that holds them.
+OUTPUTS_FEATURE = "task_outputs"        # the helper step that answers; an older helper is not asked
+OUTPUTS_WAIT = 30                       # seconds for the files to arrive. The helper polls every few seconds, and
+                                        # with the commit after it a delivery stays inside the minute Codex gives a call.
+OUTPUTS_STEP = 0.25
+OUTPUTS_FILES = 100                     # files of one delivery
+OUTPUTS_FILE_MAX = 8 * 1024 * 1024      # bytes of one file: the largest image the owner's app shows (task_artifacts)
+OUTPUTS_TOTAL_MAX = 24 * 1024 * 1024    # bytes of one delivery
+OUTPUTS_BODY_MAX = 34 * 1024 * 1024     # the helper's POST: the files in base64 and the JSON around them
+OUTPUTS_DEPTH = 6                       # names below outputs/T-<id>/, the file's own included
+OUTPUTS_NAME = r"[A-Za-z0-9_][A-Za-z0-9._+-]{0,119}"   # one of them: no dot or dash first, so no ".." and no option
+# Only in the hub's memory, as the MCP program checks are: each delivery that waits for its files. A restart ends the
+# call that waited, and the agent's deliver_result, which then failed, sends its files again.
+OUTPUTS = {}
+OUTPUTS_LOCK = threading.Lock()
+
+
+def outputs_allow(ref):
+    """The paths that a delivery of task `ref` (T-<id>) may commit: files inside outputs/<ref>/ and nothing else."""
+    return re.compile(re.escape(f"outputs/{ref}/") + f"(?:{OUTPUTS_NAME}/){{0,{OUTPUTS_DEPTH - 1}}}{OUTPUTS_NAME}\\Z")
+
+
+def outputs_waiting(token, agent):
+    """True while a delivery of this agent still waits for its files: the hub hands its helper no older request."""
+    with OUTPUTS_LOCK:
+        o = OUTPUTS.get(token) if isinstance(token, str) else None
+        return bool(o) and o["agent"] == agent and o["answer"] is None and not o["gave_up"]
+
+
+def outputs_answer(agent, token, ref, files, skipped):
+    """One helper's files for the delivery that waits for them (POST /helper/outputs/<agent>), already checked. False
+    when no delivery waits for them any more: one that gave up, an answer that came twice, another agent's token."""
+    with OUTPUTS_LOCK:
+        o = OUTPUTS.get(token) if isinstance(token, str) else None
+        if not o or o["agent"] != agent or tref(o["task"]) != ref or o["answer"] is not None or o["gave_up"]:
+            return False
+        o["answer"] = {"files": files, "skipped": skipped}
+        return True
+
+
+def commit_outputs(agent, t, files):
+    """Commit the files of one delivery to the configuration ref, signed by the agent. Files that the ref holds
+    already with these bytes need no commit, so a deliver_result that comes again adds nothing. Returns the commit
+    that holds them all."""
+    ref = tref(t["id"])
+    rev = kit_revision(fresh=True)
+    changed = {path: data for path, data in sorted(files.items()) if git_blob(rev, path) != data}
+    if not changed:
+        return rev
+    title = " ".join(str(t["title"] or "").split())[:200]
+    message = (f"{agent} delivered {ref}: {len(changed)} file{'' if len(changed) == 1 else 's'} of its output\n\n"
+               f"{title}\n\nThe agent's helper sent the files of outputs/{ref}/ when the agent delivered, and the hub "
+               f"commits only those (the owner, 25 October 2026): a checkout over git:// cannot push.")
+    first, *rest = changed
+    for attempt in range(3):
+        try:
+            return commit_kit_file(first, changed[first], message, more={p: changed[p] for p in rest}, author=agent,
+                                   allow=outputs_allow(ref))
+        except Refusal as e:
+            if e.status != 409 or attempt == 2:
+                raise
+            time.sleep(0.5)             # another write of the configuration ref came first: this one goes on top
+
+
+def deliver_outputs(agent, t):
+    """What a delivery of task t says about the files of its outputs folder: the session's helper sends them, the hub
+    commits them, and this returns the sentence for the result ("" for a folder with no file). Called without LOCK,
+    because it waits for the helper; it changes nothing but the configuration ref."""
+    ref = tref(t["id"])
+    folder = f"outputs/{ref}/"
+    if OUTPUTS_FEATURE not in helper_features(agent):
+        return ""           # a helper from before this: it updates when it is idle, and until then sends nothing
+    token = secrets.token_urlsafe(16)
+    with OUTPUTS_LOCK:
+        OUTPUTS[token] = {"agent": agent, "task": t["id"], "answer": None, "gave_up": False}
+    try:
+        emit(agent, "outputs", f"Send the files of {folder}", extra={"outputs": token, "task": ref})
+        deadline = time.monotonic() + OUTPUTS_WAIT      # not now(): a test's frozen clock would wait for ever
+        while True:
+            with OUTPUTS_LOCK:
+                o = OUTPUTS[token]
+                if o["answer"] is None and time.monotonic() >= deadline:
+                    o["gave_up"] = True         # an answer that comes later is refused, so nothing lands unsaid
+                if o["answer"] is not None or o["gave_up"]:
+                    break
+            time.sleep(OUTPUTS_STEP)
+    finally:
+        with OUTPUTS_LOCK:
+            o = OUTPUTS.pop(token)
+    if o["answer"] is None:
+        return f"{agent}'s helper did not answer within {OUTPUTS_WAIT} seconds, so no file of {folder} was committed."
+    files, skipped = o["answer"]["files"], o["answer"]["skipped"]
+    left = ("Not sent: " + "; ".join(f"{s['path']} ({s['why']})" for s in skipped[:10])
+            + (f"; and {len(skipped) - 10} more" if len(skipped) > 10 else "") + ".") if skipped else ""
+    if not files:
+        return left
+    if (q1("SELECT state FROM tasks WHERE id=?", (t["id"],)) or {"state": "canceled"})["state"] in TERMINAL:
+        return left                     # ended while the files came: the delivery is refused, so nothing is committed
+    try:
+        commit = commit_outputs(agent, t, files)
+    except Refusal as e:
+        return f"The files of {folder} did not reach the configuration ref: {e}. " + left
+    names = sorted(files)
+    return (f"Its files are on the configuration ref as {commit[:12]}: {', '.join(names[:10])}"
+            + (f" and {len(names) - 10} more" if len(names) > 10 else "") + "." + (" " + left if left else ""))
+
+
 def t_deliver_result(agent, a):
+    """deliver_result, called without LOCK (call_tool): it waits for the session's helper to send the files of the
+    task's outputs folder, which the hub commits before the task closes (deliver_outputs). Every refusal comes before
+    that wait, and the task is read again after it, under LOCK both times."""
+    with LOCK:
+        t = deliver_result(agent, a)            # the checks only: nothing is written yet
+    files_said = deliver_outputs(agent, t)
+    with LOCK:
+        return deliver_result(agent, a, files_said)
+
+
+def deliver_result(agent, a, files_said=None):
+    """Without files_said, the checks of a delivery and its task, and nothing written; with deliver_outputs's
+    sentence about the task's files, the delivery itself."""
     tid = parse_task(a.get("task_id"))
     outcome = str(a.get("outcome") or "completed").strip().lower()
     what = str(a.get("what_was_done") or "").strip()
@@ -3475,6 +3600,7 @@ def t_deliver_result(agent, a):
     if outcome == "completed" and (not where or not how):
         raise ToolError("A completed result needs where_output_is and how_checked.")
     guard(agent, what, where, how, learned or "", prevents or "", tried or "", str(a.get("recheck") or ""))
+    fence(agent, tid)                   # again here: a cancel or a Stop can land while the helper sends the files
     t = get_task(tid, owner=agent)
     if t["state"] in TERMINAL:
         raise ToolError(f"{tref(tid)} is already {t['state']}. A finished task is never reopened.")
@@ -3492,6 +3618,8 @@ def t_deliver_result(agent, a):
         raise ToolError(f"{tref(tid)} has subtask results that you have not checked: "
                         f"{', '.join(tref(r['id']) for r in unchecked)}. Check each with check_result first: after "
                         f"you deliver, nobody can.")
+    if files_said is None:
+        return t
     q("UPDATE tasks SET state=?, outcome=?, what=?, where_=?, how=?, delivered=?, waiting_on=NULL WHERE id=?",
       (outcome, outcome, what, where, how, now(), tid))
     unfile_notices(tid)
@@ -3528,10 +3656,12 @@ def t_deliver_result(agent, a):
     left = case_left_open_text(left) + " " if left else ""
     emit(t["requester"], "say",
          f"[hub] Result for {tref(tid)} ({t['title']}) from {agent}: {outcome}. Done: {what.rstrip('.')}. "
-         f"Output: {(where or '-').rstrip('.')}. Checked: {(how or '-').rstrip('.')}. "
+         f"Output: {(where or '-').rstrip('.')}. " + (files_said + " " if files_said else "") +
+         f"Checked: {(how or '-').rstrip('.')}. "
          + went_on_with(tid) + step_stands_text(t["step"]) + left +
          f"-- Check it, then call check_result(task_id=\"{tref(tid)}\", accepted=true or false).", task=tid)
-    return f"Delivered. {tref(tid)} is {outcome}.{said} You are done with it: stop now."
+    return f"Delivered. {tref(tid)} is {outcome}." + (" " + files_said if files_said else "") + \
+        f"{said} You are done with it: stop now."
 
 
 # set_duty and change_duty are here again by the owner's decision of 20 October 2026 ("manager should also act as a
@@ -13880,7 +14010,10 @@ TOOLS = [
        ["task_id", "question"])),
     ("worker", "deliver_result", t_deliver_result,
      "Finish a task. outcome is completed, failed or rejected. Say what was done, where the output is, "
-     "and how you checked it. After this call the task is closed for good. If the work taught you something worth "
+     "and how you checked it. Put your output files in outputs/T-<id>/ before you call it, and do not commit them: "
+     "your helper then sends that folder (but not its computer-use/ captures) to the hub, which commits it to the "
+     "configuration ref, and the reply names the commit. After this call the task is closed for good. If the work "
+     "taught you something worth "
      "having in your next sessions, say it in learned, with what you expect it to prevent: this is the only moment "
      "an ordinary task offers, and nothing will ask again. And if you hit a wall — a thing that cannot be done the "
      "way you tried, an approach that wasted hours — say that in tried, with what it cost. A dead end is the "
@@ -14716,8 +14849,9 @@ def call_tool(agent, name, args, context=None):
         for r, tname, fn, desc, schema in TOOLS:
             if tname == name and (r in (role, "all") or (role == "lead" and (r == "worker" or name in LEAD_TEAM_TOOLS))):
                 # These wait for an answer, a helper or Google, or read many files (search_knowledge): not under LOCK.
+                # deliver_result waits for the helper to send the task's files (deliver_outputs).
                 if name in ("ask_my_requester", "sign_in", "hand_over", "create_login", "save_key", "call_api",
-                            "message_agent", "search_knowledge", "write_knowledge") or \
+                            "message_agent", "search_knowledge", "write_knowledge", "deliver_result") or \
                         name in GOOGLE_TOOLS:
                     text = fn(agent, args)
                 else:
@@ -25472,6 +25606,9 @@ class Handler(BaseHTTPRequestHandler):
             if self.path.startswith("/helper/desktop/") and not 0 <= n <= 1500000:
                 self.close_connection = True
                 return self.json(413, {"error": "desktop frame is too large"})
+            if self.path.startswith("/helper/outputs/") and not 0 <= n <= OUTPUTS_BODY_MAX:
+                self.close_connection = True
+                return self.json(413, {"error": f"one delivery's files are at most {OUTPUTS_TOTAL_MAX // MIB} MiB"})
             if self.path.startswith("/bridge/") and not 0 <= n <= MIB:
                 self.close_connection = True
                 return self.json(413, {"db": kv_get("db_id"), "error": "a bridge body is at most 1 MiB"})
@@ -25800,6 +25937,8 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                     if r["kind"] == "mcp_program" and not mcp_probe_waiting(extra.get("probe")):
                         continue        # owner feature mcp_program: the owner's check gave up, so this asks nobody
+                    if r["kind"] == "outputs" and not outputs_waiting(extra.get("outputs"), agent):
+                        continue        # helper feature task_outputs: the delivery no longer waits for these files
                     if r["kind"] in ("signin", "handover", "create", "capture", "request") and not q1("SELECT id FROM jobs WHERE id=? AND finished IS NULL", (extra.get("job"),)):
                         continue
                     if r["kind"] == "deposit" and not deposit_waiting(extra.get("deposit"), agent):
@@ -26098,6 +26237,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.helper_integrations(parts[2])
         if parts[:3] == ["helper", "mcp", "program"] and len(parts) == 4:
             return self.helper_mcp_program(parts[3])
+        if parts[:2] == ["helper", "outputs"] and len(parts) == 3:
+            return self.helper_outputs(parts[2])
         if parts[:2] == ["helper", "vault"] and len(parts) == 3:
             return self.helper_vault(parts[2])
         if parts[:2] == ["helper", "vault"] and len(parts) == 4 and parts[3] == "fingerprints":
@@ -26445,6 +26586,57 @@ class Handler(BaseHTTPRequestHandler):
         if path is not None and not (isinstance(path, str) and 0 < len(path) <= 500):
             return self.json(400, {"error": "path must be the resolved program, or null"})
         return self.json(200, {"taken": mcp_probe_answer(agent, f.get("probe"), found, path if found else None)})
+
+    def helper_outputs(self, agent):
+        """POST /helper/outputs/<agent>: the files of one task's outputs folder, which this agent's helper sends when
+        a delivery asks for them (helper feature task_outputs, deliver_outputs). Every file is checked here, and the
+        delivery that waits commits them. A file that holds a registered secret is left out and named; so is each
+        file the helper itself did not send. `taken` is false when no delivery waits for these files any more."""
+        if agent not in agents():
+            return self.json(404, {"error": "unknown agent"})
+        if not self.allowed(agent):
+            return
+        f = self.form()
+        token, ref, sent, unsent = f.get("outputs"), f.get("task"), f.get("files"), f.get("skipped") or []
+        if not isinstance(ref, str) or not re.fullmatch(r"T-[1-9][0-9]{0,17}", ref):
+            return self.json(400, {"error": "task must be T-<id>"})
+        if not isinstance(sent, list) or len(sent) > OUTPUTS_FILES or not isinstance(unsent, list):
+            return self.json(400, {"error": f"files must be a list of at most {OUTPUTS_FILES}, skipped a list"})
+        if not outputs_waiting(token, agent):
+            return self.json(200, {"taken": False})
+        allow, files, skipped, seen, total = outputs_allow(ref), {}, [], set(), 0
+        for one in sent:
+            path = one.get("path") if isinstance(one, dict) else None
+            if not isinstance(path, str) or len(path) > 400 or not allow.match(path):
+                return self.json(400, {"error": f"{str(path)[:200]} is not a file of outputs/{ref}/"})
+            if path.lower() in seen:        # two names that differ only in case are one file on a Mac
+                skipped.append({"path": path, "why": "another file has this name in other letter case"})
+                continue
+            seen.add(path.lower())
+            try:
+                data = base64.b64decode(one.get("data") if isinstance(one.get("data"), str) else "", validate=True)
+            except ValueError:
+                return self.json(400, {"error": f"{path}: data must be base64"})
+            total += len(data)
+            if len(data) > OUTPUTS_FILE_MAX or total > OUTPUTS_TOTAL_MAX:
+                return self.json(413, {"error": f"a file is at most {OUTPUTS_FILE_MAX // MIB} MiB and one delivery "
+                                                f"{OUTPUTS_TOTAL_MAX // MIB} MiB"})
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                text = None                 # an image: what the owner's app shows of it is checked there
+            if text is not None and secret_hit(text):
+                skipped.append({"path": path, "why": "it holds a registered secret"})
+                continue
+            files[path] = data
+        for one in unsent[:50]:             # what the helper did not send, and why: said in the result as it is
+            one = one if isinstance(one, dict) else {}
+            path = LINE_CONTROL.sub("", " ".join(str(one.get("path") or "").split()))[:200]
+            why = LINE_CONTROL.sub("", " ".join(str(one.get("why") or "").split()))[:120]
+            if path and why:
+                skipped.append({"path": "a file whose name holds a registered secret" if secret_hit(path) else path,
+                                "why": "a registered secret" if secret_hit(why) else why})
+        return self.json(200, {"taken": outputs_answer(agent, token, ref, files, skipped)})
 
     def ui_agent_key(self, agent):
         """The owner registers, replaces or removes an agent's key (owner API 1.12), also for an agent that team.json

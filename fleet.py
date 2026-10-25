@@ -1936,6 +1936,74 @@ def run_source(extra, source, result, fail):
     return fail("bad_output", "the check must print {value, summary} or {error, detail, retry_after}")
 
 
+# ---------------------------------------------------------------- task outputs (helper feature task_outputs)
+# When its agent delivers a task, the hub asks this helper for the files of outputs/T-<id>/ and commits them to the
+# configuration ref (the hub's deliver_outputs): a checkout over git:// cannot push. The limits are the hub's own.
+# computer-use/ stays here: Fleet saves every screenshot of a screen task there by itself, and the agent copies the
+# one that shows the result into the folder.
+OUTPUT_FILES = 100
+OUTPUT_FILE_MAX = 8 * 1024 * 1024
+OUTPUT_TOTAL_MAX = 24 * 1024 * 1024
+OUTPUT_DEPTH = 6                        # names below outputs/T-<id>/, the file's own included
+OUTPUT_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._+-]{0,119}")
+OUTPUT_CAPTURES = "computer-use"
+OUTPUT_BAD_NAME = "its name has a character other than letters, digits and . _ + -, or starts with one of . -"
+
+
+def collect_outputs(kit, ref):
+    """([{path, data}], [{path, why}]) of outputs/<ref>/ in this checkout: its regular files in name order, each in
+    base64, inside the hub's limits. A name that starts with a dot (.DS_Store) is left out without a word; each other
+    file that is not sent is listed with why, and the result of the delivery says it."""
+    root = os.path.join(kit, "outputs", ref)
+    files, skipped, total = [], [], 0
+    if os.path.islink(root) or not os.path.isdir(root):
+        return files, skipped
+    for here, dirs, names in os.walk(root):
+        rel = os.path.relpath(here, kit).replace(os.sep, "/")
+        depth = rel.count("/") - 1          # names below outputs/<ref>/ of this folder
+        keep = []
+        for name in sorted(dirs):
+            path = f"{rel}/{name}/"
+            if name.startswith(".") or (here == root and name == OUTPUT_CAPTURES):
+                continue
+            why = ("a symbolic link" if os.path.islink(os.path.join(here, name)) else
+                   OUTPUT_BAD_NAME if not OUTPUT_NAME.fullmatch(name) else
+                   f"deeper than {OUTPUT_DEPTH} names" if depth + 1 >= OUTPUT_DEPTH else None)
+            if why:
+                skipped.append({"path": path, "why": why})
+            else:
+                keep.append(name)
+        dirs[:] = keep
+        for name in sorted(names):
+            path, full = f"{rel}/{name}", os.path.join(here, name)
+            try:
+                st = os.lstat(full)
+            except OSError:
+                continue
+            if name.startswith("."):
+                continue
+            why = ("not a regular file" if not stat.S_ISREG(st.st_mode) else
+                   OUTPUT_BAD_NAME if not OUTPUT_NAME.fullmatch(name) else
+                   f"over {OUTPUT_FILE_MAX // (1024 * 1024)} MiB" if st.st_size > OUTPUT_FILE_MAX else
+                   f"more than {OUTPUT_FILES} files" if len(files) >= OUTPUT_FILES else
+                   f"over {OUTPUT_TOTAL_MAX // (1024 * 1024)} MiB in all" if total + st.st_size > OUTPUT_TOTAL_MAX
+                   else None)
+            if not why:
+                try:
+                    with os.fdopen(os.open(full, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)), "rb") as f:
+                        data = f.read(OUTPUT_FILE_MAX + 1)
+                except OSError:
+                    data, why = b"", "it could not be read"
+                if not why and (len(data) > OUTPUT_FILE_MAX or total + len(data) > OUTPUT_TOTAL_MAX):
+                    why = "it grew while it was read"
+            if why:
+                skipped.append({"path": path, "why": why})
+                continue
+            total += len(data)
+            files.append({"path": path, "data": base64.b64encode(data).decode("ascii")})
+    return files, skipped
+
+
 class Helper:
     def __init__(self, agent, conf):
         self.agent, self.conf, self.session = agent, conf, f"fleet-{agent}"
@@ -2470,6 +2538,8 @@ class Helper:
             self.trigger_check(extra)
         elif kind == "mcp_program":
             self.mcp_program(extra)
+        elif kind == "outputs":
+            self.send_outputs(extra)
         if kind not in ("say", "task", "chat"):
             code, data = http("POST", f"/helper/ack/{self.agent}", {"ids": [ev["id"]]})
             if code != 200:
@@ -2490,6 +2560,24 @@ class Helper:
                        {"probe": probe, "found": bool(found), "path": found}, timeout=10)
         if code != 200:
             raise Refused(f"the hub did not take the answer about {command} ({code})")
+
+    def send_outputs(self, extra):
+        """The agent delivered a task, and the hub asks for the files of its outputs folder, which it commits to the
+        configuration ref (helper feature task_outputs). The delivery waits for them, so they go at once and in this
+        loop. A hub that does not answer leaves the event pending, and the next poll sends the files again while the
+        delivery still waits; a refusal is logged and ends it, because the same files would be refused again."""
+        ref, token = extra.get("task"), extra.get("outputs")
+        if not (isinstance(ref, str) and re.fullmatch(r"T-[1-9][0-9]*", ref) and isinstance(token, str)):
+            raise Refused("invalid outputs request")
+        files, skipped = collect_outputs(KIT, ref)
+        code, data = http("POST", f"/helper/outputs/{self.agent}",
+                          {"outputs": token, "task": ref, "files": files, "skipped": skipped}, timeout=120)
+        if code != 200:
+            self.say(f"{ref}: the hub refused the output files ({code}): {str(data.get('error') or '')[:200]}")
+        elif not data.get("taken"):
+            self.say(f"{ref}: the delivery no longer waits for its output files")
+        else:
+            self.say(f"{ref}: sent {len(files)} output file(s)" + (f", {len(skipped)} not sent" if skipped else ""))
 
     def runtime_login(self, extra):
         """The owner asked, in the app, for this machine's runtime to be signed in (machine_signin). The provider's

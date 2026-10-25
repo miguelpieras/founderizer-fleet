@@ -44,7 +44,8 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "manager_switch",       # the manager's helper closes its previous runtime's session after a switch
             "mcp_program",          # it resolves a command MCP server's program for POST /ui/mcp/check
             "secret_deposits",      # it carries a sealed copy of the owner's into this machine's vault (deposit)
-            "secret_withdrawals"]   # it has this machine's vault take back a secret nobody here holds (withdraw)
+            "secret_withdrawals",   # it has this machine's vault take back a secret nobody here holds (withdraw)
+            "task_outputs"]         # it sends a delivered task's outputs folder to the hub (fleet.collect_outputs)
 # ---------------------------------------------------------------- the runtimes
 #
 # What the fleet knows about a runtime is here, in one entry for each provider, and nowhere else. hub.py, fleet.py and
@@ -579,6 +580,15 @@ def follow_config_ref(kit, run=None):
             git("checkout", "-q", "-b", CONFIG_BRANCH, "--track", "origin/" + CONFIG_BRANCH)
         if code != 0:
             return f"the checkout did not move onto {CONFIG_BRANCH}: " + (err or out)[-200:]
+    # A file that this checkout holds untracked and that the ref now carries with the same bytes gives way to the
+    # tracked copy: it is one that the hub took in from here, a task's output that this helper sent when its agent
+    # delivered (helper feature task_outputs). A file with other bytes stays, and the merge then says why it cannot.
+    code, out, _ = git("diff", "--name-only", "--diff-filter=A", "-z", "HEAD", "origin/" + CONFIG_BRANCH)
+    for path in out.split("\0") if code == 0 else []:
+        full = os.path.join(kit, path)
+        if path and os.path.isfile(full) and not os.path.islink(full) and \
+                git("hash-object", "--", path)[1] == git("rev-parse", f"origin/{CONFIG_BRANCH}:{path}")[1]:
+            os.remove(full)
     code, out, err = git("merge", "-q", "--ff-only", "origin/" + CONFIG_BRANCH)
     return None if code == 0 else "git merge failed: " + (err or out)[-200:]
 
