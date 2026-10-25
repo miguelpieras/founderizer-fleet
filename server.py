@@ -13,7 +13,7 @@ checkout, through the second root command the installers put in place (hubsetup.
 reaches every checkout here and never the broker's root-owned copy, so without that step a release that changed
 vault.py left the broker behind while this machine reported the new revision.
 
-Two job kinds. install: an agent. Its steps on Linux: the agent's own OS user fleet-<agent>, then its
+Three job kinds. install: an agent. Its steps on Linux: the agent's own OS user fleet-<agent>, then its
 runtime, its checkout ~fleet-<agent>/fleet-<agent>, its service and the runtime's sign-in
 when that user is not signed in (Codex: a link and a code in Fleet; Claude Code: the sign-in that the hub drives for
 that agent, machine_signin, which the owner finishes in the app and never in a terminal). Everything of one agent is
@@ -22,7 +22,9 @@ installers put in place (/usr/local/sbin/fleet-agent-user, hubsetup.agent_helper
 through the one sudoers line beside it. A Mac keeps one user for its agents (PRODUCT.md P2), and so does an agent
 from before the move: there every step is this service's own user, as it was. prepare: the other runtime of an agent
 on this server, before the owner switches it, with the same runtime and sign-in steps, under that agent's own user;
-it changes no agent, checkout or service. The service runs no AI session and reads no secret. Its key is
+it changes no agent, checkout or service. rename: an agent the owner gave a new name (agent_rename): its checkout
+and its service move to the new name under the OS user it already has, so it keeps its runtime and its sign-in. The
+service runs no AI session and reads no secret. Its key is
 ~/.fleet/server.key (mode 600); the hub keeps only its SHA-256, and it opens only this server's routes.
 """
 import argparse
@@ -61,6 +63,7 @@ NAME = re.compile(r"[a-z][a-z0-9-]{1,30}")
 # One agent's own OS user (hubsetup.AGENT_USER), the one root command that makes it (hubsetup.HELPER), and the PATH
 # of a command run as that user: its own ~/.local/bin, then the machine's.
 AGENT_USER = "fleet-%s"
+USER_NAME = re.compile(r"fleet-[a-z][a-z0-9-]{1,25}")       # a user a job names: an agent keeps it after a rename
 AGENT_HELPER = "/usr/local/sbin/fleet-agent-user"
 AGENT_PATH = os.pathsep.join(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
 # This machine's vault broker: the root-owned copy of vault.py it runs (hubsetup.VAULT_LIB), and the other root
@@ -293,13 +296,19 @@ class Service:
 
     # ---- each agent under its own OS user (PRODUCT.md, "What the move to per-agent users decided")
 
-    def agent_user(self, agent):
-        """The OS user whose home holds this agent's checkout, runtime, credential and service: `fleet-<agent>`
-        where that user exists. None on a Mac, which keeps one user for its agents, and None for an agent from
-        before the move, whose checkout then stays where this service made it."""
+    @staticmethod
+    def os_user(agent, named=None):
+        """The OS user of this agent on Linux: the one its job names, which an agent keeps after a rename (team.json
+        "user", owner feature agent_rename), else `fleet-<agent>`."""
+        return named if isinstance(named, str) and USER_NAME.fullmatch(named) else AGENT_USER % agent
+
+    def agent_user(self, agent, named=None):
+        """The OS user whose home holds this agent's checkout, runtime, credential and service (os_user), where that
+        user exists. None on a Mac, which keeps one user for its agents, and None for an agent from before the move,
+        whose checkout then stays where this service made it."""
         if self.platform == "darwin":
             return None
-        user = AGENT_USER % agent
+        user = self.os_user(agent, named)
         return user if self.users(user) else None
 
     def home_of(self, user):
@@ -358,7 +367,7 @@ class Service:
         the machine's service user and has no root, so that command and nothing else is what it may run as root."""
         if self.platform == "darwin":
             return None
-        user = AGENT_USER % agent
+        user = self.os_user(agent, job.get("user"))
         self.post(job, "running", "user", f"The OS user {user} of {agent}.")
         code, out, err = self.run(["sudo", "-n", AGENT_HELPER, user], timeout=120)
         if code != 0 or not self.users(user):
@@ -409,7 +418,7 @@ class Service:
 
     def work(self, job):
         try:
-            kind = {"install": self.install, "prepare": self.prepare}.get(job.get("kind"))
+            kind = {"install": self.install, "prepare": self.prepare, "rename": self.rename}.get(job.get("kind"))
             if kind is None:
                 raise StepFailed(None, f"This server service does not know the job {job.get('kind')}. Update Fleet.")
             kind(job)
@@ -448,7 +457,7 @@ class Service:
         agent, runtime = job.get("agent"), job.get("runtime")
         if not NAME.fullmatch(str(agent)) or runtime not in LABELS:
             raise StepFailed(None, "The job names no agent or runtime that Fleet knows.")
-        user = self.agent_user(agent)
+        user = self.agent_user(agent, job.get("user"))
         folder = os.path.join(self.home_of(user), f"fleet-{agent}")
         if not self.ours(folder, agent, user):
             raise StepFailed(None, f"{agent} has no checkout {self.short_of(agent, user)} from Fleet on "
@@ -459,6 +468,53 @@ class Service:
         self.sign_in_step(job, agent, runtime, exe, user)
         self.post(job, "done", "sign_in", f"{LABELS[runtime]} is installed and signed in on {self.name}. Now switch {agent} "
                                           f"to it.")
+
+    # ---- a new name for an agent (owner feature agent_rename)
+    def rename(self, job):
+        """The agent under the new name the hub gave it: its checkout moves to fleet-<new> and is marked as the new
+        name's, the service of the old name ends and the service of the new name starts. It stays in the home of the
+        OS user it has (the job names that user once the agent keeps an earlier name's), so its runtime and its
+        sign-in stay where they are and nobody signs in again. Each step reads first, so Try again repeats only what
+        is missing."""
+        agent, was, runtime = job.get("agent"), job.get("was"), job.get("runtime")
+        if not NAME.fullmatch(str(agent)) or not NAME.fullmatch(str(was)) or agent == was or runtime not in LABELS:
+            raise StepFailed(None, "The job names no agent or runtime that Fleet knows.")
+        user = self.agent_user(agent, job.get("user"))
+        old, folder = (os.path.join(self.home_of(user), f"fleet-{name}") for name in (was, agent))
+        if not self.there(folder, user) and self.ours(old, was, user):
+            self.post(job, "running", "checkout", f"The checkout {self.short_of(agent, user)}.")
+            code, out, err = self.run(self.as_agent(user, ["mv", old, folder]))
+            if code != 0:
+                raise StepFailed("checkout", f"{self.short_of(was, user)} could not become "
+                                             f"{self.short_of(agent, user)}: {tail(err or out)}")
+            self.mark(folder, agent, user)
+        folder = self.checkout_step(job, agent, user)
+        self.post(job, "running", "service", f"The service of {was} ends, and the service of {agent} starts.")
+        self.retire(job, was, user)
+        self.service_step(job, agent, runtime, folder, user)
+        self.post(job, "done", "service", f"{agent} runs on {self.name}.")
+
+    def retire(self, job, was, user=None):
+        """The old name of a renamed agent ends on this server: its service stops and never starts again, its tmux
+        session ends, and its agent key goes, because the hub took that name's key back and the helper of the new
+        name enrolls its own. What is not there is no failure; a service that still runs is."""
+        if self.platform == "darwin":
+            job_name = f"gui/{os.getuid()}/com.agentfleet.{was}"
+            self.run(["launchctl", "bootout", job_name])
+            self.run(["rm", "-f", os.path.join(self.home, "Library", "LaunchAgents", f"com.agentfleet.{was}.plist")])
+            if self.run(["launchctl", "print", job_name])[0] == 0:
+                raise StepFailed("service", f"The service of {was} did not stop. Restart {self.name}, then try again.")
+        else:
+            unit = f"fleet-{was}.service"
+            self.run(self.as_agent(user, ["systemctl", "--user", "disable", "--now", unit]))
+            code, out, _err = self.run(self.as_agent(user, ["systemctl", "--user", "is-active", unit]))
+            if out.strip() == "active":
+                raise StepFailed("service", f"The service of {was} did not stop. Restart {self.name}, then try again.")
+            self.run(self.as_agent(user, ["rm", "-f", os.path.join(self.home_of(user), ".config", "systemd", "user",
+                                                                   unit)]))
+            self.run(self.as_agent(user, ["systemctl", "--user", "daemon-reload"]))
+        self.run(self.as_agent(user, ["tmux", "kill-session", "-t", f"fleet-{was}"]))
+        self.run(self.as_agent(user, ["rm", "-f", os.path.join(self.home_of(user), ".fleet", f"agent-{was}.key")]))
 
     def runtime_step(self, job, runtime, user=None):
         """The runtime of this agent, in the home of its own user: the credential the vendor's client writes lives
@@ -513,11 +569,7 @@ class Service:
             code, out, err = self.run(self.as_agent(user, ["git", "clone", "-q", self.repo, folder]), timeout=300)
             if code != 0:
                 raise StepFailed("checkout", f"git could not get the Fleet repository: {tail(err or out)}")
-            mark = os.path.join(folder, ".git", "fleet-server")
-            code, out, err = self.run(self.as_agent(user, ["/bin/sh", "-c", 'printf "%s\\n" "$2" > "$1"', "sh",
-                                                           mark, agent]))
-            if code != 0:
-                raise StepFailed("checkout", f"{short} could not be marked as Fleet's: {tail(err or out)}")
+            self.mark(folder, agent, user)
         # an origin from before the split stays as it was
         problem = lifecycle.follow_config_ref(folder, self.agent_run(user))
         if problem:
@@ -532,6 +584,16 @@ class Service:
             raise StepFailed("checkout", f"The repository does not list {agent} yet on "
                                          f"{branch or 'this checkout'}. Try again in a minute.")
         return folder
+
+    def mark(self, folder, agent, user=None):
+        """The checkout's .git/fleet-server mark, which names the agent whose checkout this service made: written as
+        the agent's own user, because this service never writes into an agent's home itself."""
+        mark = os.path.join(folder, ".git", "fleet-server")
+        code, out, err = self.run(self.as_agent(user, ["/bin/sh", "-c", 'printf "%s\\n" "$2" > "$1"', "sh", mark,
+                                                       agent]))
+        if code != 0:
+            raise StepFailed("checkout", f"{self.short_of(agent, user)} could not be marked as Fleet's: "
+                                         f"{tail(err or out)}")
 
     def there(self, folder, user=None):
         """Whether this folder is there, read as the agent's own user: its home is of mode 700, so this service

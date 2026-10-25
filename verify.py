@@ -222,13 +222,18 @@ class Verify:
     # ---- which user holds which service, which runtime and which credential (PRODUCT.md 4.1)
 
     def agent_user(self, agent):
-        """The OS user whose service, runtime and sign-in belong to this agent: `fleet-<agent>` where that user
-        exists, which is every Linux machine an installer or the agent-add path made, and otherwise the user running
-        this check (a Mac, and a machine from before the move)."""
+        """The OS user whose service, runtime and sign-in belong to this agent: its os_user where that user exists,
+        which is every Linux machine an installer or the agent-add path made, and otherwise the user running this
+        check (a Mac, and a machine from before the move)."""
         if self.platform == "darwin":
             return self.me
-        user = AGENT_USER % agent
+        user = self.os_user(agent)
         return user if self.passwd(user) else self.me
+
+    def os_user(self, agent):
+        """`fleet-<agent>`, or the OS user the agent keeps after a rename (team.json "user", owner feature
+        agent_rename): the one whose home its runtime and its sign-in are in."""
+        return ((self.conf.get("agents") or {}).get(agent) or {}).get("user") or AGENT_USER % agent
 
     def as_user(self, user, argv):
         """argv as that user, or None when this check cannot become it — and then the reading is not taken, because
@@ -253,7 +258,7 @@ class Verify:
         """The user that holds this machine's own two services, fleet-hub and fleet-git: the user running this
         check. None when it cannot be that user — an agent's own user never holds them, and root has a systemd
         manager of its own — and then the two are reported as unread instead of as stopped."""
-        if self.me in {AGENT_USER % a for a in (self.conf.get("agents") or {})}:
+        if self.me in {self.os_user(a) for a in (self.conf.get("agents") or {})}:
             return None
         if self.my_uid == 0 and not self.hub_service_here():
             return None

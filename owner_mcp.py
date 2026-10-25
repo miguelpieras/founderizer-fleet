@@ -888,6 +888,12 @@ def tools():
         tool("activate_agent", "Turn one agent on or off. An agent in setup takes no work and no message.",
              {"agent": S["text"], "active": S["bool"], **rid}, ("agent", "active"),
              with_base("/ui/team/agents/{agent}", ("active",), "the activation of this agent")),
+        tool("rename_agent", "Give an agent a new name. The hub moves everything it has to that name in one step "
+                             "(its tasks, chat, messages, memory, notes, duties, grants and profile), and its server "
+                             "moves its checkout and service; it keeps its OS user, so nobody signs in again. Not the "
+                             "manager, and not while the agent has an open task. Read servers to see the job end.",
+             {"agent": S["text"], "name": S["text"], **rid}, ("agent", "name"),
+             with_base("/ui/team/agents/{agent}/rename", ("name",), "the new name of this agent")),
         tool("agent_settings", "One agent's model, effort, capabilities, title, expertise, account or screen model. "
                                "Each of vault, runtime and vault_create is a command of its own, and has a tool of "
                                "its own here: vault_access, switch_runtime and login_creation.",

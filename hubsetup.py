@@ -209,11 +209,15 @@ def install_runtime(runtime):
     return here
 
 
-def agent_user(agent):
-    """The OS user that belongs to one agent: `fleet-<agent>`. Its home is where that agent's own runtime
-    credential, vault token and session files go, and no other agent's user can open it."""
+def agent_user(agent, conf=None):
+    """The OS user that belongs to one agent: `fleet-<agent>`, or the user it keeps after a rename (its team.json
+    entry's "user", owner feature agent_rename). Its home is where that agent's own runtime credential, vault token
+    and session files go, and no other agent's user can open it."""
     if not hub.AGENT_NAME.fullmatch(str(agent or "")):
         raise Stop(f"{agent!r} is no agent name this fleet can give a user of its own.")
+    kept = (conf or {}).get("user")
+    if isinstance(kept, str) and hub.AGENT_OS_USER.fullmatch(kept):
+        return kept
     user = AGENT_USER % agent
     if len(user) > USER_LIMIT:
         raise Stop(f"the agent {agent!r} needs the OS user {user!r}, which is longer than the {USER_LIMIT} characters "
@@ -298,7 +302,7 @@ def agent_users(team, machine, check=False, run=None):
         return []
     done = []
     for agent in agents:
-        user = agent_user(agent)
+        user = agent_user(agent, team["agents"][agent])
         before = kv(run(user_reading(user))[1])
         if (before.get("exists") == "yes" and before.get("locked") == "L" and before.get("sudo") == "no"
                 and before.get("mode") == "700" and before.get("owner") == user
@@ -1365,7 +1369,7 @@ def cmd_agent_list(args):
         raise Stop(f"{args.team} is not a team.json the hub can run, so this machine's agents are not known yet.")
     for agent in agents_of(team, args.machine):
         conf = team["agents"][agent]
-        print(f"{agent} {conf.get('runtime') or 'claude'} {agent_user(agent)}")
+        print(f"{agent} {conf.get('runtime') or 'claude'} {agent_user(agent, conf)}")
 
 
 def cmd_fleet_id(args):

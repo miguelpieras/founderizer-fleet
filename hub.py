@@ -269,7 +269,8 @@ CREATE TABLE IF NOT EXISTS join_failures(id INTEGER PRIMARY KEY, address TEXT NO
 CREATE TABLE IF NOT EXISTS server_keys(server TEXT PRIMARY KEY, sha256 TEXT NOT NULL, created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS server_status(server TEXT PRIMARY KEY, data TEXT NOT NULL, reported REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS server_jobs(id INTEGER PRIMARY KEY, server TEXT NOT NULL, kind TEXT NOT NULL, agent TEXT,
-  runtime TEXT, state TEXT NOT NULL, step TEXT, detail TEXT, prompt TEXT, created REAL NOT NULL, updated REAL NOT NULL);
+  runtime TEXT, state TEXT NOT NULL, step TEXT, detail TEXT, prompt TEXT, created REAL NOT NULL, updated REAL NOT NULL,
+  was TEXT);
 -- A sign-in that the owner drives (machine_signin; PRODUCT.md 4.5 names this table). The row carries its state and
 -- nothing of the sign-in itself:
 -- the provider's link, the code it shows and the code the owner pastes live in memory only (LIVE_LOGINS) and are
@@ -635,7 +636,7 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "releases", "entitlement", "agent_signin", "github_app", "need_options", "restore",
                "manager_start", "agent_notes", "edit_in_place", "machine_access", "push",
                "attachment_knowledge", "asking_and_waiting", "account_limits", "secret_requests",
-               "secret_deliveries"]
+               "secret_deliveries", "agent_rename"]
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # One name is not here because it is not always true: central_vault, which ui_features() adds only while the central
 # vault answers (central_ok).
@@ -1449,6 +1450,7 @@ def migrate():
                      # a dead end: what did not work, what a repeat would cost, and how to test it again cheaply
                      "kind": "TEXT NOT NULL DEFAULT 'lesson'", "cost_minutes": "INTEGER", "recheck": "TEXT"},
         "machine_checks": {"verify": "TEXT", "revision": "TEXT"},
+        "server_jobs": {"was": "TEXT"},             # owner feature agent_rename: the name a rename job moves from
         "trigger_runs": {"check_now": "INTEGER NOT NULL DEFAULT 0", "attempts": "INTEGER NOT NULL DEFAULT 0",
                          "retry_at": "REAL", "closes": "REAL", "token": "TEXT", "sent": "REAL", "expires": "REAL",
                          "value": "REAL", "summary": "TEXT", "error": "TEXT", "detail": "TEXT", "finished": "REAL",
@@ -17903,6 +17905,9 @@ def line_number(value):
 MACHINE_STALE = 600                                 # seconds after which a machine reading is stale
 UPDATE_STATES = ("requested", "waiting_idle", "updating", "failed")
 AGENT_NAME = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
+# The OS user an agent keeps on a Linux server after a rename (team.json "user"): the fleet-<name> of the name it
+# had when it was installed, at most 32 characters, as hubsetup.agent_user makes one.
+AGENT_OS_USER = re.compile(r"fleet-[a-z][a-z0-9-]{1,25}")
 SSH_USER = re.compile(r"^[A-Za-z_][A-Za-z0-9._-]{0,31}$")
 REVISION = re.compile(r"^[0-9a-f]{7,40}$")
 _revision_cache = {"at": 0.0, "value": None}
@@ -18243,6 +18248,10 @@ def validate_team(team):
             raise ValueError(f"agent {name}: google is for a worker or a lead, and maps drive and gmail to {{account, "
                              f"level}}: an email in lower case, and a level (drive read, write or write_shared; gmail "
                              f"read, write or send); an empty object is not stored")
+        if "user" in a and not (isinstance(a["user"], str) and AGENT_OS_USER.fullmatch(a["user"])
+                                and a["role"] in ("worker", "lead")):
+            raise ValueError(f"agent {name}: user is the OS user a worker or a lead keeps after a rename, fleet-<the "
+                             f"name it was installed with>, at most 32 characters")
         managers += a["role"] == "manager"
     if managers != 1:
         raise ValueError("team.json needs exactly one manager")
@@ -18259,6 +18268,11 @@ def validate_team(team):
             if other[1] != a.get("vault_recipient"):
                 raise ValueError(f"{other[0]} and {name} use the vault broker of one machine, so they pin the same "
                                  f"vault_recipient")
+    homes = {}              # owner feature agent_rename: one home, one runtime credential, one agent
+    for name, a in team["agents"].items():
+        home = (a["machine"], a.get("user") or f"fleet-{name}")
+        if homes.setdefault(home, name) != name:
+            raise ValueError(f"{homes[home]} and {name} would share the OS user {home[1]} on {a['machine']}")
     placed = {}             # owner API 1.12: agents may share a machine, which has one name for its address
     for name, a in team["agents"].items():
         other = placed.setdefault(addresses[a["machine"]], a["machine"])
@@ -19230,8 +19244,8 @@ def server_agent_entry(team, agent, server, runtime, role, parent):
 def add_server_agent(server, body):
     """POST /ui/servers/<server>/agents: a new agent on an available server. The hub registers it in team.json with its
     profile, inactive and with no credential access, and gives the server's service the job to install it. The same
-    command for the agent on this server whose last install failed gives the install job again, and changes nothing
-    else."""
+    command for the agent on this server whose last install or rename failed gives that job again, and changes
+    nothing else."""
     agent, runtime, role, parent, t0 = body["agent"], body["runtime"], body["role"], body["reports_to"], now()
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
@@ -19248,12 +19262,13 @@ def add_server_agent(server, body):
     reading = server_reading(server, [])
     if reading is None or reading["stale"]:
         raise Refusal(409, f"{server} sent no reading in the last 10 minutes: check that it is on")
-    a = team["agents"].get(agent)
+    a, kind, was = team["agents"].get(agent), "install", None
     if a is not None:
         if (a.get("machine"), a.get("runtime"), a.get("role")) != (server, runtime, role) or not last or \
-                last["kind"] != "install" or last["agent"] != agent or last["state"] != "failed":
+                last["kind"] not in ("install", "rename") or last["agent"] != agent or last["state"] != "failed":
             raise Refusal(409, f"an agent named {agent} exists")
-        commit, digest = rev, current           # the install again: the agent is in team.json already
+        commit, digest = rev, current           # the job again: the agent is in team.json already
+        kind, was = last["kind"], last["was"]
     else:
         here = server_agents(server, team)
         if here:
@@ -19274,16 +19289,18 @@ def add_server_agent(server, body):
                                  more={f"profiles/{agent}.md": profile} if profile else None)
         apply_team(team)
         digest = hashlib.sha256(data).hexdigest()
-    job = ins("INSERT INTO server_jobs(server,kind,agent,runtime,state,created,updated) VALUES(?,?,?,?,?,?,?)",
-              (server, "install", agent, runtime, "queued", t0, t0))
-    log("owner", f"added agent {agent} ({runtime}) on server {server}: job {job}")
+    job = ins("INSERT INTO server_jobs(server,kind,agent,runtime,state,created,updated,was) VALUES(?,?,?,?,?,?,?,?)",
+              (server, kind, agent, runtime, "queued", t0, t0, was))
+    log("owner", f"added agent {agent} ({runtime}) on server {server}: job {job}" if kind == "install" else
+        f"asked server {server} again to rename {was} to {agent}: job {job}")
     return {"agent": agent, "server": server, "runtime": runtime, "job": job, "revision": commit, "sha256": digest}
 
 
 def job_busy(server, last):
     """The refusal for a server whose newest job is still open: one job at a time."""
-    doing = "installs" if last["kind"] == "install" else "prepares a provider for"
-    return Refusal(409, f"{server} {doing} {last['agent']} now")
+    doing = {"install": f"installs {last['agent']}", "rename": f"renames {last['was']} to {last['agent']}"}.get(
+        last["kind"], f"prepares a provider for {last['agent']}")
+    return Refusal(409, f"{server} {doing} now")
 
 
 def prepare_server_agent(server, body):
@@ -19351,6 +19368,149 @@ def remove_server(server, body):
                    "('queued','running','needs_owner')", (t0, server))
     log("owner", f"removed server {server} in {commit[:12]}")
     return {"server": server, "removed": True, "revision": commit, "sha256": hashlib.sha256(data).hexdigest()}
+
+
+# ---- a new name for an agent (owner feature agent_rename)
+
+# Every column that holds an agent's name. A rename moves each one to the new name in one transaction, so the agent
+# keeps its tasks, its chat with the owner, its messages, memory, notes, duties, rules and grants. A column that holds
+# a person, a chat handle, a file, a tool or a machine is not here (test_rename names each one, so a new column of a
+# name like these is placed on one side or the other). Words an agent or the owner wrote stay as they were written.
+AGENT_COLUMNS = (
+    ("tasks", "owner"), ("tasks", "requester"), ("notes", "agent"), ("questions", "asker"), ("questions", "requester"),
+    ("reports", "from_agent"), ("reports", "to_agent"), ("reports", "decided_by"), ("prompts", "agent"),
+    ("prompts", "by"), ("rules", "agent"), ("rules", "by"), ("needs", "by"), ("events", "agent"), ("reminders", "agent"),
+    ("sealed", "sender"), ("sealed", "recipient"), ("jobs", "agent"), ("log", "agent"), ("agents", "name"),
+    ("agent_usage", "name"), ("calls", "agent"), ("ui_requests", "recipient"), ("owner_reports", "agent"),
+    ("holds", "by"), ("holds", "released_by"), ("outcomes", "by"), ("agent_limits", "agent"),
+    ("machine_status", "agent"), ("machine_updates", "agent"), ("goals", "paused_by"), ("goal_history", "by"),
+    ("spends", "by"), ("restart_holds", "by"), ("machine_checks", "agent"), ("session_tokens", "agent"),
+    ("triggers", "agent"), ("triggers", "paused_by"), ("triggers", "created_by"), ("trigger_code", "by"),
+    ("trigger_history", "by"), ("session_credentials", "agent"), ("responsibilities", "agent"),
+    ("responsibilities", "created_by"), ("duty_cases", "by"), ("duty_cases", "closed_by"), ("duty_steps", "by"),
+    ("agent_notes", "agent"), ("agent_notes", "by"), ("duty_history", "by"), ("memories", "agent"),
+    ("memories", "dropped_by"), ("memory_folds", "by"), ("tool_commands", "agent"), ("agent_messages", "sender"),
+    ("agent_messages", "recipient"), ("person_agents", "agent"), ("conversations", "agent"), ("server_jobs", "agent"),
+    ("signin_jobs", "agent"), ("resource_grants", "agent"), ("resource_grants", "by"), ("deposits", "agent"),
+    ("withdrawals", "agent"), ("placements", "agent"))
+# The tables with one row for each agent. A row under the new name is what an agent of that name left before it
+# was removed by hand, so it goes first, and the renamed agent's own row takes the name.
+AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent", "machine_updates": "agent"}
+# The hub's own notes about one agent in kv, each kept under a prefix and the agent's name.
+AGENT_KV = ("tools:", "offline_told:", "runtime_since:", "switched:", "switching:")
+
+
+def renamed_team(team, old, new):
+    """team.json with the agent `old` named `new`: its entry in its own place, and every reports_to and chat app
+    account that names it. On a Linux server it keeps the OS user of the name it was installed with, so its home,
+    its runtime and its sign-in stay where they are and no sign-in is needed again."""
+    out = json.loads(json.dumps(team))
+    entry = out["agents"][old]
+    user = f"fleet-{old}"
+    if (out.get("servers") or {}).get(entry.get("machine"), {}).get("kind") == "linux" and "user" not in entry \
+            and AGENT_OS_USER.fullmatch(user):
+        entry["user"] = user
+    out["agents"] = {(new if name == old else name): a for name, a in out["agents"].items()}
+    for a in out["agents"].values():
+        if a.get("reports_to") == old:
+            a["reports_to"] = new
+    for account in (out.get("chat_apps") or {}).values():
+        if isinstance(account, dict) and isinstance(account.get("agents"), list):
+            account["agents"] = [new if name == old else name for name in account["agents"]]
+    return out
+
+
+def renamed_profile(data, old, new):
+    """The agent's profile under its new name. Its title line names the agent (`# Profile: <name>`, as Add agent
+    writes it) and takes the new name in the same case; every other word is the owner's own and stays."""
+    first, sep, rest = data.decode("utf-8").partition("\n")
+    for was, now_ in ((old, new), (old.capitalize(), new.capitalize())):
+        if first.strip() == f"# Profile: {was}":
+            first = f"# Profile: {now_}"
+            break
+    return (first + sep + rest).encode("utf-8")
+
+
+def rename_rows(old, new, t0):
+    """Inside a transaction: every record of the agent under its new name (AGENT_COLUMNS, AGENT_KV). Its session
+    credentials stop, and its key goes, so the helper that starts under the new name enrolls its own: the hub takes
+    a first key from the agent's own machine only, and a second key only from the owner."""
+    in_transaction("rename_rows")
+    for table, column in AGENT_ROWS.items():
+        DB.execute(f"DELETE FROM {table} WHERE {column}=?", (new,))
+    revoke_sessions(old, t0)
+    DB.execute("DELETE FROM agent_keys WHERE agent IN (?,?)", (old, new))
+    for table, column in AGENT_COLUMNS:
+        DB.execute(f"UPDATE {table} SET {column}=? WHERE {column}=?", (new, old))
+    for prefix in AGENT_KV:
+        DB.execute("DELETE FROM kv WHERE k=?", (prefix + new,))
+        DB.execute("UPDATE kv SET k=? WHERE k=?", (prefix + new, prefix + old))
+
+
+def rename_agent(agent, body):
+    """POST /ui/team/agents/<agent>/rename: the agent's new name, everywhere. One commit moves its team.json entry,
+    every reference to it and its profile; one transaction moves every record of it; and its server's service gets
+    the job to move its checkout and its service to the new name, under the OS user it already has, so it keeps its
+    runtime and its sign-in. Not the manager, and not while the agent has an open task: a task session carries the
+    name it started with."""
+    new, t0 = body["name"], now()
+    rev = kit_revision(fresh=True)
+    team, current, _ = team_view(rev)
+    if body["base_sha256"] != current:
+        raise Conflict("team.json changed meanwhile; reload it", sha256=current)
+    a = team["agents"].get(agent)
+    if a is None:
+        raise Refusal(404, "no such agent")
+    if a.get("role") == "manager":
+        raise Refusal(409, "The manager keeps its name.")
+    if new == agent:
+        raise Refusal(409, f"{agent} has this name already.")
+    if new in team["agents"]:
+        raise Refusal(409, f"An agent named {new} exists.")
+    if q1("SELECT 1 FROM agents WHERE name=?", (new,)):
+        raise Refusal(409, f"An agent named {new} was in this fleet before, and its records are still here. Choose "
+                           f"another name.")
+    if q1("SELECT 1 FROM tasks WHERE (owner=? OR requester=?) AND state NOT IN ('completed','failed','rejected',"
+          "'canceled') LIMIT 1", (agent, agent)):
+        raise Refusal(409, f"{agent} has open tasks. Rename it when they are done.")
+    server = a.get("machine")
+    if server not in server_names(team) or not q1("SELECT 1 FROM server_keys WHERE server=?", (server,)):
+        raise Refusal(409, f"{server} has no server service, so Fleet cannot move {agent} to its new name there.")
+    expire_server_jobs(t0)
+    last = q1("SELECT * FROM server_jobs WHERE server=? ORDER BY id DESC LIMIT 1", (server,))
+    if last and last["state"] in JOB_OPEN:
+        raise job_busy(server, last)
+    if last and last["kind"] == "install" and last["agent"] == agent and last["state"] == "failed":
+        raise Refusal(409, f"The install of {agent} stopped. Try it again before you rename it.")
+    reading = server_reading(server, [])
+    if reading is None or reading["stale"]:
+        raise Refusal(409, f"{server} sent no reading in the last 10 minutes: check that it is on")
+    if open_login(agent):
+        raise Refusal(409, f"{agent} has an open sign-in. Finish it or let it run out, then try again.")
+    profile = git_blob(rev, f"profiles/{agent}.md")
+    if git_blob(rev, f"profiles/{new}.md") is not None:
+        raise Refusal(409, f"A profile for {new} is in the fleet already. Choose another name.")
+    renamed = renamed_team(team, agent, new)
+    try:
+        validate_team(renamed)
+    except ValueError as e:
+        raise Refusal(400, str(e)) from None
+    data = (json.dumps(renamed, indent=2) + "\n").encode()
+    more = None if profile is None else {f"profiles/{agent}.md": None,
+                                         f"profiles/{new}.md": renamed_profile(profile, agent, new)}
+    commit = commit_kit_file("team.json", data, f"Owner renamed agent {agent} to {new}", more=more)
+    manager = next(n for n, x in renamed["agents"].items() if x.get("role") == "manager")
+    with transaction():
+        rename_rows(agent, new, t0)
+        job = DB.execute("INSERT INTO server_jobs(server,kind,agent,runtime,state,created,updated,was) "
+                         "VALUES(?,?,?,?,?,?,?,?)", (server, "rename", new, renamed["agents"][new]["runtime"],
+                                                     "queued", t0, t0, agent)).lastrowid
+        event_rows([(manager, "say", None, f"[hub] The owner renamed {agent} to {new}. Its tasks, messages, memory "
+                                           f"and duties stay with it, under {new}: use {new} from now on.", None)], t0)
+        log_row("owner", f"renamed agent {agent} to {new} on server {server} in {commit[:12]}: job {job}")
+    apply_team(renamed)
+    return {"agent": new, "was": agent, "server": server, "job": job, "revision": commit,
+            "sha256": hashlib.sha256(data).hexdigest()}
 
 
 def save_team_entry(body, key, what, entry, busy):
@@ -22612,12 +22772,18 @@ class Handler(BaseHTTPRequestHandler):
         return self.json(200, {"ok": True, "desired_revision": kit_revision()})
 
     def server_jobs(self, name):
-        """GET /server/<name>/jobs: the open jobs of this server, oldest first."""
+        """GET /server/<name>/jobs: the open jobs of this server, oldest first. A rename job also names the agent's
+        old name (was), and a job for an agent that keeps the OS user of an earlier name names that user."""
         if not self.server_allowed(name):
             return
-        rows = q("SELECT id,kind,agent,runtime,state FROM server_jobs WHERE server=? AND state IN "
+        rows = q("SELECT id,kind,agent,runtime,state,was FROM server_jobs WHERE server=? AND state IN "
                  "('queued','running','needs_owner') ORDER BY id", (name,))
-        return self.json(200, {"jobs": [dict(r) for r in rows]})
+        jobs = []
+        for r in rows:
+            job = {k: r[k] for k in ("id", "kind", "agent", "runtime", "state")}
+            user = (agents().get(r["agent"]) or {}).get("user")
+            jobs.append(dict(job, **({"was": r["was"]} if r["was"] else {}), **({"user": user} if user else {})))
+        return self.json(200, {"jobs": jobs})
 
     def server_signin(self, name):
         """POST /server/<name>/signin: this server asks the hub to sign one of its agents in (owner feature
@@ -25737,6 +25903,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_team_agent(parts[3])
         if len(parts) == 5 and parts[:3] == ["ui", "team", "agents"] and parts[4] == "key" and AGENT_NAME.fullmatch(parts[3]):
             return self.ui_agent_key(parts[3])
+        if len(parts) == 5 and parts[:3] == ["ui", "team", "agents"] and parts[4] == "rename" and AGENT_NAME.fullmatch(parts[3]):
+            return self.ui_agent_rename(parts[3])
         if parts == ["ui", "team", "logins"]:
             return self.ui_team_login()
         if parts == ["ui", "secrets", "fingerprints"]:
@@ -26247,6 +26415,21 @@ class Handler(BaseHTTPRequestHandler):
             log("owner", f"{'removed' if deleting else 'registered'} the agent key of {agent}")
             return {"agent": agent, "key": not deleting, "since": None if deleting else t0}
         return self.ui_command(f"team/agents/{agent}/key", read, act)
+
+    def ui_agent_rename(self, agent):
+        """POST /ui/team/agents/<agent>/rename (owner feature agent_rename): the agent's new name, everywhere."""
+        def read(data):
+            extra = sorted(set(data) - {"request_id", "db", "base_sha256", "name"})
+            if extra:
+                raise ValueError(f"unknown field {extra[0]}")
+            base, name = data.get("base_sha256"), data.get("name")
+            if not (isinstance(base, str) and re.fullmatch(r"[0-9a-f]{64}", base)):
+                raise ValueError("base_sha256 must be the SHA-256 of team.json")
+            if not (isinstance(name, str) and AGENT_NAME.fullmatch(name)) or name in ("owner", "hub"):
+                raise ValueError("name must be 2 to 31 characters a-z 0-9 -, starting with a letter, and not owner "
+                                 "or hub")
+            return {"agent": agent, "base_sha256": base, "name": name}
+        return self.ui_command(f"team/agents/{agent}/rename", read, lambda body: rename_agent(agent, body))
 
     def helper_vault_fingerprints(self, agent):
         """A broker registers salted fingerprints of a login that it opened for a confirmed, still open job, before
