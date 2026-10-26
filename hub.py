@@ -9215,6 +9215,9 @@ def request_update(agent, desired):
     st = q1("SELECT data FROM machine_status WHERE agent=?", (agent,))
     if st and same_code(json.loads(st["data"]).get("revision"), desired):
         return "current"
+    up = q1("SELECT state, desired FROM machine_updates WHERE agent=?", (agent,))
+    if up and (up["state"], up["desired"]) == ("requested", desired):
+        return "requested"          # asked already: apply_team asks every machine before a write asks its own agent
     q("INSERT INTO machine_updates(agent,state,requested,desired,detail,started,finished) "
       "VALUES(?,?,?,?,NULL,NULL,NULL) ON CONFLICT(agent) DO UPDATE SET state=excluded.state, "
       "requested=excluded.requested, desired=excluded.desired, detail=NULL, started=NULL, finished=NULL",
@@ -9327,8 +9330,8 @@ def save_profile(agent, base, sections):
     whose, then = (("your profile", ": it replaces the profile in your start prompt.") if agent == mgr else
                    (f"the profile of {agent}", f", before you give {agent} new work."))
     emit(mgr, "say", f"[hub] The owner changed {whose} ({path}, commit {commit[:12]}). Read {path} again now{then}")
-    updates = [name for name, a in agents().items() if a.get("role") in ("worker", "lead")
-               and request_update(name, commit) == "requested"]
+    # Every machine, the manager's too: same_code counts a profile, so a machine left out stands "behind".
+    updates = [name for name in agents() if request_update(name, commit) == "requested"]
     log("owner", f"changed {path} in {commit[:12]}")
     return {"agent": agent, "sha256": hashlib.sha256(new).hexdigest(), "commit": commit, "revision": commit,
             "unchanged": False, "updates_requested": updates}
@@ -18861,7 +18864,14 @@ def apply_team(new):
     CFG["team_problem"] = team_problem(TEAM)    # a write that validates takes the startup reading off the board
     for name in new["agents"]:
         know(name)
-    kit_revision(fresh=True)
+    rev = kit_revision(fresh=True)
+    # Every machine runs team.json from its own checkout and same_code counts it, so a write about one agent changes
+    # what each machine should run: each one that reports is asked to follow, or it stands "behind" (Update available)
+    # until the next release, as manager, mia and ivy did on 26 October 2026. One that never reported has nothing to
+    # follow yet.
+    for name in new["agents"]:
+        if rev and q1("SELECT 1 FROM machine_status WHERE agent=?", (name,)):
+            request_update(name, rev)
     changed()                   # team.json is not in the database: its change is counted here (live_changes)
 
 
