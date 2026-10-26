@@ -1184,6 +1184,20 @@ def touch(agent):
         q("UPDATE agents SET last_seen=? WHERE name=?", (now(), agent))
 
 
+def quiet_for(last_seen, t0):
+    """How long a helper has been silent, counted from its last check-in (a poll or a presence ping) or from the hub's
+    own start, whichever is later (plan C2): a hub that was down for longer than offline_after judges nobody silent
+    for the time it could not hear them. None for a helper that never checked in."""
+    return t0 - max(last_seen, STARTED) if last_seen else None
+
+
+def listed(row):
+    """True when the hub holds the agent's window list from its helper's latest list (plan C2): every poll sends one,
+    and a presence ping sends one when tmux answered and unsets it when tmux did not, so a list is never read after
+    a check-in that could not see the windows. The caller asks whether the helper is online."""
+    return bool(row and row["alive_ts"])
+
+
 def when(ts):
     return f"{ago(ts)} ago" if ts else "never"
 
@@ -1741,6 +1755,7 @@ def t_read_messages(agent, a):
         chat_read_signals(first, now())         # owner feature chat_apps: typing, and read on WhatsApp
         if agents()[agent].get("role") == "manager":
             kv_set("mgr_screen", None)
+            kv_set("mgr_screen_shown", None)        # a session that reads has no question in front of it
         if not rows:
             return "No unread messages. Wait for the next signal."
         # A task's start event is the text that its session began with, as its first prompt or its appended system
@@ -2100,6 +2115,7 @@ def parked(task_id):
 # nothing new has to be stored and nobody has to remember to set a field. needs is the wrong lever and was not
 # used: one browser task is busy and idle in turns, and a shell task can hold one call open for an hour.
 CALL_PATIENCE = 1800            # seconds one unfinished tool call may run before the silence clock speaks
+PRESENCE_SAME = 10              # seconds two pings may disagree about a step's start and still be the same step
 TURN_CALLS = 64                 # open calls that one attempt's turn state keeps: the newest
 TURN_SAID = 500                 # characters of the attempt's last agent message that its turn state keeps
 
@@ -2171,9 +2187,10 @@ def held_word(hold):
 
 
 def session_alive(agent, task_id):
-    """True when the agent's helper reported this task's window in the last minute."""
-    row = q1("SELECT alive, alive_ts FROM agents WHERE name=?", (agent,))
-    return bool(row and row["alive_ts"] and now() - row["alive_ts"] <= 60 and
+    """True when the agent's helper listed this task's window at its latest check-in, and is online."""
+    row = q1("SELECT alive, alive_ts, last_seen FROM agents WHERE name=?", (agent,))
+    quiet = quiet_for(row["last_seen"], now()) if row else None
+    return bool(listed(row) and quiet is not None and quiet < CFG.get("offline_after", 90) and
                 tref(task_id) in (row["alive"] or "").split(","))
 
 
@@ -3839,6 +3856,17 @@ def deliver_result(agent, a, files_said=None):
 # subtask's report reaches its lead, and a report that nobody can decide is the loop that tool is there to end.
 LEAD_TEAM_TOOLS = ("create_task", "cancel_task", "restart_task", "answer", "check_result", "decide_permission",
                    "see_team", "see_capacity", "decide_report", "set_duty", "change_duty")
+# A worker writes its own duties in its task sessions (plan C17), and duty_write_allowed keeps them its own.
+WORKER_OWN_TOOLS = ("set_duty", "change_duty")
+# The one tool that only the owner chat of a worker or a lead has: it opens the work the owner asks for there.
+CHAT_ONLY = ("start_task",)
+
+
+def role_offers(role, r, name):
+    """True when a tool of role `r` (TOOLS) is one that an agent of `role` has: its own and every agent's, a lead's
+    worker tools and team tools, and a worker's own duty writes."""
+    return r in (role, "all") or (role == "lead" and (r == "worker" or name in LEAD_TEAM_TOOLS)) or \
+        (role == "worker" and name in WORKER_OWN_TOOLS)
 
 
 def role_of(name):
@@ -4961,6 +4989,10 @@ def capacity_text(view, filters, needs, restricted=False, parent=None, caller=No
             busy = a["desktop_busy"]["task"]
             out.append("    DESKTOP BUSY: its machine runs " + (f"T-{busy}" if visible(busy) else
                        "another browser or screen task") + "; a new browser or screen task waits until it ends.")
+        step = presence_of(a["agent"], t0)      # plan C2: data for this text, never in a /ui route
+        if step:
+            out.append(f"    HELPER BUSY: inside one step ({step['step']}) since {clock(step['since'])}; new work "
+                       f"for it waits until that step ends.")
         return out
 
     def left_to_give(p, name):
@@ -5206,8 +5238,9 @@ def search_block(n, entry, lines, hits, named, words):
 
 
 def t_search_knowledge(agent, a):
-    """A plain text search, with no index and no model, in the knowledge files that this agent may use: those that its
-    profile lists, and for the manager also every owner file. At the hub's HEAD, like knowledge_entries."""
+    """A plain text search, with no index and no model, in the knowledge files that this agent may use: every shared
+    file of the fleet (plan C17), those that its profile lists, and for the manager also every owner file. At the
+    hub's HEAD, like knowledge_entries."""
     query = a.get("query")
     words = search_words(query) if isinstance(query, str) else []
     if not words:
@@ -5218,10 +5251,10 @@ def t_search_knowledge(agent, a):
     except (TypeError, ValueError):
         most = SEARCH_RESULTS[0]
     listed, every = set(profile_knowledge_files(agent, kit_revision(fresh=True))), role_of(agent) == "manager"
-    files = [k for k in knowledge_entries() if k["path"] in listed or (every and k["scope"] == "owner")]
+    files = [k for k in knowledge_entries()
+             if k["scope"] == "internal" or k["path"] in listed or (every and k["scope"] == "owner")]
     if not files:
-        return ("There are no owner knowledge files yet." if every else
-                "Your profile lists no knowledge file that the hub has, so there is nothing to search.")
+        return "There are no knowledge files yet."
     found = []
     for k in files:
         text = knowledge_text(k)
@@ -6801,6 +6834,52 @@ def unanswered_owner_message(agent):
              "AND NOT EXISTS (SELECT 1 FROM owner_reports r WHERE r.agent=u.recipient AND r.in_reply_to=u.request_id) "
              "ORDER BY u.created LIMIT 1", (agent,))
     return row["request_id"] if row else None
+
+
+def owner_message(agent, reply):
+    """The owner's own message to this agent, read in its chat, that the request UUID `reply` names: its ui_requests
+    row, or a ToolError. Nothing else starts work from a chat: a message of another agent is in agent_messages, and a
+    person's is in a conversation, never here."""
+    try:
+        reply = str(uuid.UUID(str(reply)))
+    except (ValueError, AttributeError, TypeError):
+        raise ToolError("in_reply_to must be the request UUID of the owner's message.") from None
+    source = q1("SELECT u.*,e.read_at FROM ui_requests u JOIN events e ON e.id=u.event_id WHERE u.request_id=?", (reply,))
+    if not source or source["recipient"] != agent or source["kind"] != "message" or source["read_at"] is None:
+        raise ToolError("Read this agent's owner message first: in_reply_to must name a message of the owner's own in "
+                        "this chat. Another agent's message, or a message to another agent, cannot be named.")
+    return source
+
+
+def t_start_task(agent, a):
+    """The owner asks a worker or a lead for work in its own chat, and it opens the task itself (plan C17; the owner,
+    26 October 2026: no unnecessary gates). The task is the agent's own, with the manager as its requester, which
+    checks its result as for every task and is told at once, quietly. Only a message of the owner's own that this
+    chat has read starts work, and one message is one task: its request UUID is this call's request_id, so the same
+    message again gives the same task."""
+    chat_fence(agent)
+    source = owner_message(agent, a.get("in_reply_to"))
+    title, done_when = str(a.get("title") or "").strip(), str(a.get("done_when") or "").strip()
+    guard(agent, title, done_when)
+    command, stored = agent_write(agent, "start_task", {"request_id": source["request_id"]},
+                                  {"title": title, "done_when": done_when})
+    if stored:
+        return stored["text"]
+    mgr = manager_name()
+    f = check_task(mgr, {"owner": agent, "title": title, "done_when": done_when,
+                         "details": "The owner asked for this in his own words, in " + agent + "'s chat: " +
+                                    clip(source["text"] or "", 2000),
+                         "why": f"The owner asked {agent} for it in its own chat."})
+    t0 = now()
+    with transaction():
+        tid = admit_task(mgr, f)
+        text = (f"Opened {tref(tid)} ({title}) for you, with {mgr} as its requester. It starts in its own task "
+                f"session; tell the owner with tell_owner that it started, and do the work there, not here.")
+        keep_command(command, {"task": tid, "text": text}, t0)
+    emit(mgr, "say", f"[hub] The owner asked {agent} for work in its own chat, and {agent} opened {tref(tid)} "
+                     f"({title}). You are its requester: check its result when it comes.", task=tid, extra=QUIET_SAY)
+    log(agent, f"opened {tref(tid)} from the owner's message {source['request_id']}")
+    return text
 
 
 def t_tell_owner(agent, a):
@@ -10758,7 +10837,8 @@ def duty_save(body, by, t0, duty_id=None, command=None):
         # agent that now answers for the duty learned of it from its first case. The manager is told of each new
         # duty, and of each change that it did not make itself -- a lead's (RESPONSIBILITIES.md, item 8).
         moved = old is not None and old["agent"] != r["agent"]
-        told = [(manager_name(), "say", None, new_duty_text(r, by, old), None)] \
+        # A duty that its holder wrote for itself is the manager's to read, not to act on at once (plan C17).
+        told = [(manager_name(), "say", None, new_duty_text(r, by, old), QUIET_SAY if by == r["agent"] else None)] \
             if old is None or by != manager_name() else []
         if old is None or moved:
             # One notice of a duty waits at a time, filed under a task or not: an older one that nobody read says
@@ -10774,7 +10854,7 @@ def duty_save(body, by, t0, duty_id=None, command=None):
                            (new_duty_text(r, x.get("by") or manager_name(),
                                           {"agent": x["from"]} if x.get("from") else None) + DUTY_NOTICE_HOLDER,
                             e["id"]))
-        if (old is None or moved) and r["agent"] != manager_name():
+        if (old is None or moved) and r["agent"] not in (manager_name(), by):      # it wrote it: it knows
             told.append((r["agent"], "say", None, new_duty_text(r, by, old) + DUTY_NOTICE_HOLDER,
                          {"duty": r["id"], "by": by, "from": old["agent"] if moved else None}))
         event_rows(told, t0)
@@ -10883,7 +10963,8 @@ def new_duty_text(r, by, old=None):
     """The message that says a duty exists: a new one, or, with `old` (its row before the change), one that moved to
     another holder or whose words changed."""
     rules = ", ".join(f"{t['watch'] or 'clock'} rule {t['id']}" for t in duty_watches_read(r["id"])) or "none yet"
-    head = (f"New duty for {r['agent']}, from {by}" if old is None else
+    head = (f"{by} wrote {rref(r['id'])} for itself" if old is None and by == r["agent"] else
+            f"New duty for {r['agent']}, from {by}" if old is None else
             f"{by} gave {rref(r['id'])} to {r['agent']}; {old['agent']} held it until now" if old["agent"] != r["agent"]
             else f"{by} changed {rref(r['id'])} of {r['agent']}")
     return (f"[duty {rref(r['id'])}] {head}:\n{r['text']}\n"
@@ -10953,10 +11034,9 @@ def duty_write_allowed(actor, target):
     yes, that is fine"). The two are not the same reach, and this function is where the difference lives: a lead
     answers for the agents it already gives tasks to, and the manager answers for the fleet.
 
-    A worker and a lead do not write their own duty: they propose one. A duty is what somebody else answers for
-    giving you, so an agent that wrote its own would be the only reader of its own words. The manager is the one
-    exception, and it is not an exception to that reasoning: it writes its own duties because it already is the
-    agent that answers for every duty of the fleet, and there is nobody above it but the owner."""
+    A worker and a lead write their own duty too (plan C17, the owner, 26 October 2026: "make agents as autonomous as
+    possible, I dont want unnecessary gates and approvals"): standing work it found for itself becomes a duty at once,
+    the manager is told of each one (duty_save), and it changes, moves, pauses or retires it like every other."""
     if actor == "owner":
         return True, None
     if actor not in agents():
@@ -10966,6 +11046,8 @@ def duty_write_allowed(actor, target):
     manager = manager_name()
     if actor == manager:
         return authority(actor, target, "rule")
+    if target == actor and role_of(actor) in ("worker", "lead"):
+        return True, None
     if role_of(actor) == "lead" and target != actor:
         if authority(actor, target, "task")[0]:                  # its own team, by the one authority rule
             return True, None
@@ -10973,8 +11055,8 @@ def duty_write_allowed(actor, target):
                          if x.get("role") in ("worker", "lead") and reports_to(n) == actor) or "nobody"
         return False, (f"{target} does not report to you, so its duty is not yours to write. Your team: {team}. "
                        f"{manager} writes the duties of every other agent: ask it with message_agent.")
-    return False, (f"Only {manager} writes a duty of {target}. "
-                   f"Propose it with message_agent or ask_my_requester; the owner and the manager decide.")
+    return False, (f"Only {manager} writes a duty of {target}: you write duties for yourself only. Propose it to "
+                   f"{manager} with message_agent.")
 
 
 def goal_text_or_error(value, what, limit):
@@ -12746,16 +12828,9 @@ KNOWLEDGE_WRITE = re.compile(r"(?!.*\.\.)(?!knowledge/owner/)knowledge/[A-Za-z0-
 
 
 def t_write_knowledge(agent, a):
-    """One knowledge file of the agent's own profile, written whole."""
+    """One of the fleet's shared knowledge files, knowledge/<name>.md, written whole (plan C17: every agent writes
+    them, and the owner's own files stay his)."""
     path = str(a.get("path") or "").strip()
-    listed = profile_knowledge_files(agent, kit_revision(fresh=True))
-    if path not in listed:
-        raise ToolError(f"{path or 'That path'} is not one of your knowledge files. You write the ones the Knowledge "
-                        f"files section of your profile lists, because those are the ones you read: "
-                        + (", ".join(listed) if listed else "your profile lists none")
-                        + ". The owner's own files (knowledge/owner/) are his alone. Ask your requester for another "
-                          "file; a fact about a product belongs in that product's repository, and what you yourself "
-                          "learned belongs in remember.")
     if not KNOWLEDGE_WRITE.match(path):
         raise ToolError(f"{path} is the owner's own knowledge or not a knowledge file. An agent writes "
                         f"knowledge/<name>.md, never knowledge/owner/.")
@@ -12788,9 +12863,8 @@ def t_write_knowledge(agent, a):
     if stored:
         return stored["text"]
     message = (f"{agent} changed {path}: {why}\n\n"
-               f"An agent writes the knowledge files its own profile lists, directly and without asking: the owner's "
-               f"rule of 17 October 2026 is that the grant is the authorization, and the profile — which is the "
-               f"owner's — is what says this agent may read and so may write this file. A fact with no repository "
+               f"An agent writes the fleet's shared knowledge files, directly and without asking (the owner, 26 "
+               f"October 2026: no unnecessary gates); the owner's own files are his alone. A fact with no repository "
                f"has no other home, and a loop that asks for approval of each fact is not a loop. The owner reads "
                f"this commit in the configuration ref and reverts it in one step.")
     try:
@@ -14416,8 +14490,9 @@ TOOLS = [
         "became_task": {"type": "string", "description": "With decision \"task\": the task you made, for example T-9"}},
        ["report_id", "decision"])),
     ("all", "search_knowledge", t_search_knowledge,
-     "Search the knowledge files that you may use for the words of a query: the files that the Knowledge files section "
-     "of your profile lists, and for the manager also every owner file (knowledge/owner/). It reads them at the hub's "
+     "Search the knowledge files that you may use for the words of a query: every shared file of the fleet "
+     "(knowledge/<name>.md), the files that the Knowledge files section of your profile lists, and for the manager "
+     "also every owner file (knowledge/owner/). It reads them at the hub's "
      "current commit, in any case, and a word of the query matches the start of a word: refund finds Refunds. The best "
      "files come first: those with the most words of the query, then with the most of them in one line. For each file: "
      "its path, its title and up to 3 of its best lines, with the line before and after each. Then read the full file "
@@ -14672,14 +14747,15 @@ TOOLS = [
         "reason": {"type": "string", "description": "Why it no longer stands, in one line"}, "task_id": TASK_ID},
        ["request_id", "memory", "reason"])),
     ("all", "write_knowledge", t_write_knowledge,
-     "Write one of the knowledge files that your profile lists: a fact with no repository, such as an account, a "
-     "customer or a supplier. You write it directly, without asking, because those files are the ones you already "
-     "read; the owner's own files (knowledge/owner/) are his alone. text is the file's whole new content, so read it "
+     "Write one of the fleet's shared knowledge files, knowledge/<name>.md: a fact with no repository, such as an "
+     "account, a customer or a supplier, that another agent may need. You write it directly, without asking; the "
+     "owner's own files (knowledge/owner/) are his alone. text is the file's whole new content, so read it "
      "in your checkout first, change what you must and give all of it back. It becomes one commit of the "
      "configuration ref with your name and your why on it, which the owner reads and reverts in one step. What you "
      "yourself learned goes in remember instead, and a fact about a product goes in that product's repository.",
      S({"request_id": {"type": "string", "description": "A new UUID for each write"},
-        "path": {"type": "string", "description": "One of your Knowledge files, for example knowledge/services.md"},
+        "path": {"type": "string", "description": "A shared knowledge file, knowledge/<name>.md, for example "
+                                                  "knowledge/suppliers.md"},
         "text": {"type": "string", "description": "The file's whole new content, as Markdown"},
         "why": {"type": "string", "description": "What you changed and why, in one line, for the commit message"},
         "task_id": TASK_ID},
@@ -14688,9 +14764,9 @@ TOOLS = [
      "Write a duty of an agent: a new one, or a change of one that exists (give responsibility). Give the same "
      "responsibility with another agent to move the duty to that agent, or with other words to change what it "
      "says. Whose duties you may write: the manager writes the duty of any agent of the fleet, because it is the "
-     "authority over them all; a lead writes the duties of its own team and of nobody else, and asks the manager "
-     "for a duty outside it. An agent does not write its own duty, a lead included: propose it instead, and the "
-     "manager decides. You write duties that the owner asks for, and the ones you work out for yourself: work that "
+     "authority over them all; a lead writes the duties of its own team; a worker or a lead writes its own duties, "
+     "and the manager is told of each one and can change, move, pause or retire it. Ask the manager for a duty of "
+     "anybody else. You write duties that the owner asks for, and the ones you work out for yourself: work that "
      "keeps coming back, a goal that needs looking after and not one task, something you keep doing by hand. "
      "Choose the holder by suitability first (see_capacity). The manager can hold a duty itself when no agent "
      "suits it or it is about the fleet. A duty is two things: the agent, and the words. Say in text what the "
@@ -14766,6 +14842,16 @@ TOOLS = [
      "request_id is one message: the same request_id again sends nothing more. Never put a login in the text.",
      S({"request_id": {"type": "string", "description": "A new UUID for each message"},
         "text": {"type": "string", "description": "The message, 1 to 4,000 characters"}}, ["request_id", "text"])),
+    ("worker", "start_task", t_start_task,
+     "Only in your owner chat, and only when the owner asks you in his own words to do work: open it as a task of "
+     "your own. It runs in its own task session, with the manager as its requester, which checks the result; tell the "
+     "owner with tell_owner that it started. Give in_reply_to, the request UUID of his message: one message is one "
+     "task, and a message from another agent starts nothing.",
+     S({"title": STR, "done_when": {"type": "string", "description": "The line a stranger could test the result "
+                                                                   "against"},
+        "in_reply_to": {"type": "string", "description": "The request UUID of the owner's message that asks for the "
+                                                         "work"}},
+       ["title", "done_when", "in_reply_to"])),
     ("all", "message_agent", t_message_agent,
      "Send a message to another agent: a question, an answer or coordination. It has your authority, never the "
      "owner's, and a message that you get has its sender's authority. Work that needs tools is still a task, through "
@@ -14872,7 +14958,8 @@ TOOLS = [
 # The tools of the chat window. see_responsibilities and recall only read, so the owner can ask an agent in chat what
 # it is responsible for and what it has learned; a duty is still written by the manager (owner API 1.13) and a memory
 # in a task session, never in a chat window.
-CHAT_TOOLS = ("read_messages", "tell_owner", "message_owner", "message_agent", "see_responsibilities", "recall")
+CHAT_TOOLS = ("read_messages", "tell_owner", "message_owner", "message_agent", "see_responsibilities", "recall",
+              "start_task")
 
 
 def tool_contract(agent, context=None):
@@ -14896,10 +14983,10 @@ def tools_for(agent, context=None):
              "annotations": {"readOnlyHint": name in read_only, "destructiveHint": False,
                              "idempotentHint": name in read_only, "openWorldHint": False}}
             for r, name, fn, desc, schema in TOOLS if
-            (r in (role, "all") or (role == "lead" and (r == "worker" or name in LEAD_TEAM_TOOLS))) and
+            role_offers(role, r, name) and
             (name in conversation_tools(agent, context) if conversation_context(agent, context) else
              name in CHAT_TOOLS if chat_context(agent, context) else
-             not (role in ("worker", "lead") and name == "tell_owner") and name not in CONVERSATION_ONLY) and
+             not (role in ("worker", "lead") and name == "tell_owner") and name not in CONVERSATION_ONLY + CHAT_ONLY) and
             # create_login and save_key: off until the owner allows the agent
             (name not in ("create_login", "save_key") or agents()[agent].get("vault_create") is True) and
             # call_api: only for an agent whose machine has the vault broker
@@ -15011,7 +15098,7 @@ def call_tool(agent, name, args, context=None):
         if extra:
             raise ToolError(stale_instructions(name, extra))
         for r, tname, fn, desc, schema in TOOLS:
-            if tname == name and (r in (role, "all") or (role == "lead" and (r == "worker" or name in LEAD_TEAM_TOOLS))):
+            if tname == name and role_offers(role, r, name):
                 # These wait for an answer, a helper or Google, or read many files (search_knowledge): not under LOCK.
                 # deliver_result waits for the helper to send the task's files (deliver_outputs).
                 if name in ("ask_my_requester", "sign_in", "hand_over", "create_login", "save_key", "call_api",
@@ -17230,9 +17317,13 @@ def liveness(t0):
     for t in q("SELECT * FROM tasks WHERE state IN ('submitted','working','input-required','auth-required')"):
         tid, owner = t["id"], t["owner"]
         row = q1("SELECT * FROM agents WHERE name=?", (owner,))
-        online = bool(row and row["last_seen"] and t0 - row["last_seen"] < CFG.get("offline_after", 90))
-        listed = bool(row and row["alive_ts"] and t0 - row["alive_ts"] <= 60)       # the helper sends its window list
-        alive = listed and tref(tid) in set(filter(None, (row["alive"] or "").split(",")))
+        quiet = quiet_for(row["last_seen"], t0) if row else None
+        online = quiet is not None and quiet < CFG.get("offline_after", 90)
+        has_list = listed(row)       # the helper's window list came with its latest check-in
+        alive = has_list and tref(tid) in set(filter(None, (row["alive"] or "").split(",")))
+        # The step that the helper's loop is inside now starts this task: its window may not be there yet
+        busy = presence_of(owner, t0)
+        starting = online and busy and busy["task"] == tref(tid)
         hold, lim, park = active_hold(tid), active_limit(owner), parked(tid)
         # Only a question the task is actually waiting on is a live path. One asked with a default is not: its task
         # works on, so a session that then dies has no path of its own and must be restarted like any other -- and
@@ -17250,7 +17341,7 @@ def liveness(t0):
         elif t["state"] == "submitted":
             path = ((f"waiting for {owner} to load its new settings" if settings_pending(owner) else
                      "waiting for its session to start") if online else None)
-        elif alive or (online and not listed):
+        elif alive or (online and not has_list) or starting:
             path = "live session" if alive else "helper online"
         elif question:
             path = f"waiting for the answer to Q-{question['id']}"
@@ -17302,22 +17393,64 @@ def liveness(t0):
 
 
 OFFLINE_RETELL = 1800      # seconds: a machine that goes offline again within this time is not reported again
+# What a queued event of an agent is, for the requester that is told it waits behind its helper's step (plan C2).
+QUEUED_WORK = {"task": "start", "stop": "stop", "control": "pause or stop", "say": "message"}
+
+
+def presence_of(agent, t0):
+    """The step that the agent's helper is inside now, from its presence pings (plan C2), or None: {step, task, since,
+    at}. A ping older than offline_after is history: the step ended, or the helper did."""
+    try:
+        p = json.loads(kv_get("presence:" + agent) or "null")
+    except ValueError:
+        return None
+    return p if isinstance(p, dict) and t0 - float(p.get("at") or 0) <= CFG.get("offline_after", 90) else None
+
+
+def presence_ping(agent, step, task, since, t0):
+    """One presence ping, under the lock: keep the step, and at a ping after the first of the same step tell the
+    requester of each task whose work was queued before the ping before it, once for that step. The manager's own
+    helper tells nobody here: its requester is the owner, and its flag is the place for that (plan C10)."""
+    try:
+        was = json.loads(kv_get("presence:" + agent) or "null")
+    except ValueError:
+        was = None
+    same = isinstance(was, dict) and was.get("step") == step and was.get("task") == task and \
+        abs(float(was.get("since") or 0) - since) < PRESENCE_SAME
+    p = {"step": step, "task": task, "since": was["since"] if same else since, "at": t0,
+         "told": was.get("told") or [] if same else []}
+    if same and agent != manager_name():
+        queued = q("SELECT task, kind, extra FROM events WHERE agent=? AND task IS NOT NULL AND created<? AND "
+                   "helper_ack IS NULL AND read_at IS NULL AND kind IN ('task','stop','control','say') ORDER BY id",
+                   (agent, float(was.get("at") or t0)))
+        for e in queued:
+            if e["task"] in p["told"] or (e["kind"] == "say" and json.loads(e["extra"] or "{}").get("quiet")):
+                continue
+            t = q1(f"SELECT id, requester, title FROM tasks WHERE id=? AND {OPEN_TASK}", (e["task"],))
+            if not t:
+                continue
+            p["told"].append(t["id"])
+            emit(t["requester"], "say", f"[hub] {agent}'s helper is inside one step ({step}) since {clock(p['since'])}, "
+                                        f"and the {QUEUED_WORK[e['kind']]} of {tref(t['id'])} ({t['title']}) waits "
+                                        f"behind it. Nothing was restarted; it goes on when that step ends.",
+                 task=t["id"])
+            log("hub", f"{agent}'s helper is inside {step}: {tref(t['id'])} waits behind it")
+    with area("quiet"):
+        kv_set("presence:" + agent, json.dumps(p))
 
 
 def offline_sweep(t0):
     """A worker or lead whose helper stops checking in wakes the manager once per offline episode (spec: the manager
-    wakes on a machine going offline). A machine that never checked in is not going offline. Right after a hub start
-    nothing is reported, so that every helper has time to check in again."""
+    wakes on a machine going offline). A machine that never checked in is not going offline. Silence counts from the
+    hub's own start at the earliest (quiet_for), so a hub that was down reports nobody for that time."""
     grace = CFG.get("offline_after", 90)
-    if t0 - STARTED < 2 * grace:
-        return
     mgr = manager_name()
     for name, conf in agents().items():
         if conf.get("role") not in ("worker", "lead"):
             continue
         row = q1("SELECT last_seen FROM agents WHERE name=?", (name,))
         seen = row["last_seen"] if row else None
-        if not seen or t0 - seen <= grace:
+        if not seen or quiet_for(seen, t0) <= grace:
             continue
         told = float(kv_get("offline_told:" + name) or 0)
         if told >= seen or t0 - told < OFFLINE_RETELL:
@@ -17360,14 +17493,15 @@ def manager_flag_update(t0):
             flag = (f"The manager reached its usage limit. Its messages wait until {clock(lim['until'])}"
                     + ("." if lim["reset_known"] else ", one hour after the limit was seen, because no reset time was given.")
                     + " If its session shows the rate-limit menu, answer it on that machine. The helper never answers it.")
-        asks = kv_get("mgr_screen")
-        if asks and t0 - float(asks) < 90:
+        asks, shown = kv_get("mgr_screen"), kv_get("mgr_screen_shown")
+        if shown or (asks and t0 - float(asks) < 90):
             kind = "screen"
             flag = "The manager's session shows a question on its own screen. Open its session and answer it."
         row = q1("SELECT * FROM agents WHERE name=?", (mgr,))
+        quiet = quiet_for(row["last_seen"], t0) if row else None
         # A window list from before the end of a switch can still lack the new session's window (switch_ended).
-        if row and row["alive_ts"] and t0 - row["alive_ts"] < 60 and "manager" not in (row["alive"] or "").split(",") \
-                and row["alive_ts"] > switch_ended(mgr):
+        if listed(row) and quiet is not None and quiet < CFG.get("offline_after", 90) and \
+                "manager" not in (row["alive"] or "").split(",") and row["alive_ts"] > switch_ended(mgr):
             kind = "down"
             flag = "The manager session is not running. Start it again."
         # Signed out, it can do nothing, so its silence, a question on its screen, a stopped session or an old limit
@@ -17411,7 +17545,7 @@ TICK_SEEN = {}
 
 def tick_changes(t0):
     offline = tuple(sorted(r["name"] for r in q("SELECT name, last_seen FROM agents")
-                           if not r["last_seen"] or t0 - r["last_seen"] > CFG.get("offline_after", 90)))
+                           if not r["last_seen"] or quiet_for(r["last_seen"], t0) > CFG.get("offline_after", 90)))
     stale = tuple(sorted(r["agent"] for r in q("SELECT agent, reported FROM machine_status")
                          if t0 - r["reported"] > MACHINE_STALE))
     if TICK_SEEN.get("last") not in (None, (offline, stale)):
@@ -19417,7 +19551,7 @@ JOIN_CODE = re.compile(r"[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{12}")       # LINK_A
 JOIN_TAGS = "tag:claude-code-dev,tag:terminal-relay-worker"     # onboard.DEFAULT_TAGS: the hub's ports, the owner's SSH
 JOB_OPEN = ("queued", "running", "needs_owner")
 JOB_STEPS = ("user", "runtime", "checkout", "service", "sign_in")       # `user`: the agent's own OS user, on Linux
-JOB_SILENT = 1800               # seconds after which an open job whose server sent nothing has failed
+JOB_SILENT = 1800               # seconds after which an open job of a server without the job heartbeat has failed
 CODEX_SIGN_IN = RUNTIMES["codex"]["sign_in"]["url"]     # the link of its own device sign-in (sign_in_prompt)
 SERVER_PROFILE = """# Profile: %(name)s
 
@@ -19483,10 +19617,18 @@ def server_kind_of(team, machine):
 
 
 def expire_server_jobs(t0):
-    """An open job whose server sent nothing for JOB_SILENT seconds has failed: its server service stopped."""
-    q("UPDATE server_jobs SET state='failed', prompt=NULL, updated=?, detail=? WHERE state IN ('queued','running',"
-      "'needs_owner') AND updated<?", (t0, "The server service stopped answering. Check that the server is on, then "
-                                           "try again.", t0 - JOB_SILENT))
+    """An open job fails on its own failure report, or when its server service stops answering (plan C2). A server
+    that reports its status while a job runs (server.JOB_HEARTBEAT) has stopped when its newest report and the job's
+    own last word are both older than MACHINE_STALE, so a first install or clone that takes an hour stays open while
+    its server lives. One that does not report that keeps JOB_SILENT, the time since the job's own last word."""
+    for job in q("SELECT id, server, updated FROM server_jobs WHERE state IN ('queued','running','needs_owner')"):
+        st = q1("SELECT data, reported FROM server_status WHERE server=?", (job["server"],))
+        beats = bool(st) and "job_heartbeat" in (json.loads(st["data"]).get("features") or [])
+        last = max(job["updated"], st["reported"]) if beats else job["updated"]
+        if t0 - last > (MACHINE_STALE if beats else JOB_SILENT):
+            q("UPDATE server_jobs SET state='failed', prompt=NULL, updated=?, detail=? WHERE id=? AND state IN "
+              "('queued','running','needs_owner')", (t0, "The server service stopped answering. Check that the server "
+                                                         "is on, then try again.", job["id"]))
 
 
 def job_view(row):
@@ -21613,7 +21755,7 @@ def health_view():
     for name in agents():
         row = q1("SELECT last_seen FROM agents WHERE name=?", (name,))
         seen = row["last_seen"] if row else None
-        offline = not seen or t0 - seen > CFG.get("offline_after", 90)
+        offline = not seen or quiet_for(seen, t0) > CFG.get("offline_after", 90)
         helpers.append({"agent": name, "last_seen": seen, "offline": offline})
         if offline:
             warn("helper_offline", f"{name.capitalize()}'s helper has not checked in since "
@@ -23385,7 +23527,7 @@ class Handler(BaseHTTPRequestHandler):
             data = validate_status(self.form())
         except (ValueError, TypeError) as e:
             return self.json(400, {"error": f"invalid status: {e}"})
-        reading = {k: data[k] for k in ("revision", "os", "security", "runtimes", "access")}
+        reading = {k: data[k] for k in ("revision", "os", "security", "runtimes", "access", "features")}
         if secret_hit(json.dumps(reading)):
             return self.json(422, {"error": "registered login refused"})
         old = q1("SELECT data FROM server_status WHERE server=?", (name,))
@@ -26723,6 +26865,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.helper_control(parts[2])
         if parts[:2] == ["helper", "limit"] and len(parts) == 3:
             return self.helper_limit(parts[2])
+        if parts[:2] == ["helper", "presence"] and len(parts) == 3:         # plan C2: a helper inside one step
+            return self.helper_presence(parts[2])
         if parts[:1] == ["mcp"] and len(parts) in (2, 5):
             return self.mcp(parts[1], parts[2:] if len(parts) == 5 else None)
         if parts[:2] == ["hook", "permission"] and len(parts) == 4:
@@ -26948,19 +27092,38 @@ class Handler(BaseHTTPRequestHandler):
         self.send(303, b"", headers={"Location": "/board"})
 
     def helper_dialog(self, agent, task):
-        """The helper found a question on a session's own screen and did not type over it."""
+        """The helper found a question on a session's own screen and did not type over it. kind (plan C2, the screen
+        watch): "shown" when it appeared, "gone" when it went, each told once; none is a helper without the watch,
+        which tells only when a message waits to be typed, and again each minute for the manager."""
         if agent not in agents():
             return self.json(404, {"error": "unknown agent"})
         if not self.allowed(agent):
             return
+        kind = self.form().get("kind") if self.body() else None
+        if kind not in (None, "shown", "gone"):
+            return self.json(400, {"error": "kind is shown or gone"})
         if agent == manager_name():
-            kv_set("mgr_screen", now())         # the timers turn this into a banner and a notification
+            if kind is None:
+                kv_set("mgr_screen", now())         # the timers turn this into a banner and a notification
+            else:       # the watch says when it goes, so the banner stays until then and not for 90 seconds
+                kv_set("mgr_screen_shown", now() if kind == "shown" else None)
+                if kind == "gone":
+                    kv_set("mgr_screen", None)
+                manager_flag_update(now())
             return self.json(200, {})
         try:
             tid = parse_task(task)
         except ToolError:
             return self.json(200, {})
         t = q1("SELECT * FROM tasks WHERE id=?", (tid,))
+        if kind == "gone":
+            if t and t["state"] not in TERMINAL and t["waiting_on"] == "its screen":
+                # what the task waits on again: the question it asked, if one is open, else nothing on its screen
+                asked = q1("SELECT id FROM questions WHERE task=? AND answer IS NULL AND assumed IS NULL ORDER BY id",
+                           (tid,))
+                q("UPDATE tasks SET waiting_on=? WHERE id=?", (f"Q-{asked['id']}" if asked else None, tid))
+                log("hub", f"{tref(tid)} on {agent}: the question on its screen went")
+            return self.json(200, {})
         if q1("SELECT id FROM prompts WHERE task=? AND decision IS NULL", (tid,)):
             return self.json(200, {})       # that question is a permission prompt the hub is already carrying
         if t and t["state"] not in TERMINAL and t["waiting_on"] != "its screen":
@@ -27724,6 +27887,38 @@ class Handler(BaseHTTPRequestHandler):
             lim = active_limit(agent)
         return self.json(200, {"ok": True, "until": lim["until"] if lim else None})
 
+    def helper_presence(self, agent):
+        """A ping of the helper's presence thread (plan C2): its main loop is inside one named step, so it cannot poll,
+        and it is alive. It keeps the helper online, sends its window list when tmux answered, and is kept for
+        see_team and see_capacity (presence_of). The ping after the first of one step tells the requesters of the
+        work queued behind it (presence_ping)."""
+        if agent not in agents():
+            return self.json(404, {"error": "unknown agent"})
+        if not self.allowed(agent):
+            return
+        f = self.form()
+        step, task, age, alive = f.get("step"), f.get("task"), f.get("age"), f.get("alive")
+        if not isinstance(step, str) or not step.strip() or len(step) > 120 or \
+                not isinstance(age, (int, float)) or isinstance(age, bool) or not math.isfinite(age) or age < 0 or \
+                (task is not None and not (isinstance(task, str) and re.fullmatch(r"T-[1-9][0-9]{0,17}", task))) or \
+                (alive is not None and not isinstance(alive, str)):
+            return self.json(400, {"error": "step (1 to 120 characters) and age (seconds) are required; task (T-<id>) "
+                                            "and alive (the window list) are optional"})
+        touch(agent)
+        t0 = now()
+        with area("quiet"):     # tmux did not answer: the windows are not known now, and no list is read
+            q("UPDATE agents SET alive_ts=? WHERE name=?", (t0 if alive is not None else None, agent))
+        if alive is not None:
+            with LOCK:
+                moved = DB.execute("UPDATE agents SET alive=? WHERE name=? AND alive IS NOT ?",
+                                   (alive, agent, alive)).rowcount
+                commit()
+            if moved and agent == manager_name():
+                manager_flag_update(t0)
+        with LOCK:
+            presence_ping(agent, " ".join(CONTROL.sub(" ", step).split()), task, t0 - age, t0)
+        return self.json(200, {"ok": True})
+
     def helper_control(self, agent):
         """The helper reports what came of a pause or stop: confirmed or not, after it sent every record."""
         if agent not in agents():
@@ -27945,7 +28140,9 @@ def rpc(agent, m, headers, context=None, credential=None):
                                        f"You are '{agent}' in its direct owner chat. Read messages without a task id; "
                                        "reply to the owner with tell_owner using the request UUID in in_reply_to, and "
                                        "to an agent with message_agent and its AM id in in_reply_to. Discussion only; "
-                                       "no task execution."
+                                       "no task execution here: when the owner asks you in his own words to do work, "
+                                       "open it with start_task and the request UUID of his message, and it runs in "
+                                       "its own task session."
                                        if chat_context(agent, context) else
                                        f"Team tools of Founderizer. You are '{agent}'. Execution work is a task; follow RULES.md.")}
         elif method == "ping":

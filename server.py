@@ -28,6 +28,7 @@ service runs no AI session and reads no secret. Its key is
 ~/.fleet/server.key (mode 600); the hub keeps only its SHA-256, and it opens only this server's routes.
 """
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -37,6 +38,7 @@ import re
 import secrets
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -51,6 +53,9 @@ KEY_FILE = os.path.join(FLEET, "server.key")
 CONF_FILE = os.path.join(FLEET, "server.json")
 LABEL, UNIT = "com.agentfleet.server", "fleet-server.service"
 REPORT_EVERY = 300              # seconds between readings
+# The one feature of this service that the hub reads: it reports its status while a job runs too (beating), so the
+# hub tells a long step of a live server from a server that stopped, with no clock of its own (plan C2).
+JOB_HEARTBEAT = "job_heartbeat"
 POLL = 5                        # seconds between looks for a job
 SIGN_IN_WAIT = 900              # seconds a sign-in may take
 HELPER_WAIT = 120               # seconds for a new agent's own helper to reach the hub, before its sign-in can start
@@ -386,7 +391,7 @@ class Service:
         runtimes = {n: life.runtime(n) for n in lifecycle.SWITCH_RUNTIMES}
         return {"revision": self.loaded, "os": life.os_info(), "security": life.security(),
                 "runtimes": {n: {"version": r["version"], "signed_in": r["signed_in"]} for n, r in runtimes.items()},
-                "access": dict(life.access(), user=pwd.getpwuid(os.getuid()).pw_name)}
+                "access": dict(life.access(), user=pwd.getpwuid(os.getuid()).pw_name), "features": [JOB_HEARTBEAT]}
 
     def report(self):
         status, answer = self.hub.call("POST", f"/server/{self.name}/status", self.reading())
@@ -409,12 +414,31 @@ class Service:
                 continue
             jobs = answer.get("jobs") if status == 200 else None
             for job in jobs or []:
-                self.work(job)
+                with self.beating():
+                    self.work(job)
                 self.report()
             if jobs == []:
                 self.vault_program()
                 self.update()
             self.sleep(POLL)
+
+    @contextlib.contextmanager
+    def beating(self):
+        """The status goes on while a job runs, every REPORT_EVERY seconds: a first install or clone can take an
+        hour, and its own steps say nothing in between (plan C2, hub.expire_server_jobs)."""
+        done = threading.Event()
+
+        def beat():
+            while not done.wait(REPORT_EVERY):
+                try:
+                    self.report()
+                except Exception:
+                    pass        # the next beat, or the report after the job, tries again
+        threading.Thread(target=beat, name="job-heartbeat", daemon=True).start()
+        try:
+            yield
+        finally:
+            done.set()
 
     def work(self, job):
         try:

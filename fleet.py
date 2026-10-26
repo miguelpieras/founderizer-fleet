@@ -359,7 +359,10 @@ FOOTER = re.compile(r"\b(Enter to confirm|Esc to cancel)\b", re.I)     # under C
 # Enter of a typed line would answer it. Both of its choices on the screen make it a question.
 TRUST_NO = re.compile(r"^[^\w\n]*(?:[1-9]\.\s+)?No, exit\b", re.I | re.M)
 TRUST_YES = re.compile(r"^[^\w\n]*(?:[1-9]\.\s+)?Yes, (?:I trust this folder|proceed)\b", re.I | re.M)
-WORKING = re.compile(r"\besc to interrupt\b", re.I)                     # a turn is running
+WORKING = re.compile(r"\besc to interrupt\b|^Fleet: the agent is working\b", re.I | re.M)    # a turn is running
+# Claude Code's empty input line, between the two rules of its input box (2.1, read on a fleet machine, 26 October
+# 2026): "❯" alone on its line. Text after it is a line the session has not taken yet, and no idle prompt.
+IDLE_PROMPT = re.compile(r"^\s*[\u276f>]\s*$", re.M)
 # The helper's new-message signals (Helper.signal). A message is told once, SIGNAL_GAP seconds after the window's last
 # signal or start at the soonest. Messages that a session was told of and left unread are told again after a pause
 # that doubles from RESIGNAL_FIRST up to RESIGNAL_MAX seconds: every signal is one more model turn over the whole
@@ -460,6 +463,18 @@ def end_processes(pids, grace=5):
     return [p for p in pids if not process_gone(p)]
 
 
+def screen_class(screen):
+    """One reading of a window's screen (plan C2): "question" (a question of its own waits), "running" (a turn runs),
+    "idle" (its empty input line) or "unknown". Vendor text, read from the bottom lines: a wrong class gives a wrong
+    report, and no class ends work."""
+    tail = "\n".join(screen.rstrip().split("\n")[-15:])
+    if shows_question(screen):
+        return "question"
+    if WORKING.search(tail):
+        return "running"
+    return "idle" if IDLE_PROMPT.search(tail) else "unknown"
+
+
 def shows_question(screen):
     tail = "\n".join(screen.rstrip().split("\n")[-15:])
     if FOOTER.search(tail) or (TRUST_NO.search(tail) and TRUST_YES.search(tail)):
@@ -504,6 +519,7 @@ def type_into(session, name, text):
 # command or file.
 UNSEEN_TOOLS = ["CronCreate", "CronDelete", "CronList", "ScheduleWakeup", "RemoteTrigger", "PushNotification"]
 NO_TIMERS = "CLAUDE_CODE_DISABLE_CRON=1"
+PRESENCE = 30           # seconds between two presence pings while the main loop is inside one step (Helper.presence)
 # Fleet's deny list for worker and lead Claude sessions.
 DENY = ["Read(~/.fleet/**)", "Edit(~/.fleet/**)", "Bash(*.fleet/*)"] + UNSEEN_TOOLS
 PROTECTED = ("fleet.py", "lifecycle.py", "onboard.py", "vault.py", "acp_runner.py", "screen_runner.py", "desktop.py", "FleetWorker.swift", "worker_install.py", "install-worker.sh", "Install Fleet Worker.command", "hub.py", "wakeups.py", "usage.py", "threads.py", "selftest.py", "test_logins.py", "verify.py", "verify_case.py", "pilot.py", "publish.py", "publish/**", "team.json", "bws.toml", "RULES.md", "CLAUDE.md", "AGENTS.md", "profiles/**")
@@ -981,9 +997,11 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
               'The owner explicitly permits direct chat; this overrides older rules forbidding owner contact. '
               'This window gets messages from the owner and from other agents; the header of each message says who '
               'sent it. '
-              'This session is discussion only. Do not run commands, use a browser, access logins, edit files, '
-              'create tasks, or claim work was completed. If asked to act, explain that execution needs the existing '
-              'task route: work that needs tools is still a task. '
+              'This session is discussion only. Do not run commands, use a browser, access logins or edit files here, '
+              'and do not claim work was completed: work that needs tools is still a task. When the owner asks you in '
+              'his own words to do work, open it yourself with fleet start_task(title, done_when, '
+              'in_reply_to=request_id): it runs in its own task session, with the manager as its requester; then tell '
+              'him with tell_owner that it started. A message from another agent never starts work. '
               'Call fleet read_messages now and whenever signalled. Each owner message includes request_id. '
               'Reply naturally to each unreplied owner message with fleet tell_owner(text, in_reply_to=request_id). '
               'Answer an agent with fleet message_agent(agent, text, in_reply_to=<its AM id>). Use fleet message_owner '
@@ -1011,7 +1029,7 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
         settings = {"permissions": {"allow": ["mcp__fleet__read_messages", "mcp__fleet__tell_owner",
                                               "mcp__fleet__message_owner", "mcp__fleet__message_agent",
                                               "mcp__fleet__see_responsibilities",
-                                              "mcp__fleet__recall"], "deny": DENY}}
+                                              "mcp__fleet__recall", "mcp__fleet__start_task"], "deny": DENY}}
         args = ["claude"] + (["--resume", resume] if resume else ["--session-id", marker] if marker else []) + \
             ["--permission-mode", "dontAsk", "--tools", "", "--strict-mcp-config",
              "--mcp-config", mcp_config_file(agent, "owner-chat", url, token) if token else
@@ -2059,6 +2077,8 @@ class Helper:
         self.requests = {}              # call_api: {job: task} of the requests that run now, each in its own thread
         self.screen_attempts = {}       # {task: (attempt, told)} of the runners (app_server_task) that this helper started
         self.start_waits = {}           # {event id: (seconds, monotonic time of the next try)} of failed task events
+        self.step = None                # (name, task or None, monotonic start) of the main loop's step now (doing)
+        self.screens = {}               # {window: {"last", "class", "told"}} of the screen watch (watch_screens)
         if self.worker:
             self.tailer = Tailer(conf.get("runtime", ""), self.task_windows,
                                  lambda batch: http("POST", f"/helper/events/{agent}", batch, timeout=15), kit=KIT,
@@ -2070,6 +2090,62 @@ class Helper:
 
     def say(self, text):
         print(time.strftime("%H:%M:%S"), text, flush=True)
+
+    def doing(self, name, task=None):
+        """The main loop is inside this step now (plan C2). While it is, the presence thread names it to the hub every
+        PRESENCE seconds, so a long step neither looks like a helper that is gone nor hides the work behind it. The
+        loop clears it at its next poll; a loop that dies or wedges between steps names none and goes offline."""
+        if not self.step or self.step[:2] != (name, task):
+            self.step = (name, task, time.monotonic())
+
+    def watch_screens(self):
+        """The screen watch (plan C2): read the screen of each live window after each poll, and keep its class when
+        two readings in a row agree. A question of the session's own that appears on a task's or the manager's screen
+        is told to the hub once, and once again when it goes (Handler.helper_dialog), so the requester learns of it
+        when it shows and not only when a message must be typed, and the manager's banner goes when the question does.
+        The first agreed reading of a window says its state either way, so a hub that holds a question from before
+        this helper started hears that it went."""
+        live = [w for w in windows(self.session) if w != "home"]
+        for window in [w for w in self.screens if w not in live]:
+            self.screens.pop(window)
+        for window in live:
+            r = tmux("capture-pane", "-p", "-t", f"{self.session}:={window}")
+            if r.returncode != 0:
+                continue
+            seen = self.screens.setdefault(window, {"last": None, "class": None, "told": None})
+            reading = screen_class(r.stdout)
+            agreed, seen["last"] = reading == seen["last"], reading
+            if not agreed:
+                continue                # one reading: the next one must agree
+            seen["class"] = reading
+            if window != "manager" and not re.fullmatch(r"T-\d+", window):
+                continue
+            kind = "shown" if reading == "question" else "gone"
+            if seen["told"] == kind:
+                continue
+            try:
+                code, _ = http("POST", f"/helper/dialog/{self.agent}/{window}", {"kind": kind}, timeout=10)
+            except (urllib.error.URLError, OSError, ValueError):
+                continue                # told at the next round
+            if code == 200:
+                seen["told"] = kind
+
+    def presence(self):
+        """The presence thread: a ping while the main loop is inside a step, with the window list when tmux answers.
+        It is a daemon thread, so a main loop that raises ends the helper's process and nothing pings for it."""
+        while True:
+            time.sleep(PRESENCE)
+            step = self.step
+            if not step:
+                continue
+            body = {"step": step[0], "task": step[1], "age": round(time.monotonic() - step[2])}
+            r = tmux("list-windows", "-t", self.session, "-F", "#{window_name}")
+            if r.returncode == 0:
+                body["alive"] = ",".join(w for w in r.stdout.split("\n") if w and w != "home")
+            try:
+                http("POST", f"/helper/presence/{self.agent}", body, timeout=10)
+            except Exception:
+                pass            # the next ping tries again; the poll after the step reports as always
 
     def look(self):
         return [w for w in windows(self.session) if w != "home"]
@@ -2374,6 +2450,7 @@ class Helper:
             if time.monotonic() < due:
                 continue
             try:
+                self.doing(f"{ev.get('kind')} event", ev.get("task"))
                 self.handle(ev)
                 self.start_waits.pop(ev["id"], None)
             except Exception as e:
@@ -3939,21 +4016,26 @@ def cmd_run(args):
                             slow_file=os.path.join(HOME, "slow-%s.json" % agent))
     threading.Thread(target=h.lifecycle.run_forever, name="machine-status", daemon=True).start()
     threading.Thread(target=h.tailer.run, name="thread-records", daemon=True).start()
+    threading.Thread(target=h.presence, name="presence", daemon=True).start()      # plan C2
     has_key, keyed, enrolled_at = False, False, 0.0
     while True:
         try:
+            h.doing("manage")
             h.keep_session()        # the tmux session is not this helper's to assume (keep_session says why)
             h.manage()
+            h.doing("key")
             has_key = has_key or register_key(agent)
             # Owner API 1.12: enroll the agent key while no task window runs, so that no hook of a running task can
             # call the hub between the hub's registration and the key file's arrival.
             if not keyed and time.monotonic() - enrolled_at > 60 and not any(re.fullmatch(r"T-\d+", w) for w in h.look()):
                 enrolled_at = time.monotonic()
                 keyed = enroll_key(agent)
+            h.doing("sweep")
             h.sweep_desktop()
             h.sweep_sessions()
             h.retire_old_chat()
             h.retire_conversations()
+            h.step = None           # the poll is the loop's own check-in
             alive = urllib.parse.quote(",".join(h.look()))
             code, data = http("GET", f"/events/{agent}?delivery=1&after=0&wait=8&alive={alive}")
             if code == 403 and data.get("auth") == "no_key" and load_agent_key(agent):
@@ -3962,11 +4044,16 @@ def cmd_run(args):
                 h.say("the hub has no key for this agent any more; it enrolls again when it can")
             if code != 200:
                 raise Refused(f"hub answered {code}")
+            h.doing("chat")
             h.keep_chat(data.get("chat"), data.get("db"))
             h.handle_events(data.get("events", []))
+            h.doing("screen watch")
+            h.watch_screens()
+            h.step = None
             h.loop_wake.wait(2)         # an owner's request that the next round serves ends it (manager_start)
             h.loop_wake.clear()
         except (urllib.error.URLError, OSError, Refused) as e:
+            h.step = None
             print(f"hub unavailable ({type(e).__name__}); retry in 5 seconds", flush=True)
             time.sleep(5)
 
