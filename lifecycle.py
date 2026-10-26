@@ -47,7 +47,8 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "secret_deposits",      # it carries a sealed copy of the owner's into this machine's vault (deposit)
             "secret_withdrawals",   # it has this machine's vault take back a secret nobody here holds (withdraw)
             "task_outputs",         # it sends a delivered task's outputs folder to the hub (fleet.collect_outputs)
-            "status_now"]           # it reports at once when the hub asks (event status_now, report_soon)
+            "status_now",           # it reports at once when the hub asks (event status_now, report_soon)
+            "chat_warm"]            # it starts the owner chat before a message when the hub says so (keep_chat)
 # ---------------------------------------------------------------- the runtimes
 #
 # What the fleet knows about a runtime is here, in one entry for each provider, and nowhere else. hub.py, fleet.py and

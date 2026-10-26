@@ -190,7 +190,7 @@ CREATE TABLE IF NOT EXISTS trigger_history(id INTEGER PRIMARY KEY, trigger_id IN
 CREATE TABLE IF NOT EXISTS agent_keys(agent TEXT PRIMARY KEY, sha256 TEXT NOT NULL, created REAL NOT NULL,
   source TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_credentials(sha256 TEXT PRIMARY KEY, agent TEXT NOT NULL, kind TEXT NOT NULL,
-  generation TEXT NOT NULL, task INTEGER, attempt INTEGER, created REAL NOT NULL, revoked REAL);
+  generation TEXT NOT NULL, task INTEGER, attempt INTEGER, created REAL NOT NULL, revoked REAL, ready REAL);
 CREATE TABLE IF NOT EXISTS responsibilities(id INTEGER PRIMARY KEY, agent TEXT NOT NULL,
   text TEXT NOT NULL,
   state TEXT NOT NULL, revision INTEGER NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
@@ -1500,6 +1500,10 @@ def migrate():
 
     It returns the steps this database refused, one line each, and raises nothing (build_schema says why)."""
     problems = []
+    try:
+        unready = "ready" not in {r["name"] for r in q("PRAGMA table_info(session_credentials)")}
+    except sqlite3.Error:
+        unready = False
     for table, columns in {
         "tasks": {"attempt": "INTEGER DEFAULT 1", "case_id": "TEXT", "checked_at": "REAL", "live_path": "TEXT",
                   "stalled_since": "REAL", "stalled_reason": "TEXT", "stall_told": "INTEGER DEFAULT 0",
@@ -1561,6 +1565,7 @@ def migrate():
                      "kind": "TEXT NOT NULL DEFAULT 'lesson'", "cost_minutes": "INTEGER", "recheck": "TEXT"},
         "machine_checks": {"verify": "TEXT", "revision": "TEXT"},
         "server_jobs": {"was": "TEXT"},             # owner feature agent_rename: the name a rename job moves from
+        "session_credentials": {"ready": "REAL"},   # owner feature chat_warm: when its owner chat listed its tools
         "trigger_runs": {"check_now": "INTEGER NOT NULL DEFAULT 0", "attempts": "INTEGER NOT NULL DEFAULT 0",
                          "retry_at": "REAL", "closes": "REAL", "token": "TEXT", "sent": "REAL", "expires": "REAL",
                          "value": "REAL", "summary": "TEXT", "error": "TEXT", "detail": "TEXT", "finished": "REAL",
@@ -1592,6 +1597,8 @@ def migrate():
         step_columns = set()
     if "skipped" in step_columns:       # nothing is required, so nothing is skipped
         sql_step("ALTER TABLE duty_steps DROP COLUMN skipped", problems)
+    if unready:     # an owner chat that runs from before chat_warm lists its tools no more: it counts as ready
+        sql_step("UPDATE session_credentials SET ready=created WHERE kind='chat' AND revoked IS NULL", problems)
     for statement in [
         "CREATE UNIQUE INDEX IF NOT EXISTS owner_reply_identity ON owner_reports(agent,in_reply_to) WHERE in_reply_to IS NOT NULL",
         "CREATE UNIQUE INDEX IF NOT EXISTS task_trigger_run ON tasks(trigger_run) WHERE trigger_run IS NOT NULL",
@@ -1638,6 +1645,46 @@ def chat_fence(agent, context=None):
     context = context if context is not None else getattr(CALL, "context", None)
     if not chat_context(agent, context) or context[0] != kv_get("db_id") or str(context[2]) != "1":
         raise ToolError("STOP: stale or invalid owner chat. Ask the helper to restart it.")
+
+
+# Owner feature chat_warm. The owner, 26 October 2026, after his first "Hi" to an agent he had just activated waited
+# 27 seconds: "if it's not ready we should show like a Setting up panel, not the chat interface". So the helper starts
+# an agent's owner chat before his first message (helper feature chat_warm), the hub knows the moment that session has
+# its tools, and the app shows "Setting up" in place of a chat that cannot answer yet.
+
+def chat_listed(credential):
+    """An owner chat session listed its tools with this credential: it runs and can answer now. Once per credential,
+    so a later listing writes nothing."""
+    q("UPDATE session_credentials SET ready=? WHERE sha256=? AND kind='chat' AND ready IS NULL", (now(), credential))
+
+
+def chat_session_ready(agent):
+    """True when the agent's newest owner chat credential of this generation has listed its tools. A new start asks
+    for a new credential, which revokes the one before (helper_session), so this is the session that runs now."""
+    row = q1("SELECT ready FROM session_credentials WHERE agent=? AND kind='chat' AND generation=? AND revoked IS NULL "
+             "ORDER BY created DESC LIMIT 1", (agent, kv_get("db_id")))
+    return bool(row and row["ready"] is not None)
+
+
+def chat_wanted(agent, held):
+    """True when the agent's owner chat should run now, before any message: an active worker or lead whose runtime
+    has an owner chat and is not signed out. held: something holds every new session now (a usage limit, settings
+    the helper has not loaded, an update run)."""
+    a = agents().get(agent) or {}
+    return (not held and a.get("role") in ("worker", "lead") and agent_active(agent) and owner_chat(a)
+            and signed_in_now(agent, a.get("runtime")) is not False)
+
+
+def chat_ready_now(agent, alive):
+    """What the app reads as `chat_ready`: True when the agent's owner chat window runs (alive: its helper's window
+    list) and its session has its tools, False while its helper starts it, and None when its helper does not start
+    one by itself, the agent has no owner chat of its own, or it has no key: a session without a credential lists its
+    tools as no one, so its chat could never be called ready."""
+    a = agents().get(agent) or {}
+    if a.get("role") not in ("worker", "lead") or not owner_chat(a) or not agent_active(agent) or \
+            "chat_warm" not in helper_features(agent) or not agent_key(agent):
+        return None
+    return "owner-chat" in (alive or "").split(",") and chat_session_ready(agent)
 
 
 def fence(agent, tid, context=None):
@@ -22538,7 +22585,7 @@ class Handler(BaseHTTPRequestHandler):
                                      f"{agent}'s machine has no address, so the hub cannot tell who is calling. "
                                      f"See \"addresses\" in team.json."})
             return False
-        token = self.bearer()
+        token, self.credential = self.bearer(), None
         if token is None:
             return True if not shared_machine(agent) else self.refuse(
                 agent, "credential_required", f"{agent} shares its machine with other agents: this session needs its "
@@ -22546,6 +22593,7 @@ class Handler(BaseHTTPRequestHandler):
         row = q1("SELECT * FROM session_credentials WHERE sha256=?", (hashlib.sha256(token.encode()).hexdigest(),)) \
             if token else None
         if row and row["revoked"] is None and row["agent"] == agent and binding_matches(row, context):
+            self.credential = row["sha256"]     # the session that calls (chat_listed)
             return True
         return self.refuse(agent, "credential_invalid", "this session's credential is not valid for this route; the "
                                                         "session must start again")
@@ -22874,6 +22922,9 @@ class Handler(BaseHTTPRequestHandler):
                     # What its machine last said about its own provider, so the app shows a signed-out agent its
                     # sign-in in place of its chat: null when the reading is old or a local model needs none.
                     signed_in=None if local_model(config) else signed_in_now(name, config["runtime"]),
+                    # Owner feature chat_warm: whether its owner chat can answer now, so the app shows "Setting up"
+                    # in place of a chat that cannot yet (chat_ready_now).
+                    chat_ready=chat_ready_now(name, row["alive"] if row else None),
                     limit=dict(since=lim["since"], until=lim["until"], reset_known=bool(lim["reset_known"]),
                                task=lim["task"]) if lim else None, **(dict(row) if row else
                     dict(last_seen=None, alive=None, alive_ts=None, client=None, client_seen=None))))
@@ -26170,7 +26221,7 @@ class Handler(BaseHTTPRequestHandler):
                                    "chat_recap": chat_recap_text(agent)
                                    if role_of(agent) in ("worker", "lead") else None})
         if query.get("delivery") == "1" and agent != "owner":
-            deadline = now() + wait
+            deadline, told = now() + wait, None
             while True:
                 rows = q("SELECT * FROM events WHERE agent=? AND "
                          "((kind IN ('task','say') AND read_at IS NULL) OR "
@@ -26243,10 +26294,15 @@ class Handler(BaseHTTPRequestHandler):
                         continue        # Targets left the hub (24 October 2026): a placement from before asks nobody
                     keep.append(r)
                 rows = keep
-                if rows or now() >= deadline:
+                # Owner feature chat_warm: whether this agent's owner chat should run now, before any message, and
+                # whether its session has its tools. A change ends the wait, so the chat starts as soon as it may.
+                chat = {"warm": chat_wanted(agent, limited or pending or updating),
+                        "ready": chat_session_ready(agent)} if worker else None
+                if rows or now() >= deadline or told not in (None, chat):
                     break
+                told = chat
                 time.sleep(0.5)
-            return self.json(200, {"db": kv_get("db_id"), "last": newest,
+            return self.json(200, {"db": kv_get("db_id"), "last": newest, "chat": chat,
                 "events": [{"id": r["id"], "kind": r["kind"], "task": tref(r["task"]) if r["task"] else None,
                             "text": r["text"], "extra": json.loads(r["extra"] or "{}")} for r in rows]})
         if query.get("fresh") == "1":
@@ -27680,7 +27736,7 @@ class Handler(BaseHTTPRequestHandler):
         out, headers = [], {}
         for m in batch:
             if isinstance(m, dict) and "method" in m and "id" in m:
-                out.append(rpc(agent, m, headers, context))
+                out.append(rpc(agent, m, headers, context, self.credential))
         if not out:
             return self.send(202, b"")
         self.json(200, out if isinstance(msg, list) else out[0], headers)
@@ -27704,7 +27760,8 @@ def binding_matches(row, context):
         return False
 
 
-def rpc(agent, m, headers, context=None):
+def rpc(agent, m, headers, context=None, credential=None):
+    """One JSON-RPC call of an MCP session. credential: the SHA-256 of the session credential it came with, if any."""
     mid, method, params = m.get("id"), m.get("method"), m.get("params") or {}
     try:
         if method == "initialize":
@@ -27734,6 +27791,8 @@ def rpc(agent, m, headers, context=None):
             # only record of which contract it got; a worker's session is one task long and asks again with it.
             if context is None and agents().get(agent, {}).get("role") == "manager":
                 kv_set("tools:" + agent, tool_contract(agent))
+            if credential and chat_context(agent, context):
+                chat_listed(credential)
         elif method == "tools/call":
             with area("quiet"):
                 q("UPDATE agents SET client_seen=? WHERE name=? AND client IS NOT NULL", (now(), agent))

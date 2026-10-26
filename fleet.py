@@ -2013,6 +2013,7 @@ class Helper:
         self.retold = {}          # {window: seconds before the same unread messages are told again}
         self.wanted = {}          # {window: ids of this poll's events that want a signal} (handle_events)
         self.typed_at = {}        # {window: when its last signal was typed}, a model call of its session (restart_fresh)
+        self.chat_unready = False     # its owner chat started and has not listed its tools yet (keep_chat)
         self.manager_session = None
         self.retiring = None      # (first quiet reading, its marks) of the previous runtime's chat (runtime_switch)
         self.retired_left = {}    # {pid: args} of that chat's processes that did not end when it closed
@@ -2379,6 +2380,66 @@ class Helper:
             except Exception as e:      # the messages stay pending in the hub, and the next poll tells them
                 self.say(f"{window}: inbox signal failed: {type(e).__name__}")
 
+    def start_chat(self, generation):
+        """Start the owner chat window of this generation: for his message (handle), or before any message when the
+        hub wants it running (keep_chat). Raises Refused when it may not start now."""
+        window, runtime = "owner-chat", self.conf.get("runtime")
+        resume = self.chat_resume(generation)      # first: the conversation it continues, if any
+        # **One new chat a minute while its starts keep ending.** A chat whose window ended before its conversation
+        # began starts again, but not at every poll: each start asks the hub for a credential and starts the runtime,
+        # and a window that cannot run would otherwise do both every two seconds. A chat with a conversation to
+        # continue starts at once.
+        last = self.__dict__.get("chat_started")
+        if resume is None and last and last[0] == generation and time.monotonic() - last[1] < CHAT_RESTART:
+            raise Refused("the owner chat ended before its conversation began; a new one starts a minute after that "
+                          "start")
+        token = session_credential(self.agent, "chat", generation)
+        marker = None if resume or runtime not in MANAGER_RUNTIMES else str(uuid.uuid4())
+        # No conversation to continue here: a first chat, or the first after a runtime switch, because the record is
+        # this runtime's own. The hub's record of what was said takes the place of the session's own memory, so the
+        # chat does not start blind. A chat that resumes keeps its own context instead.
+        recap = "" if resume else chat_recap(self.agent)
+        self.start(window, chat_command(self.agent, self.conf, generation, token=token, marker=marker, resume=resume,
+                                        recap=recap, env=session_env(self.agent, self.conf, "chat")),
+                   1, generation)
+        self.chat_started = (generation, time.monotonic())
+        self.chat_unready = True        # its first signal waits until the hub says it has its tools (keep_chat)
+        if marker:      # Codex finds its thread by the marker later; Claude starts with the marker as session id
+            save_chat_record(self.agent, {"generation": generation, "marker": marker if runtime == "codex" else None,
+                                          "session": None if runtime == "codex" else marker,
+                                          "started": time.time()}, runtime)
+        self.say(f"owner-chat: {'conversation ' + resume + ' continued' if resume else 'session started'}"
+                 f"{' with the hub\'s recap of this chat' if recap else ''}; agent read and reply are still pending")
+
+    def keep_chat(self, chat, generation):
+        """**The owner chat runs before his first message** (helper feature chat_warm). Each poll says whether this
+        agent's chat should run now (warm) and whether its newest session has listed its tools (ready). A chat that
+        should run and is not open starts here, so that his first message finds a session that can answer it, and
+        the app shows "Setting up" until then. A new session's first signal waits only until the hub says it is
+        ready, no longer the whole signal throttle (start), which guards against a line typed before the session
+        can take it. Called before the poll's events, so that "ready" is about the session that runs now."""
+        if not self.worker or not isinstance(chat, dict):
+            return
+        window = "owner-chat"
+        if chat.get("ready") and self.chat_unready:
+            self.chat_unready = False
+            self.signalled.pop(window, None)
+        if not chat.get("warm") or not generation:
+            return
+        try:
+            if window in self.look():
+                # A chat of another hub generation cannot answer this hub, and no message of his could reach the
+                # app's chat to replace it (handle): it closes, and a new one starts.
+                r = tmux("show-options", "-wv", "-t", f"{self.session}:={window}", "@fleet_attempt")
+                if r.returncode != 0 or r.stdout.strip() in ("", f"{generation}:1") or self.other_runtime_windows():
+                    return
+                tmux("kill-window", "-t", f"{self.session}:={window}", check=True)
+            elif self.other_runtime_windows():      # the previous runtime's chat closes first (retire_old_chat)
+                return
+            self.start_chat(generation)
+        except Exception as e:      # the next poll tries again, and start_chat says how often
+            self.say_chat(f"it did not start before a message: {e}")
+
     def handle(self, ev):
         kind, task = ev["kind"], ev.get("task")
         extra = ev.get("extra") or {}
@@ -2394,35 +2455,7 @@ class Helper:
                 if existing != expected:
                     tmux("kill-window", "-t", f"{self.session}:={window}", check=True)
             if window not in self.look():
-                runtime = self.conf.get("runtime")
-                resume = self.chat_resume(extra["generation"])      # first: the conversation it continues, if any
-                # **One new chat a minute while its starts keep ending.** A chat whose window ended before its
-                # conversation began starts again, but not at every poll: each start asks the hub for a credential and
-                # starts the runtime, and a window that cannot run would otherwise do both every two seconds. A chat
-                # with a conversation to continue starts at once.
-                last = self.__dict__.get("chat_started")
-                if resume is None and last and last[0] == extra["generation"] and time.monotonic() - last[1] < CHAT_RESTART:
-                    raise Refused("the owner chat ended before its conversation began; a new one starts a minute after "
-                                  "that start")
-                token = session_credential(self.agent, "chat", extra["generation"])
-                marker = None if resume or runtime not in MANAGER_RUNTIMES else str(uuid.uuid4())
-                # No conversation to continue here: a first chat, or the first after a runtime switch, because the
-                # record is this runtime's own. The hub's record of what was said takes the place of the session's
-                # own memory, so the chat does not start blind. A chat that resumes keeps its own context instead.
-                recap = "" if resume else chat_recap(self.agent)
-                self.start(window, chat_command(self.agent, self.conf, extra["generation"], token=token, marker=marker,
-                                                resume=resume, recap=recap,
-                                                env=session_env(self.agent, self.conf, "chat")),
-                           1, extra["generation"])
-                self.chat_started = (extra["generation"], time.monotonic())
-                if marker:      # Codex finds its thread by the marker later; Claude starts with the marker as session id
-                    save_chat_record(self.agent, {"generation": extra["generation"],
-                                                  "marker": marker if runtime == "codex" else None,
-                                                  "session": None if runtime == "codex" else marker,
-                                                  "started": time.time()}, runtime)
-                self.say(f"owner-chat: {'conversation ' + resume + ' continued' if resume else 'session started'}"
-                         f"{' with the hub\'s recap of this chat' if recap else ''}; "
-                         f"agent read and reply are still pending")
+                self.start_chat(extra["generation"])
             else:
                 self.want(window, ev["id"])
         elif kind == "conversation":
@@ -3915,6 +3948,7 @@ def cmd_run(args):
                 h.say("the hub has no key for this agent any more; it enrolls again when it can")
             if code != 200:
                 raise Refused(f"hub answered {code}")
+            h.keep_chat(data.get("chat"), data.get("db"))
             h.handle_events(data.get("events", []))
             h.loop_wake.wait(2)         # an owner's request that the next round serves ends it (manager_start)
             h.loop_wake.clear()
