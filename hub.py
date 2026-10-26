@@ -3506,22 +3506,16 @@ def t_ask_my_requester(agent, a):
     if len(assumed) > ASSUMED_TEXT:
         raise ToolError(f"Say in default, in {ASSUMED_TEXT} characters, the one thing you will go on with.")
     guard(agent, question, assumed)
-    try:
-        wait = int(a.get("wait_seconds", CFG["ask_wait"]))
-    except (TypeError, ValueError):
-        wait = CFG["ask_wait"]
-    wait = max(0, min(wait, CFG["ask_max"]))       # stay under the caller's own tool time limit
     t = get_task(tid, owner=agent)
     if t["state"] in TERMINAL:
         raise ToolError(f"{tref(tid)} is already {t['state']}.")
     if assumed:
-        # The whole point of a default is that the asker does not stop, so this one neither sets input-required nor
-        # waits inside the call. The task keeps its state, the question is on the record with the reading it went
-        # on with, and the answer -- if one comes -- arrives as a message, the path t_answer already has for an
-        # asker whose call has ended.
+        # The whole point of a default is that the asker does not stop, so this one does not set input-required.
+        # The task keeps its state, the question is on the record with the reading it went on with, and the
+        # answer -- if one comes -- arrives as a message, as every answer does.
         with LOCK:
             open_under_lock(agent, tid)
-            qid = ins("INSERT INTO questions(task,asker,requester,text,asked,waiting,assumed) VALUES(?,?,?,?,?,0,?)",
+            qid = ins("INSERT INTO questions(task,asker,requester,text,asked,assumed) VALUES(?,?,?,?,?,?)",
                       (tid, agent, t["requester"], question, now(), assumed))
             activity(tid, "ask_my_requester")
             emit(t["requester"], "say",
@@ -3533,46 +3527,25 @@ def t_ask_my_requester(agent, a):
                 f"If {t['requester']} answers differently, the answer arrives as a message in this session; check "
                 f"what you already did on this reading before you continue (rule 9). Never a default for access, "
                 f"money or anything that leaves the building: for those, ask without one and wait.")
+    # No call waits for a person or an agent (the owner, 26 October 2026: no clock ends work). The question is on
+    # the record, the task is paused on it, and the answer comes as a message in this session, as an answer did
+    # once a wait had ended.
     with LOCK:
         open_under_lock(agent, tid)
-        qid = ins("INSERT INTO questions(task,asker,requester,text,asked,waiting,access,access_level) "
-                  "VALUES(?,?,?,?,?,1,?,?)", (tid, agent, t["requester"], question, now(), rid, want))
+        qid = ins("INSERT INTO questions(task,asker,requester,text,asked,access,access_level) "
+                  "VALUES(?,?,?,?,?,?,?)", (tid, agent, t["requester"], question, now(), rid, want))
         q("UPDATE tasks SET state='input-required', waiting_on=? WHERE id=?", (f"Q-{qid}", tid))
         activity(tid, "ask_my_requester")
         emit(t["requester"], "say",
              f"[hub] Question Q-{qid} from {agent} on {tref(tid)} ({t['title']}): {question} " +
              (access_route(agent, rid, t["requester"], want) + " " if rid else "") +
              f"-- Answer with the fleet tool answer(question_id=\"Q-{qid}\", text=...).", task=tid)
-    deadline = now() + wait
-    while now() < deadline:
-        row = q1("SELECT answer FROM questions WHERE id=?", (qid,))
-        if row["answer"] is not None or active_hold(tid):
-            break
-        time.sleep(0.5)
-    with LOCK:
-        # First, whatever the fence says: this call waits no more, so an answer from now on goes as a message. A fence
-        # that refused here (a new session replaced this one meanwhile) left waiting at 1, and the answer reached
-        # nobody: answer() sends no message to an asker it thinks is still inside its call.
-        q("UPDATE questions SET waiting=0 WHERE id=?", (qid,))
-        row = q1("SELECT answer FROM questions WHERE id=?", (qid,))
-        try:
-            ended = fence(agent, tid)["state"]
-        except ToolError:
-            if row["answer"] is not None:   # answered inside this wait, which no session reads: the new one does
-                emit(agent, "say", f"[hub] Answer to your question Q-{qid} on {tref(tid)}: {row['answer']} -- "
-                                   f"Continue the task.", task=tid)
-            raise
-        if row["answer"] is not None:
-            return f"Answer from {t['requester']}: {row['answer']}"
-        if active_hold(tid):
-            return f"STOP: {tref(tid)} is {held_word(active_hold(tid))}. Stop working on it now and wait."
-        if ended in TERMINAL:       # canceled while this call waited: the cancel's own message reaches no session
-            return f"STOP: {tref(tid)} is {ended}. Stop working on it now."
-    return (f"No answer yet (waited {wait}s). Question Q-{qid} is with {t['requester']} and {tref(tid)} is paused. " +
+    return (f"Q-{qid} is with {t['requester']}, and {tref(tid)} is paused: the answer comes as a message in this "
+            f"session. " +
             (f"It names {resource_phrase(*resource_parts(rid))} ({rid})" + (f" at {want}" if want else "") +
              f" as the access that you need; your requester reads who holds it and whether it may give it. "
              if rid else "") +
-            f"Stop working on {tref(tid)} now. The answer will arrive as a message in this session.")
+            f"Stop working on {tref(tid)} now.")
 
 
 def open_under_lock(agent, tid):
@@ -4225,12 +4198,12 @@ def t_answer(agent, a):
                     (t["id"], qid)))):
             q("UPDATE tasks SET state='working', waiting_on=NULL WHERE id=?", (t["id"],))
         activity(qu["task"])
-        if not qu["waiting"]:
-            emit(qu["asker"], "say",
-                 f"[hub] Answer to your question Q-{qid} on {tref(qu['task'])}: {text} -- " +
-                 (f"You went on with: {qu['assumed']} If this answer says otherwise, check what you already did on "
-                  f"that reading before you continue (rule 9)." if qu["assumed"] else "Continue the task."),
-                 task=qu["task"])
+        # Every answer is a message: no ask waits inside its call any more.
+        emit(qu["asker"], "say",
+             f"[hub] Answer to your question Q-{qid} on {tref(qu['task'])}: {text} -- " +
+             (f"You went on with: {qu['assumed']} If this answer says otherwise, check what you already did on "
+              f"that reading before you continue (rule 9)." if qu["assumed"] else "Continue the task."),
+             task=qu["task"])
     if t and t["state"] in TERMINAL:
         return f"Answered Q-{qid}. {tref(t['id'])} is already {t['state']}, so no session of it reads this answer."
     if qu["assumed"]:
@@ -7390,12 +7363,11 @@ def ensure_bridge_key():
 
 OWNER_PUSH_DAY = 30             # message_owner: messages a day that one agent writes to the owner first
 AGENT_TEXT_MAX = 8000
-AGENT_MESSAGE_DAY = 200         # message_agent: messages a day from one sender
-AGENT_PAIR_HOUR = 10            # message_agent: messages in one hour between the same two agents. Thirty was not a
-#                                 limit, it was a budget for a loop: two agents can talk ten times in an hour about
-#                                 one thing, and the eleventh is work, not talk.
-AGENT_CHAIN_MAX = 20            # message_agent: the deepest answer chain
-AGENT_WAIT_MAX = 55             # message_agent: seconds that a call waits for the first answer
+# message_agent: messages between two agents, in both directions, with no work of either between them. The talk guard
+# replaced a day budget, an hourly pair limit and an answer-depth cap (the owner, 26 October 2026: no daily budgets).
+# A count of talk since the last work, so a busy day of real work is never refused, and a loop of new messages is
+# caught as surely as a loop of answers.
+TALK_GUARD = 20
 AM_REF = re.compile(r"(?i)^\s*AM-?([1-9][0-9]{0,17})\s*$")
 DISCORD_TOKEN = re.compile(r"[A-Za-z0-9._-]{50,100}")
 WHATSAPP_NUMBER_JID = "@s.whatsapp.net"     # the phone-number form of a WhatsApp JID; "@lid" is the hidden ID
@@ -7549,25 +7521,61 @@ def agent_message_refusal(agent, to, parent_id, t0):
     return parent, agent_limit(agent, to, parent, t0)
 
 
+def last_work(one, two):
+    """When either of two agents last did work: a progress note, a question, a result, a task it asked for, or a
+    step of a duty's case. The talk guard counts their messages from there. 0 for two agents that never worked."""
+    row = q1("SELECT MAX(t) t FROM (SELECT MAX(ts) t FROM notes WHERE agent IN (?,?) UNION ALL "
+             "SELECT MAX(asked) FROM questions WHERE asker IN (?,?) UNION ALL "
+             "SELECT MAX(delivered) FROM tasks WHERE owner IN (?,?) UNION ALL "
+             "SELECT MAX(created) FROM tasks WHERE requester IN (?,?) UNION ALL "
+             "SELECT MAX(ts) FROM duty_steps WHERE by IN (?,?))", (one, two) * 5)
+    return row["t"] or 0
+
+
 def agent_limit(agent, to, parent, t0):
-    """The limits of 16.2: messages today from the sender, in one hour between the two agents, and the chain depth."""
-    if q1("SELECT COUNT(*) n FROM agent_messages WHERE sender=? AND created>=?", (agent, day_start(t0)))["n"] \
-            >= AGENT_MESSAGE_DAY:
-        return f"Refused: you already sent {AGENT_MESSAGE_DAY} agent messages today."
-    if q1("SELECT COUNT(*) n FROM agent_messages WHERE ((sender=? AND recipient=?) OR (sender=? AND recipient=?)) AND "
-          "created>?", (agent, to, to, agent, t0 - 3600))["n"] >= AGENT_PAIR_HOUR:
-        return (f"Refused: {agent} and {to} already exchanged {AGENT_PAIR_HOUR} messages in the last hour. Talking is "
-                f"not the work: open a task for it, or ask your requester with ask_my_requester.")
-    if parent and parent["depth"] + 1 > AGENT_CHAIN_MAX:
-        return f"Refused: this answer chain is already {AGENT_CHAIN_MAX} answers deep. End it here."
-    return None
+    """The talk guard of 16.2: two agents that sent each other TALK_GUARD messages with no work of either between
+    them send no more until one of them works. The manager hears of each such stop once, quietly, unless it is the
+    sender that was refused and so read it already."""
+    since = last_work(agent, to)
+    n = q1("SELECT COUNT(*) n FROM agent_messages WHERE ((sender=? AND recipient=?) OR (sender=? AND recipient=?)) "
+           "AND created>?", (agent, to, to, agent, since))["n"]
+    if n < TALK_GUARD:
+        return None
+    one, two = sorted((agent, to))
+    key = f"talk_guard:{one}:{two}"
+    if agent != manager_name() and kv_get(key) != repr(since):
+        kv_set(key, repr(since))
+        emit(manager_name(), "say", f"[hub] {one} and {two} sent each other {n} messages with no work between them, "
+                                    f"and the hub refused the next one: talking is not the work. Give it a task, or "
+                                    f"leave it.", extra=QUIET_SAY)
+    return (f"Refused: you and {to} sent each other {n} messages with no work of either of you between them. Talking "
+            f"is not the work: open a task for it, or ask your requester with ask_my_requester. The talk goes on "
+            f"once either of you works: a progress note, a question, a result, a task or a step of a case.")
+
+
+def message_landing(am):
+    """What message_agent answers: the message's id, the session it went to, and whether that session runs now (its
+    window is in its helper's newest list and the helper is online). Read from the stored event, so a repeat of the
+    same request_id answers the same place."""
+    to = am["recipient"]
+    e = q1("SELECT e.task FROM agent_messages m JOIN events e ON e.id=m.event_id WHERE m.id=?", (am["id"],))
+    row = q1("SELECT alive FROM agents WHERE name=?", (to,))
+    windows = set(filter(None, ((row["alive"] if row else None) or "").split(",")))
+    if role_of(to) == "manager":
+        where, window = f"{to}'s standing session", "manager"
+    elif e and e["task"]:
+        where, window = f"{to}'s session of {tref(e['task'])}", tref(e["task"])
+    else:
+        where, window = f"{to}'s chat window, which reads and answers messages and cannot act on its tasks", "owner-chat"
+    return {"ok": True, "id": am_ref(am["id"]), "landed": where,
+            "runs_now": window in windows and helper_online(to, now())}
 
 
 def t_message_agent(agent, a):
     """16.2: a message from one agent to another, with the sender's authority, never the owner's: no ui_requests row,
-    goal, Needs-you answer or permission decision comes from it. call_tool runs it without the lock: it takes the lock
-    for the session check and the write, and waits for the first answer without it."""
-    to, text, reply, wait = a.get("agent"), a.get("text"), a.get("in_reply_to"), a.get("wait", 0)
+    goal, Needs-you answer or permission decision comes from it. The call returns at once: an answer comes later as a
+    message, and no call waits for an agent."""
+    to, text, reply = a.get("agent"), a.get("text"), a.get("in_reply_to")
     if not isinstance(to, str) or not to.strip():
         raise ToolError("agent must be the name of the agent that gets the message.")
     to = to.strip()
@@ -7580,10 +7588,6 @@ def t_message_agent(agent, a):
         if not m:
             raise ToolError("in_reply_to must be the id of the message that you answer, for example AM-12, or null.")
         parent_id = int(m.group(1))
-    if wait is None:
-        wait = 0
-    if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not 0 <= wait <= AGENT_WAIT_MAX:
-        raise ToolError(f"wait must be 0 to {AGENT_WAIT_MAX} seconds.")
     guard(agent, text)
     chat = chat_context(agent)
     tid = parse_task(a.get("task_id")) if role_of(agent) in ("worker", "lead") and not chat else None
@@ -7609,25 +7613,7 @@ def t_message_agent(agent, a):
                 DB.execute("UPDATE agent_messages SET event_id=? WHERE id=?", (agent_delivery(am, parent, t0), n))
                 DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, agent, f"sent AM-{n} to {to}"))
                 keep_command(command, {"message": n}, t0)
-    deadline = now() + wait
-    while now() < deadline and not q1("SELECT 1 FROM agent_messages WHERE in_reply_to=?", (am["id"],)):
-        if tid and active_hold(tid):
-            break
-        time.sleep(0.25)
-    answer = None
-    if wait:
-        with LOCK:      # the call that returns the answer is its receipt, as read_messages is
-            if chat:
-                chat_fence(agent)
-            elif tid:
-                fence(agent, tid)
-            row = q1("SELECT * FROM agent_messages WHERE in_reply_to=? ORDER BY id LIMIT 1", (am["id"],))
-            if row:
-                t1 = now()
-                q("UPDATE agent_messages SET read_at=COALESCE(read_at,?) WHERE id=?", (t1, row["id"]))
-                q("UPDATE events SET read_at=COALESCE(read_at,?) WHERE id=?", (t1, row["event_id"]))
-                answer = {"id": am_ref(row["id"]), "sender": row["sender"], "text": row["text"]}
-    return json.dumps({"ok": True, "id": am_ref(am["id"]), "answer": answer})
+        return json.dumps(message_landing(am))
 
 
 # ---------------------------------------------------------------- people and conversations (CHAT-APPS.md section 7)
@@ -13760,7 +13746,6 @@ CIRCLE_RESTARTS = 3             # restarts on one task
 CIRCLE_RESTART_RATE = 6         # sessions of one open task lost and started again inside CIRCLE_RESTART_WINDOW
 CIRCLE_RESTART_WINDOW = 86400
 CIRCLE_REFUSALS = 5             # identical refusals inside one task
-CIRCLE_PAIR = 8                 # messages between two agents in a day, with no task made
 CIRCLE_SHOWN = 10
 CIRCLE_OWNER_WAIT = 86400       # seconds a circle may stand after the manager was told, before the owner is
 
@@ -13830,22 +13815,8 @@ def circles(t0):
         found.append((f"refusals:{r['task']}:{r['name']}:{r['n'] // CIRCLE_REFUSALS}",
                       f"{r['agent']} called {r['name']} on {tref(r['task'])} {r['n']} times and was refused every "
                       f"time: {clip(r['detail'], 160)}"))
-    # 5. two agents talking more and more, and no task coming of it
-    pairs = {}
-    for r in q("SELECT sender, recipient, created FROM agent_messages WHERE created>?", (t0 - 2 * 86400,)):
-        key = tuple(sorted((r["sender"], r["recipient"])))
-        pairs.setdefault(key, []).append(r["created"])
-    for (one, two), times in sorted(pairs.items()):
-        late = [x for x in times if x > t0 - 86400]
-        early = [x for x in times if x <= t0 - 86400]
-        if len(late) < CIRCLE_PAIR or len(late) <= len(early):
-            continue
-        if q1("SELECT 1 FROM tasks WHERE created>? AND ((requester=? AND owner=?) OR (requester=? AND owner=?))",
-              (t0 - 86400, one, two, two, one)):
-            continue
-        found.append((f"pair:{one}:{two}",
-                      f"{one} and {two} sent each other {len(late)} messages today, more than yesterday's "
-                      f"{len(early)}, and no task came of it."))
+    # Two agents that only talk are no circle here: the talk guard refuses their next message and tells the manager
+    # once (agent_limit).
     return found
 
 
@@ -14153,9 +14124,9 @@ TOOLS = [
      S({"task_id": TASK_ID, "attachment_id": {"type": "string", "description": "The attachment, for example A-3"}},
        ["task_id", "attachment_id"])),
     ("worker", "ask_my_requester", t_ask_my_requester,
-     "Ask the one who gave you the task a question. Blocked: ask with no default, and only this task pauses -- it "
-     "waits briefly for the answer, and if none comes you stop and the answer arrives later. Only UNSURE and not "
-     "blocked: say in default what you will go on with, and the task does NOT pause. The call returns at once, your "
+     "Ask the one who gave you the task a question. The call returns at once. Blocked: ask with no default, and only "
+     "this task pauses -- stop working on it, and the answer arrives as a message in this session. Only UNSURE and "
+     "not blocked: say in default what you will go on with, and the task does NOT pause: your "
      "requester is told that you are not waiting and answers only if your reading is wrong, and your result says "
      "this was decided by your reading and not by it. So asking costs you nothing and guessing in silence has no "
      "excuse. Never a default for access, money or anything that leaves the building -- a send, a post, a payment, "
@@ -14165,16 +14136,14 @@ TOOLS = [
      "needs is access you do not have, so name that level in needs_level.",
      S({"task_id": TASK_ID, "question": STR,
         "default": {"type": "string", "description": "What you will go on with if nobody answers. With it the task "
-                    "does not pause and the call returns at once. Leave it out when you are blocked, and never give "
-                    "one for access, money or anything that leaves the building."},
+                    "does not pause. Leave it out when you are blocked, and never give one for access, money or "
+                    "anything that leaves the building."},
         "needs_access": {"type": "string", "description": "The access that the task needs, as <kind>:<what>: "
                          "repo:acme/web, secret:bws://<uuid>, gmail:a@b.com, drive:a@b.com or tool:<MCP server>"},
         "needs_level": {"type": "string", "description": "The level of that thing that the task needs, when you "
                         "already hold it at a lower one: a GitHub repository runs read, write, deploy, so an agent "
                         "with write that must change a workflow file or run GitHub Actions asks for the same "
-                        "repository at deploy. Leave it out when any level of it does."},
-        "wait_seconds": {"type": "integer", "description": "How long to wait for the answer. Default 45, at most 55. "
-                         "Nothing waits when you give a default."}},
+                        "repository at deploy. Leave it out when any level of it does."}},
        ["task_id", "question"])),
     ("worker", "deliver_result", t_deliver_result,
      "Finish a task. outcome is completed, failed or rejected. Say what was done, where the output is, "
@@ -14773,15 +14742,15 @@ TOOLS = [
     ("all", "message_agent", t_message_agent,
      "Send a message to another agent: a question, an answer or coordination. It has your authority, never the "
      "owner's, and a message that you get has its sender's authority. Work that needs tools is still a task, through "
-     "the line above. Answer a message with in_reply_to set to its id (AM-<n>). With wait, the call waits up to that "
-     "many seconds for the first answer and returns it; else the answer comes later as a message. One request_id is "
-     "one message: the same request_id again sends nothing more.",
+     "the line above. Answer a message with in_reply_to set to its id (AM-<n>). The call returns at once and says "
+     "where the message landed and whether that session runs now; an answer comes later as a message. Two agents "
+     "that send each other 20 messages with no work of either between them send no more until one of them works. "
+     "One request_id is one message: the same request_id again sends nothing more.",
      S({"request_id": {"type": "string", "description": "A new UUID for each message"},
         "agent": {"type": "string", "description": "The agent that gets the message"},
         "text": {"type": "string", "description": "The message, 1 to 8,000 characters"},
         "in_reply_to": {"type": "string", "description": "The id of the message that this one answers, for example "
-                                                        "AM-12. Leave it out for a new message."},
-        "wait": {"type": "integer", "description": "Seconds to wait for the first answer, 0 to 55. Default 0."}},
+                                                        "AM-12. Leave it out for a new message."}},
        ["request_id", "agent", "text"])),
     # owner feature google: only the tools of the agent's level in team.json now (tools_for)
     ("worker", "drive_search", t_drive_search,
@@ -28026,8 +27995,6 @@ def main():
     ap.add_argument("--silence", type=float, default=180, help="seconds of no activity before the first nudge")
     ap.add_argument("--question-wait", type=float, default=120, help="seconds before a waiting question is chased")
     ap.add_argument("--manager-silence", type=float, default=120, help="seconds before the hub tells the owner itself")
-    ap.add_argument("--ask-wait", type=int, default=45, help="default seconds a question waits inside the call")
-    ap.add_argument("--ask-max", type=int, default=55, help="longest a question may wait inside the call")
     ap.add_argument("--hook-wait", type=float, default=240, help="seconds a permission prompt waits for a decision")
     ap.add_argument("--job-wait", type=float, default=50, help="seconds a sign-in or handover waits for the helper")
     ap.add_argument("--request-wait", type=float, default=API_WAIT,
@@ -28040,7 +28007,7 @@ def main():
                                                       "hub service takes it at its next start")
     args = ap.parse_args()
     CFG.update(silence=args.silence, question_wait=args.question_wait, manager_silence=args.manager_silence,
-               ask_wait=args.ask_wait, ask_max=args.ask_max, hook_wait=args.hook_wait, job_wait=args.job_wait,
+               hook_wait=args.hook_wait, job_wait=args.job_wait,
                request_wait=args.request_wait,
                stop_after=args.stop_after, offline_after=args.offline_after, tick=args.tick)
     CFG["team_path"] = os.path.abspath(args.team)

@@ -199,7 +199,7 @@ def named_in_the_moment(name, corpus):
 
 HUB_PROC, HUB = start_hub("main", {"vps": "", "mac-studio": "", "owner": ""},
                           "--silence", "6", "--question-wait", "60", "--manager-silence", "12", "--stop-after", "3",
-                          "--tick", "1", "--hook-wait", "4", "--ask-max", "3", "--job-wait", "3")
+                          "--tick", "1", "--hook-wait", "4", "--job-wait", "3")
 fails, count = [], [0]
 
 
@@ -588,24 +588,22 @@ msg["params"]["name"] = "deliver_result"
 msg["params"]["arguments"] = {"task_id":"T-1","what_was_done":"old","where_output_is":"old","how_checked":"old"}
 resp = json.loads(raw("POST", f"/mcp/studio/{records['db']}/T-1/0", msg)[2])["result"]
 check("an old attempt cannot deliver a result", resp["isError"] and "STOP" in resp["content"][0]["text"])
-# 3 question answered while the call waits
-later(lambda: tool("manager", "answer", question_id="Q-1", text="teal"), 1.0)
-t0 = time.time(); text, err = tool("studio", "ask_my_requester", task_id="T-1", question="Which\x03 colour;\x1b?", wait_seconds=10)
-check("an answer inside the wait comes back in the call", "teal" in text and time.time() - t0 < 3, text)
+# 3 a question returns at once, and its answer comes as a message
+t0 = time.time(); text, err = tool("studio", "ask_my_requester", task_id="T-1", question="Which\x03 colour;\x1b?")
+check("a question returns at once and says the task is paused", not err and "Q-1" in text and "paused" in text and time.time() - t0 < 2, text)
 mev = events("manager")
 check("the manager was told about the question", any("Q-1" in e["text"] for e in mev), str(mev)[:300])
 check("the inbox retains question text without typing it into a terminal", any("\x03" in e["text"] for e in mev))
-# 4 question answered late
-t0 = time.time(); text, err = tool("studio", "ask_my_requester", task_id="T-1", question="Which size?", wait_seconds=900)
-check("no answer in time: the call says the task is paused", "paused" in text, text)
-check("a question never waits longer than the caller's own limit", time.time() - t0 < 6, f"{time.time() - t0:.1f}s")
 check("task shows input-required", "[input-required]" in tool("manager", "see_team")[0])
+# 4 the answer, and a wait that an older session asks for
+text, err = tool("studio", "ask_my_requester", task_id="T-1", question="Which size?", wait_seconds=900)
+check("a wait that an older session asks for is refused, and nothing is asked", err and "wait_seconds" in text, text)
 before = events("studio")[-1]["id"]
-text, err = tool("manager", "answer", question_id="Q-2", text="large")
+text, err = tool("manager", "answer", question_id="Q-1", text="teal")
 ev = events("studio", after=before)
-check("a late answer arrives as a message for that task's session", ev and ev[0]["kind"] == "say" and ev[0]["task"] == "T-1" and "large" in ev[0]["text"], str(ev))
+check("the answer arrives as a message for that task's session", ev and ev[0]["kind"] == "say" and ev[0]["task"] == "T-1" and "teal" in ev[0]["text"], str(ev))
 check("task is working again", "T-1 [working]" in tool("manager", "see_team")[0])
-text, err = tool("manager", "answer", question_id="Q-2", text="again")
+text, err = tool("manager", "answer", question_id="Q-1", text="again")
 check("a question cannot be answered twice", err)
 
 # 5 result, check, follow-up
