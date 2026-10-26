@@ -555,6 +555,27 @@ def checkout_branch(kit, run=None):
     return out if code == 0 and BRANCH_NAME.fullmatch(out) else None
 
 
+def give_way_to(kit, target, run=None):
+    """Make room for a fast-forward to `target`: a file of outputs/ that this checkout holds untracked and that
+    `target` adds with the same bytes is removed, and the merge brings it back tracked. It is one that the hub took
+    in from here, a task's output that this helper sent when its agent delivered (helper feature task_outputs). A
+    file with other bytes stays, and the merge then says why it cannot. Every fast-forward of a checkout that
+    delivers goes through this: the task-start sync (follow_config_ref) and the Fleet update (Lifecycle.apply)."""
+    run = run or _run
+
+    def git(*args):
+        code, out, _ = run(["git", "-C", kit, *args], timeout=60)
+        return out.strip() if code == 0 else None
+
+    added = git("diff", "--name-only", "--diff-filter=A", "-z", "HEAD", target, "--", "outputs/")
+    for path in (added or "").split("\0"):
+        full = os.path.join(kit, path)
+        blob = path and os.path.isfile(full) and not os.path.islink(full) and git("hash-object", "--", path)
+        if blob and blob == git("rev-parse", f"{target}:{path}"):
+            with contextlib.suppress(OSError):
+                os.remove(full)
+
+
 def follow_config_ref(kit, run=None):
     """Bring this checkout onto the configuration ref and up to date with it, fast-forward only. The hub commits the
     owner's team.json, profiles and knowledge there and nothing else writes it, so an agent reads the current
@@ -582,15 +603,7 @@ def follow_config_ref(kit, run=None):
             git("checkout", "-q", "-b", CONFIG_BRANCH, "--track", "origin/" + CONFIG_BRANCH)
         if code != 0:
             return f"the checkout did not move onto {CONFIG_BRANCH}: " + (err or out)[-200:]
-    # A file that this checkout holds untracked and that the ref now carries with the same bytes gives way to the
-    # tracked copy: it is one that the hub took in from here, a task's output that this helper sent when its agent
-    # delivered (helper feature task_outputs). A file with other bytes stays, and the merge then says why it cannot.
-    code, out, _ = git("diff", "--name-only", "--diff-filter=A", "-z", "HEAD", "origin/" + CONFIG_BRANCH)
-    for path in out.split("\0") if code == 0 else []:
-        full = os.path.join(kit, path)
-        if path and os.path.isfile(full) and not os.path.islink(full) and \
-                git("hash-object", "--", path)[1] == git("rev-parse", f"origin/{CONFIG_BRANCH}:{path}")[1]:
-            os.remove(full)
+    give_way_to(kit, "origin/" + CONFIG_BRANCH, run)
     code, out, err = git("merge", "-q", "--ff-only", "origin/" + CONFIG_BRANCH)
     return None if code == 0 else "git merge failed: " + (err or out)[-200:]
 
@@ -1185,11 +1198,13 @@ class Lifecycle:
         # A checkout that has the requested commit already needs no fetch or merge: on the hub machine the checkout is
         # also the hub's, whose own git work a fetch here could disturb.
         if not (desired and self.has(desired)):
-            for argv in (["git", "-C", self.kit, "fetch", "-q", "origin"],
-                         ["git", "-C", self.kit, "merge", "-q", "--ff-only", target]):
-                code, out, err = self.run(argv, timeout=120)
-                if code != 0:
-                    return self.fail("The checkout could not %s: %s" % (argv[3], (err or out).strip()[-300:]))
+            code, out, err = self.run(["git", "-C", self.kit, "fetch", "-q", "origin"], timeout=120)
+            if code != 0:
+                return self.fail("The checkout could not fetch: " + (err or out).strip()[-300:])
+            give_way_to(self.kit, target, self.run)       # the files of a task that this machine delivered
+            code, out, err = self.run(["git", "-C", self.kit, "merge", "-q", "--ff-only", target], timeout=120)
+            if code != 0:
+                return self.fail("The checkout could not merge: " + (err or out).strip()[-300:])
         if desired and not (self.revision() or "").startswith(desired) and not self.has(desired):
             return self.fail("The checkout is not at the requested revision.")
         with self.lock:
