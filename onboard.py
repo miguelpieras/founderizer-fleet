@@ -1777,9 +1777,9 @@ Written by the owner. Agents cannot change it.
 
 **Responsible for.** Research, writing, code and files %(where)s. It has no browser and no screen.
 
-**May do without asking.** Read and write files in this repository, run git, and fetch public web pages.
+**May do without asking.** Anything its access allows: files, shell, git and the web, and every repository, service and login that it holds.
 
-**Must ask first.** Anything outside this repository. A task that needs a browser or a screen: reject it and say why.
+**Must ask first.** New money, a new account, or a step that only the owner can take. A task that needs a browser or a screen: reject it and say why.
 
 **Logins it may use.** None until the owner adds them here.
 """

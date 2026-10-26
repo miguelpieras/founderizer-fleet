@@ -16836,12 +16836,15 @@ def app_server_pair(a, to):
 
 def full_access(runtime, policy):
     """True when the policy is Fleet's full-access form of this runtime (FULL_ACCESS). A Codex start may leave out
-    --no-daemon, which the helper adds; a Claude allow list must be exactly the full one."""
+    --no-daemon, which the helper adds, and a Claude start may carry {chrome}, which gives a browser task its browser
+    and no other access (the owner's `can` decides which tasks need one); a Claude allow list must be exactly the
+    full one."""
     want = FULL_ACCESS.get(runtime)
     if not want or not isinstance((policy or {}).get("start"), str):
         return False
-    words = [w for w in policy["start"].split() if w != "--no-daemon"]
-    if words != [w for w in want["start"].split() if w != "--no-daemon"]:
+    same = ("--no-daemon", "{chrome}")
+    words = [w for w in policy["start"].split() if w not in same]
+    if words != [w for w in want["start"].split() if w not in same]:
         return False
     return not want.get("allow") or sorted(policy.get("allow") or []) == sorted(want["allow"])
 
@@ -19385,9 +19388,9 @@ Written by the owner. Agents cannot change it.
 
 **Responsible for.** Research, writing, code and files on its server. It has no browser and no screen.
 
-**May do without asking.** Read and write files in this repository, run git, and fetch public web pages.
+**May do without asking.** Anything its access allows: files, shell, git and the web, and every repository, service and login that it holds.
 
-**Must ask first.** Anything outside this repository. A task that needs a browser or a screen: reject it and say why.
+**Must ask first.** New money, a new account, or a step that only the owner can take. A task that needs a browser or a screen: reject it and say why.
 
 **Logins it may use.** None until the owner adds them here.
 """
@@ -19671,8 +19674,8 @@ def server_agent_entry(team, agent, server, runtime, role, parent):
     """The team.json entry of a new agent on a server. How its runtime starts comes from a worker or lead that runs that
     runtime or keeps a policy for it ("start" and "allow"), from a server of the same kind first; never another agent's
     identity, placement or grants, and never the app-server policy. The first worker of a fleet has none to copy from,
-    and takes the installer's own worker line (hubsetup.WORKER_STARTS), never the manager's. It can use shell and web,
-    starts inactive and has no credential access."""
+    and takes the installer's own worker line (hubsetup.WORKER_STARTS) with the full-access allow list, never the
+    manager's. It can use shell and web, starts inactive and has no credential access."""
     kind, choices = server_kind_of(team, server), []
     for name, a in team["agents"].items():
         policy = a if a.get("runtime") == runtime else (a.get("runtime_policies") or {}).get(runtime)
@@ -19684,14 +19687,16 @@ def server_agent_entry(team, agent, server, runtime, role, parent):
     else:
         # The first worker of a fleet, where there is nothing to copy: the installer's first team.json holds one
         # manager and nothing else, so without this no customer could ever add their first agent. It takes the
-        # installer's own worker line, never the manager's, because the manager runs bypassPermissions and a
-        # fleet's first worker must not be broader than every worker added after it. The import is here because
-        # hubsetup imports this module.
+        # installer's own worker line, Fleet's full-access worker form (plan C15: workers act without asking), never
+        # the manager's, which runs bypassPermissions with no Fleet deny list. The import is here because hubsetup
+        # imports this module.
         import hubsetup
         start = hubsetup.WORKER_STARTS.get(runtime)
         if not start:
             raise Refusal(409, f"no worker runs {runtime} yet, so Fleet has no start settings to copy for {agent}")
         entry = {"start": start}
+        if (FULL_ACCESS.get(runtime) or {}).get("allow"):
+            entry["allow"] = list(FULL_ACCESS[runtime]["allow"])
     entry.update({"role": role, "machine": server, "runtime": runtime, "can": ["shell", "web"], "active": False,
                   "vault": "none"})
     if parent:

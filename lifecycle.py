@@ -75,7 +75,9 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
 #                     permission check (its settings turn the start prompt off and add no Fleet deny rule), and
 #                     Codex as its own full_access. A switch of the manager keeps this access both ways.
 #   first_worker      the start the hub installer writes for the first worker of a fleet, which has no other worker to
-#                     copy from (hubsetup.WORKER_STARTS); None when it writes none
+#                     copy from (hubsetup.WORKER_STARTS), with the allow list of full_access; None when it writes none.
+#                     It is the full-access form (the owner, 26 October 2026: workers act without asking), with the
+#                     browser's place kept for a browser task
 #   manager           its standing session continues its own conversation, so a manager can run on it
 #   owner_chat        the owner can talk to an agent of this runtime in that agent's own chat window
 #   agent_messages    its agents send and answer agent messages
@@ -159,10 +161,10 @@ RUNTIMES = {
                         "allow": ["Bash", "Read", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch",
                                   "mcp__fleet__*"]},
         "manager_access": {"start": "claude --permission-mode bypassPermissions --tools default {settings} {prompt}"},
-        # Narrower than the manager's on purpose: a Claude worker asks before it edits, so a fleet's first worker is
-        # not broader than every worker the owner adds after it. It carries no allow, so that agent gets Founderizer's
-        # own tools and nothing else (fleet.settings_arg).
-        "first_worker": "claude --permission-mode acceptEdits {chrome} {settings} {prompt}",
+        # Fleet's full-access worker form, never the manager's bypass: a worker runs what its access allows without
+        # asking (plan C15), and Fleet's deny list still applies to it (fleet.settings_arg). {chrome} gives a browser
+        # task its browser, as a switch's form does not need to.
+        "first_worker": "claude --permission-mode dontAsk {chrome} {settings} {prompt}",
         "manager": True,
         "owner_chat": True,
         "agent_messages": True,
