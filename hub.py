@@ -7361,7 +7361,6 @@ def ensure_bridge_key():
 
 # ---------------------------------------------------------------- chat apps round 2 (CHAT-APPS.md section 16)
 
-OWNER_PUSH_DAY = 30             # message_owner: messages a day that one agent writes to the owner first
 AGENT_TEXT_MAX = 8000
 # message_agent: messages between two agents, in both directions, with no work of either between them. The talk guard
 # replaced a day budget, an hourly pair limit and an answer-depth cap (the owner, 26 October 2026: no daily budgets).
@@ -7455,10 +7454,6 @@ def t_message_owner(agent, a):
     if chat_paused():
         raise ToolError("Refused: the owner turned on Pause all for chat apps. Nothing was sent.")
     t0 = now()
-    if q1("SELECT COUNT(*) n FROM owner_reports WHERE agent=? AND pushed=1 AND created>=?",
-          (agent, day_start(t0)))["n"] >= OWNER_PUSH_DAY:
-        raise ToolError(f"Refused: you already wrote to the owner first {OWNER_PUSH_DAY} times today. "
-                        "Nothing was sent.")
     route = owner_route(agent)
     with transaction():
         rid = DB.execute("INSERT INTO owner_reports(text,about,created,agent,in_reply_to,pushed) "
@@ -9346,7 +9341,6 @@ GOOGLE_TEXT_MAX = 50000         # characters of a text in a read's result
 GOOGLE_CALL_KEEP = 4000         # characters of a read's result in the calls record
 GOOGLE_LINK_LIFE = 600          # seconds of a one-time download or upload link
 GOOGLE_UPLOAD_MAX = 50 * 1024 * 1024
-GMAIL_SENDS_DAY = 200      # team.json "google": {"max_send_per_day": n}; 0 = no limit
 GMAIL_SYSTEM = ("INBOX", "UNREAD", "STARRED", "IMPORTANT")
 GMAIL_REFUSED = ("SPAM", "TRASH", "SENT", "DRAFT", "CHAT")
 DRIVE_FOLDER, DRIVE_DOC, DRIVE_SHEET, DRIVE_SLIDES, DRIVE_DRAWING = (
@@ -10075,11 +10069,13 @@ def t_gmail_label(agent, a):
 
 
 def gmail_send_limit():
-    """The emails that one agent may send in a day, from team.json "google" ({"max_send_per_day": n}, 0 for no limit).
-    A duty that writes to every customer of one event must never stop at a guard that the owner did not choose."""
+    """The emails that one agent may send in a day, from team.json "google" ({"max_send_per_day": n}), and 0 -- no
+    limit -- when the owner wrote none. A duty that writes to every customer of one event must never stop at a guard
+    that the owner did not choose, and the owner removed the fleet's daily budgets (26 October 2026). Gmail's own
+    sending limit always applies."""
     conf = TEAM.get("google") if isinstance(TEAM.get("google"), dict) else {}
-    cap = conf.get("max_send_per_day", GMAIL_SENDS_DAY)
-    return cap if isinstance(cap, int) and not isinstance(cap, bool) and 0 <= cap <= 100000 else GMAIL_SENDS_DAY
+    cap = conf.get("max_send_per_day", 0)
+    return cap if isinstance(cap, int) and not isinstance(cap, bool) and 0 <= cap <= 100000 else 0
 
 
 def gmail_sends_today(agent):
@@ -10104,7 +10100,7 @@ def t_gmail_send(agent, a):
     def limit():
         cap = gmail_send_limit()
         if cap and gmail_sends_today(agent) >= cap:
-            raise ToolError(f"This agent sent {cap} emails today, the daily limit of this fleet (team.json "
+            raise ToolError(f"This agent sent {cap} emails today, the daily limit that the owner set (team.json "
                             f"\"google\": max_send_per_day). Ask your requester to raise it.")
     command, old = google_begin(agent, "gmail_send", a, fields, before=limit)
     if old:
@@ -13245,7 +13241,6 @@ REPORT_DECISIONS = {
 REPORT_TEXT_MAX = 2000
 REPORT_NOTE_MAX = 500
 REPORT_ABOUT_MAX = 120
-REPORT_NOW_DAY = 3              # reports a day from one sender that the hub lets through as "now"
 REPORT_COLLAPSE_DAYS = 7        # inside this, the same report is one line for the receiver
 REPORT_COLLAPSE_CHARS = 120     # of the text, for the collapse key
 REPORT_GRACE = 7200             # seconds a report may wait for its decision before the hub says so
@@ -13305,11 +13300,6 @@ def report_price(agent, severity, about, t0):
     if not live:
         return "soon", ("about names nothing the hub can confirm is live, so this went in as soon. Name an open task, "
                         "an open case, a goal, an active duty or an agent at its limit to reach it at once.")
-    sent = q1("SELECT COUNT(*) n FROM reports WHERE from_agent=? AND delivered='now' AND created>=?",
-              (agent, day_start(t0)))["n"]
-    if sent >= REPORT_NOW_DAY:
-        return "soon", (f"you already sent {REPORT_NOW_DAY} reports today that reached your requester at once, so "
-                        f"this went in as soon.")
     return "now", None
 
 
@@ -14734,7 +14724,7 @@ TOOLS = [
         "in_reply_to": STR}, ["text"])),
     ("all", "message_owner", t_message_owner,
      "Write to the owner first, for example a result or a question about the owner's own request. Keep it short and "
-     "rare: at most 30 a day. It goes to the chat app where the owner last wrote to you, else to your own WhatsApp "
+     "rare. It goes to the chat app where the owner last wrote to you, else to your own WhatsApp "
      "number or Discord bot; without one it stays in the app. Answer an owner message with tell_owner instead. One "
      "request_id is one message: the same request_id again sends nothing more. Never put a login in the text.",
      S({"request_id": {"type": "string", "description": "A new UUID for each message"},
@@ -14833,7 +14823,7 @@ TOOLS = [
        ["task_id", "request_id", "message_ids"])),
     ("worker", "gmail_send", t_gmail_send,
      "Send one plain-text email from the owner's address: a new email, or an answer in the thread of reply_to. It "
-     "reaches other people at once and cannot be taken back. At most 20 a day. One request_id is one email: the same "
+     "reaches other people at once and cannot be taken back. One request_id is one email: the same "
      "request_id again never sends again.",
      S({"task_id": TASK_ID, "request_id": {"type": "string", "description": "A new UUID for each email"},
         "to": {"type": "array", "items": {"type": "string"}, "description": "Addresses: name <a@b.c> or a@b.c"},

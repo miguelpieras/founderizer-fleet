@@ -39,7 +39,7 @@ A worker also has ten, one more on a machine with a vault broker (`call_api`), a
   kinds: `outside_task`, `someone_elses_duty`, `lesson_for_others`, `capacity`, `risk`. It goes to whoever gave you
   the task and no further, and `severity` changes how it is delivered and never who gets it: `note` and `soon` wait
   to be read, and `now` reaches your requester at once only when `about` names something the hub can confirm is live
-  (an open task, an open case, a goal, an active duty, an agent at its limit), at most three a day. A report that
+  (an open task, an open case, a goal, an active duty, an agent at its limit). A report that
   says what another one already says is one line for the receiver, and your own answer still comes back to you: your
   next task session opens with what came of what you reported up, the one judged **wrong** included.
 - `deliver_result`: finish the task.
