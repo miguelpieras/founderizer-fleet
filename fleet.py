@@ -496,20 +496,29 @@ def type_into(session, name, text):
 
 # ---------------------------------------------------------------- sessions
 
+# Claude Code tools whose waits and actions the hub cannot see (plan C4, 26 October 2026): an in-session timer dies with
+# its session and no record of the fleet shows it, a cloud routine runs on the owner's claude.ai account, and a desktop
+# notification rings a worker's machine. set_reminder and wake-up rules are the fleet's own ways to come back, where
+# the hub sees them. NO_TIMERS takes the cron tools and /loop away; the deny rules stay for a version that lists them
+# anyway. Every Claude session that a helper starts has both, the manager's too: a rule names a tool, and limits no
+# command or file.
+UNSEEN_TOOLS = ["CronCreate", "CronDelete", "CronList", "ScheduleWakeup", "RemoteTrigger", "PushNotification"]
+NO_TIMERS = "CLAUDE_CODE_DISABLE_CRON=1"
 # Fleet's deny list for worker and lead Claude sessions.
-DENY = ["Read(~/.fleet/**)", "Edit(~/.fleet/**)", "Bash(*.fleet/*)"]
+DENY = ["Read(~/.fleet/**)", "Edit(~/.fleet/**)", "Bash(*.fleet/*)"] + UNSEEN_TOOLS
 PROTECTED = ("fleet.py", "lifecycle.py", "onboard.py", "vault.py", "acp_runner.py", "screen_runner.py", "desktop.py", "FleetWorker.swift", "worker_install.py", "install-worker.sh", "Install Fleet Worker.command", "hub.py", "wakeups.py", "usage.py", "threads.py", "selftest.py", "test_logins.py", "verify.py", "verify_case.py", "pilot.py", "publish.py", "publish/**", "team.json", "bws.toml", "RULES.md", "CLAUDE.md", "AGENTS.md", "profiles/**")
 
 
 def settings_arg(agent, conf, task, tools=()):
     """Claude Code settings for one session: what runs without asking, what never runs, and the two hooks
     that carry a worker's permission prompts and activity to the hub. The owner's full-access manager has no
-    Fleet-added deny rules and starts with the recorded unattended permission-mode choice. tools: the catalog tools
+    Fleet-added deny rule that limits a command or a file, only UNSEEN_TOOLS, and starts with the recorded unattended
+    permission-mode choice. tools: the catalog tools
     of this task session, which the owner gave the agent; they run without asking (owner feature integrations)."""
     if not runtime_fact(conf.get("runtime"), "session_settings"):
         return ""
     if conf.get("role") == "manager":
-        settings = {"skipDangerousModePermissionPrompt": True, "permissions": {"allow": [], "deny": []}}
+        settings = {"skipDangerousModePermissionPrompt": True, "permissions": {"allow": [], "deny": list(UNSEEN_TOOLS)}}
     else:
         deny = DENY + [f"Edit(/{KIT}/{name})" for name in PROTECTED]
         settings = {"permissions": {"allow": conf.get("allow", ["mcp__fleet__*"]) + [f"mcp__{t}__*" for t in tools],
@@ -797,6 +806,8 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
     if resume and conf.get("runtime") == "codex":
         cmd = cmd.replace("codex ", "codex resume ", 1)     # last, so that it comes first: codex resume [options] <thread>
     env = f"FLEET_ATTEMPT={attempt} FLEET_GENERATION={shlex.quote(generation)} FLEET_HUB={shlex.quote(HUB)} FLEET_AGENT={shlex.quote(agent)} FLEET_TASK={shlex.quote(task or '')}"
+    if conf.get("runtime") == "claude":
+        env += f" {NO_TIMERS}"
     if not task and conf.get("runtime") == "claude":
         env += f" CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"
     return f"{prefix}env {env} {cmd}"
@@ -1011,7 +1022,7 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
     values = dict(env or {}, **({"FLEET_SESSION_TOKEN": token}
                                 if token and runtime_fact(conf.get("runtime"), "token_in_env", True) else {}))
     words = ["env", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}", f"FLEET_AGENT={agent}", "FLEET_TASK="] + \
-        ([f"CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"] if conf.get("runtime") == "claude" else [])
+        ([NO_TIMERS, f"CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"] if conf.get("runtime") == "claude" else [])
     return env_prefix(agent, "owner-chat", values) + shlex.join(words + args)
 
 
@@ -1067,7 +1078,7 @@ def conversation_command(agent, conf, generation, conversation, url, token, prom
     args = ["claude", "--setting-sources", "", "--permission-mode", "dontAsk", "--tools", "", "--strict-mcp-config",
             "--mcp-config", mcp_config_file(agent, window, url, token), "--settings", json.dumps(settings),
             "--append-system-prompt-file", session_file(agent, window, "md", prompt)] + shlex.split(model_flags(conf))
-    words = ["env", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}", f"FLEET_AGENT={agent}", "FLEET_TASK="]
+    words = ["env", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}", f"FLEET_AGENT={agent}", "FLEET_TASK=", NO_TIMERS]
     return f"cd {shlex.quote(folder)} && exec " + shlex.join(words + args)
 
 

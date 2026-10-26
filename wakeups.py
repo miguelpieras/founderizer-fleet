@@ -268,8 +268,9 @@ def execution_grant(conf, features=()):
     if runtime == "claude":
         allow = list(conf.get("allow") or []) + option_values(words, "--allowedTools", "--allowed-tools")
         bypass = "--dangerously-skip-permissions" in words or flag(words, "--permission-mode") == "bypassPermissions"
-        # fleet.py settings_arg gives the manager no deny rule. Its start must keep every built-in tool: one that
-        # removes a tool, such as Bash, would let a check run what the session itself cannot.
+        # fleet.py settings_arg gives the manager no deny rule that limits a command or a file (only the tools whose
+        # waits the hub cannot see, UNSEEN_TOOLS). Its start must keep every built-in tool: one that removes a tool,
+        # such as Bash, would let a check run what the session itself cannot.
         every_tool = flag(words, "--tools") in (None, "default") and \
             not option_values(words, "--disallowedTools", "--disallowed-tools")
         if bypass and conf.get("role") == "manager" and every_tool:
