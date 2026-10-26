@@ -107,6 +107,9 @@ def diff_counts(diff):
 
 
 NOTICE = re.compile(r"<task-notification>.*?</task-notification>", re.S)
+# The statuses of a notice that ends a background command or a monitor. A notice without one is a monitor's event, and
+# its call stays open (plan C1: background work is a fact of the attempt until its own end notice).
+SHELL_ENDS = ("completed", "failed", "stopped", "killed")
 
 
 def notice_tag(notice, name):
@@ -167,6 +170,12 @@ class Translator:
         self.prefix = prefix        # a subagent's records: its starting call's id
         self.agents = {}            # open subagent call -> its agent (Claude agent id, Codex thread id), once launched
         self.pending = {}           # Claude: async subagent call -> agent id, until its end notice
+        self.shells = {}            # Claude: background command or monitor call -> its task id, until its end notice
+        self.shell_calls = {}       # Claude: Bash and Monitor calls of this session -> the tool's name
+        self.turn = False           # Claude: a turn of the main session runs
+        self.ending = None          # Claude: the message that ended a turn. One message can be two rows (its thinking
+                                    # and its text), so the turn end goes out at the next row, or when a read finds
+                                    # no new line (idle): one end for each turn, not one for each row.
         self.read_paths = set()     # Claude: files this session has read, written or edited: a Write to them is a change
         self.seq = 0
         self.started = False
@@ -201,11 +210,27 @@ class Translator:
         """The session is over: subagents with no recorded end are shown as far as they got."""
         return self.number(self.remaining(), None)
 
+    def idle(self):
+        """A read found no new line: the message that ended a turn was read whole, so the turn's end goes out now."""
+        return self.number(self.turn_end("end_turn"), None) if self.ending else []
+
+    def turn_end(self, how):
+        """The one result record of a turn of the main session that ended; how: its stop reason."""
+        self.ending, self.turn = None, False
+        return [{"type": "result", "stop_reason": how}]
+
     def remaining(self):
-        out = []
+        out = self.turn_end("end_turn") if self.ending else []
         for call, agent in sorted(self.pending.items()):
             out.extend(self.subagent_block(call, agent))
         self.pending.clear()
+        # The session is over, and Claude Code stops its background commands when it exits: one with no end notice
+        # did not finish. A Codex session's background commands end with it the same way.
+        for call in sorted(self.shells) + sorted(p for p in self.background.values() if p in self.open):
+            self.open.discard(call)
+            out.append({"type": "tool_call_update", "tool_call_id": call, "status": "failed", "interrupted": False})
+        self.shells.clear()
+        self.background.clear()
         for thread, call in sorted(self.threads.items()):
             out.extend(self.codex_kid(thread, call, last=True))
         return out
@@ -263,22 +288,29 @@ class Translator:
                 or row.get("isVisibleInTranscriptOnly"):
             return []
         kind, out = row.get("type"), []
+        message = row.get("message") if isinstance(row.get("message"), dict) else {}
+        if self.ending and not (kind == "assistant" and message.get("id") == self.ending):
+            out += self.turn_end("end_turn")        # the first row after the message that ended the turn
         if kind == "queue-operation" and row.get("operation") == "enqueue":
-            return self.notices(row.get("content"))
+            return out + self.notices(row.get("content"))
         if kind == "attachment":
             attachment = row.get("attachment") if isinstance(row.get("attachment"), dict) else {}
-            return self.notices(attachment.get("prompt")) if attachment.get("type") == "queued_command" else out
+            return out + (self.notices(attachment.get("prompt")) if attachment.get("type") == "queued_command" else [])
         if kind not in ("user", "assistant", "system"):
             return out
         if not self.started and row.get("sessionId"):
             self.started = True
             out.append({"type": "session", "runtime": "claude", "session_id": clip(row["sessionId"], 80)})
-        message = row.get("message") if isinstance(row.get("message"), dict) else {}
         if kind == "assistant" and self.prefix is None:
             out += self.model_record(message.get("model"), None)       # Claude transcripts give no effort
+            self.turn = True
         content = message.get("content")
         if kind == "system":
-            if row.get("subtype") == "turn_duration":
+            # turn_duration is missing on about one turn in five, and it follows the end_turn row when it is there:
+            # it is the end only of a turn whose end_turn row was not read.
+            if row.get("subtype") == "turn_duration" and self.turn and self.prefix is None:
+                out += self.turn_end("end_turn")
+            elif row.get("subtype") == "turn_duration" and self.prefix is not None:
                 out.append({"type": "result", "stop_reason": "end_turn"})
             return out
         if kind == "assistant" and row.get("isApiErrorMessage"):
@@ -289,6 +321,8 @@ class Translator:
                         "message": clip(text_of(content).strip(), MESSAGE),
                         "retryable": code in ("rate_limit", "server_error"),
                         "resets_at": when(quota.get("resetsAt")) if limited else None})
+            if self.prefix is None:
+                out += self.turn_end("error")       # the turn stops at the error that Claude Code shows
             return out
         blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content if isinstance(content, list) else []
         for block in blocks:
@@ -305,9 +339,14 @@ class Translator:
                 text = str(block.get("text") or "").strip()
                 if text.startswith("<task-notification>"):     # a background task's end, not the user's words
                     out.extend(self.notices(text))
+                    self.turn = self.turn or self.prefix is None    # an idle session's notice starts a turn
                 elif text.startswith("[Request interrupted by user"):
-                    out.append({"type": "result", "stop_reason": "cancelled"})
+                    if self.prefix is not None:
+                        out.append({"type": "result", "stop_reason": "cancelled"})
+                    elif self.turn:
+                        out += self.turn_end("cancelled")
                 elif text:
+                    self.turn = self.turn or self.prefix is None
                     out.append({"type": "user_message", "text": clip(text, TEXT)})
             elif kind == "user" and btype == "tool_result":
                 call = clip(block.get("tool_use_id"), 100)
@@ -318,29 +357,54 @@ class Translator:
                     agent = result.get("agentId")
                     if result.get("status") == "async_launched" or result.get("isAsync") is True:
                         self.pending[call] = agent      # it runs on; its end comes as a notice
+                        out.append({"type": "tool_call_update", "tool_call_id": call, "status": "in_progress",
+                                    "background": True, "interrupted": False})
                         continue
                     out.extend(self.subagent_block(call, agent))
-                self.open.discard(call)
                 body = text_of(block.get("content")).strip()
+                tool = self.shell_calls.pop(call, None)
+                running = result.get("backgroundTaskId") if tool == "Bash" else result.get("taskId") if tool == "Monitor" \
+                    else None
+                if isinstance(running, str) and running.strip() and not block.get("is_error"):
+                    # A command that runs on in the background, or a monitor: open until its own end notice.
+                    self.shells[call] = running.strip()
+                    out.append({"type": "tool_call_update", "tool_call_id": call, "status": "in_progress",
+                                "background": True, "interrupted": False, "output": clip(body, OUTPUT)})
+                    continue
+                self.open.discard(call)
                 out.append({"type": "tool_call_update", "tool_call_id": call,
                             "status": "failed" if block.get("is_error") else "completed",
                             "interrupted": "[Request interrupted by user" in body, "output": clip(body, OUTPUT)})
+        if kind == "assistant" and self.prefix is None and message.get("stop_reason") == "end_turn":
+            if message.get("id"):
+                self.ending = message["id"]         # its turn end goes out at the next row or a quiet read
+            else:
+                out += self.turn_end("end_turn")
         return out
 
     def notices(self, text):
-        """Async subagents that ended, by Claude Code's task notices (the first copy of a notice counts)."""
+        """Async subagents and background commands that ended, by Claude Code's task notices (the first copy of a
+        notice counts). A notice without one of SHELL_ENDS is a monitor's event: its call stays open."""
         out = []
-        if not self.pending or "<task-notification>" not in str(text or ""):
+        if not (self.pending or self.shells) or "<task-notification>" not in str(text or ""):
             return out
         for notice in NOTICE.findall(str(text)):
             named = clip(notice_tag(notice, "tool-use-id") or "", 100)
             agents = set(re.findall(r"<task-id>\s*([^<]*?)\s*</task-id>", notice))    # older notices name only agents
             calls = [named] if named in self.pending else [c for c, a in sorted(self.pending.items()) if a and a in agents]
-            status = "completed" if notice_tag(notice, "status") == "completed" else "failed"
+            state = notice_tag(notice, "status")
+            status = "completed" if state == "completed" else "failed"
             for call in calls:
                 out.extend(self.subagent_block(call, self.pending.pop(call)))
                 self.open.discard(call)
                 out.append({"type": "tool_call_update", "tool_call_id": call, "interrupted": False, "status": status})
+            if state in SHELL_ENDS:
+                shells = [named] if named in self.shells else [c for c, t in sorted(self.shells.items()) if t in agents]
+                for call in shells:
+                    self.shells.pop(call)
+                    self.open.discard(call)
+                    out.append({"type": "tool_call_update", "tool_call_id": call, "interrupted": False,
+                                "status": status})
         return out
 
     def claude_call(self, block):
@@ -357,6 +421,8 @@ class Translator:
         value = args.get(field) if field else next((v for v in args.values() if isinstance(v, str) and v.strip()), "")
         detail = first_line(value)
         self.open.add(call)
+        if name in ("Bash", "Monitor"):
+            self.shell_calls[call] = name           # a result with a task id makes it a background call
         record = {"type": "tool_call", "tool_call_id": call, "title": clip(f"{label}: {detail}" if detail else label, TITLE),
                   "kind": kind, "status": "in_progress", "server": clip(server, 60) if server else None}
         path = args.get("file_path") or args.get("notebook_path") or (args.get("path") if name in ("Grep", "Glob", "LS") else None)
@@ -1095,6 +1161,8 @@ class Tailer:
                     continue
                 feed.pending.extend(feed.translator.records(row))
             feed.offset += consumed
+            if not consumed:
+                feed.pending.extend(feed.translator.idle())
             if len(data) < READ_STEP:
                 if last:
                     feed.pending.extend(feed.translator.finish())

@@ -1524,6 +1524,8 @@ def migrate():
         # is one row for each agent it holds and one message for the manager. `route` is the route of this agent
         # that spends from that account, which a derived row cannot read from a task of its own.
         "agent_limits": {"cause": "INTEGER", "route": "TEXT"},
+        # plan C1: the attempt's turn state, as JSON (turn_state), kept from every record the helper sends
+        "attempts": {"turn": "TEXT"},
         "events": {"read_at": "REAL", "helper_ack": "REAL"},
         "prompts": {"kind": "TEXT NOT NULL DEFAULT 'tool'", "subject": "TEXT", "used": "REAL"},
         "sealed": {"bound_task": "INTEGER", "expired": "REAL", "login": "TEXT", "job": "INTEGER"},
@@ -2098,28 +2100,62 @@ def parked(task_id):
 # nothing new has to be stored and nobody has to remember to set a field. needs is the wrong lever and was not
 # used: one browser task is busy and idle in turns, and a shell task can hold one call open for an hour.
 CALL_PATIENCE = 1800            # seconds one unfinished tool call may run before the silence clock speaks
-CALL_LOOK = 500                 # the newest call records of the attempt that open_call reads
+TURN_CALLS = 64                 # open calls that one attempt's turn state keeps: the newest
+TURN_SAID = 500                 # characters of the attempt's last agent message that its turn state keeps
+
+
+def turn_state(task_id, attempt):
+    """The turn state of one attempt (plan C1), or None before its helper sent a record: {session, seq, turns,
+    running, how, at, calls, said}. turns counts the turn ends of its main session, running says whether a turn runs
+    now and how the last one ended, at is when that changed, calls maps each open tool call to [title, started,
+    background], and said is its last agent message, masked. A read that commits nothing (read_row)."""
+    row = read_row("SELECT turn FROM attempts WHERE task=? AND attempt=?", (task_id, attempt))
+    try:
+        state = json.loads(row["turn"]) if row and row["turn"] else None
+    except (TypeError, ValueError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def turn_records(state, session, records, t0):
+    """The attempt's turn state after these records (clean_record's (seq, ts, kind, data)). Every record counts
+    once, also one past EVENT_CAP that the hub no longer stores: the state keeps the newest seq of its session, and
+    a new session of the attempt starts it again. A record of a subagent (parent) neither starts nor ends a turn of
+    the main session, and its calls are open calls like any other."""
+    if not state or state.get("session") != session:
+        state = {"session": session, "seq": 0, "turns": 0, "running": False, "how": None, "at": None, "calls": {},
+                 "said": None}
+    state = json.loads(json.dumps(state))       # a new state: the caller compares it with the one it read
+    for seq, ts, kind, data in records:
+        if seq <= state["seq"]:
+            continue
+        state["seq"], at, main = seq, ts or t0, "parent" not in data
+        if kind == "result" and main:
+            state.update(turns=state["turns"] + 1, running=False, how=data["stop_reason"], at=at)
+        elif kind not in ("session", "model", "error", "result") and main and not state["running"]:
+            state.update(running=True, how=None, at=at)         # the first record of a new turn
+        if kind == "tool_call":
+            state["calls"][data["tool_call_id"]] = [data.get("title"), at, False]
+        elif kind == "tool_call_update" and data["status"] in ("completed", "failed"):
+            state["calls"].pop(data["tool_call_id"], None)
+        elif kind == "tool_call_update" and data.get("background"):
+            title, started, _ = state["calls"].get(data["tool_call_id"]) or [None, at, False]
+            state["calls"][data["tool_call_id"]] = [title, started, True]
+        elif kind == "agent_message" and main:
+            state["said"] = data["text"][:TURN_SAID]
+    if len(state["calls"]) > TURN_CALLS:
+        state["calls"] = dict(sorted(state["calls"].items(), key=lambda c: c[1][1] or 0)[-TURN_CALLS:])
+    return state
 
 
 def open_call(task_id, attempt):
     """The longest-running tool call of this attempt that the session has not finished, or None: (title, started).
-    Bounded, so a long task costs the same: with more than CALL_LOOK call records the oldest open call can be older
-    than the window, which only makes the hub less patient, never more."""
-    status, started, title = {}, {}, {}
-    for r in reversed(q("SELECT data, created FROM thread_events WHERE task=? AND attempt=? AND "
-                        "type IN ('tool_call','tool_call_update') ORDER BY id DESC LIMIT ?",
-                        (task_id, attempt, CALL_LOOK))):
-        d = json.loads(r["data"])
-        call = d["tool_call_id"]
-        status[call] = d["status"]
-        started.setdefault(call, r["created"])
-        if d.get("title"):
-            title.setdefault(call, d["title"])
-    live = [c for c, state in status.items() if state in ("pending", "in_progress")]
-    if not live:
+    A background command, monitor or subagent counts until its own end notice (plan C1)."""
+    calls = (turn_state(task_id, attempt) or {}).get("calls") or {}
+    if not calls:
         return None
-    call = min(live, key=lambda c: started[c])
-    return title.get(call, "a tool call"), started[call]
+    title, started, _ = min(calls.values(), key=lambda c: c[1] or 0)
+    return title or "a tool call", started
 
 
 def busy_in_a_call(t, t0):
@@ -2758,7 +2794,8 @@ def start_limit(agent, resets_at, task_id=None):
 def screen_failed(key, seq, error):
     """A turn of a session in the runner failed (app_server_task: every screen task, and each task of a Codex agent
     with the app-server start policy): its records have a result with the stop reason "error" (a tool call that
-    failed is no result; only the runner's records have this result). `key`: (task, attempt, session); `seq`: the
+    failed is no result; a Claude terminal session's error turn has this result too, and is not the runner's, so the
+    gate below leaves it alone). `key`: (task, attempt, session); `seq`: the
     result's number; `error`: the turn's error record, or None when it is not in the batch of the result. A usage
     limit is start_limit's. For every other error the runner starts no other turn, and a new session would fail in the
     same way. So the hub starts none and types nothing: the existing pause hold, in the requester's name, and one
@@ -18299,6 +18336,8 @@ def clean_record(e):
                 d["subagent"] = {"name": text_field(e["subagent"]["name"], 100, False)}
         else:
             d["interrupted"] = e.get("interrupted") is True
+            if e.get("background") is True:     # plan C1: it runs on after its result, until its own end notice
+                d["background"] = True
         locations = [x["path"] for x in e.get("locations") or [] if isinstance(x, dict) and isinstance(x.get("path"), str)
                      and x["path"].strip()] if isinstance(e.get("locations"), list) else []
         if locations:
@@ -27620,7 +27659,11 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             last = q1("SELECT COALESCE(MAX(seq),0) m FROM thread_events WHERE task=? AND attempt=? AND session=?", key)["m"]
             count = q1("SELECT COUNT(*) n FROM thread_events WHERE task=? AND attempt=?", (tid, attempt))["n"]
+            before = turn_state(tid, attempt)
+            state = turn_records(before, session, records, now())
             with area("activity"), committed():         # thread records: the apps read them on their own clock
+                if state != before:
+                    DB.execute("UPDATE attempts SET turn=? WHERE task=? AND attempt=?", (json.dumps(state), tid, attempt))
                 for seq, ts, kind, data in records:
                     if seq <= last:
                         continue
@@ -27671,7 +27714,12 @@ class Handler(BaseHTTPRequestHandler):
         if runtime is not None and not isinstance(runtime, str):
             return self.json(400, {"error": "runtime must be a runtime name or null"})
         with LOCK:
-            if runtime is None or runtime == agents()[agent].get("runtime"):
+            # The helper reads the manager's whole transcript again after a restart, so a report can be of an episode
+            # that the hub held or ended already: that one starts nothing (plan C1, in place of the helper's 15-minute
+            # age test, which dropped a limit the helper saw late).
+            seen = reset is not None and q1("SELECT 1 FROM agent_limits WHERE agent=? AND until=? AND reset_known=1",
+                                            (agent, reset))
+            if (runtime is None or runtime == agents()[agent].get("runtime")) and not seen:
                 start_limit(agent, reset)
             lim = active_limit(agent)
         return self.json(200, {"ok": True, "until": lim["until"] if lim else None})

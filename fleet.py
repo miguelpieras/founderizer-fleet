@@ -3005,9 +3005,12 @@ class Helper:
         return [("manager", "", 0, self.manager_session)] if self.manager_session else []
 
     def report_limit(self, batch):
-        """The manager's own records stay on its machine. Only a fresh usage-limit record goes to the hub."""
+        """The manager's own records stay on its machine. Only a usage-limit record goes to the hub: one with a reset
+        whatever its age, because the hub knows an episode it already held or ended by that reset, and one without a
+        reset only while it is fresh, because nothing else tells an old one from a new one."""
         for r in batch["events"]:
-            if r["type"] == "error" and r.get("code") == "usage_limit" and r.get("ts") and time.time() - r["ts"] < 900:
+            if r["type"] == "error" and r.get("code") == "usage_limit" and r.get("ts") and \
+                    (r.get("resets_at") or time.time() - r["ts"] < 900):
                 code, _ = http("POST", f"/helper/limit/{self.agent}",      # the hub holds only its runtime's limit
                                {"resets_at": r.get("resets_at"), "runtime": self.conf.get("runtime")}, timeout=10)
                 if code != 200:
