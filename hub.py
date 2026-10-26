@@ -15283,9 +15283,12 @@ def board_html():
     # session_allowed), the key or the session credential (Handler.refuse), and the rest of what the hub refuses.
     machine = q1("SELECT COUNT(*) c FROM log WHERE what LIKE 'REFUSED a call from % that claimed to be %'")["c"]
     credential = q1("SELECT COUNT(*) c FROM log WHERE what LIKE 'REFUSED a call for % from %'")["c"]
-    other = q1("SELECT COUNT(*) c FROM log WHERE what LIKE 'REFUSED%'")["c"] - machine - credential
+    named = q1("SELECT COUNT(*) c FROM log WHERE what LIKE 'REFUSED a request from % for the Host %'")["c"]
+    other = q1("SELECT COUNT(*) c FROM log WHERE what LIKE 'REFUSED%'")["c"] - machine - credential - named
     p.append(f"<tr><td>Calls refused because they came from the wrong machine</td><td>{machine}</td></tr>")
     p.append(f"<tr><td>Calls refused because a key or a session credential did not match</td><td>{credential}</td></tr>")
+    p.append(f"<tr><td>Requests refused because their Host is not a name of this hub (each pair logged once)</td>"
+             f"<td>{named}</td></tr>")
     p.append(f"<tr><td>Other refused calls: a join code, the bridge, a handover, a vault job</td>"
              f"<td>{other}</td></tr></table>")
     p.append("<h2>Recent activity</h2><table><tr><th>When</th><th>Who</th><th>What</th></tr>")
@@ -17493,6 +17496,7 @@ def tick():
             settle_checks(t0)
             attachment_sweep(t0)            # owner feature attachments: the files that the hub may let go
             release_sweep(t0)               # owner feature releases: the automatic poll, when the owner opted in
+            names_sweep(t0)                 # devops task 1.1: the Tailscale names, when the start found none
         except Exception:
             traceback.print_exc()           # a goal or database check must not stop the timers below
         # close sessions of finished tasks
@@ -17689,6 +17693,95 @@ def address_checked():
     at all tells none of them apart by address (the throwaway hubs of selftest.py, and fixtures that pin the owner
     alone) and takes a name as it is given."""
     return any(address_of_machine(a.get("machine", "")) for a in agents().values())
+
+
+# ---------------------------------------------------------------- which names the hub answers to
+
+# DNS rebinding and cross-site requests (devops task 1.1, 24 October 2026). The hub knows its callers by their address,
+# so a web page in a browser on one of those machines is that machine to the address check: under a name of its own
+# that points at the hub (a rebinding, which reads every answer), or from another site (a form or an image, which
+# writes). So the hub refuses what only a browser sends: a Host that is not one of its own names, an Origin that is not
+# its own, and a Sec-Fetch-Site of another site. fleet.py, the apps, the helpers and the MCP clients send the hub's own
+# Host and neither of the other two, and nothing changes for them.
+LOOPBACK_NAMES = ("127.0.0.1", "localhost", "[::1]")
+WILDCARDS = ("", "0.0.0.0", "::")
+SAME_SITE = ("same-origin", "none")         # the Sec-Fetch-Site of the hub's own pages, and of an address typed in
+HOST_SHOWN, HOSTS_LOGGED = 200, 1000        # a refused Host comes from the caller: what is logged of it, and how often
+HOST_NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*")
+EXTRA_HOST = re.compile(r"(?:\[[0-9a-f:.]{2,45}\]|" + HOST_NAME.pattern + r"):[0-9]{1,5}")
+EXTRA_HOSTS_MAX = 16
+TAILNET_NAMES = {"names": ()}               # the hub machine's Tailscale names: at the start, and again at each reload
+REFUSED_HOSTS = set()                       # the (source, Host) pairs logged since the start
+REFUSED_LOCK = threading.Lock()
+
+
+def tailnet_names():
+    """The hub machine's own names on the private network: Self.DNSName of `tailscale status --json` without its final
+    dot, full and short. () when the command is absent, fails or takes more than 5 seconds: the hub starts without
+    them, and the next reload_team asks again."""
+    try:
+        done = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True, timeout=5,
+                              stdin=subprocess.DEVNULL)
+        name = str((json.loads(done.stdout).get("Self") or {}).get("DNSName") or "").rstrip(".").lower()
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError, TypeError):
+        return ()
+    if not HOST_NAME.fullmatch(name):
+        return ()
+    return tuple(dict.fromkeys((name, name.split(".")[0])))
+
+
+def learn_tailnet_names():
+    """The names again, at a reload. In the background, because a reload runs under LOCK and the command may take 5
+    seconds. A lookup that fails keeps the names that the hub has. Returns the thread."""
+    def run():
+        TAILNET_NAMES["names"] = tailnet_names() or TAILNET_NAMES["names"]
+    thread = threading.Thread(target=run, name="tailnet-names", daemon=True)
+    thread.start()
+    return thread
+
+
+def names_sweep(t0):
+    """A hub whose start lookup found no Tailscale names (tailscaled was updating, a race at boot) asks again once a
+    minute until it has them. A hub that has them asks again only at a reload."""
+    if not TAILNET_NAMES["names"] and t0 - TAILNET_NAMES.get("asked", 0) >= 60:
+        TAILNET_NAMES["asked"] = t0
+        learn_tailnet_names()
+
+
+def host_value(name, port):
+    """The Host header of a client that uses this name and port: in lowercase, an IPv6 address in brackets."""
+    name = name.lower()
+    return f"[{name}]:{port}" if ":" in name and not name.startswith("[") else f"{name}:{port}"
+
+
+def allowed_hosts(bound):
+    """Every Host value that this hub answers, for the server bound at `bound` (address, port). Each name takes the port
+    that the server actually bound: the bound address unless it is a wildcard, the hub machine's address in team.json,
+    the hub machine's Tailscale names, and loopback. Then each "host:port" of team.json hub.extra_hosts as it is, for a
+    name that none of these gives (a tunnel, a proxy): an install sets it with no release."""
+    names = {*LOOPBACK_NAMES, *TAILNET_NAMES["names"], hub_address()[0]}
+    if bound[0] not in WILDCARDS:
+        names.add(bound[0])
+    hosts = {host_value(name, bound[1]) for name in names if name}
+    extra = (TEAM.get("hub") or {}).get("extra_hosts") if isinstance(TEAM.get("hub"), dict) else None
+    # The rule of validate_team again: a hub may start on a team.json that no check has read (team_problem).
+    hosts.update(e.strip().lower() for e in (extra if isinstance(extra, list) else ())
+                 if isinstance(e, str) and EXTRA_HOST.fullmatch(e.strip().lower()))
+    return hosts
+
+
+def get_writes(parts):
+    """True for a GET route that writes state. Its method never changes, because an older fleet.py must keep working,
+    so a browser's cross-site request to one of these is refused instead (Handler.site_allowed). A GET route that
+    starts to write belongs here."""
+    return (len(parts) == 2 and parts[0] in ("events", "sealed")        # every query, the owner's too; the binding
+            or len(parts) == 3 and parts[:2] in (["attachment", "file"], ["google", "file"])     # a one-use link
+            or parts in (["site", "logout"], ["site", "mfa", "expire"], ["site", "key"], ["site", "blue"],
+                         ["site", "orange"], ["site", "price"], ["api", "price"], ["bridge", "out"],
+                         ["bridge", "config"], ["ui", "backup"])
+            or len(parts) == 4 and parts[:2] == ["helper", "login"]
+            or len(parts) == 5 and parts[:2] == ["helper", "trigger"] and parts[4] == "code"
+            or len(parts) == 4 and parts[:2] == ["ui", "tasks"] and parts[3] == "desktop")
 
 
 # ---------------------------------------------------------------- http
@@ -18501,6 +18594,12 @@ def validate_team(team):
         raise ValueError("team.json needs addresses and a hub machine with an address")
     if "owner" not in addresses:
         raise ValueError("team.json needs the owner address")
+    extra = hub_conf.get("extra_hosts", [])     # devops task 1.1: a name of this hub that it cannot find by itself
+    if not isinstance(extra, list) or len(extra) > EXTRA_HOSTS_MAX or not all(
+            isinstance(e, str) and EXTRA_HOST.fullmatch(e.lower()) and 1 <= int(e.rsplit(":", 1)[1]) <= 65535
+            for e in extra):
+        raise ValueError(f'hub.extra_hosts must be a list of up to {EXTRA_HOSTS_MAX} "host:port" values, for example '
+                         f'"fleet.example.com:8765"')
     for machine, ip in addresses.items():
         try:
             ipaddress.ip_address(ip)
@@ -18850,6 +18949,7 @@ def reload_team(revision):
         if code != 0:
             raise Refusal(500, "the fast-forward failed: " + err[-200:])
     apply_team(new)
+    learn_tailnet_names()           # devops task 1.1: a hub that started without its names has them after a reload
     log("owner", f"team reloaded at {full[:12]}: added {added}, changed {changed}, removed {removed}")
     return {"revision": full, "agents": sorted(new["agents"]), "added": added, "changed": changed, "removed": removed}
 
@@ -22555,6 +22655,44 @@ class Handler(BaseHTTPRequestHandler):
         self.json(403, {"error": why, "auth": code})
         return False
 
+    def host_allowed(self):
+        """Before any route (devops task 1.1): the one Host header names this hub (allowed_hosts). A missing Host, a
+        name without the port, or any other value gets 421 with an empty body. Each refused (source, Host) pair is
+        logged once, at most HOSTS_LOGGED of them until a restart, because the value comes from the caller."""
+        given = self.headers.get_all("Host") or []
+        if len(given) == 1 and given[0].strip().lower() in allowed_hosts(self.server.server_address):
+            return True
+        src, shown = self.client_address[0], (given[0] if given else "")[:HOST_SHOWN]
+        with REFUSED_LOCK:
+            first = (src, shown) not in REFUSED_HOSTS and len(REFUSED_HOSTS) < HOSTS_LOGGED
+            if first:
+                REFUSED_HOSTS.add((src, shown))
+        if first:
+            log("hub", f"REFUSED a request from {src} for the Host {shown!r}: 421, not a name of this hub")
+        self.send(421, b"", headers={"Connection": "close"})       # its body stays unread, so the connection ends here
+        return False
+
+    def foreign(self):
+        self.json(403, {"error": "foreign origin"})
+        return False
+
+    def site_allowed(self):
+        """A browser says in Sec-Fetch-Site where a request comes from: the hub's own pages (same-origin) and an address
+        that a person typed (none) pass. A request without it, which is every client that is not a browser, passes."""
+        site = self.headers.get("Sec-Fetch-Site")
+        return site is None or site.strip().lower() in SAME_SITE or self.foreign()
+
+    def origin_allowed(self):
+        """Every POST and DELETE, after the body is read and before any route (devops task 1.1): an Origin is this hub's
+        own, http:// and a Host that it answers, and never null; then site_allowed. A request with neither header,
+        which is every client that is not a browser, passes. ui_allowed keeps its own stricter rule: no Origin."""
+        origin = self.headers.get("Origin")
+        if origin is not None:
+            given = origin.strip().lower()
+            if not given.startswith("http://") or given[7:] not in allowed_hosts(self.server.server_address):
+                return self.foreign()
+        return self.site_allowed()
+
     def allowed(self, who, broker=False):
         """True when this call comes from `who`'s own machine with what owner API 1.12 asks. An agent with a key sends
         it on every route, also while it is alone on its address, except broker: a vault route that the machine's
@@ -25924,6 +26062,8 @@ class Handler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_DELETE(self):
+        if not self.host_allowed() or not self.origin_allowed():
+            return
         parts, _ = self.route()
         if parts[:1] == ["mcp"]:
             return self.send(200, b"{}")
@@ -25931,6 +26071,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
+            if not self.host_allowed() or (get_writes(self.route()[0]) and not self.site_allowed()):
+                return
             self.get()
         except (BrokenPipeError, ConnectionResetError):
             pass
@@ -25961,7 +26103,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.close_connection = True
                 return self.send(413, "The file is larger than 50 MiB. It was not uploaded.\n", "text/plain; charset=utf-8")
             self._raw = self.rfile.read(n) if n else b""
-            self.post()
+            if self.host_allowed() and self.origin_allowed():      # after the body, so the client reads its 421
+                self.post()
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception:
@@ -27954,9 +28097,11 @@ def main():
     threading.Thread(target=central_timer, name="central-vault", daemon=True).start()
     threading.Thread(target=knowledge_refresher, name="knowledge-pages", daemon=True).start()
     threading.Thread(target=ping_sender, name="pings", daemon=True).start()
+    TAILNET_NAMES["names"] = tailnet_names()        # devops task 1.1: the names that a client may call this hub by
     server = ThreadingHTTPServer((host, port), Handler)
     server.daemon_threads = True
     print(f"Founderizer hub on http://{host}:{port}  board: http://{host}:{port}/board")
+    print(f"It answers the Host values: {', '.join(sorted(allowed_hosts(server.server_address)))}.", flush=True)
     print(f"Agents: {', '.join(agents())}. Records: {db_path}.")
     # flush, because the service writes this output to the journal, where a block buffer would hold a warning back
     # until the hub has printed 8 KiB of other things: an operator reads it at the start or not at all.

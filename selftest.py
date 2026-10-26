@@ -932,6 +932,22 @@ check("board renders", "Retake the screenshot" in b and "read by Chrome" in b an
 check("board does not show the password", password not in b)
 check("text board", "OPEN TASKS" in raw("GET", "/board.txt")[2])
 
+# 9b the names the hub answers to (devops task 1.1), on the port that it really bound: a page in a browser on an allowed
+# machine reads nothing under a name of its own (DNS rebinding) and writes nothing from another site
+own_port = int(HUB.rsplit(":", 1)[1])
+other_port = own_port + 1 if own_port < 65535 else own_port - 1
+check("the hub answers 127.0.0.1 with its own port", raw("GET", "/board.txt", headers={"Host": f"127.0.0.1:{own_port}"})[0] == 200)
+check("the hub answers localhost with its own port", raw("GET", "/board.txt", headers={"Host": f"localhost:{own_port}"})[0] == 200)
+code, _, text = raw("GET", "/board.txt", headers={"Host": f"127.0.0.1:{other_port}"})
+check("a Host with another port gets 421 and no body", (code, text) == (421, ""), f"{code} {text[:80]}")
+code, _, text = raw("POST", "/say", form={"text": ""}, headers={"Origin": "https://attacker.example"})
+check("a foreign Origin gets 403 foreign origin", (code, text) == (403, '{"error": "foreign origin"}'), f"{code} {text[:80]}")
+check("the hub's own Origin is answered on /say", raw("POST", "/say", form={"text": ""}, headers={"Origin": HUB})[0] == 303)
+check("no Origin is answered on /say", raw("POST", "/say", form={"text": ""})[0] == 303)
+code, _, text = raw("GET", "/events/owner?wait=0", headers={"Sec-Fetch-Site": "cross-site"})
+check("a cross-site GET of /events/owner gets 403 foreign origin", (code, text) == (403, '{"error": "foreign origin"}'),
+      f"{code} {text[:80]}")
+
 # 10 timers (this hub runs with short timers)
 text, err = tool("manager", "set_reminder", minutes=0.03, note="look at T-2")
 before = events("manager")[-1]["id"]
