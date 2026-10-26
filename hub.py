@@ -746,9 +746,10 @@ MOBILE_CHAT = 30                # chat items in one page for the phone
 MOBILE_PREVIEW = 120            # characters of a chat preview in the phone's agent list
 MOBILE_HEAD = ("id", "title", "state", "owner", "requester", "goal", "needs", "attempt", "accepted", "created",
                "started", "last_activity", "delivered", "checked_at", "waiting_on", "follows")
+MOBILE_SEEN = 60                # seconds: a helper seen this recently is online in both apps (helperIsRecent)
 DEVICE_PATHS = (("/ui/mobile", ("GET",)), ("/ui/state", ("GET",)), ("/ui/knowledge", ("GET",)),
                 ("/ui/owner/devices", ("GET",)), ("/ui/messages", ("POST",)), ("/ui/needs", ("POST",)),
-                ("/ui/tasks", ("GET", "POST")))
+                ("/ui/tasks", ("GET", "POST")), ("/ui/wait", ("GET",)))
 DEVICE_PUSH = re.compile(r"/ui/owner/devices/[a-z][a-z0-9-]{1,30}/push")    # a device's own push token (push)
 
 
@@ -1104,6 +1105,17 @@ def mobile_state(generation):
             "counts": {"tasks_open": len(tasks), "needs_open": len(needs),
                        "messages": q1("SELECT COUNT(*) n FROM ui_requests")["n"],
                        "reports": q1("SELECT COUNT(*) n FROM owner_reports")["n"]}}
+
+
+def mobile_tagged(answer):
+    """What the ETag of GET /ui/mobile hashes: the answer without its clock, its change token and the times of each
+    helper's check-ins. A helper checks in every few seconds, so a tag of those times was new at every read and no
+    phone ever got a 304. In their place it hashes whether the helper was seen in the last minute, which is what
+    both apps draw as online: an idle fleet answers 304, and an agent that goes offline or comes back is a new tag."""
+    t = answer["time"]
+    agents = [dict({k: v for k, v in a.items() if k not in ("last_seen", "alive_ts")},
+                   seen=bool(a["last_seen"]) and -5 <= t - a["last_seen"] < MOBILE_SEEN) for a in answer["agents"]]
+    return dict({k: v for k, v in answer.items() if k not in ("time", "token")}, agents=agents)
 
 
 def mobile_chat(agent, since):
@@ -22658,16 +22670,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def ui_mobile(self, query):
         """GET /ui/mobile (owner feature mobile): the phone's own read, with an ETag, so that an unchanged fleet
-        costs one empty answer. The whole snapshot of /ui/state is too much for a phone."""
+        costs one empty answer. The whole snapshot of /ui/state is too much for a phone. It carries the change token
+        (live_changes), read under the same lock, for the phone's GET /ui/wait; the tag leaves it out."""
         if not self.ui_allowed():
             return
         generation = kv_get("db_id")
         if query.get("db") not in (None, generation):
             return self.json(409, {"error": "hub generation changed; refresh state"})
         with LOCK:
-            result = scrub(mobile_state(generation))
-        tag = '"' + hashlib.sha256(json.dumps({k: v for k, v in result.items() if k != "time"},
-                                              sort_keys=True).encode()).hexdigest()[:32] + '"'
+            result = scrub(dict(mobile_state(generation), token=change_token()))
+        tag = '"' + hashlib.sha256(json.dumps(mobile_tagged(result), sort_keys=True).encode()).hexdigest()[:32] + '"'
         headers = {"ETag": tag, "Cache-Control": "no-store"}
         if self.headers.get("If-None-Match") == tag:
             return self.send(304, b"", headers=headers)
