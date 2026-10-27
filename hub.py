@@ -16775,8 +16775,10 @@ def history_agents(a, days, start, before):
                     (name, start))["n"]
         limits_before = q1("SELECT COUNT(*) n FROM agent_limits WHERE agent=? AND cause IS NULL AND since>=? "
                            "AND since<?", (name, before, start))["n"]
-        tokens = q1("SELECT COALESCE(SUM(total),0) n FROM session_tokens WHERE agent=? AND reported>=?",
-                    (name, start))["n"]
+        # Each session once, in the window of its last activity: a helper reports its 500 newest sessions again
+        # every 30 seconds, so `reported` is no time of spending (AUTONOMY.md P8, lane L7).
+        tokens = q1("SELECT COALESCE(SUM(total),0) n FROM session_tokens WHERE agent=? AND last_activity>=? AND "
+                    "last_activity<?", (name, start, now()))["n"]
         out.append(f"  {name}: delivered {moved(len(new), len(old))}; "
                    f"accepted {moved(len([t for t in new if t['accepted'] == 1]), len([t for t in old if t['accepted'] == 1]))}; "
                    f"refused {moved(len([t for t in new if t['accepted'] == 0]), len([t for t in old if t['accepted'] == 0]))}; "
@@ -17009,12 +17011,15 @@ def costs_view(names, start, end, minimum=COSTS_MINIMUM):
     for t in read_rows(f"SELECT id, agent FROM triggers WHERE agent IN ({marks}) ORDER BY id", tuple(names)):
         check = {"trigger": t["id"], "agent": t["agent"]}
         for when, (since, until) in (("now", (start, end)), ("before", (before, start))):
-            runs = read_rows("SELECT state, task, event_id" + (", runs" if quiet else "") + " FROM trigger_runs "
+            runs = read_rows("SELECT state" + (", runs" if quiet else "") + " FROM trigger_runs "
                              "WHERE trigger_id=? AND finished>=? AND finished<?", (t["id"], since, until))
             spent = costs_sums(read_rows("SELECT * FROM session_tokens WHERE agent=? AND kind='wake' AND "
                                          "task_kind=? AND last_activity>=? AND last_activity<?",
                                          (t["agent"], f"trigger {t['id']}", since, until)), book)
-            check[when] = {"wakes": len([r for r in runs if r["task"] or r["event_id"]]),
+            # lane L4: a wake is a run that started one; new lines that went into the check's open wake joined it,
+            # and the third failure in a row, which wakes the agent once, is still a failure
+            check[when] = {"wakes": len([r for r in runs if r["state"] == "started"]),
+                           "joined": len([r for r in runs if r["state"] == "joined"]),
                            "quiet": sum((r["runs"] or 1) if quiet else 1 for r in runs if r["state"] == "quiet"),
                            "failed": len([r for r in runs if r["state"] == "error"]), "cost": spent["cost"]}
         out["checks"].append(check)
@@ -17119,10 +17124,12 @@ def costs_text(view, days, viewer):
             out.append(f"    and {len(largest) - HISTORY_ROWS} more kinds of work, each of which cost less")
     for c in view["checks"]:
         n, b = c["now"], c["before"]
-        if any(n[k] or b[k] for k in ("wakes", "quiet", "failed")):
-            out.append(f"  check {c['trigger']} of {c['agent']}: {n['wakes']} wakes ({b['wakes']} before), "
-                       f"{n['quiet']} quiet runs ({b['quiet']}), {n['failed']} failed ({b['failed']}); its wakes "
-                       f"cost {was(n['cost'], b['cost'], costs_money)}")
+        if any(n[k] or b[k] for k in ("wakes", "joined", "quiet", "failed")):
+            out.append(f"  check {c['trigger']} of {c['agent']}: {n['wakes']} wakes ({b['wakes']} before)"
+                       + (f", {n['joined']} runs added lines to an open wake ({b['joined']})"
+                          if n["joined"] or b["joined"] else "")
+                       + f", {n['quiet']} quiet runs ({b['quiet']}), {n['failed']} failed ({b['failed']}); its "
+                         f"wakes cost {was(n['cost'], b['cost'], costs_money)}")
     for acc in view["accounts"]:
         windows = "; ".join(f"{w['label']} {w['used_percent']:g}% used, {w['left_percent']:g}% left"
                             + (f", resets {until_clock(w['resets_at'])}" if w["resets_at"] else "")
