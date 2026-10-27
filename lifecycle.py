@@ -138,8 +138,9 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
 #   routine           the model and effort of routine work on it, {model, effort}, None for the runtime's own
 #                     default model: what an agent's one changer reaches for first (plan P9.7, P8)
 #   task_tools        the built-in tools that a task session of it gets, as its own --tools list (AUTONOMY.md
-#                     decision 36, helper feature task_tools): an allow list, so that a new version of the runtime adds
-#                     no tool by itself; None where Fleet passes none
+#                     decision 36, helper feature task_tools): every tool that its task sessions had before, less the
+#                     ones that the owner took away; an allow list, so that a new version of the runtime adds no tool by
+#                     itself; None where Fleet passes none
 #   task_opening      how a task session that opens with its stable text first (helper feature stable_start, plan
 #                     P9.2) gets its task: "read", in its first read_messages answer, because the rules and the
 #                     profile are its appended system prompt; "prompt", at the end of its first prompt, because it
@@ -248,9 +249,13 @@ RUNTIMES = {
         "compact_tokens": 200000,       # fleet.STANDING_COMPACT, the window that Fleet starts its standing sessions with
         "routine": {"model": "sonnet", "effort": "low"},
         # The owner, 27 October 2026: "Yes, remove Artifact, Workflow, AskUserQuestion, ReportFindings, Skill and
-        # ListAgents from agent task sessions." So the work tools and ToolSearch, and the tools that ToolSearch loads
-        # when a session needs them: WebFetch, WebSearch and NotebookEdit (the Fleet tools are MCP tools)
-        "task_tools": "Bash,Read,Edit,Write,Agent,ToolSearch,WebFetch,WebSearch,NotebookEdit",
+        # ListAgents from agent task sessions." So every other built-in tool that a task session had before, on
+        # Claude Code 2.1.301, 2.1.304, 2.1.308, 2.1.311 and 2.1.312 (recorded against stand-ins on 27 October 2026;
+        # most of them deferred, which ToolSearch loads; the Fleet tools are MCP tools). Claude Code offers
+        # ArtifactComments and ArtifactData only together with Artifact, so on all five they go with it.
+        "task_tools": "Bash,Read,Edit,Write,Agent,ToolSearch,WebFetch,WebSearch,NotebookEdit,Monitor,TaskStop,"
+                      "EnterPlanMode,ExitPlanMode,EnterWorktree,ExitWorktree,SendMessage,ArtifactComments,"
+                      "ArtifactData,DesignSync",
         "task_opening": "read",
         # Anthropic's list prices of 6 October 2026. Its sessions write one-hour caches, which cost twice the input.
         "token_weights": {"default": {"input": 4.0, "cache_read": 0.2, "cache_write": 8.0, "output": 20.0},
@@ -343,19 +348,23 @@ def session_reuse(runtime, context, started, now_runs, settings=None, at=None, f
 
     A session is reused only when its cache is still warm (its records' cache lifetime, else its runtime's
     cache_seconds, less the margin), its context has at most grown by the growth factor since its start, there is
-    room before its runtime's compaction point, and it runs on the runtime, model and effort that the agent has now.
-    The same thread is the caller's: a window is one thread (a task, a case, a conversation, the owner chat).
+    room before its runtime's compaction point, and it runs on the runtime, model, effort and account that the agent
+    has now: a provider keeps a cache for each account. The same thread is the caller's: a window is one thread (a
+    task, a case, a conversation, the owner chat).
 
     context: its own records, (tokens now, tokens at its first call, time of its last model call, cache seconds or
     None), or None for a session that made no call yet, which has no context to read again. started and now_runs:
-    {"runtime", "model", "effort"} that it started with and that the agent has now; started is None when its start
-    cannot be read, and then nothing is compared. facts: the runtime's facts as the owner set them (facts_now), else
-    the table's."""
+    {"runtime", "model", "effort", "account"} that it started with and that the agent has now; started is None when its
+    start cannot be read, and then nothing is compared; an account that either of them does not name is not compared.
+    facts: the runtime's facts as the owner set them (facts_now), else the table's."""
     settings = dict(REUSE_SETTINGS, **(settings or {}))
     if not settings["on"]:
         return True, ""
     if started is not None and any(started.get(k) != (now_runs or {}).get(k) for k in ("runtime", "model", "effort")):
         return False, "it runs another runtime, model or effort than the agent has now"
+    account, now_account = (started or {}).get("account"), (now_runs or {}).get("account")
+    if account and now_account and account != now_account:
+        return False, "it started on another account than the agent has now"
     if not context:
         return True, ""
     tokens, first, last, cache = context

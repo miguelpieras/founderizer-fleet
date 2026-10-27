@@ -1075,6 +1075,23 @@ def started_runs(start, runtime):
     return out
 
 
+ACCOUNT_KEY = re.compile(r"(?:anthropic|openai):[a-f0-9]{32}")      # usage.account_key: a provider and a hash
+
+
+def account_now(agent, runtime):
+    """The provider account that this machine's runtime is signed in to now, by the key of the agent's last usage
+    reading (usage.Collector writes ~/.fleet/usage-<agent>.json), or None while no reading of that runtime names one.
+    A window keeps the one it started on (@fleet_account), and the session reuse rule compares the two: a provider
+    keeps a cache for each account."""
+    try:
+        with open(os.path.join(os.path.expanduser("~"), ".fleet", f"usage-{agent}.json"), encoding="utf-8") as f:
+            cache = json.load(f)
+        key = cache["data"]["limits"]["account_key"] if cache.get("runtime") == runtime else None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    return key if isinstance(key, str) and ACCOUNT_KEY.fullmatch(key) else None
+
+
 # Claude Code puts RULES.md in the context through CLAUDE.md, so a session that also read it was given its
 # 17,000 tokens twice; a Codex session reads it. The first 60 characters find a session from before session ids
 # (manager_windows), so they stay as they were.
@@ -2799,6 +2816,9 @@ class Helper:
                 start_window(self.session, name, command)
             try:
                 tmux("set-option", "-w", "-t", f"{self.session}:={name}", "@fleet_attempt", f"{generation}:{attempt}", check=True)
+                account = account_now(self.agent, self.conf.get("runtime"))
+                if account:             # the account it starts on, which the session reuse rule compares
+                    tmux("set-option", "-w", "-t", f"{self.session}:={name}", "@fleet_account", account)
                 if needs:               # every task window says what it runs; runner() and task_windows() rely on it
                     tmux("set-option", "-w", "-t", f"{self.session}:={name}", "@fleet_needs", needs, check=True)
                 if session and not standing:    # after @fleet_needs: the record reader takes a window with a session
@@ -3420,9 +3440,9 @@ class Helper:
 
         - The session reuse rule says so (lifecycle.session_reuse, plan P9.10, helper feature session_reuse): its
           cache is cold, its context has grown past the growth factor since its start, it has no room before its
-          compaction, or it runs another model or effort than the agent has now. Telling it would read all of its
-          context again at the price of writing it, where a new session pays only for a start. Nothing is lost that
-          a read cannot give back: the fleet's state is in the hub, and the brief opens with it.
+          compaction, or it runs another model, effort or account than the agent has now. Telling it would read all
+          of its context again at the price of writing it, where a new session pays only for a start. Nothing is
+          lost that a read cannot give back: the fleet's state is in the hub, and the brief opens with it.
         - It started without the compaction window (STANDING_COMPACT), before this helper had it: one time.
 
         A signal that this helper typed less than one cache lifetime ago counts as a model call, so a conversation file
@@ -3438,12 +3458,12 @@ class Helper:
         # A window of another runtime is the switch's to replace.
         if self.window_runtime(window) != runtime:
             return False
-        r = tmux("display-message", "-p", "-t", target, "#{@fleet_session}\t#{pane_start_command}")
+        r = tmux("display-message", "-p", "-t", target, "#{@fleet_session}\t#{@fleet_account}\t#{pane_start_command}")
         screen = tmux("capture-pane", "-p", "-t", target)
         if r.returncode != 0 or screen.returncode != 0 or shows_question(screen.stdout) or \
                 WORKING.search("\n".join(screen.stdout.rstrip().split("\n")[-15:])):
             return False                # unknown, a question waits on its screen, or a turn runs: not now
-        session, _, start = r.stdout.rstrip("\n").partition("\t")
+        session, account, start = (r.stdout.rstrip("\n").split("\t", 2) + ["", "", ""])[:3]
         if window == "manager" and runtime == "claude" and start.strip() and \
                 "CLAUDE_CODE_AUTO_COMPACT_WINDOW=" not in start and not self.compact_restarted:
             self.compact_restarted = True       # one time for this helper, whatever the new start says
@@ -3454,10 +3474,12 @@ class Helper:
                 # A signal that this helper typed less than one cache lifetime ago counts as a model call.
                 typed = time.time() - (time.monotonic() - self.typed_at.get(window, float("-inf")))
                 seen = seen[:2] + (max(seen[2], typed),) + seen[3:]
-            reuse, why = session_reuse(runtime, seen, started_runs(start, runtime) if start.strip() else None,
+            reuse, why = session_reuse(runtime, seen,
+                                       dict(started_runs(start, runtime), account=account or None)
+                                       if start.strip() else None,
                                        {"runtime": runtime, "model": self.conf.get("model"),
-                                        "effort": self.conf.get("effort")}, reuse_settings(team),
-                                       facts=facts_now(team, runtime))
+                                        "effort": self.conf.get("effort"), "account": account_now(self.agent, runtime)},
+                                       reuse_settings(team), facts=facts_now(team, runtime))
             if reuse:
                 return False
         with contextlib.suppress(subprocess.CalledProcessError, Refused):
@@ -3478,12 +3500,12 @@ class Helper:
         if runtime_fact(runtime, "driver") != "terminal" or self.window_runtime(window) != runtime:
             return None
         r = tmux("display-message", "-p", "-t", target,
-                 "#{@fleet_session}\t#{@fleet_attempt}\t#{@fleet_needs}\t#{pane_start_command}")
+                 "#{@fleet_session}\t#{@fleet_attempt}\t#{@fleet_needs}\t#{@fleet_account}\t#{pane_start_command}")
         screen = tmux("capture-pane", "-p", "-t", target)
         if r.returncode != 0 or screen.returncode != 0 or shows_question(screen.stdout) or \
                 WORKING.search("\n".join(screen.stdout.rstrip().split("\n")[-15:])):
             return None
-        session, attempt, needs, start = (r.stdout.rstrip("\n").split("\t", 3) + ["", "", "", ""])[:4]
+        session, attempt, needs, account, start = (r.stdout.rstrip("\n").split("\t", 4) + [""] * 5)[:5]
         attempt = attempt.rpartition(":")[2]
         if not THREAD_ID.fullmatch(session) or not attempt.isdigit() or app_server_task(self.conf, needs or "none"):
             return None
@@ -3497,18 +3519,20 @@ class Helper:
             typed = time.time() - (time.monotonic() - self.typed_at.get(window, float("-inf")))
             seen = seen[:2] + (max(seen[2], typed),) + seen[3:]
         team = checkout_team()
-        reuse, why = session_reuse(runtime, seen, started_runs(start, runtime) if start.strip() else None,
+        reuse, why = session_reuse(runtime, seen,
+                                   dict(started_runs(start, runtime), account=account or None)
+                                   if start.strip() else None,
                                    {"runtime": runtime, "model": self.conf.get("model"),
-                                    "effort": self.conf.get("effort")}, reuse_settings(team),
-                                   facts=facts_now(team, runtime))
+                                    "effort": self.conf.get("effort"), "account": account_now(self.agent, runtime)},
+                                   reuse_settings(team), facts=facts_now(team, runtime))
         return reuse, why, int(attempt)
 
     def fresh_task(self, target, window):
         """True when the hub started this task window's task fresh (plan P9.10, helper feature fresh_tasks): the
-        session reuse rule found its session cold, grown past its start or on another runtime, model or effort, and
-        the hub made a new attempt with its short brief, whose start replaces this window at the next poll. Between
-        two turns of a terminal session only; anything unknown, and a refusal of the hub, tells the session as
-        before."""
+        session reuse rule found its session cold, grown past its start or on another runtime, model, effort or
+        account, and the hub made a new attempt with its short brief, whose start replaces this window at the next
+        poll. Between two turns of a terminal session only; anything unknown, and a refusal of the hub, tells the
+        session as before."""
         decided = self.window_reuse(target, window)
         if decided is None or decided[0]:
             return False
@@ -3527,7 +3551,7 @@ class Helper:
     def fresh_conversation(self, target, window):
         """True when this closed a tools-on conversation window (AUTONOMY.md P2) instead of telling it of a person's
         new message (plan P9.10, helper feature fresh_conversations): the session reuse rule found its session cold,
-        grown past its start or on another runtime, model or effort. The message stays unread, so the next poll
+        grown past its start or on another runtime, model, effort or account. The message stays unread, so the next poll
         starts a new window, whose first read is the hub's brief with its recap (conversation_brief). A closed
         conversation keeps its own rule (retire_conversations)."""
         if self.conversation_kind(window) != "tools":
@@ -4983,8 +5007,10 @@ def cmd_start(args):
             save_handover(agent, start_handover(agent, generation))
             if record:      # first: no window runs without it (a start that never begins is replaced next time)
                 save_chat_record(agent, record, conf.get("runtime"), "manager")
+            account = account_now(agent, conf.get("runtime"))
             try:
-                start_window(session, "manager", command, {"@fleet_session": sid})
+                start_window(session, "manager", command, dict({"@fleet_session": sid},
+                                                               **({"@fleet_account": account} if account else {})))
             except subprocess.CalledProcessError as e:
                 die(f"tmux did not start the manager window ({(e.stderr or '').strip() or e.returncode}). Look with: "
                     f"tmux list-windows -t {session}; then run this command again")

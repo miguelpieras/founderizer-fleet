@@ -2690,12 +2690,33 @@ def fresh_refusal(t, attempt):
 
 def fresh_attempt(t, why):
     """Start the task of row `t` once more in a new session (plan P9.10): its start is the hub's short brief of what
-    the attempt before it did (attempt_event), and its unread messages wait for it. Not a restart that counts, because
-    nothing was lost. Check fresh_refusal first. Returns the new attempt."""
-    new_attempt(t, FRESH_REASON, note=f"Its session was {why}, so this session starts fresh, with what the attempt "
-                                      f"before it did.")
+    the attempt before it did (attempt_event), and its unread messages wait for it, the owner's steers included
+    (carry_steers). Not a restart that counts, because nothing was lost. Check fresh_refusal first. Returns the new
+    attempt."""
+    event = attempt_event(t, f"Its session was {why}, so this session starts fresh, with what the attempt before it "
+                             f"did.")
+    with transaction():
+        attempt_rows(t, FRESH_REASON, event, now())
+        carry_steers(t)
     log("hub", f"{tref(t['id'])} starts fresh in attempt {t['attempt'] + 1}: its session was {why}")
     return t["attempt"] + 1
+
+
+def carry_steers(t):
+    """Inside the transaction of a fresh attempt of task row `t`: the owner's steers that the session it replaces had
+    not read move to the new attempt, unread. A steer is bound to its attempt (owner API 1.4), and read_messages and
+    the delivery give a later attempt none, so a steer written while that session was quiet was never read. A fresh
+    attempt is the same work in a new session; a restart keeps 1.4, and the owner sees its steer as not delivered.
+    The other events of an attempt need nothing: its start is replaced, and fresh_refusal refuses while a hold, a
+    prompt or a job is open."""
+    in_transaction("carry_steers")
+    for e in read_rows("SELECT id, extra FROM events WHERE task=? AND kind='say' AND read_at IS NULL AND "
+                       "json_extract(extra, '$.steer')=1", (t["id"],)):
+        extra = json.loads(e["extra"])
+        if extra.get("attempt", 1) == t["attempt"]:
+            DB.execute("UPDATE events SET extra=? WHERE id=?", (json.dumps(dict(extra, attempt=t["attempt"] + 1)),
+                                                                 e["id"]))
+            DB.execute("UPDATE steers SET attempt=? WHERE event_id=?", (t["attempt"] + 1, e["id"]))
 
 
 def control_extra(t, hid, kind):
