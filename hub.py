@@ -14806,6 +14806,13 @@ def t_decide_report(agent, a):
         became = parse_task(a.get("became_task"))
         if not q1("SELECT 1 FROM tasks WHERE id=?", (became,)):
             raise ToolError(f"There is no task {tref(became)}.")
+    if r["kind"] == "proposal" and decision == "goal":
+        # AUTONOMY.md P3: only the owner's yes makes a proposal a goal, and the decision names that goal
+        named = re.search(r"\bG-([1-9][0-9]*)\b", note)
+        if not named or not q1("SELECT 1 FROM goals WHERE id=?", (int(named.group(1)),)):
+            raise ToolError("A proposal becomes a goal only on the owner's yes: write that goal with update_goal and "
+                            "name it in note, for example \"the owner said yes: G-4\". Decide a weak one yourself: "
+                            "noted or wrong.")
     t0 = now()
     with transaction():
         for row in [r] + list(DB.execute("SELECT * FROM reports WHERE collapsed_into=?", (rid,)).fetchall()):
@@ -15640,8 +15647,9 @@ TOOLS = [
         "duty": {"type": "string", "description": "One duty only, for example R-2 (with what=\"duties\")"}})),
     ("manager", "decide_report", t_decide_report,
      "Decide one report that an agent sent you with report_up. Every report must be decided, the wrong one included: "
-     "task (it becomes work, and you name the task you made), duty, goal, noted, or wrong. The sender reads your "
-     "decision at the start of its next task session, and that is the only thing that stops an agent filing noise.",
+     "task (it becomes work, and you name the task you made), duty, goal, noted, or wrong. A proposal becomes a goal "
+     "only on the owner's yes, with that goal named in note. The sender reads your decision at the start of its next "
+     "task session, and that is the only thing that stops an agent filing noise.",
      S({"report_id": {"type": "string", "description": "The report, for example UP-3"},
         "decision": {"type": "string", "enum": list(REPORT_DECISIONS),
                      "description": "; ".join(f"{k}: {v}" for k, v in REPORT_DECISIONS.items())},
@@ -16437,7 +16445,7 @@ def overview_text():
     out.append("")
     # AUTONOMY.md P3: report_up's proposals wait here for the weekly list that the fleet manager takes to the owner
     out.append("PROPOSALS FOR THE OWNER. Decide a weak one yourself with decide_report (noted or wrong); every other one "
-               "goes on your weekly list to him, and only his yes makes it goal.")
+               "goes on your weekly list to him, and only his yes makes it goal, with that goal named in note.")
     rows = q("SELECT * FROM reports WHERE kind='proposal' AND decided IS NULL AND collapsed_into IS NULL ORDER BY id")
     out += [report_line(r) for r in rows] or ["  none"]
     out.append("")
