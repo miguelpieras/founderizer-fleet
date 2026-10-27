@@ -26678,7 +26678,7 @@ def running_turns(owner=None, t0=None):
     window list of the helper, an open task counts unless its turn state says it is between turns. An offline helper's
     sessions do not reach the hub, so a restart cuts nothing of theirs, and they never keep a release waiting."""
     t0 = t0 or now()
-    rows = q(f"SELECT id, owner, attempt, source_conversation, source_message FROM tasks WHERE {OPEN_TASK}" +
+    rows = q(f"SELECT id, owner, attempt, state, source_conversation, source_message FROM tasks WHERE {OPEN_TASK}" +
              (" AND owner=?" if owner else "") + " ORDER BY id", (owner,) if owner else ())
     helpers, busy = {}, []
     for t in rows:
@@ -26691,6 +26691,8 @@ def running_turns(owner=None, t0=None):
         if not online:
             continue
         state = turn_state(t["id"], t["attempt"])
+        if state is None and is_conversation_task(t) and not conversation_signalled(t):
+            continue                        # its signal waits in the hub: nothing runs it, however long that is
         if listed(row):
             # Starting: the helper's step names it, or it took the session's credential after its last window list,
             # which therefore cannot show the window yet. A list taken after that credential is the fact. A
@@ -26709,6 +26711,16 @@ def running_turns(owner=None, t0=None):
         if state is None or state.get("running"):
             busy.append(t["id"])
     return busy
+
+
+def conversation_signalled(t):
+    """Whether the session of conversation task row `t` (AUTONOMY.md P2) can have begun a turn on it: its helper took
+    the signal of one of its messages, or the session read one (the task is no longer submitted). Its window C-<id>
+    outlives each task, so an open window says nothing about this one, and while every signal of it waits in the hub
+    (a usage limit, settings that wait, an update run) nothing runs it, for days at a weekly limit."""
+    return t["state"] != "submitted" or bool(q1(
+        "SELECT 1 FROM conversation_messages m JOIN events e ON e.id=m.event WHERE m.task=? AND "
+        "(e.helper_ack IS NOT NULL OR e.read_at IS NOT NULL) LIMIT 1", (t["id"],)))
 
 
 def checks_running(runner=None, online=True):
