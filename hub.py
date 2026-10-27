@@ -524,8 +524,8 @@ def in_transaction(what):
     caller written outside one reads this exception instead of getting a row that is sometimes there.
 
     Guarded: keep_command, event_rows, waiting_say_rows, dispatch_check, resource_record, log_row, duty_new_case,
-    memory_from_work, and the row writers of the six crash windows — record_outcome_rows, stop_request_rows,
-    request_unknown_rows, duty_history_row, duty_watch_rows, duty_review_rows, trigger_create_rows,
+    memory_from_work, memory_close_rows, and the row writers of the six crash windows — record_outcome_rows,
+    stop_request_rows, request_unknown_rows, duty_history_row, duty_watch_rows, duty_review_rows, trigger_create_rows,
     trigger_edit_rows and trigger_state_rows. Each of those has a committing twin for the callers that have no
     transaction of their own, so the guard never stands between a caller and the write it meant to make.
 
@@ -4393,7 +4393,8 @@ def deliver_result(agent, a, files_said=None):
                             " Nothing can contradict it, because this was not a duty's case, so your review lists it "
                             "when nothing has confirmed it for a while."))
             if tried:
-                dead = memory_from_work(agent, MEMORY_TRIED + tried, DEAD_END_PREVENTS, about, now(), task=tid)
+                dead = memory_from_work(agent, MEMORY_TRIED + tried, DEAD_END_PREVENTS, about, now(), task=tid,
+                                        beside=(mid,) if learned else ())
                 said += f" {mref(dead)} keeps what did not work, so that nobody need pay for it again."
     elif (hard := work_was_hard(t)):
         said = (f" You recorded nothing learned and {hard}. If something would have saved that, say it in learned "
@@ -12645,13 +12646,16 @@ def duty_save(body, by, t0, duty_id=None, command=None):
 
 # What a review says about the lessons it lists (AUTONOMY.md P7, lane L6): the agent removes or rewrites them, and the
 # hub removes nothing by itself. Here and not in the memory region, because the review's texts below are built from it.
-MEMORY_REVIEW_WHAT = ("Call recall with stale=true to read them. A CONTRADICTED one claimed to stop a case key that "
+MEMORY_REVIEW_WHAT = ("Call recall to read them: memory=\"M-<id>\" for one, stale=true for every one that is "
+                      "contradicted or unconfirmed. A CONTRADICTED one claimed to stop a case key that "
                       "has come back since, so it was wrong, or right and never acted on: write it again so it says "
                       "which, with remember instead_of=\"M-<id>\", which hands the new lesson the same claim, or "
                       "remove it with forget and the reason. One that nothing has confirmed for a while is not "
                       "thereby wrong: if your work still bears it out, write it again the same way, which dates it "
-                      "today; if not, forget it. Where two say the same thing, write one of them again and forget "
-                      "the other.")
+                      "today; if not, forget it. Two that say much the same thing: keep one and forget the other, "
+                      "and if the one you keep needs words of the other, first write it again with remember "
+                      "instead_of. If they say different things after all, write one of them again in words that "
+                      "say how.")
 MEMORY_REVIEW_TASK = {
     "title": "Put your lessons in order",
     "details": "Lessons of your memory need looking at; they are listed below. " + MEMORY_REVIEW_WHAT + " Then give "
@@ -12739,9 +12743,9 @@ def duty_news(agent, since, seen):
 
 def duty_reviews(t0):
     """Plan C13: a holder's duties are reviewed when they have news, not once a day. AUTONOMY.md P7: so are an agent's
-    lessons, whether or not it holds a duty -- one contradicted, or not confirmed for MEMORY_KEYLESS_DAYS, that its
-    last review did not list. An agent with news and no review open gets one review, on the wake-up route: a task, or
-    a message for the manager."""
+    lessons, whether or not it holds a duty -- one contradicted, or not confirmed for MEMORY_KEYLESS_DAYS, or two that
+    the work wrote close to each other, that its last review did not list. An agent with news and no review open gets
+    one review, on the wake-up route: a task, or a message for the manager."""
     holders = {r["agent"] for r in q("SELECT DISTINCT agent FROM responsibilities WHERE state='active'")}
     for agent in sorted(holders | set(memory_reviewers(t0))):
         if agent not in agents():
@@ -12750,8 +12754,8 @@ def duty_reviews(t0):
         if duty_review_open(last):
             continue
         news = duty_news(agent, float(last.get("at") or 0), set(last.get("seen") or []))
-        lessons = memory_to_review(agent, t0)
-        fresh = [m for m in lessons if memory_review_mark(m) not in set(last.get("lessons") or [])]
+        lessons = memory_review_items(agent, t0)
+        fresh = [line for mark, line in lessons if mark not in set(last.get("lessons") or [])]
         if not news and not fresh:
             continue
         route, _ = wakeups.wake_route(wake_org(), agent)
@@ -12759,19 +12763,19 @@ def duty_reviews(t0):
             continue            # nobody could follow its review; the duty sweep still tells the manager of its marks
         with transaction():
             duty_review_rows(agent, route, news, t0, lessons, agent in holders)
-        log("hub", f"review of {agent}: " + "; ".join(news + memory_review_lines(fresh)))
+        log("hub", f"review of {agent}: " + "; ".join(news + fresh))
 
 
 def duty_review_rows(agent, route, news, t0, lessons=(), duties=True):
     """Inside the caller's transaction: one review on the agent's wake-up route (wakeups.wake_route), with the news that
-    started it, and the record of it that the next review starts from. `lessons` are the ones of its memory that the
-    review lists (memory_to_review); an agent that holds no duty gets a review of its lessons alone."""
+    started it, and the record of it that the next review starts from. `lessons` are what the review lists of its
+    memory (memory_review_items); an agent that holds no duty gets a review of its lessons alone."""
     in_transaction("duty_review_rows")
     seen = [f"{r['id']}:{r['marker_kind']}" for r in read_rows(
         "SELECT id, marker_kind FROM responsibilities WHERE agent=? AND state='active' AND marker_kind IS NOT NULL",
         (agent,))]
-    record = {"at": t0, "seen": seen, "lessons": [memory_review_mark(m) for m in lessons]}
-    listed = "\n".join(memory_review_lines(lessons))
+    record = {"at": t0, "seen": seen, "lessons": [mark for mark, _ in lessons]}
+    listed = "\n".join(line for _, line in lessons)
     duties = duties and bool(news)          # news of its lessons alone is a review of its lessons alone
     if route["kind"] == "message":
         say = "\n".join(([DUTY_REVIEW_SAY.format(news="\n".join(news))] if duties else [])
@@ -13465,7 +13469,8 @@ def t_close_case(agent, a):
                      f"If it comes back, the hub marks this lesson contradicted and your next review reads that.")
         if tried:
             dead = memory_from_work(agent, MEMORY_TRIED + tried, DEAD_END_PREVENTS,
-                                    duty_name(r["text"])[:MEMORY_ABOUT], t0, task=t_of_case(c["id"]))
+                                    duty_name(r["text"])[:MEMORY_ABOUT], t0, task=t_of_case(c["id"]),
+                                    beside=(mid,) if learned else ())
             DB.execute("INSERT INTO duty_history(responsibility,ts,by,kind,detail) VALUES(?,?,?,'learned',?)",
                        (r["id"], t0, agent, f"{mref(dead)} from {cref(c)}, a dead end: {tried}"))
             text += f" {mref(dead)} keeps what did not work, so that nobody need pay for it again."
@@ -13615,6 +13620,7 @@ MEMORY_REF = re.compile(r"[Mm]-(\d+)\Z")
 MEMORY_MOST = 200               # the most rows any one read of the store returns, so none of them is unbounded
 MEMORY_TERMS = 24               # the words of a task or a lesson that one search of lessons matches on
 MEMORY_CLOSE = 3                # the closest lessons that remember answers with
+MEMORY_CLOSE_KEY = "memory_close:"  # kv, per agent: pairs of its lessons that the work wrote close to each other
 # What `tried` on deliver_result and close_case writes: an ordinary lesson that says what did not work. Its prevents
 # is always this sentence, so the agent writes one field and not two.
 MEMORY_TRIED = "What did not work: "
@@ -13770,8 +13776,11 @@ def memory_overlap(one, other, tags=()):
     many they share). At a half or more they are close. The words are memory_terms, less the words of their tags: two
     lessons about acme/web both say "acme" and "web", and that makes them related, not close. Two shared words are
     not enough unless they are all the words the shorter one has -- "the smoke of the deploy needs the pool" and "the
-    deploy check is the smoke" share two, and say different things -- so below that the share is 0."""
+    deploy check is the smoke" share two, and say different things -- so below that the share is 0. The words that
+    `tried` puts before what did not work (MEMORY_TRIED) are the hub's and not the lesson's, so they count for
+    nothing."""
     skip = set(memory_terms(*tags, most=None))
+    one, other = (str(x or "").removeprefix(MEMORY_TRIED) for x in (one, other))
     a, b = (set(memory_terms(one, most=None)) - skip), (set(memory_terms(other, most=None)) - skip)
     shared, least = len(a & b), min(len(a), len(b))
     return (shared / least if shared >= 3 or shared == least == 2 else 0.0), shared
@@ -13779,7 +13788,8 @@ def memory_overlap(one, other, tags=()):
 
 def memory_closest(agent, tag, text):
     """The agent's current lessons that are close to a new one (memory_overlap at a half or more), the closest first,
-    at most MEMORY_CLOSE: what remember answers with before it writes, so that the agent decides."""
+    at most MEMORY_CLOSE: what remember answers with before it writes, so that the agent decides, and what
+    memory_from_work keeps for the agent's review. Reads only, so a transaction may call it."""
     rows, _ = memory_matches(agent, f"{tag} {text}", limit=50)
     scored = sorted(((memory_overlap(text, m["text"], (tag, m["about"])), m) for m in rows), key=lambda x: x[0],
                     reverse=True)
@@ -14177,7 +14187,7 @@ def memory_spent(minutes):
     return f"{minutes / 60:.0f} h" if minutes < 60 * 24 else f"{minutes / 1440:.0f} d"
 
 
-def memory_from_work(agent, text, prevents, about, t0, task=None, responsibility=None, prevents_key=None):
+def memory_from_work(agent, text, prevents, about, t0, task=None, responsibility=None, prevents_key=None, beside=()):
     """Inside the caller's transaction: one lesson written by the work that taught it, rather than by an agent that
     remembered to call remember. close_case and deliver_result write here: `learned`, and `tried`, which is an
     ordinary lesson that says what did not work (MEMORY_TRIED, DEAD_END_PREVENTS).
@@ -14186,16 +14196,57 @@ def memory_from_work(agent, text, prevents, about, t0, task=None, responsibility
     claims to prevent that case's key, so when the key comes back duty_new_case can mark it contradicted. A lesson
     out of an ordinary task has neither, and nothing can ever contradict it — which is why a keyless lesson goes to
     the review when nothing confirms it, and a keyed one earns its life by not coming back. The two travel together:
-    a key without its duty names no case and a duty without a key claims nothing."""
+    a key without its duty names no case and a duty without a key claims nothing.
+
+    **Written whatever it is close to** (AUTONOMY.md P7). remember shows the agent its close lessons before it writes,
+    and the agent decides; a delivery is the end of the task, where nobody is left to decide, and a lesson lost there
+    is lost for good. So it is written, and each lesson the agent already held close to it is kept as a pair for its
+    next review (memory_close_rows). `beside` are the lessons the same call wrote: the agent wrote those side by side
+    on purpose, as remember new=true does, so they make no pair."""
     in_transaction("memory_from_work")
     if bool(responsibility) != bool(prevents_key):
         raise ToolError("A lesson that claims to stop an event needs both the duty and its key, or neither.")
+    close = [m["id"] for m in memory_closest(agent, about, text) if m["id"] not in beside]
     mid = DB.execute("INSERT INTO memories(agent,about,text,prevents,created,by_task,request_id,"
                      "responsibility,prevents_key,read_untrusted) VALUES(?,?,?,?,?,?,'',?,?,?)",
                      (agent, about, mask_secrets(text), mask_secrets(prevents), t0, task, responsibility,
                       prevents_key, untrusted_reads(task))).lastrowid
     memory_indexed(mid)
+    if close:
+        memory_close_rows(agent, [(held, mid) for held in close])
     return mid
+
+
+def memory_close_pairs(agent):
+    """The pairs of the agent's lessons that the work wrote close to each other and that both still stand, as (the one
+    it held, the one the work wrote), in the order they were written. Read only (read_rows), so a transaction may
+    call it. A pair one of whose lessons was removed, written again or folded is gone: the agent has decided."""
+    row = read_row("SELECT v FROM kv WHERE k=?", (MEMORY_CLOSE_KEY + agent,))
+    try:
+        kept = json.loads(row["v"]) if row else []
+    except ValueError:
+        kept = []
+    pairs = []
+    for p in kept if isinstance(kept, list) else []:
+        if isinstance(p, list) and len(p) == 2 and all(type(x) is int for x in p) and tuple(p) not in pairs:
+            pairs.append(tuple(p))
+    ids = sorted({x for p in pairs for x in p})
+    if not ids:
+        return []
+    standing = {r["id"] for r in read_rows(f"SELECT id FROM memories WHERE agent=? AND {MEMORY_ON_SHELF} AND id IN "
+                                           f"({','.join('?' * len(ids))})", (agent, *ids))}
+    return [p for p in pairs if set(p) <= standing]
+
+
+def memory_close_rows(agent, pairs):
+    """Inside the caller's transaction: pairs of the agent's lessons that say much the same thing, kept for its next
+    review (memory_review_items), with the ones it kept before that still stand, and never more than MEMORY_MOST: the
+    newest. In kv and not in a column of memories, so the release before reads the table as it always did."""
+    in_transaction("memory_close_rows")
+    kept = memory_close_pairs(agent)
+    kept += [tuple(p) for p in pairs if tuple(p) not in kept]
+    DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+               (MEMORY_CLOSE_KEY + agent, json.dumps([list(p) for p in kept[-MEMORY_MOST:]])))
 
 
 def memory_contradicted(duty_id, key, t0):
@@ -14223,10 +14274,14 @@ def memory_to_review(agent, t0):
 
 
 def memory_reviewers(t0):
-    """The agents that hold a lesson their review would list, from one read of the table."""
+    """The agents that hold a lesson their review would list (one read of the table), or a pair of lessons that the
+    work wrote close to each other and that both still stand (memory_close_pairs)."""
     where, args = memory_stale_sql(t0)
-    return [r["agent"] for r in read_rows(f"SELECT DISTINCT agent FROM memories WHERE {MEMORY_ON_SHELF} AND {where}",
-                                          args)]
+    stale = {r["agent"] for r in read_rows(f"SELECT DISTINCT agent FROM memories WHERE {MEMORY_ON_SHELF} AND {where}",
+                                           args)}
+    paired = {r["k"][len(MEMORY_CLOSE_KEY):] for r in read_rows("SELECT k FROM kv WHERE k GLOB ?",
+                                                                 (MEMORY_CLOSE_KEY + "*",))}
+    return sorted(stale | {agent for agent in paired - stale if memory_close_pairs(agent)})
 
 
 def memory_review_mark(m):
@@ -14243,6 +14298,17 @@ def memory_review_lines(rows):
                                     f"nothing has confirmed it since "
                                     f"{goal_time(m['reinforced_at'] or m['created']).split(' ')[0]}")
             for m in rows]
+
+
+def memory_review_items(agent, t0):
+    """What an agent's review lists of its memory, as (mark, line): each lesson that memory_to_review gives, then each
+    pair of lessons that the work wrote close to each other (memory_close_pairs). A line holds ids and the reason,
+    never a lesson's words (memory_review_lines). The marks are what the review's record keeps, so that what one
+    review listed and the agent kept as it was starts no second review by itself."""
+    rows = memory_to_review(agent, t0)
+    return ([(memory_review_mark(m), line) for m, line in zip(rows, memory_review_lines(rows))]
+            + [(f"{mref(held)}+{mref(new)}", f"{mref(held)} and {mref(new)} say much the same: keep one, and forget "
+                                             f"the other.") for held, new in memory_close_pairs(agent)])
 
 
 def memory_summary(rows, total, page, pages, heading, t0, more, full=False):
