@@ -15075,12 +15075,22 @@ HISTORY_STREAMS = history_streams()
 HISTORY_BY_NAME = {s.name: s for s in HISTORY_STREAMS}
 
 
+def history_masked(text):
+    """A record's words as the history keeps them: the first HISTORY_TEXT characters, with every registered login
+    masked. Only that part is read for logins, with the run of characters that the cut falls in whole, because a
+    login holds no whitespace (SECRET_RUN): so no login is cut in two, and masking a row costs what the part kept
+    costs, however long the record. A step masks its rows inside the hub's lock."""
+    text = str(text or "")
+    run = SECRET_RUN.match(text, HISTORY_TEXT)
+    return mask_secrets(text[:run.end() if run else HISTORY_TEXT])[:HISTORY_TEXT]
+
+
 def history_insert(src, src_id, recs, keys, keep=False):
     """Inside the caller's transaction: the records of one source row into history and its index. The words are
     masked on the way in and kept in the row, except a tool record's on a machine with the index: those are read
     back from their session record. `keys` caches the agents' index keys for the caller's step."""
     for r in recs:
-        text = mask_secrets(r["text"])[:HISTORY_TEXT]
+        text = history_masked(r["text"])
         hid = DB.execute("INSERT INTO history(agent,kind,ref,person,task,at,owner_chat,src,src_id,text) "
                          "VALUES(?,?,?,?,?,?,?,?,?,?)",
                          (r["agent"], r["kind"], r["ref"], r["person"], r["task"], r["at"], r["owner_chat"], src,
@@ -15091,11 +15101,13 @@ def history_insert(src, src_id, recs, keys, keep=False):
             DB.execute("INSERT INTO history_fts(rowid,text,agent) VALUES(?,?,?)", (hid, text, keys[r["agent"]]))
 
 
-def history_step(s, keys):
+def history_step(s, keys, end=None, least=1):
     """One step of one stream, in one transaction: up to HISTORY_CHUNK of its rows into the index and its cursor past
-    them, or neither. True when more may wait. A stream of a moment (`at`) keeps the time and the id it reached; a
-    stream of rows keeps the id, and moves to the end of the ids it looked through when the step was not full, so rows
-    that its filter leaves out are not read again."""
+    them, or neither. Gives whether more may wait, and how many rows it took. A stream of a moment (`at`) keeps the
+    time and the id it reached; a stream of rows keeps the id, and moves to the end of the ids it looked through when
+    the step took all it read and was not full, so rows that its filter leaves out are not read again. A step holds
+    the hub's lock, and one row can be slow to mask: so once it has taken `least` rows it takes none past `end` (a
+    time.monotonic()), and its cursor stays on the last row it took, where the next step goes on from."""
     where = f" AND {s.where}" if s.where else ""
     with area("quiet"), transaction():
         cursor = DB.execute("SELECT v FROM kv WHERE k=?", ("history:" + s.name,)).fetchone()
@@ -15103,15 +15115,17 @@ def history_step(s, keys):
             at, last = (float(cursor["v"].split(":")[0]), int(cursor["v"].split(":")[1])) if cursor else (0.0, 0)
             rows = DB.execute(f"{s.select} WHERE {s.at} IS NOT NULL AND {s.at}>=? AND ({s.at}>? OR {s.key}>?){where} "
                               f"ORDER BY {s.at}, {s.key} LIMIT ?", (at, at, last, HISTORY_CHUNK)).fetchall()
-            moved = f"{float(rows[-1]['_at'])!r}:{rows[-1]['_id']}" if rows else None
         else:
             last = int(cursor["v"]) if cursor else 0
             top = DB.execute(f"SELECT MAX(rowid) m FROM {s.table}").fetchone()["m"] or 0
             upper = min(top, last + HISTORY_SPAN)
             rows = DB.execute(f"{s.select} WHERE {s.key}>? AND {s.key}<=?{where} ORDER BY {s.key} LIMIT ?",
                               (last, upper, HISTORY_CHUNK)).fetchall()
-            moved = str(rows[-1]["_id"] if len(rows) == HISTORY_CHUNK else upper) if upper > last else None
+        taken = 0
         for row in rows:
+            if taken >= least and end is not None and time.monotonic() >= end:
+                break
+            taken += 1
             try:
                 recs = s.build(row)
             except (ValueError, TypeError, KeyError, IndexError, AttributeError) as e:
@@ -15120,19 +15134,31 @@ def history_step(s, keys):
                 log_row("hub", f"history: {s.name} {row['_id']} was not indexed: {e!r}")
                 continue
             history_insert(s.name, row["_id"], recs, keys)
+        stopped = taken < len(rows)
+        if not taken:
+            moved = None if stopped or s.at or upper <= last else str(upper)
+        elif s.at:
+            moved = f"{float(rows[taken - 1]['_at'])!r}:{rows[taken - 1]['_id']}"
+        else:
+            moved = str(rows[taken - 1]["_id"] if stopped or taken == HISTORY_CHUNK else upper)
         if moved is not None:
             DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                        ("history:" + s.name, moved))
-    return len(rows) == HISTORY_CHUNK or (not s.at and upper < top)
+    return stopped or len(rows) == HISTORY_CHUNK or (not s.at and upper < top), taken
 
 
-def history_catch_up(budget=HISTORY_STEP):
-    """Index what was written since the last pass, stream by stream, for about `budget` seconds of work at most.
-    True when every stream has caught up. Each step is a transaction of its own, so the hub answers between two."""
-    end, keys = time.monotonic() + budget, {}
+def history_catch_up(budget=None):
+    """Index what was written since the last pass, stream by stream, for about `budget` seconds of work at most: no
+    row is taken past it, except the first row of a pass, so that every pass moves. With no budget, until every
+    stream has caught up: the tick, the start's thread and a search each give theirs. True when every stream has
+    caught up. Each step is a transaction of its own, so the hub answers between two."""
+    end, keys, taken = None if budget is None else time.monotonic() + budget, {}, 0
     for s in HISTORY_STREAMS:
-        while history_step(s, keys):
-            if time.monotonic() >= end:
+        more = True
+        while more:
+            more, took = history_step(s, keys, end, 0 if taken else 1)
+            taken += took
+            if more and end is not None and time.monotonic() >= end:
                 return False
     return True
 
@@ -15194,10 +15220,18 @@ def history_note(agent, kind, ref, text, at=None, task=None, person=None, owner_
 
 def history_forget_person(person_id):
     """Inside the caller's transaction: every record of one person's conversations leaves the history, words and
-    all. The owner removed the person, and person_remove deletes their messages, so the index forgets them too."""
+    all. The owner removed the person, and person_remove deletes their messages, so the index forgets them too.
+    It deletes their open Needs-you items as well. SQLite gives a deleted newest id to the next row of its table,
+    unless the writer takes ids above a floor (unused_id: the conversations have one, needs do not), and a stream would
+    take that row for one it has read: so each stream of rows goes back to its table's newest id, in the same write.
+    person_remove is the only writer that deletes a stream's rows."""
     in_transaction("history_forget_person")
     for h in DB.execute("SELECT id, agent, text FROM history WHERE person=?", (f"P-{person_id}",)).fetchall():
         history_drop_row(h)
+    for s in HISTORY_STREAMS:
+        if not s.at:
+            top = DB.execute(f"SELECT MAX(rowid) m FROM {s.table}").fetchone()["m"] or 0
+            DB.execute("UPDATE kv SET v=? WHERE k=? AND CAST(v AS INTEGER)>?", (str(top), "history:" + s.name, top))
 
 
 def history_rewrite(src, src_id, ref):
@@ -15247,7 +15281,7 @@ def history_heal(h):
         recs = [r for r in (s.build(row) if row else []) if r["agent"] == h["agent"]][:1]
     except (ValueError, TypeError, KeyError, IndexError, AttributeError):
         return False
-    if recs and mask_secrets(recs[0]["text"])[:HISTORY_TEXT] == h["text"]:
+    if recs and history_masked(recs[0]["text"]) == h["text"]:
         return False
     with area("quiet"), transaction():
         history_drop_row(h)
