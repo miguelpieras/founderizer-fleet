@@ -390,6 +390,7 @@ def runtime_fact(runtime, fact, otherwise=None):
 # (plan P0): the hub checks none of those, and every write keeps them as they are.
 TOKEN_KINDS = ("input", "cache_read", "cache_write", "output")
 MODEL_KEY = re.compile(r"[A-Za-z0-9._:/\[\]-]{1,120}")
+EFFORT_KEY = re.compile(r"[a-z]{1,20}")                 # hub.EFFORT_NAME: an effort as a runtime names it
 
 
 def whole_or_none(low, high):
@@ -415,8 +416,20 @@ def weights_check(value):
     return value
 
 
+def routine_check(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"model", "effort"} or \
+            not (value["model"] is None or isinstance(value["model"], str) and MODEL_KEY.fullmatch(value["model"])) or \
+            not (value["effort"] is None or isinstance(value["effort"], str) and EFFORT_KEY.fullmatch(value["effort"])):
+        raise ValueError('must be {"model": a model name or null for the runtime\'s own, "effort": 1 to 20 letters a-z '
+                         'or null}, or null for none')
+    return value
+
+
 EDITABLE_FACTS = {"cache_seconds": whole_or_none(0, 86400), "compact_tokens": whole_or_none(1000, 100000000),
-                  "token_weights": weights_check}
+                  "token_weights": weights_check,
+                  "routine": routine_check}             # plan P9.7: what an agent's one changer reaches for first
 
 
 def facts_now(team, runtime):

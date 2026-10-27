@@ -17015,7 +17015,10 @@ def costs_view(names, start, end, minimum=COSTS_MINIMUM):
     from. GET /ui/costs answers it, and see_history what="costs" says it."""
     t0, before, book = now(), start - (end - start), price_book()
     out = {"from": start, "to": end, "before": before, "minimum": minimum, "unit": "list dollars",
-           "prices": book, "agents": [], "checks": [], "accounts": [], "model_changes": []}
+           "prices": book, "agents": [], "checks": [], "accounts": [], "model_changes": [],
+           # plan P9.7: the model and effort of routine work on each runtime of these agents, the owner's own first
+           "routine": {r: facts_now(TEAM, r)["routine"] for r in dict.fromkeys(
+               (agents().get(n) or {}).get("runtime") for n in names) if r in RUNTIMES}}
     for name in names:
         rows = read_rows("SELECT * FROM session_tokens WHERE agent=? AND last_activity>=? AND last_activity<?",
                          (name, before, end))
@@ -17168,8 +17171,11 @@ def costs_text(view, days, viewer):
     if len(out) == 1:
         out.append("  No session was measured in either period.")
     if role_of(viewer) in ("manager", "lead"):
+        routine = "; ".join(f"{runtime} {costs_model(view['routine'][runtime])}" for runtime in view["routine"]
+                            if view["routine"][runtime])
         out.append("  Change one thing at a time and read the next period: set_agent_model changes the model or effort "
-                   "of an agent you give work to, inside its own account.")
+                   "of an agent you give work to, inside its own account."
+                   + (f" For routine work the runtime facts give: {routine}." if routine else ""))
     return out
 
 

@@ -1105,10 +1105,11 @@ def tools():
              plain("/ui/roles", ("name", "prompt", "tools", "daily", "rename", "delete"), "this role")),
         tool("save_settings", "The fleet's settings, in team.json: settings maps the name of each one to change to "
                               "its new value, or to null for its default. runtime_facts maps a runtime to the facts "
-                              "of it to change -- cache_seconds, compact_tokens and token_weights, its list prices "
+                              "of it to change -- cache_seconds, compact_tokens, token_weights (its list prices "
                               "in dollars per million tokens as {model: {input, cache_read, cache_write, output}} "
-                              "with \"default\" for any other model -- or to null for the table's value, for when a "
-                              "provider changes its prices or its cache. fleet_read(page=\"settings\") gives every "
+                              "with \"default\" for any other model) and routine (the {model, effort} of routine "
+                              "work) -- or to null for the table's value, for when a provider changes its prices, "
+                              "its cache or its models. fleet_read(page=\"settings\") gives every "
                               "setting and fact with its value and its default. One commit of team.json, applied "
                               "at once.",
              {"settings": {"type": "object"}, "runtime_facts": {"type": "object"}, **rid}, (),
