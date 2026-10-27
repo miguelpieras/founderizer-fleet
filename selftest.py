@@ -955,11 +955,26 @@ time.sleep(4)
 check("reminder fires", any("Reminder" in e["text"] and "look at T-2" in e["text"] for e in events("manager", after=before)))
 tool("studio", "report_progress", task_id="T-2", note="working on it")
 before_s = events("studio")[-1]["id"]; before_m = events("manager")[-1]["id"]
-time.sleep(8)
-check("silence: the owner of the task is nudged first", any("No activity on T-2" in e["text"] for e in events("studio", after=before_s)))
-time.sleep(7)
-check("silence: then the requester is told", any("T-2" in e["text"] and "silent" in e["text"] for e in events("manager", after=before_m)))
+# plan C9: no clock nudges a task. A turn of its session that ends with nothing waiting is asked about once, and the
+# second in a row tells the requester with the session's last words.
+records_now = json.loads(raw("GET", "/records")[2])
+t2 = next(t for t in records_now["tasks"] if t["id"] == 2)
+def turn_of_t2(seq, said):
+    tool("studio", "read_messages", task_id="T-2")          # the session reads what came, then its turn ends
+    return raw("POST", "/helper/events/studio", {"generation": records_now["db"], "task": "T-2", "attempt": t2["attempt"],
+                                                  "session": "33333333-2222-4333-8444-555555555555", "events": [
+        {"seq": seq, "type": "user_message", "text": "Go on."}, {"seq": seq + 1, "type": "agent_message", "text": said},
+        {"seq": seq + 2, "type": "result", "stop_reason": "end_turn"}]})[0]
+check("a turn's records reach the hub", turn_of_t2(1, "I checked the queue.") == 200)
+check("turn end: the owner of the task is asked first",
+      any("T-2 is open and nothing is waiting" in e["text"] for e in events("studio", after=before_s)))
+turn_of_t2(10, "Still checking the queue.")
+check("turn end: then the requester is told, with the last words",
+      any("T-2" in e["text"] and "two turns in a row" in e["text"] and "Still checking the queue." in e["text"]
+          for e in events("manager", after=before_m)))
 check("board marks the stall", "STALLED" in board())
+# plan C10: silence is a fact, a line that the manager's helper told it twice and that it took neither time
+raw("POST", "/helper/dialog/manager/manager", {"kind": "untaken"})
 time.sleep(4)
 check("manager silence: the hub tells the owner itself", any("Fleet hub" in e["text"] for e in events("owner")), str(events("owner")))
 check("board shows the banner", "telling you itself" in board())

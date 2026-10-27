@@ -1896,6 +1896,13 @@ def save_place(path, db, cursor):
 
 CHECK_SLOTS = threading.BoundedSemaphore(4)     # checks that run at the same time on this machine
 CHECK_SOURCE_MAX, CHECK_OUTPUT_MAX = 65536, 4096
+# plan C12: the check's own process ends at its time too, a little after the helper's own end of it, so a check whose
+# helper died does not run on. Its arguments stay as a check reads them: sys.argv[1] is the JSON it is given.
+CHECK_WRAPPER = ("import signal, sys\n"
+                 "signal.alarm({alarm})\n"
+                 "source = sys.argv[1]\n"
+                 "sys.argv = sys.argv[:1] + sys.argv[2:]\n"
+                 "exec(compile(source, '<check>', 'exec'), {{'__name__': '__main__', '__builtins__': __builtins__}})\n")
 
 
 def git_blob(kit, spec):
@@ -1970,7 +1977,8 @@ def run_source(extra, source, result, fail):
     with tempfile.TemporaryDirectory(prefix="fleet-check-") as folder:
         env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": folder, "LANG": os.environ.get("LANG", "C.UTF-8")}
         try:
-            proc = subprocess.Popen([sys.executable, "-I", "-c", source, given], cwd=folder, env=env,
+            wrapper = CHECK_WRAPPER.format(alarm=int(extra["timeout_seconds"]) + 5)
+            proc = subprocess.Popen([sys.executable, "-I", "-c", wrapper, source, given], cwd=folder, env=env,
                                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                     start_new_session=True)
         except OSError as e:
@@ -2010,9 +2018,9 @@ def run_source(extra, source, result, fail):
         code, detail, retry = found["error"], found.get("detail", ""), found.get("retry_after")
         if not (isinstance(code, str) and re.fullmatch(r"[a-z_]{1,40}", code)) or not isinstance(detail, str) \
                 or len(detail) > 200 or (retry is not None and (isinstance(retry, bool) or not isinstance(retry, int)
-                                                                or not 60 <= retry <= 86400)):
+                                                                or not 1 <= retry <= 10 ** 7)):
             return fail("bad_output", "error must be a code of a-z and _, detail text of at most 200 characters, and "
-                                      "retry_after 60 to 86400 seconds")
+                                      "retry_after a whole number of seconds from 1")
         return result(ok=False, error=code, detail=detail, **({} if retry is None else {"retry_after": retry}))
     return fail("bad_output", "the check must print {value, summary} or {error, detail, retry_after}")
 
@@ -2097,6 +2105,7 @@ class Helper:
         self.wanted = {}          # {window: ids of this poll's events that want a signal} (handle_events)
         self.typed_at = {}        # {window: when its last signal was typed}, a model call of its session (restart_fresh)
         self.manager_session = None
+        self.manager_turn = {}    # {"session", "running"}: the manager's own turn, as its records go by (report_limit)
         self.retiring = None      # (first quiet reading, its marks) of the previous runtime's chat (runtime_switch)
         self.retired_left = {}    # {pid: args} of that chat's processes that did not end when it closed
         self.manager_lock = None        # the start lock while the previous runtime's manager session closes
@@ -2134,6 +2143,7 @@ class Helper:
         # plan C7: {job: its report or None} from the job's ack until the hub took its report, which each poll lists
         # (jobs=), and {job: (pause, due)} for a report that the hub did not take yet
         self.jobs_held, self.report_waits = {}, {}
+        self.check_runs = set()         # plan C12: the check runs this helper holds, until the hub took their result
         self.screen_attempts = {}       # {task: (attempt, told)} of the runners (app_server_task) that this helper started
         self.start_waits = {}           # {event id: (seconds, monotonic time of the next try)} of failed task events
         self.step = None                # (name, task or None, monotonic start) of the main loop's step now (doing)
@@ -3113,14 +3123,13 @@ class Helper:
         return self.lifecycle.runtime(runtime).get("signed_in") is True
 
     def trigger_check(self, extra):
-        """A check run from the hub (owner API 1.8), in its own thread and outside every AI session."""
-        need = ("trigger", "run", "token", "expires", "sha256", "timeout_seconds") + \
+        """A check run from the hub (owner API 1.8), in its own thread and outside every AI session. No claim expires
+        (plan C12): the run is in each poll's list from here until the hub took its result."""
+        need = ("trigger", "run", "token", "sha256", "timeout_seconds") + \
             (() if extra.get("code") == "saved" else ("path", "commit"))
         if not all(k in extra for k in need):
             raise Refused("invalid check event")
-        if time.time() > float(extra["expires"]):
-            self.say(f"check run {extra['run']}: its claim expired before it arrived")
-            return
+        self.check_runs.add(extra["run"])
         if not CHECK_SLOTS.acquire(blocking=False):
             busy = {"ok": False, "error": "busy", "detail": "four checks already run on this machine", "elapsed_ms": 0}
             threading.Thread(target=self.post_check, args=(extra, busy), daemon=True).start()
@@ -3198,21 +3207,24 @@ class Helper:
             time.sleep(1)
 
     def post_check(self, extra, result):
-        """Send a check result. Without an answer, send the same body again, at most three times, until the claim
-        expires."""
-        body = dict(result, token=extra["token"])
-        for pause in (0, 5, 15, 30):
-            time.sleep(pause)
-            if pause and time.time() > float(extra["expires"]):
-                break
-            try:
-                code, data = http("POST", f"/helper/trigger/{self.agent}/{extra['run']}", body, timeout=15)
-            except (urllib.error.URLError, OSError):
-                continue
-            if code in (200, 409):
-                self.say(f"check run {extra['run']}: {data.get('decision') or data.get('error')}")
-                return
-        self.say(f"check run {extra['run']}: the hub took no result")
+        """Send a check result, and send it again after a pause only when the hub could not answer (no connection, or
+        a 5xx): for as long as the helper runs (plan C12). Any other answer ends it, and the run leaves the poll's
+        list."""
+        body, pause = dict(result, token=extra["token"]), 5
+        try:
+            while True:
+                try:
+                    code, data = http("POST", f"/helper/trigger/{self.agent}/{extra['run']}", body, timeout=15)
+                except (urllib.error.URLError, OSError, ValueError):
+                    code, data = None, {}
+                if code is not None and code < 500:
+                    self.say(f"check run {extra['run']}: " + str((data or {}).get("decision") or
+                                                                 (data or {}).get("error") or code))
+                    return
+                time.sleep(pause)
+                pause = min(pause * 2, 60)
+        finally:
+            self.check_runs.discard(extra["run"])
 
     def task_windows(self):
         """(window, generation, attempt, session id, runtime, needs) for each task session started with a session id.
@@ -3246,7 +3258,9 @@ class Helper:
     def report_limit(self, batch):
         """The manager's own records stay on its machine. Only a usage-limit record goes to the hub: one with a reset
         whatever its age, because the hub knows an episode it already held or ended by that reset, and one without a
-        reset only while it is fresh, because nothing else tells an old one from a new one."""
+        reset only while it is fresh, because nothing else tells an old one from a new one. Its turn starts and ends
+        go too, with no content (plan C1): the newest of each in the batch, so that the hub knows when the manager
+        last ended a turn. A hub before that route answers 404, and the batch goes on."""
         for r in batch["events"]:
             if r["type"] == "error" and r.get("code") == "usage_limit" and r.get("ts") and \
                     (r.get("resets_at") or time.time() - r["ts"] < 900):
@@ -3255,6 +3269,21 @@ class Helper:
                 if code != 200:
                     return code, {}
                 self.say(f"manager: usage limit reported to the hub, reset {r.get('resets_at')}")
+        turn = {"session": batch.get("session"), "running": self.manager_turn.get("session") == batch.get("session")
+                and self.manager_turn.get("running", False)}
+        marks = {}
+        for r in batch["events"]:
+            if "parent" in r or not r.get("ts"):        # a subagent's record starts and ends no turn of the session
+                continue
+            if r["type"] == "result":
+                turn["running"], marks["ended"] = False, r["ts"]
+            elif r["type"] not in ("session", "model", "error") and not turn["running"]:
+                turn["running"], marks["started"] = True, r["ts"]
+        if marks:
+            code, _ = http("POST", f"/helper/turn/{self.agent}", marks, timeout=10)
+            if code not in (200, 404):
+                return code, {}
+        self.manager_turn = turn
         return 200, {"last_seq": max([0] + [r["seq"] for r in batch["events"]])}
 
     def runner(self, target):
@@ -4299,7 +4328,8 @@ def cmd_run(args):
             listed = f"alive={urllib.parse.quote(','.join(names))}" if names is not None else "alive_unknown=1"
             h.send_reports()
             held = ",".join(str(j) for j in list(h.jobs_held) if isinstance(j, int))    # plan C7: the jobs it holds
-            code, data = http("GET", f"/events/{agent}?delivery=1&after=0&wait=8&{listed}&jobs={held}")
+            checks = ",".join(str(r) for r in list(h.check_runs) if isinstance(r, int))  # C12: its check runs
+            code, data = http("GET", f"/events/{agent}?delivery=1&after=0&wait=8&{listed}&jobs={held}&checks={checks}")
             if code == 403 and data.get("auth") == "no_key" and load_agent_key(agent):
                 os.remove(key_file(agent))      # the owner removed this agent's key: legacy again until it enrolls
                 keyed, enrolled_at = False, 0.0

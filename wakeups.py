@@ -31,15 +31,14 @@ import re
 import shlex
 
 CODE_MAX = 65536            # bytes of one saved check: the limit of a repository check (owner API 1.8)
-RULES_MAX = 20              # rules that agents set for one target and that are not deleted
+RULES_MAX = 20              # active and paused rules that one agent saved itself (plan C12)
 ACTIONS = ("pause", "resume", "delete", "check_now")
-RULE_FIELDS = ("agent", "schedule", "task", "late_minutes", "max_tasks_per_day")    # the hub checks them (1.7)
+RULE_FIELDS = ("agent", "schedule", "task")      # the hub checks them (1.7); no late window and no cap (plan C12)
 SAVE_KEYS = {"request_id", "trigger_id", "base_revision", "check", "task_id"} | set(RULE_FIELDS)
 CHANGE_KEYS = {"request_id", "trigger_id", "base_revision", "action", "task_id"}    # call_tool adds task_id
 CHECK_KEYS = {"code", "run_on", "args", "timeout_seconds", "condition", "repeat_minutes"}
 SAVED = ("code", "sha256", "bytes")       # the fields of a stored saved check that come from its code
 REQUEST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,63}")
-DENY_PATHS = "check_deny_paths"     # helper feature: it applies Fleet's deny list (fleet.py DENY, PROTECTED) to checks
 OWNER, FLEET, SELF, NONE = 3, 2, 1, 0       # levels; OWNER is only the owner's own rules
 OPS = {">": "more than", ">=": "at least", "<": "less than", "<=": "at most", "==": "equal to", "!=": "not equal to"}
 
@@ -235,7 +234,7 @@ def option_values(words, *names):
     return out
 
 
-def execution_grant(conf, features=()):
+def execution_grant(conf):
     """(granted, why): the narrow execution grant for saved code, one rule for every runtime. Saved code runs as the
     runner's machine user, outside every AI session, so it may run only where it adds no access: the runner's existing
     runtime grant (its start command and allow list in team.json) already runs any command without asking, and every
@@ -245,10 +244,10 @@ def execution_grant(conf, features=()):
     - Codex: --sandbox danger-full-access with --ask-for-approval never, or its bypass flag, and no -c override of the
       sandbox or the approvals. No restriction is left, so it is granted.
     - Claude Code: --dangerously-skip-permissions, --permission-mode bypassPermissions, or Bash allowed without a
-      pattern. Fleet's deny list (fleet.py DENY and PROTECTED) still applies to a worker's or a lead's runtime, so it is
-      granted only when the runner's helper reports the feature check_deny_paths: it applies the same deny list to
-      each check, with the operating system. No helper reports it yet. The fleet manager's sessions have no Fleet deny
-      list (owner correction, 13 October 2026), so its permission bypass is granted without that feature.
+      pattern (the full-access worker form: dontAsk with Bash), and a start that keeps every built-in tool. Fleet's
+      deny list of a worker (fleet.py DENY and PROTECTED) names files and command patterns, and a Bash that runs any
+      command without asking already reaches past a pattern, so a check adds no access (plan C14, the owner's yes of
+      26 October 2026). It runs on the agent's own machine, as its own user.
     - Everything else asks before commands, or is not known: not granted."""
     try:
         words = shlex.split(conf.get("start") or "")
@@ -268,21 +267,17 @@ def execution_grant(conf, features=()):
     if runtime == "claude":
         allow = list(conf.get("allow") or []) + option_values(words, "--allowedTools", "--allowed-tools")
         bypass = "--dangerously-skip-permissions" in words or flag(words, "--permission-mode") == "bypassPermissions"
-        # fleet.py settings_arg gives the manager no deny rule that limits a command or a file (only the tools whose
-        # waits the hub cannot see, UNSEEN_TOOLS). Its start must keep every built-in tool: one that removes a tool,
-        # such as Bash, would let a check run what the session itself cannot.
+        # The start must keep every built-in tool: one that removes a tool, such as Bash, would let a check run what
+        # the session itself cannot.
         every_tool = flag(words, "--tools") in (None, "default") and \
             not option_values(words, "--disallowedTools", "--disallowed-tools")
-        if bypass and conf.get("role") == "manager" and every_tool:
-            return True, "Claude Code already runs any command without asking, and Fleet adds no deny rule to it."
         if not (bypass or any(a in ("Bash", "Bash(*)", "Bash(*:*)") for a in allow)):
             return False, (f"Its Claude Code runtime asks before commands (permission mode "
                            f"{flag(words, '--permission-mode') or 'default'}).")
-        if DENY_PATHS not in features:
-            return False, ("Its Claude Code runtime runs commands without asking, but Fleet's deny list still applies to "
-                           "it, and its helper does not apply that list to checks yet (helper feature "
-                           "check_deny_paths). Claude Code checks are not supported yet.")
-        return True, "Claude Code already runs any command without asking, and the helper applies Fleet's deny list."
+        if not every_tool:
+            return False, ("Its Claude Code start removes a built-in tool (--tools or --disallowedTools), so a check "
+                           "could run what its sessions cannot.")
+        return True, "Claude Code already runs any command without asking, with every built-in tool."
     return False, f"There is no known execution grant for the runtime {runtime}."
 
 
@@ -312,7 +307,7 @@ def runner_problem(org, runner, author):
         return f"There is no agent {runner} in the team to run the check."
     if conf.get("active", True) is False:
         return f"{runner} is in setup and cannot run checks."
-    granted, why = execution_grant(conf, org.features(runner))
+    granted, why = execution_grant(conf)
     if not granted:
         return (f"{runner} cannot run saved code: {why} Saved code runs only on an agent with the execution grant "
                 f"that you control. {runner_hint(org, author)}")
@@ -365,7 +360,7 @@ def eligible_runners(org, author):
     selects one, and the list gives no authority."""
     return sorted(name for name, conf in org.agents.items()
                   if conf.get("active", True) is not False and level(org, author, name) >= SELF
-                  and execution_grant(conf, org.features(name))[0])
+                  and execution_grant(conf)[0])
 
 
 def runner_hint(org, author):
@@ -473,7 +468,7 @@ def plan_save(org, caller, args, rule=None, rules=(), approval=None):
     1.8 check fields with trigger_check_spec, and applies the plan in one transaction, with a trigger_history row.
 
     rule: the stored rule of args["trigger_id"] for an edit, or None when there is no such trigger.
-    rules: the stored rules that are not deleted, for RULES_MAX (all targets; the count filters by target).
+    rules: the stored rules that are not deleted, for RULES_MAX: the active and paused rules that the caller saved.
 
     Returns {"op": "create" or "edit", "trigger_id", "base_revision", "fields", "route", "source", "by"},
     and "check" when the save sets the check. fields has the 1.7 fields (an edit only the given ones). check is None
@@ -499,7 +494,7 @@ def plan_save(org, caller, args, rule=None, rules=(), approval=None):
         base = revision_of(args)
         may_control(org, caller, rule)
         if not fields and "check" not in args:
-            raise Refused("Give at least one of agent, schedule, task, late_minutes, max_tasks_per_day and check.")
+            raise Refused("Give at least one of agent, schedule, task and check.")
         target = fields.get("agent", rule["agent"])
     else:
         if "base_revision" in args:
@@ -550,12 +545,11 @@ def plan_save(org, caller, args, rule=None, rules=(), approval=None):
             stored["approval"] = approval
         if "check" in plan or stored != check:
             plan["check"] = stored
-    if not editing or target != rule["agent"]:
-        have = sum(1 for r in rules if r.get("agent") == target and (r.get("created_by") or "owner") != "owner"
-                   and r.get("state") != "deleted" and r.get("id") != tid)
+    if not editing:
+        have = sum(1 for r in rules if r.get("created_by") == caller and r.get("state") in ("active", "paused"))
         if have >= RULES_MAX:
-            raise Refused(f"{target} has {have} wake-up rules that agents set; the limit is {RULES_MAX}. Delete one "
-                          f"that it no longer needs first.")
+            raise Refused(f"You have {have} active or paused wake-up rules of your own; the limit is {RULES_MAX}. "
+                          f"Delete one that you no longer need first.")
     return plan
 
 
@@ -664,9 +658,8 @@ def manager_decision(facts, when):
     still_valid before, and reads these facts:
 
     check: a check run. matches: the check's value matches the condition. check_now: a Check now run.
-    repeat_minutes, last, quiet_after: as for wake_armed. started_24h and max_per_day: this trigger's wake-ups in
-    the last 24 hours and its limit. fleet_24h and fleet_cap: the same for all triggers. limit_until: the end of the
-    manager's usage limit, or None. t0: now.
+    repeat_minutes, last, quiet_after: as for wake_armed. limit_until: the end of the manager's usage limit, or None.
+    t0: now. No count of wake-ups caps a rule (plan C12): its brakes are one open wake-up and repeat_minutes.
 
     A prompt run gives "started" or "not_started" (never tried again). A check run gives "quiet", "not_started"
     (final), "waiting" (tried again on fresh data) or "started". Only "started" writes anything that a model reads."""
@@ -682,12 +675,6 @@ def manager_decision(facts, when):
     wait = "waiting" if check else "not_started"
     if last and last["open"]:
         return wait, f"{last['ref']} is still unread."
-    if facts["started_24h"] >= facts["max_per_day"]:
-        return wait, (f"This trigger started {facts['started_24h']} wake-ups in the last 24 hours (limit "
-                      f"{facts['max_per_day']}).")
-    if facts["fleet_24h"] >= facts["fleet_cap"]:
-        return wait, (f"Triggers reached the fleet limit: {facts['fleet_24h']} in the last 24 hours (limit "
-                      f"{facts['fleet_cap']}).")
     if check and facts.get("limit_until"):
         return "waiting", f"The manager is at its usage limit until {when(facts['limit_until'])}."
     return "started", None
@@ -751,6 +738,8 @@ def check_text(c, target):
 
 def run_text(r, when):
     out = f"run {r['id']} for {when(r['due'])}: {r['state']}"
+    if r.get("state") == "sent" and r.get("sent"):
+        out += f", in flight since {when(r['sent'])}"
     if r.get("value") is not None:
         out += f", value {r['value']:g}" + (f" ({r['summary']!r})" if r.get("summary") else "")
     if r.get("error"):
@@ -778,11 +767,13 @@ def describe(rule, when):
     armed = rule.get("armed")
     if armed and not armed.get("armed"):
         lines.append(f"  Armed: no. {armed.get('reason') or ''}".rstrip())
-    if rule.get("failures"):
-        lines.append(f"  Check errors in a row: {rule['failures']} (the hub pauses the rule at 5).")
+    if rule.get("failures"):        # plan C12: nothing pauses a failing check; this says that it is broken
+        since = rule.get("failing_since")
+        lines.append(f"  Failing" + (f" since {when(since)}" if since else "") + f": {rule['failures']} check "
+                     f"error(s) in a row, and no valid value since. Fix the check; the next valid value clears this.")
     if rule.get("last_run"):
         lines.append(f"  Last {run_text(rule['last_run'], when)}")
-    lines.append(f"  Wake-ups in the last 24 hours: {rule.get('tasks_24h', 0)} of {rule['max_tasks_per_day']}.")
+    lines.append(f"  Wake-ups in the last 24 hours: {rule.get('tasks_24h', 0)}.")
     return "\n".join(lines)
 
 
@@ -836,25 +827,29 @@ TOOL_SPECS = (
      "yourself; the manager for any agent, itself included (a wake-up of the manager is an inbox message). The "
      "task's requester is the agent's own requester; its result arrives as for every task.\n"
      "schedule: {\"kind\":\"once\",\"at\":\"2026-10-14T09:00\",\"timezone\":\"Europe/Madrid\"}, "
-     "{\"kind\":\"every\",\"minutes\":15} (5 to 10080), "
+     "{\"kind\":\"every\",\"minutes\":15} (any whole number of minutes from 1), "
      "{\"kind\":\"daily\",\"time\":\"09:00\",\"days\":[\"mon\",\"thu\"] or null,\"timezone\":\"Europe/Madrid\"}, or "
      "{\"kind\":\"monthly\",\"day\":1,\"time\":\"09:00\",\"timezone\":\"Europe/Madrid\"}.\n"
      "task: {\"title\", \"details\", \"done_when\", \"needs\": \"none\", \"browser\" or \"screen\", \"goal_id\": a "
      "goal number or null}.\n"
      "check: {\"code\": a Python 3 program, \"condition\": {\"op\": \">\", \">=\", \"<\", \"<=\", \"==\" or \"!=\", "
-     "\"value\": a number}, \"repeat_minutes\": null (once, until a check is quiet again) or 0 to 10080 (again that "
-     "many minutes after the last task completed, while the check still matches), \"run_on\": an optional agent "
-     "whose machine runs the check, \"args\": an optional JSON object of at most 4 KiB, \"timeout_seconds\": 1 to 60, "
-     "default 30}. The check runs only on an agent whose runtime already runs any command without asking, and that "
-     "you already control; no Claude Code agent can run checks yet. So a Claude Code agent names "
-     "such an agent in run_on; a refusal lists the ones that you control. If you control none, save the check from a "
+     "\"value\": a number}, \"repeat_minutes\": null (once, until a check is quiet again) or a whole number from 0 "
+     "(again that many minutes after the last task completed, while the check still matches), \"run_on\": an optional "
+     "agent whose machine runs the check, \"args\": an optional JSON object of at most 4 KiB, \"timeout_seconds\": "
+     "your own whole number of seconds from 1, default 30}. Give the check's network calls their own timeouts, "
+     "inside timeout_seconds. A run that waits says its one reason in see_triggers and goes on when that reason ends; "
+     "no count of wake-ups and no late window stops a rule. The check runs on your own machine, as your own user, "
+     "when your runtime already runs any command without asking (Codex with full access, or Claude Code that runs "
+     "Bash without asking and keeps every built-in tool). Otherwise name in run_on an agent with such a runtime that "
+     "you control; a refusal lists the ones that you control. If you control none, save the check from a "
      "task session with run_on naming a runner that the requester of your task controls: the hub asks that requester "
      "to approve this exact code, its args, its runner and its time limit, and you save the same check again after "
      "the decision. Until a save goes through, nothing is saved, and an existing rule stays as it is. Each new code "
      "revision needs a new decision; you get no code access of your own. The program gets one argument, the JSON "
      "{\"trigger\", \"run\", "
      "\"args\"}, and must print exactly one JSON object and exit with 0: {\"value\": a number, \"summary\": at most "
-     "200 characters} or {\"error\": a code of a-z and _, \"detail\": text, \"retry_after\": 60 to 86400 seconds}. "
+     "200 characters} or {\"error\": a code of a-z and _, \"detail\": text, \"retry_after\": seconds from 1, for a "
+     "failure that passes; never 0}. "
      "It runs with python3 -I as that machine's user, in an empty folder, with no Fleet token and no login. Never put "
      "a login, a token or another secret in the code or the args. In a change, a check without code keeps the saved "
      "code, and \"check\": null removes the check.",
@@ -862,8 +857,6 @@ TOOL_SPECS = (
           "agent": {"type": "string", "description": "The agent that the rule wakes. Default: you."},
           "schedule": {"type": "object", "description": "When the rule runs. See the forms above."},
           "task": {"type": "object", "description": "What the agent does when the rule wakes it."},
-          "late_minutes": {"type": "integer", "description": "0 to 1440, default 60: a later run starts nothing."},
-          "max_tasks_per_day": {"type": "integer", "description": "0 to 48, default 4: wake-ups in any 24 hours."},
           "check": {"description": "The check object above, or null for no check."},
           "task_id": TASK_ID}, ["request_id"])),
     ("change_trigger",

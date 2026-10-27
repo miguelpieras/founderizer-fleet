@@ -53,7 +53,8 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "turn_close",           # a delivered task's window closes at the end of its turn (plan C5)
             "start_once",           # it starts each attempt once and says why a start failed (plan C6)
             "prompt_polls",         # its hooks and runners ask again for a permission prompt until it is decided (C7)
-            "job_runs"]             # it acks a job before it runs it and lists the jobs it holds in each poll (C7)
+            "job_runs",             # it acks a job before it runs it and lists the jobs it holds in each poll (C7)
+            "check_runs"]           # it lists the check runs it holds in each poll, and no claim expires (C12)
 # ---------------------------------------------------------------- the runtimes
 #
 # What the fleet knows about a runtime is here, in one entry for each provider, and nowhere else. hub.py, fleet.py and

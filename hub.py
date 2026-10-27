@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS reports(id INTEGER PRIMARY KEY, from_agent TEXT NOT N
   to_agent TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, about TEXT, severity TEXT NOT NULL,
   delivered TEXT NOT NULL, created REAL NOT NULL, request_id TEXT NOT NULL, event_id INTEGER,
   collapsed_into INTEGER, repeats INTEGER NOT NULL DEFAULT 0,
-  decided REAL, decided_by TEXT, decision TEXT, note TEXT, became_task INTEGER,
+  decided REAL, decided_by TEXT, decision TEXT, note TEXT, became_task INTEGER, feedback_shown REAL,
   UNIQUE(from_agent, request_id));
 CREATE INDEX IF NOT EXISTS report_open ON reports(to_agent, decided, id);
 CREATE INDEX IF NOT EXISTS report_from ON reports(from_agent, id);
@@ -109,7 +109,7 @@ CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, agent TEXT, kind TEXT,
 -- "Come back to this at this time", for any agent. agent is who set it and who the hub brings it back to;
 -- task is the work it brings back, and while it waits that task is parked: no nudge and no new session.
 CREATE TABLE IF NOT EXISTS reminders(id INTEGER PRIMARY KEY, due REAL, note TEXT, done INTEGER DEFAULT 0,
-  agent TEXT, task INTEGER, created REAL, fired REAL);
+  agent TEXT, task INTEGER, created REAL, fired REAL, goal INTEGER);
 CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY, key TEXT, text TEXT, ts REAL, ua TEXT);
 CREATE TABLE IF NOT EXISTS sealed(id INTEGER PRIMARY KEY, sender TEXT, recipient TEXT, task TEXT, label TEXT,
   ciphertext TEXT, created REAL, fetched INTEGER DEFAULT 0);
@@ -341,7 +341,6 @@ CREATE TABLE IF NOT EXISTS place_hosts(machine TEXT NOT NULL, host TEXT NOT NULL
 
 """
 EVENT_CAP = 5000                                    # thread records kept per task attempt
-LIMIT_GRACE = 120                                   # seconds after a reset before the hub resumes work that did not continue
 TOOL_KINDS = ("read", "edit", "delete", "move", "search", "execute", "think", "fetch", "other")
 EFFECTFUL = ("execute", "edit", "delete", "move", "other")
 UUID_TEXT = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -496,7 +495,7 @@ def in_transaction(what):
     caller written outside one reads this exception instead of getting a row that is sometimes there.
 
     Guarded: keep_command, event_rows, waiting_say_rows, dispatch_check, resource_record, log_row, duty_new_case,
-    memory_from_work, came_back, and the row writers of the six crash windows — record_outcome_rows, stop_request_rows,
+    memory_from_work, and the row writers of the six crash windows — record_outcome_rows, stop_request_rows,
     request_unknown_rows, duty_history_row, duty_watch_rows, duty_review_rows, trigger_create_rows,
     trigger_edit_rows and trigger_state_rows. Each of those has a committing twin for the callers that have no
     transaction of their own, so the guard never stands between a caller and the write it meant to make.
@@ -1565,7 +1564,8 @@ def migrate():
         # null when any level does), and what the asker said it would go on with when it asked without stopping
         # (asking_and_waiting): the record of what was decided by default
         "questions": {"access": "TEXT", "assumed": "TEXT", "access_level": "TEXT"},
-        "reminders": {"agent": "TEXT", "task": "INTEGER", "created": "REAL", "fired": "REAL"},
+        "reminders": {"agent": "TEXT", "task": "INTEGER", "created": "REAL", "fired": "REAL", "goal": "INTEGER"},
+        "reports": {"feedback_shown": "REAL"},     # plan C10: a decision shows in its sender's start once
         "needs": {"kind": "TEXT", "conversation": "INTEGER",   # owner feature conversations: ask_owner, request_work
                   "options": "TEXT", "chosen": "INTEGER",     # owner feature need_options: the agent's own answers
                   "answered_by": "TEXT",      # null is the owner; "P-<id> <name>" is the deputy of that conversation
@@ -1591,7 +1591,8 @@ def migrate():
         "trigger_runs": {"check_now": "INTEGER NOT NULL DEFAULT 0", "attempts": "INTEGER NOT NULL DEFAULT 0",
                          "retry_at": "REAL", "closes": "REAL", "token": "TEXT", "sent": "REAL", "expires": "REAL",
                          "value": "REAL", "summary": "TEXT", "error": "TEXT", "detail": "TEXT", "finished": "REAL",
-                         "result_body": "TEXT", "answer": "TEXT", "event_id": "INTEGER", "parent_task": "INTEGER"},
+                         "result_body": "TEXT", "answer": "TEXT", "event_id": "INTEGER", "parent_task": "INTEGER",
+                         "blocked_task": "INTEGER"},       # plan C12: the task whose end a waiting check run waits for
     }.items():
         try:
             have = {r["name"] for r in q(f"PRAGMA table_info({table})")}
@@ -1783,6 +1784,10 @@ def t_read_messages(agent, a):
         if not rows:
             if chat_context(agent) or agents()[agent].get("role") == "manager":
                 unanswered(agent, now())            # plan C8: a standing session's closing empty read ends its turn
+            if agents()[agent].get("role") == "manager" and not chat_context(agent):
+                chase = requester_chase(agent, now())   # plan C9: what it read and left open, once each
+                if chase:
+                    chased(agent, chase[1], emit(agent, "say", chase[0]))
             return "No unread messages. Wait for the next signal."
         # A task's start event is the text that its session began with, as its first prompt or its appended system
         # prompt (fleet.session_command), so its first read gave the same thousands of characters a second time.
@@ -1959,8 +1964,8 @@ def team_start_text(agent):
             + (f" | and {left} more, which {manager_name()} knows." if left else "")
             + ". Work that needs a colleague's access or machine: name the thing in ask_my_requester's needs_access "
               "and say who you think holds it; your requester reads the holder itself. A question for one of them: "
-              "message_agent, which it answers from a session that can talk and not act. None of this gives you "
-              "their access.\n")
+              "message_agent: a message between linked tasks reaches the colleague's task, and any other its chat, "
+              "which can talk and not act. None of this gives you their access.\n")
 
 
 def allowance_start_text(agent, task_id):
@@ -2012,7 +2017,8 @@ RULE_FOUR = (" Never contact the owner: if you are blocked, use ask_my_requester
              "Never a default for access, money or anything that leaves the building. If you are not blocked but "
              "found something this task does not cover -- an event that belongs to another agent's duty, a fact the "
              "other agents need, something the fleet does not have, a risk -- say it with report_up, which pauses "
-             "nothing.")
+             "nothing. A turn that ends with this task open and nothing waiting is asked about once, and the second "
+             "time your requester is told.")
 
 
 def start_text(agent, task_id, resume=False):
@@ -2071,8 +2077,8 @@ def part_start_text(task_id):
     return (f'This task is ONE PART of step {s["n"]} of {gref(s["goal"])}: "{clip(s["text"], 200)}". '
             + (("The other parts: " + "; ".join(f"{tref(r['id'])} with {r['owner']} ({clip(r['title'], 60)})"
                                                 for r in others) + ". Do your part only, and leave theirs alone: "
-                "write to them with message_agent when your part needs something of theirs, with waits=true when "
-                "your part cannot go on without the answer. ")
+                "write to them with message_agent when your part needs something of theirs (it reaches their part), "
+                "with waits=true when your part cannot go on without the answer. ")
                if others else "No other part has been given out yet. ")
             + f"{manager_name()} holds the whole piece together and checks each part. ")
 
@@ -2091,8 +2097,8 @@ def get_task(task_id, owner=None, requester=None):
 
 
 def activity(task_id, tool=None):
-    q("UPDATE tasks SET last_activity=?, nudge_level=0, last_tool=COALESCE(?, last_tool) WHERE id=?",
-      (now(), tool, task_id))
+    # plan C9: activity is no event that clears the Stalled mark; a new turn, a message, a hold or a new attempt does
+    q("UPDATE tasks SET last_activity=?, last_tool=COALESCE(?, last_tool) WHERE id=?", (now(), tool, task_id))
     duty_first_step(task_id, now())             # owner API 1.13: the first step of this task's case
     if tool:        # the session is moving again, so nobody needs to look at its screen any more
         q("UPDATE tasks SET waiting_on=NULL WHERE id=? AND waiting_on='its screen'", (task_id,))
@@ -2131,17 +2137,19 @@ def parked(task_id):
     agent said when to come back to it, so it is quiet on purpose: the third kind of deliberate quiet beside a hold
     and a usage limit, and the clocks leave all three alone. read_row and not q1: describe_task is reached from
     start_text, which admit_task runs inside the transaction that writes the task."""
-    return read_row("SELECT * FROM reminders WHERE task=? AND done=0 AND due>? ORDER BY id DESC LIMIT 1",
-                    (task_id, now())) if task_id else None
+    r = read_row("SELECT * FROM reminders WHERE task=? AND done=0 AND due>? ORDER BY id DESC LIMIT 1",
+                 (task_id, now())) if task_id else None
+    if not r:
+        return None
+    # plan C9: the park ends early at a turn start of the task's session after a turn end stored after the reminder
+    # was set (helper_events), or when a new attempt came up after it; the reminder itself still fires
+    newest = read_row("SELECT created FROM attempts WHERE task=? ORDER BY attempt DESC LIMIT 1", (task_id,))
+    if read_row("SELECT 1 FROM kv WHERE k=?", (f"park_ended:{r['id']}",)) or \
+            (newest and newest["created"] > r["created"]):
+        return None
+    return r
 
 
-# The patience a single long call buys (asking_and_waiting). "Activity" was measured at the boundaries of tool
-# calls, so a session inside one call that runs for minutes read exactly like a wedged one: `gh run watch`, a build
-# or a deploy wait is the cheapest way for an agent to wait and the clock charged it a worker turn at three minutes
-# and a manager turn at six. The hub already stores every call and every status change of it (thread_events), so
-# nothing new has to be stored and nobody has to remember to set a field. needs is the wrong lever and was not
-# used: one browser task is busy and idle in turns, and a shell task can hold one call open for an hour.
-CALL_PATIENCE = 1800            # seconds one unfinished tool call may run before the silence clock speaks
 PRESENCE_SAME = 10              # seconds two pings may disagree about a step's start and still be the same step
 TURN_CALLS = 64                 # open calls that one attempt's turn state keeps: the newest
 TURN_SAID = 500                 # characters of the attempt's last agent message that its turn state keeps
@@ -2158,6 +2166,38 @@ def turn_state(task_id, attempt):
     except (TypeError, ValueError):
         return None
     return state if isinstance(state, dict) else None
+
+
+def turn_ended(agent):
+    """When the standing session of this agent, the manager's, last ended a turn, from its helper's report (plan C1,
+    helper_turn), or 0 before the first. A read that commits nothing."""
+    row = read_row("SELECT v FROM kv WHERE k=?", (f"turn_ended:{agent}",))
+    return float(row["v"]) if row else 0.0
+
+
+def not_acting(receiver, event_id):
+    """True when `receiver` left the notice `event_id` unread and has ended a turn since it was told (plan C10): it had
+    its turn and did not read it, so it is not acting on it. False before that turn, after a read, and for a notice
+    that is gone. The manager's turn ends come from its helper (helper_turn); another receiver's from the session of
+    the task its notice is filed under. A notice that waits for a later read is told when it wakes its receiver."""
+    e = q1("SELECT agent, task, created, read_at, extra FROM events WHERE id=?", (event_id,)) if event_id else None
+    if not e or e["read_at"] is not None or e["agent"] != receiver:
+        return False
+    try:
+        told = e["created"] + float(json.loads(e["extra"] or "{}").get("wake_after") or 0)
+    except (TypeError, ValueError):
+        told = e["created"]
+    if receiver == manager_name():
+        return turn_ended(receiver) > told
+    row = q1("SELECT attempt FROM tasks WHERE id=?", (e["task"],)) if e["task"] else None
+    state = turn_state(e["task"], row["attempt"]) if row else None
+    return bool(state) and not state.get("running") and (state.get("at") or 0) > told
+
+
+def stuck_told(task_id, event_id):
+    """The notice that told a task's requester the task is stuck (plan C10): the owner's screen shows the task only
+    while its requester had a turn and left this notice unread (tasks_stuck)."""
+    kv_set(f"stuck_notice:{task_id}", event_id)
 
 
 def turn_records(state, session, records, t0):
@@ -2191,6 +2231,169 @@ def turn_records(state, session, records, t0):
     return state
 
 
+# ---- plan C9: the turn-end check. At each stored turn end of the current attempt of an open task, whatever its
+# state, the hub looks for a live reason. The first empty turn end asks the agent once; the second in a row, with no
+# message between them, tells the requester once with the agent's last words and sets the board's Stalled mark
+# (nudge_level 2). Nothing repeats until an event: a turn end with a live reason, a message, a new attempt. No clock.
+TURN_CONTINUE = ("[hub] {task} is open and nothing is waiting for it. Deliver it (deliver_result), ask your requester "
+                 "(ask_my_requester, with default when you are only unsure), set_reminder for a time, or leave a "
+                 "command running in the background.")
+TURN_ACK = ("[hub] Your turn ended with {task} open. The hub counts {command} as work and will not ask again while it "
+            "runs. If you are done, deliver.")
+SHELL_TITLES = ("Bash", "Monitor")      # a Claude background command or monitor; an async subagent is the other kind
+
+
+def unread_for(t):
+    """True when a message for the task's session waits that its helper will type: not a quiet one, and not one
+    whose line the helper reported as not taken (plan C5) since it came."""
+    rows = q("SELECT created, extra FROM events WHERE agent=? AND task=? AND kind IN ('say','task') AND read_at IS NULL",
+             (t["owner"], t["id"]))
+    loud = [r["created"] for r in rows if not json.loads(r["extra"] or "{}").get("quiet")]
+    untaken = float(kv_get(f"untaken:{t['owner']}:{tref(t['id'])}") or 0)
+    return bool(loud) and max(loud) > untaken
+
+
+def live_reason(t, state):
+    """The first live reason of open task row `t` at a turn end of its current attempt (plan C9): (kind, words), or
+    None when nothing waits for it. Kind "shell" is a background command or monitor of a Claude session, which counts
+    after one acknowledgment; a background subagent counts as it is; a Codex background command is data only."""
+    tid, owner = t["id"], t["owner"]
+    hold = active_hold(tid)
+    if hold:
+        return "hold", held_word(hold)
+    if active_limit(owner):
+        return "limit", f"{owner}'s usage limit"
+    found = q1("SELECT id FROM reminders WHERE task=? AND done=0 ORDER BY id", (tid,))
+    if found:
+        return "reminder", f"R-{found['id']}"
+    found = q1("SELECT id FROM questions WHERE task=? AND answer IS NULL AND assumed IS NULL ORDER BY id", (tid,))
+    if found:
+        return "question", f"Q-{found['id']}"
+    found = q1("SELECT id FROM prompts WHERE task=? AND decision IS NULL ORDER BY id", (tid,))
+    if found:
+        return "prompt", f"P-{found['id']}"
+    if waits_on_parts(tid):
+        return "parts", "its open subtasks"
+    if unread_for(t):
+        return "unread", "a message that its session has not read"
+    found = waits_on_message(tid)
+    if found:
+        return "message", f"AM-{found['id']}"
+    if open_job(tid):
+        return "job", "a job of its machine"
+    calls = [(call, c[0] or "a command") for call, c in ((state or {}).get("calls") or {}).items() if c[2]]
+    agents_ = [c for c in calls if not str(c[1]).startswith(SHELL_TITLES)]
+    if agents_:
+        return "subagent", agents_[0][1]
+    if calls:
+        return "shell", calls[0]
+    return None
+
+
+def turn_end_check(t, state, t0, force=False):
+    """The decision at one stored turn end of task row `t`'s current attempt (plan C9), once for each (attempt, turn
+    index) unless forced (a line that was not taken changes what waits). Returns what it did, for the log and tests."""
+    tid, attempt = t["id"], t["attempt"]
+    if t["state"] in TERMINAL or not state or state.get("running") or not state.get("turns"):
+        return None
+    key = f"{attempt}:{state['turns']}"
+    if not force and kv_get(f"turn_checked:{tid}") == key:
+        return None
+    kv_set(f"turn_checked:{tid}", key)
+    reason = live_reason(t, state)
+    stretch = json.loads(kv_get(f"turn_empty:{tid}") or "null")
+    if stretch and stretch.get("attempt") != attempt:
+        stretch = None
+    if reason and reason[0] == "shell":
+        call, command = reason[1]
+        if kv_get(f"turn_ack:{tid}") != f"{attempt}:{call}":         # once for each background command
+            kv_set(f"turn_ack:{tid}", f"{attempt}:{call}")
+            emit(t["owner"], "say", TURN_ACK.format(task=tref(tid), command=command), task=tid)
+            emit(t["requester"], "say", f"[hub] {tref(tid)} ({t['title']}, owner {t['owner']}) ended a turn with "
+                 f"{command} running in the background; the hub counts it as work.", task=tid, extra=QUIET_SAY)
+            kv_set(f"turn_empty:{tid}", None)
+            return "ack"
+        kv_set(f"turn_empty:{tid}", None)
+        return "background"
+    if reason:
+        kv_set(f"turn_empty:{tid}", None)       # a live reason ends the empty stretch
+        return reason[0]
+    if stretch and q1("SELECT 1 FROM events WHERE agent=? AND task=? AND kind='say' AND id>? LIMIT 1",
+                      (t["owner"], tid, stretch["event"])):
+        stretch = None                          # a message came between: a new stretch
+    if not stretch:
+        chase = requester_chase(t["owner"], t0, task=t) if role_of(t["owner"]) == "lead" else None
+        if chase:           # a lead whose own team waits on it gets that, in place of the continue
+            event = emit(t["owner"], "say", chase[0], task=tid)
+            chased(t["owner"], chase[1], event)
+        else:
+            event = emit(t["owner"], "say", TURN_CONTINUE.format(task=tref(tid)), task=tid)
+        kv_set(f"turn_empty:{tid}", json.dumps({"attempt": attempt, "turn": state["turns"], "event": event, "told": 0}))
+        log("hub", f"{tref(tid)} ended a turn with nothing waiting; {t['owner']} was asked once")
+        return "continue"
+    if stretch.get("told"):
+        return "quiet"                          # the requester knows; nothing more until an event
+    said = clip((state.get("said") or "").strip(), 600) or "nothing"
+    stretch["told"] = 1
+    kv_set(f"turn_empty:{tid}", json.dumps(stretch))
+    q("UPDATE tasks SET nudge_level=2, nudged_at=? WHERE id=?", (t0, tid))
+    stuck_told(tid, emit(t["requester"], "say", f"[hub] {tref(tid)} ({t['title']}, owner {t['owner']}) ended two turns "
+                         f"in a row with nothing waiting for it, and it was asked once. Its last words: \"{said}\" "
+                         f"Decide what to do: answer it, steer it, restart_task, or cancel_task.", task=tid))
+    log("hub", f"{tref(tid)} ended two empty turns in a row; {t['requester']} was told")
+    return "told"
+
+
+def turn_end_sweep(t0):
+    """The tick's reconcile of the turn-end check (plan C9): each open task whose current attempt has a stored turn
+    end that was not decided yet, as after a hub restart between the store and the decision."""
+    for t in q(f"SELECT * FROM tasks WHERE {OPEN_TASK}"):
+        state = turn_state(t["id"], t["attempt"])
+        if state and not state.get("running") and state.get("turns") and \
+                kv_get(f"turn_checked:{t['id']}") != f"{t['attempt']}:{state['turns']}":
+            turn_end_check(t, state, t0)
+
+
+def requester_chase(agent, t0, task=None):
+    """What `agent` read as a requester and left open (plan C9): each blocking question, permission prompt, result to
+    check and report to decide, once each, in one message: (its text, the keys it names; chased keeps them once the
+    message is written), or None when nothing new is left open. For the manager at its
+    closing empty read, and for a lead at a turn end of its task session (task: that task, whose subtasks it is)."""
+    scope = (f"AND t.parent={task['id']}" if task else "")
+    # what it read: an item from before its newest read, which is when the message that told it was in front of it
+    read = q1("SELECT MAX(read_at) at FROM events WHERE agent=?", (agent,))["at"] or 0
+    items = []
+    for r in q(f"SELECT q.id, q.task, q.text FROM questions q JOIN tasks t ON t.id=q.task WHERE q.requester=? AND "
+               f"q.answer IS NULL AND q.assumed IS NULL AND q.asked<? AND {OPEN_TASK.replace('state', 't.state')} "
+               f"{scope}", (agent, read)):
+        items.append((f"Q-{r['id']}", f"Q-{r['id']} on {tref(r['task'])} waits for your answer: {clip(r['text'], 160)}"))
+    for r in q(f"SELECT p.id, p.task, p.tool FROM prompts p JOIN tasks t ON t.id=p.task WHERE t.requester=? AND "
+               f"p.decision IS NULL AND p.created<? {scope}", (agent, read)):
+        items.append((f"P-{r['id']}", f"P-{r['id']} on {tref(r['task'])} waits for decide_permission ({r['tool']})"))
+    for r in q(f"SELECT t.id, t.title, t.state FROM tasks t WHERE t.requester=? AND t.state IN "
+               f"('completed','failed','rejected') AND t.accepted IS NULL AND t.delivered<? {scope}", (agent, read)):
+        items.append((tref(r["id"]), f"{tref(r['id'])} ({clip(r['title'], 80)}) ended {r['state']}: check_result"))
+    for r in open_reports(kinds=False):
+        sub = q1("SELECT parent FROM tasks WHERE id=?", (r["from_task"],)) if task and r["from_task"] else None
+        mine = (r["to_agent"] == agent and (not task or (sub and sub["parent"] == task["id"]))) or \
+            (not task and agent == manager_name() and report_for_manager(r))     # a lead can no longer decide it
+        if mine:            # a report is in the lists the receiver reads (see_team, its start), not in a message
+            items.append((upref(r["id"]), f"{upref(r['id'])} [{r['kind']}] from {r['from_agent']} waits for "
+                                          f"decide_report: {clip(r['text'], 120)}"))
+    new = [(k, line) for k, line in items if not kv_get(f"chased:{agent}:{k}")]
+    if not new:
+        return None
+    return ("[hub] You read these and left them open:\n" + "\n".join(f"  {line}" for _, line in new) +
+            "\nSettle each one, or say why it waits.", [k for k, _ in new])
+
+
+def chased(agent, keys, event_id):
+    """The message that named each of these items to `agent` (requester_chase): each is named once, and the owner's
+    screen shows a report while its receiver had a turn after this message and left it unread (plan C10)."""
+    for k in keys:
+        kv_set(f"chased:{agent}:{k}", event_id)
+
+
 def open_call(task_id, attempt):
     """The longest-running tool call of this attempt that the session has not finished, or None: (title, started).
     A background command, monitor or subagent counts until its own end notice (plan C1)."""
@@ -2199,14 +2402,6 @@ def open_call(task_id, attempt):
         return None
     title, started, _ = min(calls.values(), key=lambda c: c[1] or 0)
     return title or "a tool call", started
-
-
-def busy_in_a_call(t, t0):
-    """What the session of task row `t` has been inside for too long, or None: (title, how long). The clocks use it
-    twice -- it buys the patience, and when the patience is gone it is the one fact that changes the requester's
-    decision, so the message says it."""
-    call = open_call(t["id"], t["attempt"])
-    return (call[0], t0 - call[1]) if call else None
 
 
 def held_word(hold):
@@ -2232,8 +2427,10 @@ def attempt_event(t, note=""):
 def attempt_rows(t, reason, event, t0, counted=False):
     """Inside a transaction: the next attempt of task row `t` and its start event. A new attempt number without its
     start event would leave a task that no helper starts."""
-    DB.execute("UPDATE tasks SET attempt=attempt+1, restarts=restarts+?, missing_since=?, started=? WHERE id=?",
-               (1 if counted else 0, t0 if counted else None, t0, t["id"]))
+    DB.execute("UPDATE tasks SET attempt=attempt+1, restarts=restarts+?, missing_since=?, started=?, nudge_level=0 "
+               "WHERE id=?", (1 if counted else 0, t0 if counted else None, t0, t["id"]))
+    # plan C10: a new attempt moves the task again, so what its stuck notice said is over (tasks_stuck)
+    DB.execute("DELETE FROM kv WHERE k=?", (f"stuck_notice:{t['id']}",))
     DB.execute("UPDATE attempts SET ended=COALESCE(ended,?) WHERE task=? AND attempt=?", (t0, t["id"], t["attempt"]))
     DB.execute("INSERT INTO attempts(task,attempt,created,reason) VALUES(?,?,?,?)", (t["id"], t["attempt"] + 1, t0, reason))
     # The session that asked is gone, and a prompt never expires by itself (plan C7): it ends here, unanswered.
@@ -2243,6 +2440,7 @@ def attempt_rows(t, reason, event, t0, counted=False):
                "waiting_on LIKE 'P-%'", (t["id"],))
     event_rows([event], t0)
     waiting_say_rows(t["owner"], t["id"])
+    feedback_rows(t["owner"], t0)
 
 
 PROMPT_REPLACED = "The session that asked was replaced before a decision reached it, so it did not run."
@@ -2302,6 +2500,7 @@ def request_hold(task_id, kind, by, note=""):
     # a permission prompt that is waiting gets its answer now, so the session is not left at a question
     q("UPDATE prompts SET decision='deny', reason=?, decided=?, by='hub' WHERE task=? AND decision IS NULL "
       "AND kind<>'code'", (f"{tref(task_id)} is held.", now(), task_id))
+    q("UPDATE tasks SET nudge_level=0 WHERE id=? AND nudge_level=2", (task_id,))      # plan C9: a hold is an event
     emit(t["owner"], "control", f"{kind} {tref(task_id)}", task=task_id, extra=control_extra(t, hid, kind))
     if by != t["requester"]:
         verb = "paused" if kind == "pause" else "stopped"
@@ -2841,6 +3040,27 @@ def start_limit(agent, resets_at, task_id=None):
         (f"; so are {', '.join(also)}, on the same account" if also else ""))
 
 
+def limit_reading(agent, reading, t0):
+    """A usage limit that came with no reset time ends at the first usage reading that says more (plan C9): one that
+    gives a reset sets it, and one that shows every window open ends the hold now. Without a reading it keeps its
+    hour. The whole episode moves together, as in start_limit."""
+    lim = active_limit(agent)
+    if not lim or lim["reset_known"] or not reading or reading.get("error"):
+        return
+    windows = reading.get("windows") or []
+    if not windows or t0 - (reading.get("collected_at") or 0) > USAGE_STALE:
+        return
+    resets = [w["resets_at"] for w in windows if w.get("used_percent", 0) >= 100 and w.get("resets_at")]
+    root = lim["cause"] or lim["id"]
+    if resets:
+        q("UPDATE agent_limits SET until=?, reset_known=1 WHERE ended IS NULL AND (id=? OR cause=?)",
+          (max(resets), root, root))
+        log("hub", f"{agent}'s usage limit resets at {clock(max(resets))}, as its reading says")
+    elif all(w.get("used_percent", 0) < 100 for w in windows):
+        q("UPDATE agent_limits SET until=? WHERE ended IS NULL AND (id=? OR cause=?)", (t0, root, root))
+        log("hub", f"{agent}'s usage reading shows its windows open; its limit ends now")
+
+
 def screen_failed(key, seq, error):
     """A turn of a session in the runner failed (app_server_task: every screen task, and each task of a Codex agent
     with the app-server start policy): its records have a result with the stop reason "error" (a tool call that
@@ -2876,8 +3096,8 @@ def resume_held(lim, t0):
     when it does not. The new attempt is not counted, so a reset never spends one of the three session restarts."""
     done = []
     for t in q("SELECT * FROM tasks WHERE owner=? AND state='working' ORDER BY id", (lim["agent"],)):
-        if active_hold(t["id"]) or parked(t["id"]) or (t["last_activity"] or 0) >= lim["until"]:
-            continue            # a parked task comes back at the time its own agent named (reminder_sweep)
+        if active_hold(t["id"]) or parked(t["id"]) or (turn_state(t["id"], t["attempt"]) or {}).get("running"):
+            continue            # a parked task comes back at its own time (reminder_sweep); a running turn needs nothing
         text = (f"Your usage limit has reset. Continue {tref(t['id'])}. First check what was already done (rule 9): "
                 f"never repeat an outside action that already happened.")
         if session_alive(lim["agent"], t["id"]):
@@ -2890,8 +3110,8 @@ def resume_held(lim, t0):
 
 
 def end_limits(t0):
-    """At the reset, held messages flow again. After a short grace time, each held task that did not continue
-    by itself (the vendor can resume on its own) is resumed one time.
+    """At the reset, held messages flow again, and each held task is read at once (plan C9): a turn that runs needs
+    nothing, an idle session gets the resume message, and a lost session gets a new attempt.
 
     One episode of one account is one reported row and a row for each other agent it holds (account_limits), and it
     ends as one thing: every agent's work resumes exactly once, and the manager reads one message for the episode
@@ -2904,7 +3124,7 @@ def end_limits(t0):
     # to resume exactly once.
     for lim in q("SELECT l.* FROM agent_limits l LEFT JOIN agent_limits c ON c.id=l.cause "
                  "WHERE l.ended IS NOT NULL AND l.resumed IS NULL AND l.until<=? "
-                 "AND (l.cause IS NULL OR c.resumed IS NOT NULL) ORDER BY l.id", (t0 - LIMIT_GRACE,)):
+                 "AND (l.cause IS NULL OR c.resumed IS NOT NULL) ORDER BY l.id", (t0,)):
         episode = [lim] + q("SELECT * FROM agent_limits WHERE cause=? AND resumed IS NULL AND ended IS NOT NULL "
                             "ORDER BY id", (lim["id"],))
         told = []
@@ -4227,6 +4447,7 @@ def admit_task(requester, f, trigger_id=None, trigger_run=None):
                 json.dumps({"needs": f["needs"], "resume": False, "attempt": 1,
                             "generation": generation[0] if generation else None})))
     waiting_say_rows(f["owner"], tid)
+    feedback_rows(f["owner"], t0)
     return tid
 
 
@@ -4495,7 +4716,6 @@ def remembered(agent, tool, key):
     return None
 
 
-REMINDER_MAX = 366 * 86400      # a reminder is a time, so it has the bound a time has: within one year
 
 
 def t_set_reminder(agent, a):
@@ -4510,14 +4730,14 @@ def t_set_reminder(agent, a):
     if (minutes in (None, "")) == (at in (None, "")):
         raise ToolError("Give either minutes (a count from now) or at (a time), and not both.")
     if at not in (None, ""):
-        due = parse_wake(at, "at")
+        due = parse_wake(at, "at", within=None)     # plan C12: a reminder's time is the agent's own
     else:
         try:
             minutes = float(minutes)
         except (TypeError, ValueError):
             raise ToolError("minutes must be a number.") from None
-        if not 0 <= minutes * 60 <= REMINDER_MAX:
-            raise ToolError("minutes must be from now and within one year.")
+        if not 0 <= minutes or not math.isfinite(minutes):
+            raise ToolError("minutes must be a number of minutes from now.")
         due = now() + minutes * 60
     note = str(a.get("note") or "").strip()
     if not note:
@@ -4864,8 +5084,8 @@ def agent_directory(agent):
     for r in q("SELECT agent, text FROM responsibilities WHERE state!='retired' ORDER BY id"):
         duties.setdefault(r["agent"], []).append(duty_name(r["text"]))
     for name, a in agents().items():
-        if name == agent or not agent_active(name):
-            continue
+        if name == agent or not agent_active(name) or not runtime_fact(a.get("runtime"), "agent_messages"):
+            continue            # plan C11: a runtime with no agent messages reads none, so it is not listed
         facts = colleague_facts(name)
         line = (f"{name} ({a.get('role')}) looks after: {looks_after(name, rev, duties.get(name, []))}."
                 + (" It holds: " + "; ".join(facts) + "." if facts else ""))
@@ -4876,7 +5096,9 @@ def agent_directory(agent):
     if not kept:
         return "There is no other active agent to write to."
     return ("The agents you can write to, and what each looks after -- " + " | ".join(kept) +
-            (f" | and {left} more, which the manager knows." if left else ""))
+            (f" | and {left} more, which the manager knows." if left else "") +
+            ". A message to a colleague whose task the hub links to yours (your requester, your lead, a part of the "
+            "same step) reaches that task; any other reaches its chat window.")
 
 
 def capacity_view(names=None, expertise=None, needs=None, login=None):
@@ -7792,7 +8014,7 @@ def agent_message_view(m):
             "in_reply_to": am_ref(m["in_reply_to"]), "created": m["created"], "read_at": m["read_at"]}
 
 
-def agent_delivery(m, parent, t0):
+def agent_delivery(m, parent, t0, linked=None):
     """Inside a transaction: the event of one agent message (16.2). The manager gets a say event. A worker or a lead
     gets it in the task session that sent the message that this one answers, while that task is open; else in its chat
     window, as a chat event (the helper starts the window as for an owner chat). Returns the event ID.
@@ -7805,6 +8027,12 @@ def agent_delivery(m, parent, t0):
     waits = ", waits for your answer" if m["waits"] else ""         # plan C8
     text = f"[message from {m['sender']}{on} id=AM-{m['id']}{waits}] {m['text']}"
     to = m["recipient"]
+    if linked:          # plan C11: into the recipient's task that the hub links to the sender's, with what it may do
+        task, relation, limit = linked
+        about = f", {relation}," if relation else ""
+        on = f" on {tref(m['sender_task'])}" if relation and m["sender_task"] else f" on {tref(task)}"
+        text = f"[message from {m['sender']}{about}{on} id=AM-{m['id']}: {limit}{waits}] {m['text']}"
+        return DB.execute(EVENT, (to, "say", task, text, t0, "{}")).lastrowid
     if role_of(to) == "manager":
         return DB.execute(EVENT, (to, "say", None, text, t0, "{}")).lastrowid
     task = parent["sender_task"] if parent and parent["sender"] == to else None
@@ -7813,6 +8041,69 @@ def agent_delivery(m, parent, t0):
     generation = DB.execute("SELECT v FROM kv WHERE k='db_id'").fetchone()
     return DB.execute(EVENT, (to, "chat", None, text, t0, json.dumps({
         "generation": generation["v"] if generation else None, "agent_message": m["id"]}))).lastrowid
+
+
+COLLEAGUE_LIMIT = "a colleague's words, which never widen your task or undo a no from your requester"
+REQUESTER_LIMIT = "from your requester; it does not change your done-when"
+
+
+def linked_tasks(agent, tid, to):
+    """The open tasks of `to` that the hub links to the sender's side (plan C11): {task id: (relation, limit)}. tid
+    is the sender's task, or None for the manager or a chat window. Linked are: the task of `to` that requested the
+    sender's task (a lead's session of the parent), the tasks of `to` that the sender requested, and the open parts of
+    the same step or subtasks of the same parent."""
+    out = {}
+    if role_of(to) not in ("worker", "lead"):
+        return out
+    mine = q1("SELECT * FROM tasks WHERE id=?", (tid,)) if tid else None
+    if mine and mine["requester"] == to and mine["parent"]:
+        lead = q1(f"SELECT id FROM tasks WHERE id=? AND owner=? AND {OPEN_TASK}", (mine["parent"], to))
+        if lead:
+            out[lead["id"]] = (f"whose task {tref(tid)} you requested", COLLEAGUE_LIMIT)
+    scope = "AND parent=?" if mine and role_of(agent) == "lead" else ""
+    for r in q(f"SELECT id FROM tasks WHERE owner=? AND requester=? AND {OPEN_TASK} {scope}",
+               (to, agent) + ((tid,) if scope else ())):
+        out[r["id"]] = (None, REQUESTER_LIMIT)
+    if mine and (mine["step"] or mine["parent"]):
+        for r in q(f"SELECT id, step, parent FROM tasks WHERE owner=? AND id<>? AND {OPEN_TASK} AND "
+                   f"((step IS NOT NULL AND step=?) OR (parent IS NOT NULL AND parent=?))",
+                   (to, tid, mine["step"], mine["parent"])):
+            if r["id"] not in out:
+                step = q1("SELECT n FROM goal_steps WHERE id=?", (r["step"],)) if r["step"] and r["step"] == mine["step"] \
+                    else None
+                out[r["id"]] = (f"part of step {step['n']}" if step else f"beside you under {tref(r['parent'])}",
+                                COLLEAGUE_LIMIT)
+    return out
+
+
+def linked_choice(agent, tid, to, to_task):
+    """(task id, relation, limit) of the recipient's task that a new message goes to (plan C11), or None for its chat
+    window as before. Refused: a to_task that is not linked, several links with none named, and a task that waits on
+    the sender's own answer or decision."""
+    links = linked_tasks(agent, tid, to)
+    if to_task not in (None, ""):
+        want = parse_task(to_task)
+        if want not in links:
+            raise ToolError(f"{tref(want)} is no open task of {to} that the hub links to yours"
+                            + (f"; the linked ones: {', '.join(tref(x) for x in links)}." if links else "."))
+        links = {want: links[want]}
+    if len(links) > 1:
+        raise ToolError(f"Your message could go to {len(links)} tasks of {to}: "
+                        + "; ".join(f"{tref(x)} ({q1('SELECT title FROM tasks WHERE id=?', (x,))['title'][:60]})"
+                                    for x in links) + ". Name one in to_task.")
+    if not links:
+        return None
+    (task, (relation, limit)), = links.items()
+    asked = q1("SELECT id FROM questions WHERE task=? AND requester=? AND answer IS NULL AND assumed IS NULL",
+               (task, agent))
+    if asked:
+        raise ToolError(f"{tref(task)} waits for your answer to Q-{asked['id']}: answer it with answer, which ends "
+                        f"its wait.")
+    prompt = q1("SELECT p.id FROM prompts p JOIN tasks t ON t.id=p.task WHERE p.task=? AND t.requester=? AND "
+                "p.decision IS NULL", (task, agent))
+    if prompt:
+        raise ToolError(f"{tref(task)} waits for your decision of P-{prompt['id']}: decide it with decide_permission.")
+    return task, relation, limit
 
 
 def agent_message_refusal(agent, to, parent_id, t0):
@@ -7906,6 +8197,7 @@ def t_message_agent(agent, a):
     waits = a.get("waits") is True
     chat = chat_context(agent)
     tid = parse_task(a.get("task_id")) if role_of(agent) in ("worker", "lead") and not chat else None
+    to_task = a.get("to_task")
     with LOCK:
         if chat:
             chat_fence(agent)
@@ -7917,7 +8209,8 @@ def t_message_agent(agent, a):
             raise ToolError(f"{to} gave you {tref(tid)}: to wait for its answer, use ask_my_requester, which pauses "
                             f"the task until the answer comes.")
         command, old = agent_write(agent, "message_agent", a, dict({"agent": to, "text": text, "in_reply_to": parent_id},
-                                                                    **({"waits": True} if waits else {})))
+                                                                    **({"waits": True} if waits else {}),
+                                                                    **({"to_task": to_task} if to_task else {})))
         if old:
             am = q1("SELECT * FROM agent_messages WHERE id=?", (old["message"],))
         else:
@@ -7931,13 +8224,17 @@ def t_message_agent(agent, a):
             parent, why = agent_message_refusal(agent, to, parent_id, t0)
             if why:
                 raise ToolError(why)
+            # plan C11: a new message goes into the recipient's task that the hub links to the sender's side; an
+            # answer keeps its own route (agent_delivery). Read before the transaction, as its reads commit.
+            linked = None if parent and parent["sender"] == to and parent["sender_task"] else \
+                linked_choice(agent, tid, to, to_task)
             with transaction():
                 n = DB.execute("INSERT INTO agent_messages(sender,sender_task,recipient,text,in_reply_to,created,"
                                "request_id,depth,waits) VALUES(?,?,?,?,?,?,?,?,?)",
                                (agent, tid, to, text, parent_id, t0, command[1], parent["depth"] + 1 if parent else 0,
                                 1 if waits else None)).lastrowid
                 am = DB.execute("SELECT * FROM agent_messages WHERE id=?", (n,)).fetchone()
-                DB.execute("UPDATE agent_messages SET event_id=? WHERE id=?", (agent_delivery(am, parent, t0), n))
+                DB.execute("UPDATE agent_messages SET event_id=? WHERE id=?", (agent_delivery(am, parent, t0, linked), n))
                 if parent and parent["waits"] and not parent["wait_end"]:
                     DB.execute("UPDATE agent_messages SET wait_end=? WHERE id=?", (f"answered by AM-{n}", parent["id"]))
                 DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, agent, f"sent AM-{n} to {to}"))
@@ -7990,6 +8287,13 @@ def end_waits(task_id):
                                                f"without it, or ask your requester.")
     q("UPDATE agent_messages SET wait_end=? WHERE sender_task=? AND waits=1 AND wait_end IS NULL",
       (f"{tref(task_id)} ended", task_id))
+    # plan C11: a linked message that the task's session never read, told once to its sender
+    for m in q("SELECT m.* FROM agent_messages m JOIN events e ON e.id=m.event_id WHERE e.task=? AND e.read_at IS NULL "
+               "AND m.waits IS NULL", (task_id,)):
+        open_ = q1(f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (m["sender_task"],)) if m["sender_task"] else None
+        if open_ or role_of(m["sender"]) == "manager":
+            emit(m["sender"], "say", f"[hub] AM-{m['id']} reached {tref(task_id)}, which ended before it read it.",
+                 task=m["sender_task"] if open_ else None)
 
 
 def wait_sweep(t0):
@@ -8632,8 +8936,6 @@ def conversation_message_view(r):
 GOAL_REF = re.compile(r"(?i)^\s*G-?(\d+)\s*$")
 CURRENCY = re.compile(r"[A-Z]{3}")
 OPEN_TASK = "state NOT IN ('completed','failed','rejected','canceled')"
-NEXT_STEP_GRACE = 900       # seconds an active goal may have no next step and no date
-REVIEW_GRACE = 7200         # seconds the manager has to answer the daily review
 GOAL_ACTIONS = {"pause": (("active",), "paused"), "resume": (("paused",), "active"), "done": (("active", "paused"), "done"),
                 "drop": (("active", "paused"), "dropped"), "reopen": (("done", "dropped"), "active")}
 GOAL_OPEN = ("active", "paused")    # the goals the fleet is working on; the others are there to look back at
@@ -8939,7 +9241,7 @@ def task_goal(value):
     return g["id"]
 
 
-def parse_wake(value, field="wake_at"):
+def parse_wake(value, field="wake_at", within=366 * 86400):
     """An ISO date or date and time in the fleet's own time zone. A date alone means the review hour of that day.
     One parser for every "at this time" the fleet takes: a goal's wake_at and a reminder's at (asking_and_waiting)."""
     import datetime
@@ -8955,8 +9257,8 @@ def parse_wake(value, field="wake_at"):
         raise ToolError(f"{field} must be an ISO date or date and time, for example 2026-10-14 or 2026-10-14T09:00. "
                         f"A time with no zone is read in the fleet's own time zone.")
     ts = at.timestamp()
-    if not now() < ts <= now() + 366 * 86400:
-        raise ToolError(f"{field} must be in the future and within one year.")
+    if not now() < ts or (within is not None and ts > now() + within):
+        raise ToolError(f"{field} must be in the future" + (" and within one year." if within is not None else "."))
     return ts
 
 
@@ -9213,7 +9515,14 @@ def t_update_goal(agent, a):
     if wake:
         sets.append("wake_at=?")
         args.append(wake)
-    q(f"UPDATE goals SET {', '.join(sets)} WHERE id=?", (*args, g["id"]))
+    with transaction():
+        DB.execute(f"UPDATE goals SET {', '.join(sets)} WHERE id=?", (*args, g["id"]))
+        if wake:        # plan C13: the hub brings the manager back to the goal at that time, once; a new time replaces it
+            DB.execute("UPDATE reminders SET done=1 WHERE goal=? AND done=0", (g["id"],))
+            DB.execute("INSERT INTO reminders(due,note,agent,goal,created) VALUES(?,?,?,?,?)",
+                       (wake, f"{gref(g['id'])} {g['title']}: you planned to look at this goal again now. Check its "
+                              f"tasks and results with see_goals, then call update_goal with a next step or a date.",
+                        agent, g["id"], t0))
     if step or wake:
         detail = [step + (f" ({tref(task)})" if task else "")] if step else []
         goal_history(g["id"], agent, "next_step", "; ".join(detail + ([f"look again {goal_time(wake)}"] if wake else [])))
@@ -9256,11 +9565,11 @@ def t_record_spend(agent, a):
 
 def goal_sweep(t0):
     """Fixed checks on every open goal, from the hub tick. No AI turn: the manager gets a message only for a
-    budget step, a goal that newly needs attention, and one daily review. The first two wait for its next read, an
-    hour at most (LATER_SAY); the budget that is used up and the daily review wake it."""
-    import datetime
+    budget step and a goal that newly needs attention, and both wait for its next read, an hour at most
+    (LATER_SAY). There is no daily review (plan C13): a goal reaches the manager through its markers, which are
+    state, and through its own wake_at, which is a reminder at that time."""
     mgr = manager_name()
-    minutes, hour, zone = goal_settings()
+    minutes = goal_settings()[0]
     for g in q("SELECT * FROM goals WHERE state IN ('active','paused') ORDER BY id"):
         share = budget_use(g)
         if not budget_pause(g) and not g["warned"] and share is not None and 0.8 <= share < 1:
@@ -9294,15 +9603,6 @@ def goal_sweep(t0):
         if sweep_news("goal_sweep_sig", sig):
             emit(mgr, "say", "[hub] Goal sweep. These goals need you:\n" + "\n".join(lines) +
                  "\nFor each one, act, then call update_goal with a next step or a date.", extra=LATER_SAY)
-    local = datetime.datetime.fromtimestamp(t0, zone)
-    if local.hour >= hour and kv_get("goal_review_day") != local.strftime("%Y-%m-%d"):
-        kv_set("goal_review_day", local.strftime("%Y-%m-%d"))
-        rows = q("SELECT * FROM goals WHERE state IN ('active','paused') ORDER BY id")
-        if rows:
-            q("UPDATE goals SET review_asked=? WHERE state IN ('active','paused')", (t0,))
-            emit(mgr, "say", "[hub] Daily goal review. For each goal: check its tasks and results with see_goals, then "
-                 "call update_goal with a next step or a date and a short note. Close a finished goal with result.\n" +
-                 "\n".join(f"{gref(g['id'])} {g['title']} ({g['state']})" for g in rows))
 
 
 def goal_marker(g, t0, share):
@@ -9321,14 +9621,11 @@ def goal_marker(g, t0, share):
                  "ORDER BY id LIMIT 1", (g["id"],))
     if stalled:
         return "task_stalled", f"{tref(stalled['id'])}: {stalled['stalled_reason'] or 'it has no live path'}."
-    if g["review_asked"] and (g["reviewed_at"] or 0) < g["review_asked"] and t0 - g["review_asked"] > REVIEW_GRACE:
-        return "review_overdue", f"The daily review asked at {goal_time(g['review_asked'])}; the manager has not answered."
-    if g["wake_at"] and t0 - g["wake_at"] > 900 and (g["reviewed_at"] or 0) < g["wake_at"]:
-        return "wake_passed", f"The manager planned to look again at {goal_time(g['wake_at'])}."
     waiting = plan_blocked_step(g["id"])
     if waiting:
         return "plan_blocked", f"Every step of the plan waits on something. Step {waiting['n']}: {waiting['text']}"
-    if g["state"] == "active" and g["idle_since"] and t0 - g["idle_since"] > NEXT_STEP_GRACE:
+    # plan C13: the manager had its turn since the goal lost its next step, and ended it without one
+    if g["state"] == "active" and g["idle_since"] and turn_ended(manager_name()) > g["idle_since"]:
         return "no_next_step", "The goal has no next step and no date."
     if share is not None and 0.8 <= share < 1:
         return "budget_near", f"{share:.0%} of the budget is used ({budget_text(g)})."
@@ -10709,14 +11006,12 @@ DUTY_ACTIONS = {"pause": ("active",), "resume": ("paused",), "retire": ("active"
 DUTY_STATE = {"pause": "paused", "resume": "active", "retire": "retired", "reopen": "active"}
 DUTY_WATCHES = ("check", "clock")   # the kinds that the owner and the manager write for a duty
 DUTY_OWN = "own"                    # a wake-up rule that the agent made itself and attached to its duty
-DUTY_REVIEW = "review"              # the hub's own rule, one for each agent that holds an active duty
+DUTY_REVIEW = "review"              # the daily review rule of an earlier version: duty_sweep deletes one (plan C13)
 DUTY_FIELDS = ("agent", "text", "watch")
 DUTY_OUTCOMES = ("handled", "no_action", "failed")
 DUTY_MAX = 12                   # duties of one agent that are not retired
 DUTY_WATCH_MAX = 8              # watches of one duty
-DUTY_WATCH_TASKS = 8            # wake-ups a day for one watch
 DUTY_REPEAT_DAYS = 30           # a key that comes back inside this time is a repeat: the preventive action did not work
-DUTY_REVIEW_GRACE = 2 * 86400   # seconds without a finished review task before the duty needs attention
 DUTY_WATCH_MINUTES = 30         # the cadence of a watch that brings no times of its own
 DUTY_LOOK_BACK = 10             # duties or cases named when an agent looks back, newest first, with a count of more
 DUTY_HISTORY_SHOWN = 30         # history rows of one duty: how it was managed, newest kept, oldest of those first
@@ -10836,7 +11131,7 @@ def duty_watch_spec(value, create):
     it names it in `trigger`; a live rule of the duty that the new list does not name is deleted."""
     if not isinstance(value, list) or len(value) > DUTY_WATCH_MAX:
         raise ValueError(f"watch must be a list of at most {DUTY_WATCH_MAX} watches")
-    known = {"kind", "schedule", "check", "title", "done_when", "needs", "late_minutes", "max_tasks_per_day", "trigger"}
+    known = {"kind", "schedule", "check", "title", "done_when", "needs", "trigger"}
     out = []
     for w in value:
         if not isinstance(w, dict) or set(w) - known:
@@ -10855,10 +11150,7 @@ def duty_watch_spec(value, create):
         item = {"kind": kind, "needs": w.get("needs", "none"),
                 "trigger": None if w.get("trigger") is None else whole(w["trigger"], 1, 10 ** 9, "watch.trigger"),
                 "check": None if w.get("check") is None else trigger_check_spec(w["check"]),
-                "schedule": None if w.get("schedule") is None else trigger_schedule(w["schedule"]),
-                "late_minutes": whole(w.get("late_minutes", 60), 0, 1440, "watch.late_minutes"),
-                "max_tasks_per_day": whole(w.get("max_tasks_per_day", DUTY_WATCH_TASKS), 0, 48,
-                                           "watch.max_tasks_per_day")}
+                "schedule": None if w.get("schedule") is None else trigger_schedule(w["schedule"])}
         if item["needs"] not in ("none", "browser", "screen"):
             raise ValueError("watch.needs must be none, browser or screen")
         for key, most in (("title", 200), ("done_when", 2000)):
@@ -10920,7 +11212,8 @@ def duty_mechanism_text(body):
     """What the agent does when its duty has no watch that finds the event cheaply. The hub holds the duty, the case
     and the scheduler; the agent builds the mechanism from its own tools (owner direction, 16 October 2026)."""
     return (f"{duty_toolbox(body['agent'])} If no watch of this duty finds the event by itself, build the mechanism "
-            f"yourself with what you have — saved code for anything that needs no login (save_trigger), a wake-up "
+            f"yourself with what you have — saved code for anything that needs no login (save_trigger: it runs on "
+            f"your own machine, as your own user, when your runtime runs any command without asking), a wake-up "
             f"that starts you when the work needs your own tools, a script or a service in a repository that you may "
             f"write — and attach that wake-up rule to the duty with attach_watch. Then every event of it becomes a "
             f"case of this duty. Prefer the way that costs no model turn when nothing happened. see_triggers shows "
@@ -10948,8 +11241,7 @@ def duty_task_text(body, watch):
 def duty_watch_body(body, watch, request_id=None):
     """The trigger body of one watch."""
     return {"agent": body["agent"], "schedule": watch["schedule"] or duty_default_schedule(),
-            "check": watch["check"], "late_minutes": watch["late_minutes"],
-            "max_tasks_per_day": watch["max_tasks_per_day"], "request_id": request_id or str(uuid.uuid4()),
+            "check": watch["check"], "request_id": request_id or str(uuid.uuid4()),
             "task": {"title": (watch["title"] or duty_name(body["text"]))[:200], "needs": watch["needs"],
                      "goal_id": None,
                      "details": duty_task_text(body, watch),
@@ -11030,7 +11322,6 @@ def duty_watch_rows(r, want, by, t0):
             row = read_row("SELECT * FROM triggers WHERE id=?", (w["trigger"],))
             fields = {k: payload[k] for k in TRIGGER_FIELDS}
             stored = {"agent": row["agent"], "schedule": json.loads(row["schedule"]), "task": json.loads(row["task"]),
-                      "late_minutes": row["late_minutes"], "max_tasks_per_day": row["max_tasks_per_day"],
                       "check": json.loads(row["check_spec"]) if row["check_spec"] else None}
             if fields != stored:
                 trigger_edit_rows(row["id"], row["revision"], fields, by, t0, created_by=row["created_by"])
@@ -11053,15 +11344,14 @@ def duty_kept_watches(duty_id):
         task = json.loads(row["task"])
         want.append({"kind": row["watch"] or "clock", "trigger": row["id"], "needs": task["needs"],
                      "check": json.loads(row["check_spec"]) if row["check_spec"] else None,
-                     "schedule": json.loads(row["schedule"]), "title": task["title"], "done_when": task["done_when"],
-                     "late_minutes": row["late_minutes"], "max_tasks_per_day": row["max_tasks_per_day"]})
+                     "schedule": json.loads(row["schedule"]), "title": task["title"], "done_when": task["done_when"]})
     return want
 
 
 def duty_save(body, by, t0, duty_id=None, command=None):
-    """A new duty, or a change of one: the row, its watches, its history row, the review wake-up of its agent, the
-    message that says the duty exists and an agent's receipt, in one transaction. Everything that can be refused is
-    checked before the first write.
+    """A new duty, or a change of one: the row, its watches, its history row, the message that says the duty exists
+    and an agent's receipt, in one transaction. Its history row is the news that starts its holder's review at the
+    next tick (duty_reviews). Everything that can be refused is checked before the first write.
 
     The receipt used to be inside the transaction and the watches, the review rule and the two messages after it. A
     repeat of the same request_id short-circuits on the receipt, so a hub that died in that window left a duty with
@@ -11079,8 +11369,6 @@ def duty_save(body, by, t0, duty_id=None, command=None):
     if want is None:
         want = duty_kept_watches(duty_id)
     duty_watch_target(body, want, t0)
-    review = duty_review_plan(body["agent"], t0)
-    left_review = duty_review_plan(old["agent"], t0) if old and old["agent"] != body["agent"] else (None, None)
     with transaction():
         if old is None:
             new_id = DB.execute(
@@ -11102,9 +11390,6 @@ def duty_save(body, by, t0, duty_id=None, command=None):
                                "text": f"{rref(new_id)} saved."}, t0)
         r = read_row("SELECT * FROM responsibilities WHERE id=?", (new_id,))
         duty_watch_rows(r, want, by, t0)
-        duty_review_rows(r["agent"], by, t0, review)
-        if old and old["agent"] != r["agent"]:  # the agent it left keeps no daily review for a duty it lost
-            duty_review_rows(old["agent"], by, t0, left_review)
         # The message names the watches this transaction has just written. A new duty and a moved one tell their
         # holder, which reads it in its next task session (waiting_say_rows): a move used to tell nobody, so the
         # agent that now answers for the duty learned of it from its first case. The manager is told of each new
@@ -11154,82 +11439,150 @@ def duty_save(body, by, t0, duty_id=None, command=None):
     return duty_row(new_id)
 
 
-def duty_review_plan(agent, t0):
-    """What duty_review_rows needs to make the agent's daily review wake-up, worked out before the transaction
-    starts: (the trigger body, the refusal that body would raise), or (None, None) when its time has passed.
-    trigger_slots and agent_rule_problem read the goals and the team, and those reads commit, so a caller that is
-    about to write cannot run them itself. A caller that only deletes the rule never looks at this."""
-    _, hour, zone = goal_settings()
-    body = {"agent": agent, "check": None, "late_minutes": 240, "max_tasks_per_day": 2, "request_id": str(uuid.uuid4()),
-            "schedule": {"kind": "daily", "time": f"{hour:02d}:00", "days": None, "timezone": str(zone)},
-            "task": {"title": "Put your duties and your notes in order", "needs": "none", "goal_id": None,
-                     "details": "Call see_responsibilities. For each of your duties: work an open case that "
-                                "waits, record what you did with record_step, repair a watch that is broken, and "
-                                "open a case with open_case for anything that you find yourself. Look at the "
-                                "repeats: a key that came back is a preventive action that did not work, so say "
-                                "what you will do differently, and open a case for it where the duty needs one. "
-                                "Then read your own notes with see_notes. Your next sessions start with them, so "
-                                "rewrite them with write_notes when the work since the last review taught you "
-                                "something they do not say, or showed that something in them is wrong. Leave them "
-                                "as they are when nothing changed: a version that says the same thing is noise. "
-                                + NOTES_RULE +
-                                " Then call recall with stale=true: it gives exactly the lessons that need "
-                                "looking at, so you read no others. A CONTRADICTED one claimed to stop a case key "
-                                "that has come back since, so it was wrong, or right and never acted on — write "
-                                "it again with remember instead_of=\"M-<id>\" so it says which, which hands the "
-                                "new lesson the same claim and lets the work judge that one too, or drop it with "
-                                "forget. A plain remember would lose the claim and leave a lesson nothing can "
-                                "check. A keyless one "
-                                "that has aged with nothing to bear it out is not thereby right, and not "
-                                "thereby wrong either — ageing is the absence of evidence, so judge it on what "
-                                "you now know: drop it unless the work has taught it to you again, and when it "
-                                "has, say so with remember held=\"M-<id>\" instead of writing it twice. Where "
-                                "two or more say the same thing, fold them with remember covers=[\"M-4\", "
-                                "\"M-9\"], which keeps every member's words and where each came from instead of "
-                                "losing them. A lesson whose key has not come "
-                                "back is the best-evidenced kind you hold, and what that evidence says is that "
-                                "nothing has refuted it, not that it was right: a key can also stay away because "
-                                "the circumstance did. Leave it alone. Join two that say "
-                                "the same thing into one. "
-                                "Then give one line for each duty in your result: is it in order, and what did "
-                                "you do; one line saying whether you changed your notes and what taught you; and "
-                                "one line on what you dropped, what you kept and what held. "
-                                "Ask your requester only for what the duty does not cover.",
-                     "done_when": "Each duty of this agent is in order, or its problem is named in the result, "
-                                  "each case that waited has its first step, the notes are either rewritten or "
-                                  "left as they are on purpose, and every contradicted lesson has been rewritten "
-                                  "or dropped, with the reasons in the result."}}
-    if not trigger_slots(body["schedule"], t0, t0, 1):
-        return None, None
-    return body, agent_rule_problem(body)
+# The review of a holder's duties (plan C13). It starts when they have news, on the wake-up route, and it is no rule
+# of the hub's: a rule with no schedule is one that the owner's app cannot draw.
+DUTY_REVIEW_TASK = {
+    "title": "Put your duties and your notes in order",
+    "details": "Call see_responsibilities. For each of your duties: build the mechanism of a duty that has no watch "
+               "(a rule of your own with save_trigger, attached to the duty with attach_watch), repair a watch that "
+               "is broken, work an open case that waits, record what you did with record_step, and open a case "
+               "with open_case for anything that you find yourself. Look at the "
+               "repeats: a key that came back is a preventive action that did not work, so say "
+               "what you will do differently, and open a case for it where the duty needs one. "
+               "Then read your own notes with see_notes. Your next sessions start with them, so "
+               "rewrite them with write_notes when the work since the last review taught you "
+               "something they do not say, or showed that something in them is wrong. Leave them "
+               "as they are when nothing changed: a version that says the same thing is noise. "
+               + NOTES_RULE +
+               " Then call recall with stale=true: it gives exactly the lessons that need "
+               "looking at, so you read no others. A CONTRADICTED one claimed to stop a case key "
+               "that has come back since, so it was wrong, or right and never acted on — write "
+               "it again with remember instead_of=\"M-<id>\" so it says which, which hands the "
+               "new lesson the same claim and lets the work judge that one too, or drop it with "
+               "forget. A plain remember would lose the claim and leave a lesson nothing can "
+               "check. A keyless one "
+               "that has aged with nothing to bear it out is not thereby right, and not "
+               "thereby wrong either — ageing is the absence of evidence, so judge it on what "
+               "you now know: drop it unless the work has taught it to you again, and when it "
+               "has, say so with remember held=\"M-<id>\" instead of writing it twice. Where "
+               "two or more say the same thing, fold them with remember covers=[\"M-4\", "
+               "\"M-9\"], which keeps every member's words and where each came from instead of "
+               "losing them. A lesson whose key has not come "
+               "back is the best-evidenced kind you hold, and what that evidence says is that "
+               "nothing has refuted it, not that it was right: a key can also stay away because "
+               "the circumstance did. Leave it alone. Join two that say "
+               "the same thing into one. "
+               "Then give one line for each duty in your result: is it in order, and what did "
+               "you do; one line saying whether you changed your notes and what taught you; and "
+               "one line on what you dropped, what you kept and what held. "
+               "Ask your requester only for what the duty does not cover.",
+    "done_when": "Each duty of this agent is in order, or its problem is named in the result, "
+                 "each case that waited has its first step, the notes are either rewritten or "
+                 "left as they are on purpose, and every contradicted lesson has been rewritten "
+                 "or dropped, with the reasons in the result."}
+DUTY_REVIEW_SAY = ("[hub] Your duties have news since your last review:\n{news}\nPut them in order as their words "
+                   "say: build the mechanism of a duty that has no watch, repair a broken watch and work a case that "
+                   "waits. Then read your notes with see_notes and call recall with stale=true, and rewrite or drop "
+                   "what the work since your last review showed you.")
 
 
-def duty_review_rows(agent, by, t0, plan):
-    """Inside the caller's transaction: one review wake-up for each agent that holds an active duty, daily at the
-    review hour of team.json — it reads its duties, puts the late work in order and reports one line to the manager
-    (R6). The hub owns this rule. `plan` is duty_review_plan(agent, t0), from before the transaction."""
+def duty_review_last(agent):
+    """The agent's last review: {"at": when it started, "task" or "event": what it started, "seen": the marks of its
+    duties then, "<duty>:<kind>"}, or {} before its first."""
+    try:
+        last = json.loads(kv_get(f"duty_review:{agent}") or "{}")
+    except ValueError:
+        return {}
+    return last if isinstance(last, dict) else {}
+
+
+def duty_review_open(last):
+    """True while the agent's last review is open: its task has not ended, or the manager has not read its message."""
+    if last.get("task"):
+        t = q1("SELECT state FROM tasks WHERE id=?", (last["task"],))
+        return bool(t) and t["state"] not in TERMINAL
+    if last.get("event"):
+        e = q1("SELECT read_at FROM events WHERE id=?", (last["event"],))
+        return bool(e) and e["read_at"] is None
+    return False
+
+
+def duty_news(agent, since, seen):
+    """What is new in the agent's active duties since its last review started, one line each: a duty given or moved
+    to it, new words of one (by somebody else: a duty that it wrote it knows), and a mark that is set now, was set
+    after that start, and was not set at that start. A mark that was set then counts no more until the next review, so
+    a watch that breaks and recovers again and again starts one review. A level and not an edge: a hub that stops
+    loses nothing."""
+    out = []
+    for h in q("SELECT h.responsibility, h.kind, h.detail, h.by, r.text FROM duty_history h JOIN responsibilities r "
+               "ON r.id=h.responsibility WHERE r.agent=? AND r.state='active' AND h.ts>? AND h.by<>? AND "
+               "(h.kind='created' OR (h.kind='edited' AND h.detail<>'no field')) ORDER BY h.id", (agent, since, agent)):
+        what = (f"new, from {h['by']}" if h["kind"] == "created" else
+                f"moved to you by {h['by']}" if "agent" in h["detail"] else f"new words from {h['by']}")
+        out.append(f"{rref(h['responsibility'])} {duty_name(h['text'])}: {what}.")
+    for r in q("SELECT * FROM responsibilities WHERE agent=? AND state='active' AND marker_kind IS NOT NULL AND "
+               "marker_since>? ORDER BY id", (agent, since)):
+        if f"{r['id']}:{r['marker_kind']}" not in seen:
+            out.append(f"{rref(r['id'])} {duty_name(r['text'])}: {r['marker_kind'].replace('_', ' ')}. "
+                       f"{r['marker_detail']}")
+    return out
+
+
+def duty_reviews(t0):
+    """Plan C13: a holder's duties are reviewed when they have news, not once a day. A holder with news since its last
+    review started and no review open gets one review, on the wake-up route: a task, or a message for the manager."""
+    for agent in [r["agent"] for r in q("SELECT DISTINCT agent FROM responsibilities WHERE state='active' "
+                                        "ORDER BY agent")]:
+        if agent not in agents():
+            continue
+        last = duty_review_last(agent)
+        if duty_review_open(last):
+            continue
+        news = duty_news(agent, float(last.get("at") or 0), set(last.get("seen") or []))
+        if not news:
+            continue
+        route, _ = wakeups.wake_route(wake_org(), agent)
+        if route is None:
+            continue            # nobody could follow its review; the duty sweep still tells the manager of its marks
+        with transaction():
+            duty_review_rows(agent, route, news, t0)
+        log("hub", f"duty review of {agent}: " + "; ".join(news))
+
+
+def duty_review_rows(agent, route, news, t0):
+    """Inside the caller's transaction: one review of the agent's duties on its wake-up route (wakeups.wake_route), with
+    the news that started it, and the record of it that the next review starts from."""
     in_transaction("duty_review_rows")
-    row = read_row("SELECT * FROM triggers WHERE agent=? AND watch='review' AND state IN ('active','paused')", (agent,))
-    if not read_row("SELECT COUNT(*) n FROM responsibilities WHERE agent=? AND state='active'", (agent,))["n"]:
-        if row:
-            trigger_state_rows(row["id"], row["revision"], "delete", by, t0)
-        return None
-    if row:
-        return row["id"]
-    body, problem = plan
-    if body is None:
-        return None
-    if problem:
-        raise Refusal(400, problem)
-    made = trigger_create_rows(body, by, t0, created_by=manager_name())
-    DB.execute("UPDATE triggers SET watch='review' WHERE id=?", (made,))
-    return made
+    seen = [f"{r['id']}:{r['marker_kind']}" for r in read_rows(
+        "SELECT id, marker_kind FROM responsibilities WHERE agent=? AND state='active' AND marker_kind IS NOT NULL",
+        (agent,))]
+    record = {"at": t0, "seen": seen}
+    if route["kind"] == "message":
+        record["event"] = DB.execute(EVENT, (agent, "say", None, DUTY_REVIEW_SAY.format(news="\n".join(news)), t0,
+                                             json.dumps(LATER_SAY))).lastrowid
+    else:
+        task = dict(DUTY_REVIEW_TASK, details=DUTY_REVIEW_TASK["details"] + "\n\nThis review started because your "
+                    "duties have news since your last one:\n" + "\n".join(news))
+        common = {"needs": "none", "goal": None, "goal_id": None, "follows": None, "case_id": None, "parent": None}
+        if route["parent"]:
+            common["parent"] = admit_task(manager_name(), dict(
+                common, owner=route["requester"], title=f"Review of {agent}'s duties",
+                details=f"{agent}'s duties have news, so a review of them is a subtask of this task. Its result, its "
+                        f"questions and its permission prompts arrive in this session. Check the result with "
+                        f"check_result and answer with answer; then deliver this task.",
+                done_when=f"The review subtask for {agent} has ended and you have checked its result.",
+                why=f"{agent}'s duties have news; its review's result arrives in this task."))
+        record["task"] = admit_task(route["requester"], dict(common, owner=agent, **task,
+                                                             why="Its duties have news since its last review."))
+    DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+               (f"duty_review:{agent}", json.dumps(record)))
 
 
 # The holder reads its notice in the session of a task it was given for something else, so it says what to do there.
 DUTY_NOTICE_HOLDER = ("\nYou read this in the session of a task: do the task of that session. This duty's own work "
-                      "comes as tasks of its own and in your daily review, and an event of it that you meet in other "
-                      "work you open with open_case. see_responsibilities shows the duty.")
+                      "comes as tasks of its own and in a review task that starts when your duties have news, and an "
+                      "event of it that you meet in other work you open with open_case. see_responsibilities shows "
+                      "the duty.")
 
 
 def new_duty_text(r, by, old=None):
@@ -11247,8 +11600,8 @@ def new_duty_text(r, by, old=None):
 
 
 def duty_state_change(r, action, by, note="", command=None, receipt=None):
-    """One state action on a duty, in one transaction: the row, its history line, its watches, the review wake-up of
-    its agent, the message to the manager and the caller's receipt. A pause and a retire pause its watches, a resume
+    """One state action on a duty, in one transaction: the row, its history line, its watches, the message to the
+    manager and the caller's receipt. A pause and a retire pause its watches, a resume
     starts them again, and a retire keeps its cases as history.
 
     The duty used to change with a commit of its own and the receipt to be kept afterwards. A hub that died in
@@ -11260,7 +11613,6 @@ def duty_state_change(r, action, by, note="", command=None, receipt=None):
         raise Refusal(400, "action must be pause, resume, retire or reopen")
     if r["state"] not in DUTY_ACTIONS[action]:
         raise Refusal(409, f"{rref(r['id'])} is {r['state']}; {action} does not apply")
-    review = duty_review_plan(r["agent"], t0)       # its reads commit, so it runs before the transaction
     with transaction():
         open_cases = [c["id"] for c in read_rows(
             "SELECT id FROM duty_cases WHERE responsibility=? AND state='open' ORDER BY id", (r["id"],))]
@@ -11278,7 +11630,6 @@ def duty_state_change(r, action, by, note="", command=None, receipt=None):
                     trigger_state_rows(row["id"], row["revision"], "resume", by, t0)
             except Refusal:
                 continue            # a rule whose time has passed stays paused, and the sweep marks the duty
-        duty_review_rows(r["agent"], by, t0, review)
         cases = ", ".join(f"C-{c}" for c in open_cases) or "none"
         say = {"pause": f"paused. Its watches are paused. Its open cases stay: {cases}.",
                "resume": "active again. Its watches run again.",
@@ -11534,6 +11885,12 @@ def duty_marker(r, t0):
         if t["state"] == "paused":
             return "watch_broken", (f"Watch rule {t['id']} is paused by {t['paused_by'] or 'the owner'}: "
                                     f"{t['paused_reason'] or 'no reason given'}.")
+        since = failing_since(t) if t["check_spec"] else None
+        if since:           # plan C12: nothing pauses a failing check, so its failing is what says it is broken
+            last = q1("SELECT error FROM trigger_runs WHERE trigger_id=? AND error IS NOT NULL ORDER BY id DESC LIMIT 1",
+                      (t["id"],))
+            return "watch_broken", (f"Watch rule {t['id']} has failed since {clock(since)}"
+                                    + (f": {last['error']}" if last else "") + ", with no valid value since.")
     if not live:
         return "no_watch", "This duty has no watch, so no event reaches its agent."
     left = case_left_open(r["id"])
@@ -11546,16 +11903,13 @@ def duty_marker(r, t0):
     if repeat:
         return "repeat", (f"{cref(repeat)} came back with the same key inside {DUTY_REPEAT_DAYS} days "
                           f"({repeat['key']}): the preventive action did not work.")
-    done = q1("SELECT MAX(delivered) d FROM tasks WHERE owner=? AND state='completed' AND trigger_id IN "
-              "(SELECT id FROM triggers WHERE agent=? AND watch='review')", (r["agent"], r["agent"]))["d"]
-    if done and t0 - done > DUTY_REVIEW_GRACE:
-        return "no_review", f"{r['agent']} last put its duties in order {span(t0 - done)} ago."
     return None, None
 
 
 def duty_sweep(t0):
     """Fixed checks on every duty that is not retired, from the hub tick. No AI turn: the manager gets one message
-    when a duty is newly not in order, and it waits for the manager's next read, an hour at most (LATER_SAY)."""
+    when a duty is newly not in order, and it waits for the manager's next read, an hour at most (LATER_SAY). A holder
+    whose duties have news gets its review at once (duty_reviews)."""
     for row in q("SELECT * FROM responsibilities WHERE state IN ('active','paused') ORDER BY id"):
         r = duty_row(row["id"])
         kind, detail = duty_marker(r, t0)
@@ -11564,6 +11918,10 @@ def duty_sweep(t0):
               (kind, t0 if kind else None, detail, r["id"]))
         elif kind and detail != r["marker_detail"]:
             q("UPDATE responsibilities SET marker_detail=? WHERE id=?", (detail, r["id"]))
+    for rule in q("SELECT id, revision FROM triggers WHERE watch=? AND state IN ('active','paused')", (DUTY_REVIEW,)):
+        with transaction():         # the daily review rule of an earlier version (plan C13)
+            trigger_state_rows(rule["id"], rule["revision"], "delete", "hub", t0)
+    duty_reviews(t0)
     if t0 - float(kv_get("duty_sweep_at") or 0) < goal_settings()[0] * 60:
         return
     kv_set("duty_sweep_at", t0)
@@ -13625,13 +13983,9 @@ REPORT_DECISIONS = {
 REPORT_TEXT_MAX = 2000
 REPORT_NOTE_MAX = 500
 REPORT_ABOUT_MAX = 120
-REPORT_COLLAPSE_DAYS = 7        # inside this, the same report is one line for the receiver
 REPORT_COLLAPSE_CHARS = 120     # of the text, for the collapse key
-REPORT_GRACE = 7200             # seconds a report may wait for its decision before the hub says so
-REPORT_OWNER_WAIT = 86400       # and before it reaches the owner's own screen, because by then nobody is deciding
 REPORT_SHOWN = 12               # reports of one list
-REPORT_FEEDBACK_DAYS = 7        # how far back a session reads the decisions on its own reports
-REPORT_FEEDBACK_SHOWN = 3
+REPORT_FEEDBACK_SHOWN = 3       # decisions on its own reports that one task start shows, the oldest not shown first
 UP_REF = re.compile(r"(?i)^\s*UP-?([1-9][0-9]{0,17})\s*$")
 
 
@@ -13689,12 +14043,12 @@ def report_price(agent, severity, about, t0):
 
 def report_head(to_agent, kind, about, text, t0):
     """The open report this one says the same thing as, or None. The key is the receiver, the kind, what it is about
-    and the first REPORT_COLLAPSE_CHARS characters of the text, inside REPORT_COLLAPSE_DAYS days: three agents
-    that find one broken thing are one line for the receiver, and still three rows, so each of them reads the one
-    answer back itself."""
+    and the first REPORT_COLLAPSE_CHARS characters of the text, while the first one is undecided (plan C10, with no
+    window of days): three agents that find one broken thing are one line for the receiver, and still three rows, so
+    each of them reads the one answer back itself."""
     head = clip(text, REPORT_COLLAPSE_CHARS).lower()
-    for r in q("SELECT * FROM reports WHERE to_agent=? AND kind=? AND decided IS NULL AND collapsed_into IS NULL AND "
-               "created>? ORDER BY id", (to_agent, kind, t0 - REPORT_COLLAPSE_DAYS * 86400)):
+    for r in q("SELECT * FROM reports WHERE to_agent=? AND kind=? AND decided IS NULL AND collapsed_into IS NULL "
+               "ORDER BY id", (to_agent, kind)):
         if (r["about"] or "") == (about or "") and clip(r["text"], REPORT_COLLAPSE_CHARS).lower() == head:
             return r
     return None
@@ -13749,11 +14103,10 @@ def managers_reports():
 
 def report_feedback(agent):
     """The decisions on this agent's own reports, for the tail of its next task start. This is the only thing that
-    stops an agent filing noise: a report judged wrong comes back to the one who wrote it. It is a read and writes
-    nothing, so a repeat inside the window simply says it again (admit_task calls this inside its transaction)."""
-    rows = read_rows("SELECT * FROM reports WHERE from_agent=? AND decided IS NOT NULL AND decided>? "
-                     "ORDER BY decided DESC LIMIT ?",
-                     (agent, now() - REPORT_FEEDBACK_DAYS * 86400, REPORT_FEEDBACK_SHOWN))
+    stops an agent filing noise: a report judged wrong comes back to the one who wrote it. Each decision shows until
+    it was shown once (plan C10, with no window of days), the oldest first. A read: feedback_rows marks them shown,
+    in the transaction that writes the start."""
+    rows = read_rows(FEEDBACK_ROWS, (agent, REPORT_FEEDBACK_SHOWN))
     if not rows:
         return ""
     said = "; ".join(f"{upref(r['id'])} ({clip(r['text'], 80)}) -> {r['decided_by']} says "
@@ -13762,6 +14115,19 @@ def report_feedback(agent):
                      + (f" ({tref(r['became_task'])})" if r["became_task"] else "")
                      for r in rows)
     return f" What came of what you reported up: {said}."
+
+
+FEEDBACK_ROWS = ("SELECT * FROM reports WHERE from_agent=? AND decided IS NOT NULL AND feedback_shown IS NULL "
+                 "ORDER BY decided, id LIMIT ?")
+
+
+def feedback_rows(agent, t0):
+    """Inside the transaction that writes a task start of `agent`: the decisions that report_feedback put in it are
+    shown, so the next start gives the ones after them."""
+    in_transaction("feedback_rows")
+    ids = [r["id"] for r in read_rows(FEEDBACK_ROWS, (agent, REPORT_FEEDBACK_SHOWN))]
+    if ids:
+        DB.execute(f"UPDATE reports SET feedback_shown=? WHERE id IN ({','.join('?' * len(ids))})", (t0, *ids))
 
 
 def t_report_up(agent, a):
@@ -13875,30 +14241,6 @@ def t_decide_report(agent, a):
             + (f", {tref(became)}" if became else "") + ". "
             + (f"The {also} report(s) that say the same take this decision with it. " if also else "")
             + f"{r['from_agent']} reads it at the start of its next task session.")
-
-
-def report_sweep(t0):
-    """The reports nobody decided, from the hub tick. No AI turn: one message to the manager when a report joins
-    them, the same shape as duty_sweep, and not when one is decided. A lead with an undecided report is in that
-    message, because a lead has no standing session and the manager is the one that stays on top of it (rule 7)."""
-    if t0 - float(kv_get("report_sweep_at") or 0) < goal_settings()[0] * 60:
-        return
-    kv_set("report_sweep_at", t0)
-    rows = [r for r in open_reports(kinds=False) if t0 - r["created"] > REPORT_GRACE]
-    passed = {r["id"] for r in rows if report_for_manager(r)}
-    # A report that its lead can no longer decide is news the moment it becomes the manager's, although it was in the
-    # set before, as the lead's: so it is a new item of the set then, and the manager hears it at the next sweep.
-    if not sweep_news("report_sweep_sig", [str(r["id"]) + ("m" if r["id"] in passed else "") for r in rows]):
-        return
-    mine = [r for r in rows if r["to_agent"] == manager_name() or r["id"] in passed]
-    theirs = [r for r in rows if r["to_agent"] != manager_name() and r["id"] not in passed]
-    lines = [report_line(r) + (f" -- sent to {r['to_agent']}, which can no longer decide it, so it is yours"
-                               if r["to_agent"] != manager_name() else "") for r in mine[:REPORT_SHOWN]]
-    lines += [f"  {upref(r['id'])} waits with {r['to_agent']} ({clip(r['text'], 120)})" for r in theirs[:REPORT_SHOWN]]
-    emit(manager_name(), "say", f"[hub] {len(rows)} report(s) wait for a decision:\n" + "\n".join(lines) +
-         "\nDecide each of yours with decide_report: " + "; ".join(REPORT_DECISIONS) +
-         (". A report that waits with a lead is that lead's to decide in its task session; ask it with message_agent."
-          if theirs else "."), extra=LATER_SAY)
 
 
 # ---------------------------------------------------------------- see_history: a number with the window before it
@@ -14119,7 +14461,6 @@ CIRCLE_CHAIN = 3                # tasks in one follows chain whose last one ende
 CIRCLE_RESTARTS = 2             # counted losses in a row of one task: its automatic restarts stopped (plan C6)
 CIRCLE_REFUSALS = 5             # identical refusals inside one task
 CIRCLE_SHOWN = 10
-CIRCLE_OWNER_WAIT = 86400       # seconds a circle may stand after the manager was told, before the owner is
 
 
 def circle_chain(t):
@@ -14200,9 +14541,13 @@ def circle_watched(found, t0):
 
 
 def circles_waiting(t0):
-    """[(when it was first seen, its line)] of the circles that have stood longer than CIRCLE_OWNER_WAIT since the
-    manager was told, oldest first. health_view reads the sweep's own map and never recomputes the circles: the
-    owner's screen is polled, and a warning that says what the last sweep found is both cheaper and honest."""
+    """[(when it was first seen, its line)] of the circles that the manager was told of, while it had a turn after
+    that message and left it unread (plan C10), oldest first. health_view reads the sweep's own map and never
+    recomputes the circles: the owner's screen is polled, and a warning that says what the last sweep found is both
+    cheaper and honest."""
+    told = kv_get("circle_notice")
+    if not told or not not_acting(manager_name(), int(told)):
+        return []
     try:
         watch = json.loads(kv_get("circle_watch") or "{}")
     except ValueError:
@@ -14210,79 +14555,52 @@ def circles_waiting(t0):
     out = []
     for sig, entry in watch.items():
         try:
-            seen, line = float(entry[0]), str(entry[1])
+            out.append((float(entry[0]), str(entry[1])))
         except (TypeError, ValueError, IndexError):
             continue
-        if t0 - seen > CIRCLE_OWNER_WAIT:
-            out.append((seen, line))
     return sorted(out)
 
 
 def reports_waiting(t0):
-    """The reports that have waited longer than REPORT_OWNER_WAIT for a decision, oldest first."""
-    return [r for r in open_reports(kinds=False) if t0 - r["created"] > REPORT_OWNER_WAIT]
+    """The reports that wait for a decision whose receiver had a turn after the message that named them and left it
+    unread (plan C10: requester_chase names each one once), oldest first."""
+    out = []
+    for r in open_reports(kinds=False):
+        receiver = manager_name() if report_for_manager(r) else r["to_agent"]
+        told = kv_get(f"chased:{receiver}:{upref(r['id'])}")
+        if told and not_acting(receiver, int(told)):
+            out.append(r)
+    return out
 
 
-# A task that nothing is moving (tasks_stuck). Every alarm the hub raises about one task is sent once: the worker is
-# nudged, the requester is told, and after that the hub is silent for ever -- a wedged session, a session that
-# finished without deliver_result, a task that never started and a task with no session left after its three
-# restarts all read alike, and `see_team` says "quiet 24h00" while the owner's screen says nothing at all. These
-# three measures are the owner's own rung, and they add no message to any agent: the hub still changes nothing by
-# itself about a stuck task, because cancelling or reassigning it is the manager's decision.
-STUCK_NO_PATH = 3600        # seconds an open task may have no live path at all (liveness has given up on it)
-STUCK_SUBMITTED = 1200      # seconds a task may sit submitted while its own agent's helper keeps checking in
-STUCK_SILENT = 7200         # seconds a working task may be silent while no call of its session is open
+# A task that nothing is moving (tasks_stuck). Every alarm the hub raises about one task goes to its requester once,
+# and the owner's screen shows the task only while that requester is not acting on it (plan C10): it had a turn
+# after the notice and left the notice unread. No clock decides it, and the board's Stalled mark still shows it.
 
 
 def tasks_stuck(t0):
-    """[(since, one line)] of the open tasks that nothing is moving and that the requester was already told about,
-    oldest first.
+    """[(when its requester was told, one line)] of the open tasks whose requester had a turn after the notice that
+    the task is stuck and left that notice unread, oldest first. A requester that read the notice decides, and the
+    owner is told only what the manager (or a lead) already had in front of it and did not settle.
 
-    The rule `circles_waiting` sets holds here: the owner is told only what the manager (or a lead) already had in
-    front of it and did not settle, so every line here has had its own message upward -- `nudge_level` 2 is the
-    silence rung, the never-started nudge and the no-live-path report, and a `restarts` over the bound is the "no
-    running session after 3 restarts" message. Without that gate this would be a third rung aimed at the owner,
-    which is the drowning the fleet's own rule about his attention forbids.
-
-    A `restarts` over the bound still means exactly that the hub has given up: only liveness writes
-    SESSION_RESTARTS + 1, and only when it has refused to restart a session that died young. A task whose restarts
-    are no longer being spent -- its sessions live and work and are then lost -- does not fall off this screen
-    either, and through this rung's own two measures and not through a special case. A restart resets neither
-    `last_activity` nor `nudge_level`, so a session that is replaced and is silent again keeps the silence measure
-    and the nudge that opens the gate; and a replacement that never comes up is a young loss, which spends the
-    budget and ends at the no-path measure. What is left is a task whose new sessions do work each time, which is
-    not stuck: its requester gets a quiet note every LOST_NOTE losses (session_lost, plan C6).
-
-    **Deliberate quiet is not stuckness**, and that is the case that must not regress. A held task, a task whose
-    agent is at its usage limit and a parked task are left out whole, exactly as the clocks of `tick` leave them
-    out; and a session inside one unfinished call is left out of the silence measure however long that call has
-    run, because it is visibly inside that call, the requester's own message named the call and its age, and this
-    rung exists for work that nothing is doing."""
-    out, updating = [], release_applying()      # an update run holds every start on purpose, as the nudge knows
+    **Deliberate quiet is not stuckness**: a held task, a task whose agent is at its usage limit and a parked task are
+    left out whole."""
+    out = []
     for t in q(f"SELECT * FROM tasks WHERE {OPEN_TASK} ORDER BY id"):
         if active_hold(t["id"]) or active_limit(t["owner"]) or parked(t["id"]):
-            continue        # the three kinds of quiet on purpose, as in tick's own silence loop
-        if t["nudge_level"] < 2 and t["restarts"] <= SESSION_RESTARTS:
-            continue        # nobody upward has been told yet: it is not the owner's to see
-        if not t["live_path"] and t0 - (t["stalled_since"] or t0) > STUCK_NO_PATH:
-            since = t["stalled_since"]
-            says = (f"has had no live path for {ago(since)} and is still {t['state']}: "
-                    f"{t['stalled_reason'] or 'no reason recorded'}")
-        elif (t["state"] == "submitted" and not updating and t0 - t["created"] > STUCK_SUBMITTED
-                and helper_online(t["owner"], t0)):
-            since = t["created"]
-            says = (f"has not started in {ago(since)}, though {t['owner']}'s helper keeps checking in: its runtime "
-                    f"may be signed out, or its session may be failing to start")
-        elif t["state"] == "working":
-            quiet = t0 - max(t["last_activity"] or t["created"], limit_ended(t["owner"]), STARTED)
-            if quiet <= STUCK_SILENT or busy_in_a_call(t, t0) or waits_on_parts(t["id"]) or open_job(t["id"]) or \
-                    waits_on_message(t["id"]):
-                continue        # the fourth kind of quiet on purpose: one call of its own that has not finished,
-                                # and the fifth: a lead that waits for its open subtasks
-            since = t0 - quiet
-            says = f"has been silent for {ago(since)} with no call of its session open"
-        else:
             continue
+        told = kv_get(f"stuck_notice:{t['id']}")
+        if not told or not not_acting(t["requester"], int(told)):
+            continue
+        if not t["live_path"] and t["stalled_since"]:      # liveness found it with no path
+            says = f"has no live path and is still {t['state']}: {t['stalled_reason'] or 'no reason recorded'}"
+        elif t["restarts"] >= LOST_IN_A_ROW:
+            says = "lost its session again and again, and the hub starts it no more by itself"
+        elif t["nudge_level"] >= 2:
+            says = "ended two turns in a row with nothing waiting for it, and nothing took it up since"
+        else:
+            continue        # it moves again: a new turn, a new attempt or a live path ended what the notice said
+        since = q1("SELECT created FROM events WHERE id=?", (int(told),))["created"]
         out.append((since, f"{tref(t['id'])} ({clip(t['title'], 60)}, owner {t['owner']}) {says}"))
     return sorted(out)
 
@@ -14297,13 +14615,13 @@ def circle_sweep(t0):
     circle_watched(found, t0)       # before the signature check: an unchanged set keeps its first sighting
     if not sweep_news("circle_sweep_sig", [s for s, _ in found]):
         return
-    emit(manager_name(), "say", f"[hub] {len(found)} thing(s) look like running in circles:\n" +
+    kv_set("circle_notice", emit(manager_name(), "say", f"[hub] {len(found)} thing(s) look like running in circles:\n" +
          "\n".join("  " + line for _, line in found[:CIRCLE_SHOWN]) +
          (f"\n  and {len(found) - CIRCLE_SHOWN} more." if len(found) > CIRCLE_SHOWN else "") +
          "\nThe hub only sees the pattern and changes nothing: the third attempt is sometimes the right one. Decide "
          "each: write the answer where it is read next time (a profile, a knowledge file, the task's own words), "
          "give the work to a suitable agent, settle the access, cancel what nothing needs, or leave it as it is. "
-         "see_history tells you what moved and what did not.", extra=LATER_SAY)
+         "see_history tells you what moved and what did not.", extra=LATER_SAY))
 
 
 ALLOWANCE_STAGES = {"pace": 1, "last": 2, "spent": 3}  # allowance_worth_saying's why, each one worse than the one before
@@ -15034,7 +15352,8 @@ TOOLS = [
      "suits it or it is about the fleet. A duty is two things: the agent, and the words. Say in text what the "
      "agent answers for, what it does itself and what it brings to you first, because nothing else carries that: "
      "there is no other field. A watch becomes a wake-up rule, so you write no schedule, and the agent builds the "
-     "mechanism that finds the event.",
+     "mechanism that finds the event. The holder starts on it at once: a new duty, a moved one and new words start "
+     "a review task of its duties.",
      S({"request_id": {"type": "string", "description": "A new UUID for each write"},
         "responsibility": {"type": "string", "description": "The duty to change, for example R-1. Leave it out for a "
                                                             "new duty."},
@@ -15118,7 +15437,9 @@ TOOLS = [
      "Send a message to another agent: a question, an answer or coordination. It has your authority, never the "
      "owner's, and a message that you get has its sender's authority. Work that needs tools is still a task, through "
      "the line above. Answer a message with in_reply_to set to its id (AM-<n>). The call returns at once and says "
-     "where the message landed and whether that session runs now; an answer comes later as a message. In a task "
+     "where the message landed and whether that session runs now; an answer comes later as a message. A message to a "
+     "colleague whose task the hub links to yours (you requested it, it requested yours, or both are parts of one "
+     "step or one parent) reaches that task's session; any other reaches its chat window. In a task "
      "session, waits=true says that your task cannot go on without the answer: the hub tells you if the answer will "
      "not come, and nothing nudges the task while it waits. Two agents that send each other 20 messages with no work "
      "of either between them send no more until one of them works; an answer to a message that waits is never "
@@ -15129,7 +15450,9 @@ TOOLS = [
         "in_reply_to": {"type": "string", "description": "The id of the message that this one answers, for example "
                                                         "AM-12. Leave it out for a new message."},
         "waits": {"type": "boolean", "description": "true only when your task cannot go on without the answer. Not "
-                                                     "for your own requester: ask it with ask_my_requester"}},
+                                                     "for your own requester: ask it with ask_my_requester"},
+        "to_task": {"type": "string", "description": "The colleague's task that the message is about, for example "
+                                                     "T-15, when your task is linked to more than one of theirs"}},
        ["request_id", "agent", "text"])),
     # owner feature google: only the tools of the agent's level in team.json now (tools_for)
     ("worker", "drive_search", t_drive_search,
@@ -15654,10 +15977,10 @@ def board_html():
 TRIGGER_DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 TRIGGER_KEYS = {"once": {"kind", "at", "timezone"}, "every": {"kind", "minutes"},
                 "daily": {"kind", "time", "days", "timezone"}, "monthly": {"kind", "day", "time", "timezone"}}
-TRIGGER_FIELDS = ("agent", "schedule", "task", "late_minutes", "max_tasks_per_day", "check")
+TRIGGER_FIELDS = ("agent", "schedule", "task", "check")
 TRIGGER_ACTIONS = {"pause": ("active",), "resume": ("paused",), "delete": ("active", "paused", "done"),
                    "run_now": ("active",), "check_now": ("active",)}
-TRIGGER_FLEET_LIMIT = 20        # trigger tasks in 24 hours for the whole fleet when team.json has no "triggers"
+EVERY_MAX = 10 ** 7             # minutes: an interval is the author's own; this only keeps the number a number
 
 
 @functools.lru_cache(maxsize=1)
@@ -15682,7 +16005,7 @@ def trigger_schedule(value):
     if extra:
         raise ValueError(f"a {kind} schedule has no {extra[0]}")
     if kind == "every":
-        return {"kind": kind, "minutes": whole(value.get("minutes"), 5, 10080, "minutes")}
+        return {"kind": kind, "minutes": whole(value.get("minutes"), 1, EVERY_MAX, "minutes")}
     zone = value.get("timezone")
     if not isinstance(zone, str) or zone not in time_zones():
         raise ValueError("timezone must be an IANA time zone name, for example Europe/Madrid")
@@ -15741,10 +16064,6 @@ def trigger_fields(data, create):
         body["schedule"] = trigger_schedule(data.get("schedule"))
     if create or "task" in data:
         body["task"] = trigger_task(data.get("task"))
-    if create or "late_minutes" in data:
-        body["late_minutes"] = whole(data.get("late_minutes", 60), 0, 1440, "late_minutes")
-    if create or "max_tasks_per_day" in data:
-        body["max_tasks_per_day"] = whole(data.get("max_tasks_per_day", 4), 0, 48, "max_tasks_per_day")
     return body
 
 
@@ -15855,10 +16174,9 @@ def trigger_create_rows(body, by, t0, created_by, source=None, command=None, con
     use_code_prompt(consume, t0)
     tid = DB.execute("INSERT INTO triggers(agent,state,revision,schedule,check_spec,task,late_minutes,"
                      "max_tasks_per_day,anchor,next_due,created,updated,request_id,created_by) "
-                     "VALUES(?,'active',1,?,?,?,?,?,?,?,?,?,?,?)",
+                     "VALUES(?,'active',1,?,?,?,0,0,?,?,?,?,?,?)",       # plan C12: no late window and no cap
                      (body["agent"], json.dumps(body["schedule"]), json.dumps(body["check"]) if body["check"] else None,
-                      json.dumps(body["task"]), body["late_minutes"], body["max_tasks_per_day"], t0, due[0], t0, t0,
-                      body["request_id"], created_by)).lastrowid
+                      json.dumps(body["task"]), t0, due[0], t0, t0, body["request_id"], created_by)).lastrowid
     if source is not None:
         DB.execute("INSERT OR IGNORE INTO trigger_code(sha256,source,bytes,created,by) VALUES(?,?,?,?,?)",
                    (body["check"]["sha256"], source, len(source.encode("utf-8")), t0, by))
@@ -15883,7 +16201,6 @@ def trigger_create(body, by, t0, created_by, source=None, command=None, consume=
 def trigger_edit_fields(t, body, created_by):
     """(the trigger's fields now, the fields this edit asks for). created_by stays unless given."""
     old = {"agent": t["agent"], "schedule": json.loads(t["schedule"]), "task": json.loads(t["task"]),
-           "late_minutes": t["late_minutes"], "max_tasks_per_day": t["max_tasks_per_day"],
            "check": json.loads(t["check_spec"]) if t["check_spec"] else None,
            "created_by": t["created_by"]}
     new = dict(old, **{k: body[k] for k in TRIGGER_FIELDS if k in body})
@@ -15915,11 +16232,10 @@ def trigger_edit_rows(trigger_id, base, body, by, t0, created_by=..., source=Non
         state = "done"
     use_code_prompt(consume, t0)
     end_open_runs(trigger_id, "The trigger changed.", t0)      # their results are stale
-    DB.execute("UPDATE triggers SET agent=?, schedule=?, check_spec=?, task=?, late_minutes=?, max_tasks_per_day=?, "
-               "anchor=?, next_due=?, state=?, created_by=?, revision=revision+1, updated=? WHERE id=?",
+    DB.execute("UPDATE triggers SET agent=?, schedule=?, check_spec=?, task=?, anchor=?, next_due=?, state=?, "
+               "created_by=?, revision=revision+1, updated=? WHERE id=?",
                (new["agent"], json.dumps(new["schedule"]), json.dumps(new["check"]) if new["check"] else None,
-                json.dumps(new["task"]), new["late_minutes"], new["max_tasks_per_day"], anchor, due, state,
-                new["created_by"], t0, trigger_id))
+                json.dumps(new["task"]), anchor, due, state, new["created_by"], t0, trigger_id))
     if source is not None:
         DB.execute("INSERT OR IGNORE INTO trigger_code(sha256,source,bytes,created,by) VALUES(?,?,?,?,?)",
                    (new["check"]["sha256"], source, len(source.encode("utf-8")), t0, by))
@@ -16059,11 +16375,6 @@ def latest_due(schedule, anchor, due, t0):
     return later[-1] if later else due
 
 
-def trigger_fleet_limit():
-    conf = TEAM.get("triggers") if isinstance(TEAM.get("triggers"), dict) else {}
-    return conf.get("max_tasks_per_day", TRIGGER_FLEET_LIMIT)
-
-
 def trigger_row(trigger_id):
     return q1("SELECT * FROM triggers WHERE id=?", (trigger_id,))
 
@@ -16081,7 +16392,7 @@ def run_view(r):
             "created": r["created"], "attempts": r["attempts"], "retry_at": r["retry_at"], "value": r["value"],
             "summary": r["summary"], "error": r["error"], "detail": r["detail"],
             "finished": r["finished"] if r["finished"] is not None or r["state"] in OPEN_RUN else r["created"],
-            "event_id": r["event_id"], "parent_task": r["parent_task"]}
+            "event_id": r["event_id"], "parent_task": r["parent_task"], "sent": r["sent"]}
 
 
 def trigger_view(t, t0):
@@ -16090,13 +16401,23 @@ def trigger_view(t, t0):
     return {"id": t["id"], "agent": t["agent"], "state": t["state"], "paused_by": t["paused_by"],
             "paused_reason": t["paused_reason"], "revision": t["revision"], "schedule": json.loads(t["schedule"]),
             "check": json.loads(t["check_spec"]) if t["check_spec"] else None, "task": json.loads(t["task"]),
-            "late_minutes": t["late_minutes"], "max_tasks_per_day": t["max_tasks_per_day"], "next_due": t["next_due"],
+            "next_due": t["next_due"],
             "last_run": run_view(last) if last else None, "last_task": task["id"] if task else None,
             "tasks_24h": wakes_24h(t, t0) if agent_rule(t) else trigger_tasks_24h(t["id"], t0),
             "created": t["created"], "updated": t["updated"],
-            "request_id": t["request_id"], "failures": t["failures"],
+            "request_id": t["request_id"], "failures": t["failures"], "failing_since": failing_since(t),
             "created_by": t["created_by"],
             "armed": dict(zip(("armed", "reason"), rule_armed(t, t0)[:2])) if t["check_spec"] else None}
+
+
+def failing_since(t):
+    """When the check of a trigger began to fail, with no valid value since: the time of the first error of the
+    series, or None (plan C12: the hub pauses nothing for errors, and this is what says that a check is broken)."""
+    if not t["failures"]:
+        return None
+    row = q1("SELECT MIN(finished) at FROM trigger_runs WHERE trigger_id=? AND error IS NOT NULL AND id>"
+             "(SELECT COALESCE(MAX(id), 0) FROM trigger_runs WHERE trigger_id=? AND value IS NOT NULL)", (t["id"], t["id"]))
+    return row["at"] if row else None
 
 
 def trigger_upcoming(t):
@@ -16116,10 +16437,13 @@ def trigger_when(t, ts):
     return f"{d:%a} {d.day} {d:%b %Y %H:%M} {zone.key}"
 
 
-def trigger_provenance(t, run, due, manual, check=None):
-    """The end of a triggered task's details: where the task came from and, for a check, what the check found."""
+def trigger_provenance(t, run, due, manual, check=None, t0=None):
+    """The end of a triggered task's details: where the task came from, how late it started (plan C12: no late window
+    ends a run, so the task says it) and, for a check, what the check found."""
+    late = (t0 or now()) - due
     line = (f"Started by trigger {t['id']} (revision {t['revision']}, run {run}) "
-            + (f"through Run task now at {trigger_when(t, due)}." if manual else f"for {trigger_when(t, due)}."))
+            + (f"through Run task now at {trigger_when(t, due)}." if manual else f"for {trigger_when(t, due)}.")
+            + (f" It started {span(late)} after that time." if not manual and late >= 120 else ""))
     if check:
         spec, value, summary = check
         cond = spec["condition"]
@@ -16135,9 +16459,6 @@ def trigger_decision(t, manual, due, t0):
     """("missed" or "not_started", why) for a run that starts no task, or (None, the checked task fields). The first
     rule that applies wins. A run is never tried again: the next due time is the next chance."""
     agent, task = t["agent"], json.loads(t["task"])
-    if not manual and t0 - due >= (t["late_minutes"] + 1) * 60:     # whole minutes: a tick seconds late is on time
-        return "missed", (f"The hub did not run this at its time. It was {span(t0 - due)} late; "
-                          f"the limit is {t['late_minutes']} minutes.")
     if agent not in agents():
         return "not_started", f"{agent} is no longer in the team, so the hub paused this trigger."
     if role_of(agent) not in ("worker", "lead") or reports_to(agent) != manager_name():
@@ -16151,12 +16472,6 @@ def trigger_decision(t, manual, due, t0):
                  (last["id"],)) if last else None
     if unknown:
         return "not_started", f"O-{unknown['id']} of {tref(last['id'])} is unknown. Settle it first."
-    mine = trigger_tasks_24h(t["id"], t0)
-    if mine >= t["max_tasks_per_day"]:
-        return "not_started", f"This trigger started {mine} tasks in the last 24 hours (limit {t['max_tasks_per_day']})."
-    fleet, cap = trigger_tasks_24h(None, t0), trigger_fleet_limit()
-    if fleet >= cap:
-        return "not_started", f"Trigger tasks reached the fleet limit: {fleet} in the last 24 hours (limit {cap})."
     try:            # the create_task rules for a task that the manager requests: capability, goal, login text
         return None, check_task(manager_name(), {"owner": agent, "title": task["title"], "details": task["details"],
                                                  "done_when": task["done_when"], "needs": task["needs"],
@@ -16179,7 +16494,7 @@ def run_trigger(t, due, manual, t0):
                          "VALUES(?,?,?,?,?,?,?,?)", (t["id"], t["revision"], due, int(manual), state or "started",
                                                      info if state else None, t0, t0)).lastrowid
         if state is None:
-            line = trigger_provenance(t, run, due, manual)
+            line = trigger_provenance(t, run, due, manual, t0=t0)
             tid = admit_task(manager_name(), dict(info, details=f"{info['details']}\n\n{line}" if info["details"]
                                                   else line), trigger_id=t["id"], trigger_run=run)
             DB.execute("UPDATE trigger_runs SET task=? WHERE id=?", (tid, run))
@@ -16194,10 +16509,7 @@ def run_trigger(t, due, manual, t0):
 def run_wake(t, due, manual, t0):
     """One prompt run of an agent's rule, as run_trigger: the run, what it starts and the next due time commit
     together. A stale rule starts nothing, and the hub pauses it."""
-    if not manual and t0 - due >= (t["late_minutes"] + 1) * 60:
-        state, reason, admission, pause = "missed", (f"The hub did not run this at its time. It was {span(t0 - due)} "
-                                                     f"late; the limit is {t['late_minutes']} minutes."), None, None
-    elif t["agent"] not in agents():
+    if t["agent"] not in agents():
         state, reason, admission = "not_started", f"{t['agent']} is no longer in the team, so the hub paused this trigger.", None
         pause = f"{t['agent']} is no longer in the team."
     else:
@@ -16207,7 +16519,7 @@ def run_wake(t, due, manual, t0):
         run = DB.execute("INSERT INTO trigger_runs(trigger_id,revision,due,manual,state,reason,created,finished) "
                          "VALUES(?,?,?,?,?,?,?,?)", (t["id"], t["revision"], due, int(manual), state, reason, t0, t0)).lastrowid
         if state == "started":
-            task, event, parent = admit_wake(t, run, admission, trigger_provenance(t, run, due, manual), t0)
+            task, event, parent = admit_wake(t, run, admission, trigger_provenance(t, run, due, manual, t0=t0), t0)
             DB.execute("UPDATE trigger_runs SET task=?, event_id=?, parent_task=? WHERE id=?", (task, event, parent, run))
         if pause:
             pause_trigger(t["id"], "hub", pause, t0)
@@ -16224,9 +16536,12 @@ CHECK_OPS = {">": "more than", ">=": "at least", "<": "less than", "<=": "at mos
              "!=": "not equal to"}
 CHECK_SOURCE_MAX = 65536        # bytes of one check file
 CHECK_ARGS_MAX = 4096           # bytes of a check's fixed arguments, as compact UTF-8 JSON
-CHECK_RETRY = 900               # seconds before a waiting check run is tried again, on fresh data
-CHECK_GRACE = 120               # seconds after a check's timeout before its claim expires
-CHECK_FAILURES = 5              # check errors in a row before the hub pauses the trigger
+# plan C12: no claim expires and no error count pauses a rule. A check runs until it answers or its author's own
+# timeout; a run that its helper lost is sent once more; one machine runs at most CHECK_SLOTS checks at a time.
+CHECK_TIMEOUT_MAX = 10 ** 7     # seconds: the author's own timeout; this only keeps the number a number
+CHECK_SLOTS = 4                 # check runs in flight on one runner, as the helper's own slots (fleet.CHECK_SLOTS)
+CHECK_BUSY_RETRY = 60           # seconds before a run that its helper answered busy is sent again
+CHECK_RUNS = "check_runs"       # the helper feature: it lists its running check runs in each poll
 CATALOG_MAX = 2 * 1024 * 1024   # the app's limit for one answer
 OPEN_RUN = ("waiting", "sent")
 
@@ -16302,9 +16617,10 @@ def check_rules(value):
             or cond["op"] not in CHECK_OPS or not finite(cond["value"]):
         raise ValueError("check.condition must be {op, value}: op >, >=, <, <=, == or !=, and a finite number")
     repeat = value["repeat_minutes"]
-    return {"args": args, "timeout_seconds": whole(value.get("timeout_seconds", 30), 1, 60, "check.timeout_seconds"),
+    return {"args": args, "timeout_seconds": whole(value.get("timeout_seconds", 30), 1, CHECK_TIMEOUT_MAX,
+                                                   "check.timeout_seconds"),
             "condition": {"op": cond["op"], "value": cond["value"]},
-            "repeat_minutes": None if repeat is None else whole(repeat, 0, 10080, "check.repeat_minutes")}
+            "repeat_minutes": None if repeat is None else whole(repeat, 0, EVERY_MAX, "check.repeat_minutes")}
 
 
 def kit_blob(obj):
@@ -16460,12 +16776,6 @@ def wakes_24h(t, t0):
               (t["id"], t0 - 86400))["n"]
 
 
-def fleet_wakes_24h(t0):
-    """Trigger tasks and trigger messages to the manager of the whole fleet in the last 24 hours."""
-    return trigger_tasks_24h(None, t0) + q1("SELECT COUNT(*) n FROM trigger_runs WHERE state='started' AND "
-                                            "event_id IS NOT NULL AND finished>?", (t0 - 86400,))["n"]
-
-
 def wake_goal(t, task):
     """(goal reference, goal id) of a wake-up: its linked goal must be active (not paused, done, dropped or past its
     money budget). ToolError otherwise."""
@@ -16517,9 +16827,8 @@ def wake_decision(t, r, value, manual, t0, due=None):
         state, reason = wakeups.manager_decision({
             "check": check, "matches": check and check_matches(spec["condition"], value),
             "check_now": bool(check and r["check_now"]), "repeat_minutes": spec["repeat_minutes"] if spec else None,
-            "last": last, "quiet_after": quiet, "started_24h": wakes_24h(t, t0), "max_per_day": t["max_tasks_per_day"],
-            "fleet_24h": fleet_wakes_24h(t0), "fleet_cap": trigger_fleet_limit(),
-            "limit_until": limit["until"] if limit else None, "t0": t0}, wake_when(t))
+            "last": last, "quiet_after": quiet, "limit_until": limit["until"] if limit else None, "t0": t0},
+            wake_when(t))
         if state == "started":              # after the quiet rule: a check that does not match stays quiet
             try:
                 wake_goal(t, task)
@@ -16546,12 +16855,6 @@ def wake_decision(t, r, value, manual, t0, due=None):
                  (done["id"],)) if done else None
     if unknown:
         return wait, f"O-{unknown['id']} of {tref(done['id'])} is unknown. Settle it first.", None, None
-    mine = wakes_24h(t, t0)
-    if mine >= t["max_tasks_per_day"]:
-        return wait, f"This trigger started {mine} wake-ups in the last 24 hours (limit {t['max_tasks_per_day']}).", None, None
-    fleet, cap = fleet_wakes_24h(t0), trigger_fleet_limit()
-    if fleet >= cap:
-        return wait, f"Triggers reached the fleet limit: {fleet} in the last 24 hours (limit {cap}).", None, None
     limit = active_limit(t["agent"])
     if check and limit:
         return "waiting", f"{t['agent']} is at its usage limit until {clock(limit['until'])}.", None, None
@@ -16622,12 +16925,6 @@ def check_decision(t, r, value, t0):
                  (last["id"],)) if last else None
     if unknown:
         return "waiting", f"O-{unknown['id']} of {tref(last['id'])} is unknown. Settle it first.", None
-    mine = trigger_tasks_24h(t["id"], t0)
-    if mine >= t["max_tasks_per_day"]:
-        return "waiting", f"This trigger started {mine} tasks in the last 24 hours (limit {t['max_tasks_per_day']}).", None
-    fleet, cap = trigger_tasks_24h(None, t0), trigger_fleet_limit()
-    if fleet >= cap:
-        return "waiting", f"Trigger tasks reached the fleet limit: {fleet} in the last 24 hours (limit {cap}).", None
     lim = active_limit(agent)
     if lim:
         return "waiting", f"{agent} is at its usage limit until {clock(lim['until'])}.", None
@@ -16667,17 +16964,11 @@ def check_body(data):
             raise ValueError("error must be a code of a-z and _")
         body.update(error=data["error"], detail=text.get("detail", ""))
         if "retry_after" in data:
-            body["retry_after"] = whole(data["retry_after"], 60, 86400, "retry_after")
+            body["retry_after"] = whole(data["retry_after"], 1, CHECK_TIMEOUT_MAX, "retry_after")
     if secret_hit(*text.values()):
         body = dict({k: body[k] for k in ("token", "elapsed_ms") if k in body}, ok=False, error="blocked",
                     detail="The check output contained a registered login.")
     return body
-
-
-def check_closes(t, due):
-    """The end of a scheduled check run's window: late_minutes whole minutes after its due time, as for prompt runs,
-    and never after the trigger's next due time."""
-    return min([due + (t["late_minutes"] + 1) * 60] + trigger_slots(json.loads(t["schedule"]), t["anchor"], due, 1))
 
 
 def end_open_runs(trigger_id, why, t0):
@@ -16722,11 +17013,13 @@ def dispatch_check(t, run, t0):
     event wakes no model."""
     in_transaction("dispatch_check")
     spec = json.loads(t["check_spec"])
-    token, expires = str(uuid.uuid4()), t0 + spec["timeout_seconds"] + CHECK_GRACE
+    token = str(uuid.uuid4())
     generation = DB.execute("SELECT v FROM kv WHERE k='db_id'").fetchone()
-    DB.execute("UPDATE trigger_runs SET state='sent', token=?, sent=?, expires=?, attempts=attempts+1, retry_at=NULL, "
-               "reason=NULL, result_body=NULL, answer=NULL WHERE id=?", (token, t0, expires, run))
-    extra = {"trigger": t["id"], "run": run, "token": token, "expires": expires, "sha256": spec["sha256"],
+    DB.execute("UPDATE trigger_runs SET state='sent', token=?, sent=?, expires=NULL, attempts=attempts+1, retry_at=NULL, "
+               "reason=NULL, blocked_task=NULL, result_body=NULL, answer=NULL WHERE id=?", (token, t0, run))
+    # plan C12: no claim expires; the run's earlier event, of a send that its helper lost, goes
+    DB.execute("DELETE FROM events WHERE kind='trigger_check' AND json_extract(extra, '$.run')=?", (run,))
+    extra = {"trigger": t["id"], "run": run, "token": token, "sha256": spec["sha256"],
              "args": spec["args"], "timeout_seconds": spec["timeout_seconds"],
              "generation": generation[0] if generation else None}
     extra.update({"code": "saved"} if spec.get("code") == "saved" else {"path": spec["path"], "commit": spec["commit"]})
@@ -16744,22 +17037,20 @@ def check_feature(t):
 
 
 def open_check_run(t, due, t0):
-    """A due time of a check trigger: one waiting run, which the sweep sends when it can. A newer due time ends the
-    trigger's open scheduled run, so there is at most one."""
+    """A due time of a check trigger: one waiting run, which the sweep sends when it can (plan C12: no window ends
+    it). One run is in flight at a time: a due time that comes while a run is with its helper joins that run, and a
+    newer due time replaces a run that still waits, so there is at most one."""
     later = trigger_slots(json.loads(t["schedule"]), t["anchor"], max(due, t0), 1)
-    closes = check_closes(t, due)
-    late = (f"The hub did not run this at its time. It was {span(t0 - due)} late; the limit is "
-            f"{t['late_minutes']} minutes.") if t0 >= closes else None
     with transaction():
-        DB.execute("UPDATE trigger_runs SET state='missed', reason='A newer due time replaced it.', retry_at=NULL, "
-                   "finished=? WHERE trigger_id=? AND check_now=0 AND state IN ('waiting','sent')", (t0, t["id"]))
-        DB.execute("INSERT INTO trigger_runs(trigger_id,revision,due,manual,check_now,state,reason,created,retry_at,"
-                   "closes,finished) VALUES(?,?,?,0,0,?,?,?,?,?,?)",
-                   (t["id"], t["revision"], due, "missed" if late else "waiting", late, t0, None if late else due,
-                    closes, t0 if late else None))
+        flying = DB.execute("SELECT id FROM trigger_runs WHERE trigger_id=? AND check_now=0 AND state='sent'",
+                            (t["id"],)).fetchone()
+        if not flying:
+            DB.execute("UPDATE trigger_runs SET state='missed', reason='A newer due time replaced it.', retry_at=NULL, "
+                       "blocked_task=NULL, finished=? WHERE trigger_id=? AND check_now=0 AND state='waiting'",
+                       (t0, t["id"]))
+            DB.execute("INSERT INTO trigger_runs(trigger_id,revision,due,manual,check_now,state,created,retry_at) "
+                       "VALUES(?,?,?,0,0,'waiting',?,?)", (t["id"], t["revision"], due, t0, due))
         DB.execute("UPDATE triggers SET next_due=? WHERE id=?", (later[0] if later else None, t["id"]))
-        if late:
-            once_done(t)
 
 
 def send_check(r, t0):
@@ -16767,12 +17058,6 @@ def send_check(r, t0):
     it as missed when its window has closed."""
     t = trigger_row(r["trigger_id"])
     agent = t["agent"]
-    if t0 >= r["closes"]:
-        with transaction():
-            DB.execute("UPDATE trigger_runs SET state='missed', reason=?, retry_at=NULL, finished=? WHERE id=?",
-                       (r["reason"] or "The check did not run in time.", t0, r["id"]))
-            once_done(t)
-        return
     stale = None
     if agent not in agents():
         stale = (f"{agent} is no longer in the team, so the hub paused this trigger.", f"{agent} is no longer in the team.")
@@ -16790,12 +17075,20 @@ def send_check(r, t0):
         why = f"{runner} is offline."
     elif check_feature(t) not in helper_features(runner):
         why = f"{runner}'s helper cannot run {'saved ' if check_feature(t) == 'trigger_code' else ''}checks yet. Update Fleet on that machine."
+    elif checks_in_flight(runner) >= CHECK_SLOTS:       # plan C12: busy is no error, and the run waits its turn
+        why = f"busy: {CHECK_SLOTS} checks run on {runner}'s machine now."
     else:
         with transaction():
             dispatch_check(t, r["id"], t0)
         return
     if why != r["reason"]:                  # it stays waiting: the next tick tries again
         q("UPDATE trigger_runs SET reason=? WHERE id=?", (why, r["id"]))
+
+
+def checks_in_flight(runner):
+    """The check runs that are with this runner's helper now (plan C12: at most CHECK_SLOTS)."""
+    return sum(1 for r in q("SELECT t.* FROM trigger_runs r JOIN triggers t ON t.id=r.trigger_id WHERE r.state='sent'")
+               if runner_of(r) == runner)
 
 
 def check_now(t, t0, command=None):
@@ -16823,14 +17116,25 @@ def check_now(t, t0, command=None):
 
 
 def check_result(t, r, body, t0, stored=None):
-    """Decide one check result: a helper's body, or the hub's own error for an expired claim (stored None). The run, a
-    started task, the trigger's failure count and the stored body and answer commit together. Every valid value ends
-    a series of errors, also a value that a limit or the repeat rule blocks. Returns the answer."""
+    """Decide one check result: a helper's body, or the hub's own error for a run that its helper lost twice (stored
+    None). The run, a started task, the trigger's failure count and the stored body and answer commit together.
+    Every valid value ends a series of errors, also a value that the repeat rule blocks. Returns the answer.
+
+    Plan C12: no clock and no count ends a rule. A series of errors pauses nothing: it shows as "failing since" until a
+    valid value comes. A run that waits says its one reason and goes on when that reason ends: at the reset of a usage
+    limit, when the task it waits for ends, at its own retry_after after an error, or at the next due time, which
+    replaces it. "busy" is no error: the run waits for a free slot on its machine. A quiet run takes the place of the
+    quiet run before it, so a frequent check that stays quiet keeps one row."""
     fields = admission = None
+    retry = blocked = None
     stale = wakeups.still_valid(wake_org(), trigger_view(t, t0)) if agent_rule(t) and t["agent"] in agents() else (True, None)
     if not stale[0]:                        # checked again at each result: a stale claim starts nothing
         failures, error, detail = t["failures"], None, None
         state, reason, pause = "not_started", stale[1], stale[1]
+    elif not body["ok"] and body["error"] == "busy":
+        failures, error, detail = t["failures"], None, None
+        state, reason, pause = "waiting", f"busy: {body.get('detail') or 'its machine runs four checks now'}.", None
+        retry = t0 + CHECK_BUSY_RETRY
     elif body["ok"] and agent_rule(t):
         failures, error, detail = 0, None, None
         state, reason, admission, pause = wake_decision(t, r, float(body["value"]), False, t0)
@@ -16841,19 +17145,32 @@ def check_result(t, r, body, t0, stored=None):
                  else None)
     else:
         failures, error, detail = t["failures"] + 1, body["error"], body.get("detail") or None
-        state, reason, pause = ("error" if r["check_now"] else "waiting"), f"The check failed: {error}.", None
-        if failures >= CHECK_FAILURES:
-            state, pause = "error", f"The check failed {failures} times in a row. The last error: {error}."
-    retry = None
-    if state == "waiting":              # a scheduled run tries again on fresh data, inside its window
-        retry = t0 + max(CHECK_RETRY, body.get("retry_after") or 0)
-        if retry >= r["closes"]:
-            state, retry = "missed", None
+        state, reason, pause = "error", f"The check failed: {error}.", None
+        if body.get("retry_after") and not r["check_now"]:      # its own time to try again, on fresh data
+            state, retry = "waiting", t0 + body["retry_after"]
+    if state == "waiting" and retry is None:
+        # the one thing it waits for: the reset of a usage limit, or the end of the rule's open task
+        spec_route = wakeups.wake_route(wake_org(), t["agent"])[0] if agent_rule(t) else None
+        lim = active_limit(spec_route["to"] if spec_route and spec_route["kind"] == "message" else t["agent"])
+        last = q1("SELECT id, state FROM tasks WHERE trigger_id=? ORDER BY id DESC LIMIT 1", (t["id"],))
+        if lim:
+            retry = lim["until"]
+        elif last and last["state"] not in TERMINAL:
+            blocked = last["id"]
+        else:
+            retry = rearm_at(t, t0)         # its repeat window, which ends at a known time
+            if retry is None and json.loads(t["schedule"])["kind"] == "once":      # nothing replaces it
+                state = "not_started"
+    fold = None
+    if state == "quiet" and not r["check_now"]:
+        prev = q1("SELECT id, state, check_now, created FROM trigger_runs WHERE trigger_id=? AND id<? ORDER BY id DESC "
+                  "LIMIT 1", (t["id"], r["id"]))
+        fold = prev if prev and prev["state"] == "quiet" and not prev["check_now"] else None
     answer, event, parent = {"decision": state, "task": None}, None, None
     with transaction():
         if state == "started":
             line = trigger_provenance(t, r["id"], r["due"], False,
-                                      (json.loads(t["check_spec"]), body["value"], body.get("summary") or ""))
+                                      (json.loads(t["check_spec"]), body["value"], body.get("summary") or ""), t0=t0)
             if admission:
                 answer["task"], event, parent = admit_wake(t, r["id"], admission, line, t0)
             else:
@@ -16861,10 +17178,15 @@ def check_result(t, r, body, t0, stored=None):
                                                                  if fields["details"] else line),
                                             trigger_id=t["id"], trigger_run=r["id"])
         DB.execute("UPDATE trigger_runs SET state=?, reason=?, task=?, value=?, summary=?, error=?, detail=?, "
-                   "retry_at=?, finished=?, result_body=?, answer=?, event_id=?, parent_task=? WHERE id=?",
+                   "retry_at=?, blocked_task=?, finished=?, result_body=?, answer=?, event_id=?, parent_task=? "
+                   "WHERE id=?",
                    (state, reason, answer["task"], body.get("value"), body.get("summary"), error, detail, retry,
-                    None if state in OPEN_RUN else t0, stored, json.dumps(answer) if stored else None, event, parent,
-                    r["id"]))
+                    blocked, None if state in OPEN_RUN else t0, stored, json.dumps(answer) if stored else None, event,
+                    parent, r["id"]))
+        if fold:            # one row for a series of quiet runs: it keeps the time the series began
+            DB.execute("UPDATE trigger_runs SET created=? WHERE id=?", (fold["created"], r["id"]))
+            DB.execute("DELETE FROM trigger_runs WHERE id=?", (fold["id"],))
+        DB.execute("DELETE FROM events WHERE kind='trigger_check' AND json_extract(extra, '$.run')=?", (r["id"],))
         DB.execute("UPDATE triggers SET failures=? WHERE id=?", (failures, t["id"]))
         if pause:
             pause_trigger(t["id"], "hub", pause, t0)
@@ -16873,10 +17195,47 @@ def check_result(t, r, body, t0, stored=None):
     return answer
 
 
+def rearm_at(t, t0):
+    """When a check rule that its repeat_minutes holds may start again: the end of its last wake-up plus that many
+    minutes, or None when no such time holds it now."""
+    repeat = (json.loads(t["check_spec"]) if t["check_spec"] else {}).get("repeat_minutes")
+    if repeat is None:
+        return None
+    if agent_rule(t):
+        last, _ = wake_last(t)
+        ended = last["ended_at"] if last and not last["open"] else None
+    else:
+        row = q1("SELECT state, delivered, last_activity FROM tasks WHERE trigger_id=? ORDER BY id DESC LIMIT 1",
+                 (t["id"],))
+        ended = (row["delivered"] or row["last_activity"]) if row and row["state"] == "completed" else None
+    again = ended + repeat * 60 if ended else None
+    return again if again and again > t0 else None
+
+
+def lost_checks(runner, running, t0):
+    """The check runs that a helper holds, from its poll (helper feature check_runs). A run that it acked, that this
+    list leaves out and that has no result, was lost: a helper that started again does not run it. It is sent once
+    more; a second loss ends it as an error (plan C12). Called with LOCK held."""
+    for r in q("SELECT r.* FROM trigger_runs r JOIN events e ON e.kind='trigger_check' AND "
+               "json_extract(e.extra, '$.run')=r.id WHERE r.state='sent' AND r.result_body IS NULL AND "
+               "e.agent=? AND e.helper_ack IS NOT NULL AND e.helper_ack < ?", (runner, t0)):
+        if r["id"] in running:
+            continue
+        t = trigger_row(r["trigger_id"])
+        if kv_get(f"check_lost:{r['id']}") or r["check_now"]:
+            check_result(t, r, {"ok": False, "error": "lost", "detail": f"{runner}'s helper lost it twice."}, t0)
+            kv_set(f"check_lost:{r['id']}", None)
+        else:
+            kv_set(f"check_lost:{r['id']}", t0)
+            q("UPDATE trigger_runs SET state='waiting', retry_at=?, reason=? WHERE id=?",
+              (t0, f"{runner}'s helper lost it; it is sent once more.", r["id"]))
+        log("hub", f"check run {r['id']} of trigger {t['id']} was lost on {runner}")
+
+
 def trigger_sweep(t0):
     """Due triggers, in the hub tick: one run for the latest due time, then the next due time in the future. Missed
-    times make no backlog. Check runs go to their helper, or wait inside their window (owner API 1.8). Only database
-    work happens here, while the tick holds the lock."""
+    times make no backlog, and the run says how late it is. Check runs go to their helper, or wait for the one thing
+    they wait for (owner API 1.8, plan C12). Only database work happens here, while the tick holds the lock."""
     def each(rows, act):
         for row in rows:
             try:
@@ -16891,10 +17250,10 @@ def trigger_sweep(t0):
         else:
             run_trigger(t, at, False, t0)
 
-    each(q("SELECT * FROM trigger_runs WHERE state='sent' AND expires<?", (t0,)),
-         lambda r: check_result(trigger_row(r["trigger_id"]), r, {
-             "ok": False, "error": "expired", "detail": "The helper sent no result before the claim expired."}, t0))
     each(q("SELECT * FROM triggers WHERE state='active' AND next_due<=? ORDER BY next_due, id", (t0,)), due)
+    # plan C12: a run that waits for a task goes on when that task ends
+    q(f"UPDATE trigger_runs SET retry_at=?, blocked_task=NULL WHERE state='waiting' AND blocked_task IN "
+      f"(SELECT id FROM tasks WHERE state IN ({','.join(repr(s) for s in TERMINAL)}))", (t0,))
     each(q("SELECT * FROM trigger_runs WHERE state='waiting' AND retry_at<=? ORDER BY id", (t0,)),
          lambda r: send_check(r, t0))
 
@@ -17259,7 +17618,6 @@ def manager_held(name):
     return role_of(name) == "manager" and kv_get("switching:" + name) is not None
 
 
-SWITCH_STALL = 600          # seconds after which a manager switch that has not finished becomes the owner's warning
 MANAGER_FLAG_QUIET = ("switching",)    # manager flags that show everywhere and notify nobody (a normal switch)
 
 
@@ -17366,10 +17724,9 @@ def switch_rules(name, a, to):
     """The enabled rules whose saved check this agent runs and that would stop on `to`: with the existing wake-up
     grant (wakeups.execution_grant), the agent runs saved code now and would not after the switch. Their next run
     would pause them, so the owner pauses each one or names another runner first. Other rules keep working."""
-    feats = helper_features(name)
     policy = switch_policy(a, to)
     new = dict({k: v for k, v in a.items() if k not in ("start", "allow")}, runtime=to, **policy)
-    if not wakeups.execution_grant(a, feats)[0] or wakeups.execution_grant(new, feats)[0]:
+    if not wakeups.execution_grant(a)[0] or wakeups.execution_grant(new)[0]:
         return []
     return [t["id"] for t in q("SELECT id, agent, check_spec FROM triggers WHERE state='active' ORDER BY id")
             if ((json.loads(t["check_spec"]) if t["check_spec"] else None) or {}).get("code") == "saved"
@@ -17528,6 +17885,9 @@ def reminder_sweep(t0):
         if r["task"] and (not t or t["state"] in TERMINAL):
             q("UPDATE reminders SET done=1 WHERE id=?", (r["id"],))     # the task ended; nothing to come back to
             continue
+        if r["goal"] and not q1("SELECT 1 FROM goals WHERE id=? AND state IN ('active','paused')", (r["goal"],)):
+            q("UPDATE reminders SET done=1 WHERE id=?", (r["id"],))     # the goal closed; nothing to look at again
+            continue
         if t and (active_hold(t["id"]) or active_limit(t["owner"])):
             continue            # held work and an agent at its usage limit wait; the reminder waits with them
         note = (f"Reminder R-{r['id']}: {r['note']}"
@@ -17537,15 +17897,12 @@ def reminder_sweep(t0):
             event = attempt_event(t, note)      # outside the transaction: the start text reads, and a read commits
             with transaction():
                 DB.execute("UPDATE reminders SET done=1, fired=? WHERE id=?", (t0, r["id"]))
-                came_back(t["id"], t0)
                 attempt_rows(t, "reminder", event, t0, counted=False)
             log("hub", f"reminder R-{r['id']} brought {agent} back to {tref(t['id'])} in a new session")
             continue
         filed = filed_under(agent, "say", r["task"])
         with transaction():
             DB.execute("UPDATE reminders SET done=1, fired=? WHERE id=?", (t0, r["id"]))
-            if t:
-                came_back(t["id"], t0)
             event_rows([(agent, "say", filed, "[hub] " + note, None)], t0)
         log("hub", f"reminder R-{r['id']} delivered to {agent}")
 
@@ -17567,14 +17924,6 @@ def unfile_notices(task_id):
     (waiting_say_rows). Committing: its callers end a task with q()."""
     q("UPDATE events SET task=NULL WHERE task=? AND kind='say' AND read_at IS NULL AND "
       "json_extract(extra, '$.duty') IS NOT NULL", (task_id,))
-
-
-def came_back(task_id, t0):
-    """Inside the caller's transaction: the silence clock of a task the hub has just brought back starts now. The
-    work was quiet because its own agent said when to come back to it, so the quiet before this moment is not
-    silence -- without this the task is nudged on the same tick that ends its wait."""
-    in_transaction("came_back")
-    DB.execute("UPDATE tasks SET last_activity=?, nudge_level=0, nudged_at=NULL WHERE id=?", (t0, task_id))
 
 
 def liveness(t0):
@@ -17664,16 +18013,20 @@ def liveness(t0):
                                f"restarting it on {owner}" + ("" if young else " (not counted: it was not a crash loop)"))
                 elif t["restarts"] == SESSION_RESTARTS:
                     q("UPDATE tasks SET restarts=? WHERE id=?", (SESSION_RESTARTS + 1, tid))
-                    emit(t["requester"], "say", f"[hub] {tref(tid)} has no running session on {owner} after "
-                         f"{SESSION_RESTARTS} restarts. This one was lost within {span(SESSION_YOUNG)} of its own "
-                         f"start, and a session that keeps dying that young says the start is failing and not the "
-                         f"work: {owner}'s runtime may be signed out, or its session may be failing to start. "
-                         f"Decide what to do.", task=tid)
-        elif not t["stall_told"] and t0 - (t["stalled_since"] or t0) >= CFG.get("silence", 180):
+                    stuck_told(tid, emit(t["requester"], "say", f"[hub] {tref(tid)} has no running session on {owner} "
+                                         f"after {SESSION_RESTARTS} restarts. This one was lost within "
+                                         f"{span(SESSION_YOUNG)} of its own start, and a session that keeps dying that "
+                                         f"young says the start is failing and not the work: {owner}'s runtime may be "
+                                         f"signed out, or its session may be failing to start. Decide what to do.",
+                                         task=tid))
+        elif not t["stall_told"]:
+            # plan C10: told at the label flip, once. The manager's own notice of the machine names its tasks
+            # (offline_sweep), so a task it requested gets none of its own.
             q("UPDATE tasks SET stall_told=1, nudge_level=2 WHERE id=?", (tid,))
-            emit(t["requester"], "say", f"[hub] {tref(tid)} ({t['title']}, owner {owner}) has no live path: {reason}. "
-                 f"It is still {t['state']}. Decide what to do: wait, cancel it and give it to another worker, "
-                 f"or raise a Needs-you item.", task=tid)
+            if t["requester"] != manager_name():
+                stuck_told(tid, emit(t["requester"], "say", f"[hub] {tref(tid)} ({t['title']}, owner {owner}) has no "
+                                     f"live path: {reason}. It is still {t['state']}. Decide what to do: wait, cancel "
+                                     f"it and give it to another worker, or raise a Needs-you item.", task=tid))
             log("hub", f"{tref(tid)} has no live path: {reason}")
 
 
@@ -17718,10 +18071,10 @@ def session_lost(t, t0):
     if counted and t["restarts"] + 1 >= LOST_IN_A_ROW:
         if t["restarts"] < LOST_IN_A_ROW:
             q("UPDATE tasks SET restarts=? WHERE id=?", (LOST_IN_A_ROW, tid))
-            emit(t["requester"], "say", f"[hub] {tref(tid)} ({t['title']}) lost its session on {owner} {LOST_IN_A_ROW} "
-                 f"times in a row, and each left nothing to start from" + (f": {why}" if why else "") + ". The hub "
-                 f"starts it no more by itself. Fix the cause, then restart_task starts it again; or cancel it.",
-                 task=tid)
+            stuck_told(tid, emit(t["requester"], "say", f"[hub] {tref(tid)} ({t['title']}) lost its session on {owner} "
+                                 f"{LOST_IN_A_ROW} times in a row, and each left nothing to start from"
+                                 + (f": {why}" if why else "") + ". The hub starts it no more by itself. Fix the "
+                                 f"cause, then restart_task starts it again; or cancel it.", task=tid))
             log("hub", f"{tref(tid)} on {owner} was lost {LOST_IN_A_ROW} times in a row; no more restarts")
         return
     if not counted:
@@ -17737,7 +18090,6 @@ def session_lost(t, t0):
              extra=QUIET_SAY)
 
 
-OFFLINE_RETELL = 1800      # seconds: a machine that goes offline again within this time is not reported again
 # What a queued event of an agent is, for the requester that is told it waits behind its helper's step (plan C2).
 QUEUED_WORK = {"task": "start", "stop": "stop", "control": "pause or stop", "say": "message"}
 
@@ -17764,6 +18116,12 @@ def presence_ping(agent, step, task, since, t0):
         abs(float(was.get("since") or 0) - since) < PRESENCE_SAME
     p = {"step": step, "task": task, "since": was["since"] if same else since, "at": t0,
          "told": was.get("told") or [] if same else []}
+    if same and agent == manager_name():
+        # plan C10: a message that waits for the manager was queued before the ping before this one, and the helper
+        # is still inside the same step, so nothing types it: the manager's flag says so
+        p["blocked"] = bool(q1("SELECT 1 FROM events WHERE agent=? AND kind='say' AND read_at IS NULL AND created<? "
+                               "AND NOT COALESCE(json_extract(extra, '$.quiet'), 0) LIMIT 1",
+                               (agent, float(was.get("at") or t0))))
     if same and agent != manager_name():
         queued = q("SELECT task, kind, extra FROM events WHERE agent=? AND task IS NOT NULL AND created<? AND "
                    "helper_ack IS NULL AND read_at IS NULL AND kind IN ('task','stop','control','say') ORDER BY id",
@@ -17782,12 +18140,25 @@ def presence_ping(agent, step, task, since, t0):
             log("hub", f"{agent}'s helper is inside {step}: {tref(t['id'])} waits behind it")
     with area("quiet"):
         kv_set("presence:" + agent, json.dumps(p))
+    if agent == manager_name() and bool(p.get("blocked")) != bool(isinstance(was, dict) and was.get("blocked")):
+        manager_flag_update(t0)
+
+
+def machine_news(name, since):
+    """True when something happened on this agent's machine after `since` (plan C10): new work went to it, an attempt
+    of its tasks came up, or one of its tasks ended. Its helper coming back is no news: a flapping machine is one."""
+    return bool(q1("SELECT 1 FROM tasks WHERE owner=? AND (created>? OR delivered>?) LIMIT 1", (name, since, since)) or
+                q1("SELECT 1 FROM attempts a JOIN tasks t ON t.id=a.task WHERE t.owner=? AND a.started>? LIMIT 1",
+                   (name, since)))
 
 
 def offline_sweep(t0):
-    """A worker or lead whose helper stops checking in wakes the manager once per offline episode (spec: the manager
-    wakes on a machine going offline). A machine that never checked in is not going offline. Silence counts from the
-    hub's own start at the earliest (quiet_for), so a hub that was down reports nobody for that time."""
+    """A worker or lead whose helper stops checking in tells the manager once per offline episode, at the label flip
+    (spec: the manager wakes on a machine going offline). It wakes the manager when something happened on that machine
+    since its last notice, or at its first one; a machine that goes offline again with nothing in between is a quiet
+    message (plan C10, in place of a 30-minute mute). A machine that never checked in is not going offline. Silence
+    counts from the hub's own start at the earliest (quiet_for), so a hub that was down reports nobody for that time.
+    The notice names the machine's open tasks, so a task that the manager requested gets no notice of its own."""
     grace = CFG.get("offline_after", 90)
     mgr = manager_name()
     for name, conf in agents().items():
@@ -17798,19 +18169,25 @@ def offline_sweep(t0):
         if not seen or quiet_for(seen, t0) <= grace:
             continue
         told = float(kv_get("offline_told:" + name) or 0)
-        if told >= seen or t0 - told < OFFLINE_RETELL:
-            continue                    # this episode was reported, or a flapping machine was reported just now
+        if told >= seen:
+            continue                    # this episode was reported
         kv_set("offline_told:" + name, t0)
-        tasks = [tref(r["id"]) for r in q(f"SELECT id FROM tasks WHERE owner=? AND {OPEN_TASK} ORDER BY id", (name,))]
+        open_tasks = q(f"SELECT id, requester FROM tasks WHERE owner=? AND {OPEN_TASK} ORDER BY id", (name,))
+        tasks = [tref(r["id"]) for r in open_tasks]
         waiting = [f"{tref(r['sender_task'])} (AM-{r['id']})" for r in q(   # plan C8: the tasks that wait on it
             "SELECT id, sender_task FROM agent_messages WHERE recipient=? AND waits=1 AND wait_end IS NULL ORDER BY id",
             (name,))]
-        emit(mgr, "say", f"[hub] {name}'s machine went offline: its helper last checked in at {clock(seen)}. "
-             f"Its open tasks: {', '.join(tasks) or 'none'}. " +
-             (f"Waiting for its answer: {', '.join(waiting)}. " if waiting else "") +
-             f"Give it no new work until it checks in again; the hub keeps its tasks and reports any that lose their "
-             f"live path.")
-        log("hub", f"{name} went offline (last check-in {clock(seen)}); the manager was told")
+        quiet = bool(told) and not machine_news(name, told)
+        event = emit(mgr, "say", f"[hub] {name}'s machine went offline: its helper last checked in at {clock(seen)}. "
+                     f"Its open tasks: {', '.join(tasks) or 'none'}. " +
+                     (f"Waiting for its answer: {', '.join(waiting)}. " if waiting else "") +
+                     f"Give it no new work until it checks in again; the hub keeps its tasks and reports any that "
+                     f"lose their live path.", extra=QUIET_SAY if quiet else None)
+        for r in open_tasks:
+            if r["requester"] == mgr:
+                stuck_told(r["id"], event)
+        log("hub", f"{name} went offline (last check-in {clock(seen)}); the manager was told"
+                   + (" quietly: nothing happened on it since its last notice" if quiet else ""))
 
 
 # How long the hub's own timers may be silent before the owner's screen asks about them (tick_heartbeat). A pass
@@ -17821,8 +18198,9 @@ TICK_WARN = 60
 
 def manager_flag_update(t0):
     """The manager's own warning (`mgr_flag`), which the hub tells the owner itself. The tick runs it, and so do the
-    moments its inputs change — the manager's status report and its window list — so the banner follows at once and
-    not at the next tick (live_changes)."""
+    moments its inputs change — the manager's status report, its window list, its helper's presence and its screen —
+    so the banner follows at once and not at the next tick (live_changes). Every kind rests on a fact and none on a
+    message's age (plan C10): a long healthy turn of the manager raises nothing."""
     mgr = manager_name()
     if not mgr:
         return
@@ -17833,10 +18211,22 @@ def manager_flag_update(t0):
         pending = q1("SELECT MIN(created + COALESCE(json_extract(extra, '$.wake_after'), 0)) ts FROM events "
                      "WHERE agent=? AND kind='say' AND read_at IS NULL AND (NOT COALESCE(json_extract(extra, "
                      "'$.quiet'), 0) OR json_extract(extra, '$.wake_after') IS NOT NULL)", (mgr,))["ts"]
-        if pending and t0 - max(float(pending), limit_ended(mgr), switch_ended(mgr)) > CFG["manager_silence"]:
-            kind = "silent"
-            flag = (f"The manager has not acted on a message for {span(t0 - float(pending))}. "
-                    f"Open its session.")
+        pending = float(pending) if pending is not None and float(pending) <= t0 else None
+        row = q1("SELECT * FROM agents WHERE name=?", (mgr,))
+        quiet = quiet_for(row["last_seen"], t0) if row else None
+        online = quiet is not None and quiet < CFG.get("offline_after", 90)
+        if pending:
+            # Its helper told it the line twice, at two idle points, and it took neither (C5's untaken report).
+            untaken = float(kv_get(f"untaken:{mgr}:manager") or 0)
+            read = q1("SELECT MAX(read_at) m FROM events WHERE agent=?", (mgr,))["m"] or 0
+            step = presence_of(mgr, t0)
+            if untaken >= pending and untaken > max(read, limit_ended(mgr), switch_ended(mgr)):
+                kind = "silent"
+                flag = "The manager did not take a message that its helper told it twice. Open its session."
+            elif online and step and step.get("blocked"):
+                kind = "silent"
+                flag = (f"The manager's helper is inside one step ({step['step']}) since {clock(step['since'])}, and "
+                        f"a message waits behind it. Look at its machine.")
         lim = active_limit(mgr)
         if lim:
             kind = "limited"
@@ -17844,31 +18234,38 @@ def manager_flag_update(t0):
                     + ("." if lim["reset_known"] else ", one hour after the limit was seen, because no reset time was given.")
                     + " If its session shows the rate-limit menu, answer it on that machine. The helper never answers it.")
         asks, shown = kv_get("mgr_screen"), kv_get("mgr_screen_shown")
-        if shown or (asks and t0 - float(asks) < 90):
+        if shown or asks:           # it stays until the question goes or the manager reads (plan C10: no 90 s life)
             kind = "screen"
             flag = "The manager's session shows a question on its own screen. Open its session and answer it."
-        row = q1("SELECT * FROM agents WHERE name=?", (mgr,))
-        quiet = quiet_for(row["last_seen"], t0) if row else None
         # A window list from before the end of a switch can still lack the new session's window (switch_ended).
-        if listed(row) and quiet is not None and quiet < CFG.get("offline_after", 90) and \
-                "manager" not in (row["alive"] or "").split(",") and row["alive_ts"] > switch_ended(mgr):
+        if listed(row) and online and "manager" not in (row["alive"] or "").split(",") and \
+                row["alive_ts"] > switch_ended(mgr):
             kind = "down"
             flag = "The manager session is not running. Start it again."
+        elif row and row["last_seen"] and not online and pending:
+            kind = "down"
+            flag = (f"The manager's machine stopped checking in at {clock(row['last_seen'])}, and a message waits for "
+                    f"it. Look at that machine.")
         # Signed out, it can do nothing, so its silence, a question on its screen, a stopped session or an old limit
         # only show what that looks like, and the sign-in is the step (the owner, 25 October 2026). A switch keeps
         # its own words below.
-        if not local_model(agents()[mgr]) and signed_in_now(mgr, agents()[mgr].get("runtime")) is False:
+        signed_out = not local_model(agents()[mgr]) and signed_in_now(mgr, agents()[mgr].get("runtime")) is False
+        if signed_out:
             kind = "signed_out"
             flag = "The manager is not signed in."
-        # Its runtime switch waits for the new session: no reader yet, so neither down nor silent. A usage limit or a
-        # question of the new session still shows, and a switch that does not finish becomes a warning of its own.
-        if manager_held(mgr) and kind in (None, "silent", "down", "signed_out"):
-            since, runtime = float(kv_get("switching:" + mgr)), agents()[mgr].get("runtime")
-            if t0 - since > SWITCH_STALL:
+        # Its runtime switch waits for the new session: no reader yet, so neither down nor silent. A usage limit of
+        # the new session still shows. A switch stalls on a fact (plan C10): a question on the old session's screen,
+        # a failed update of its machine, or a sign-out; otherwise it is the quiet switching, however long it takes.
+        if manager_held(mgr) and kind in (None, "silent", "down", "signed_out", "screen"):
+            runtime = agents()[mgr].get("runtime")
+            up = q1("SELECT state FROM machine_updates WHERE agent=?", (mgr,))
+            why = ("its previous session shows a question on its screen" if shown or asks else
+                   "the Fleet update of its machine failed" if up and up["state"] == "failed" else
+                   f"it is not signed in to {runtime}" if signed_out else None)
+            if why:
                 kind = "switch_stalled"
-                flag = (f"The manager's switch to {runtime} has not finished for {span(t0 - since)}, and its messages "
-                        "wait. Open its session on its machine: the previous session can wait for an answer there, or "
-                        "the new one does not run. If its Fleet update failed, update its machine in Fleet.")
+                flag = (f"The manager's switch to {runtime} cannot finish: {why}. Its messages wait. Open its session "
+                        f"on its machine, answer what it shows, sign it in, or update its machine in Fleet.")
             else:
                 kind = "switching"
                 flag = f"The manager switches to {runtime}. Its messages wait until its new session runs."
@@ -17876,14 +18273,18 @@ def manager_flag_update(t0):
             kv_set("mgr_flag_kind", kind)
             kv_set("mgr_flag", flag)
             kv_set("mgr_flag_since", t0 if kind else None)      # one episode per kind (manager_warning)
-            # "switching" is the normal middle of a runtime switch the owner asked for himself, and it ends by
-            # itself; the event is switch_stalled. So it shows on the board, in /ui/health and on the phone, and it
-            # wakes nobody.
-            if flag and kind not in MANAGER_FLAG_QUIET:
+            # One notification for each kind in one episode, which ends when the flag clears: a flag that turns from
+            # one kind to another and back rings once for each (plan C10). "switching" is the normal middle of a
+            # runtime switch the owner asked for himself, and it ends by itself; the event is switch_stalled. So it
+            # shows on the board, in /ui/health and on the phone, and it wakes nobody.
+            told = json.loads(kv_get("mgr_flag_told") or "[]") if kind else []
+            if flag and kind not in MANAGER_FLAG_QUIET and kind not in told:
+                told.append(kind)
                 emit("owner", "notify", f"Fleet hub: {flag}")
                 log("hub", f"told the owner: {flag}")
+            kv_set("mgr_flag_told", json.dumps(told) if told else None)
         elif flag:
-            kv_set("mgr_flag", flag)        # keep the minutes current
+            kv_set("mgr_flag", flag)        # keep the words current
             if not kv_get("mgr_flag_since"):
                 kv_set("mgr_flag_since", t0)
 
@@ -17913,65 +18314,14 @@ def tick():
         reminder_sweep(t0)      # what an agent asked to come back to, at the time it named
         wait_sweep(t0)          # plan C8: a waited message to an agent that is no longer active
         chat_sweep(t0)          # owner feature chat_apps: a message item without a report for 120 seconds
-        # Silence on working tasks: nudge the owner, then the requester. Four kinds of task are quiet on purpose and
-        # none of them is nudged -- a held one, one whose agent is at its usage limit, one that is parked until the
-        # time its own agent named, and one whose session is inside a single call that has not run too long yet.
-        # STARTED is in the measure because the hub's own restart is not a task's silence: without it one outage
-        # made every healthy task look silent at the first tick (both rungs, five seconds apart).
-        for t in q("SELECT * FROM tasks WHERE state='working'"):
-            if active_hold(t["id"]) or active_limit(t["owner"]) or parked(t["id"]) or waits_on_parts(t["id"]) or \
-                    open_job(t["id"]) or waits_on_message(t["id"]):     # C7: a job runs; C8: a named wait
-                continue
-            quiet = t0 - max(t["last_activity"] or t["created"], limit_ended(t["owner"]), STARTED)
-            # The second rung is measured from the first nudge and not from the same quiet time: after a hub outage
-            # the whole silence was already there at the first tick, so both rungs fired five seconds apart and the
-            # worker never had a chance to answer the first one.
-            if t["nudge_level"] == 0 and quiet > CFG["silence"]:
-                rung = 1
-            elif t["nudge_level"] == 1 and quiet > 2 * CFG["silence"] and t0 - (t["nudged_at"] or 0) > CFG["silence"]:
-                rung = 2
-            else:
-                continue
-            busy = busy_in_a_call(t, t0)
-            if busy and busy[1] < CALL_PATIENCE:
-                continue        # it is inside one call and has been for less than the patience: busy, not silent
-            inside = f" It has been inside one call, \"{busy[0]}\", for {span(busy[1])}." if busy else ""
-            if rung == 1:
-                q("UPDATE tasks SET nudge_level=1, nudged_at=? WHERE id=?", (t0, t["id"]))
-                emit(t["owner"], "say", f"[hub] No activity on {tref(t['id'])} for {span(quiet)}.{inside} "
-                     f"Report progress, deliver, or ask your requester -- and if you are only unsure, ask with a "
-                     f"default and go on.", task=t["id"])
-                log("hub", f"nudged {t['owner']} about silent {tref(t['id'])}")
-            else:
-                q("UPDATE tasks SET nudge_level=2 WHERE id=?", (t["id"],))
-                emit(t["requester"], "say", f"[hub] {tref(t['id'])} ({t['title']}, owner {t['owner']}) has been silent "
-                     f"for {span(quiet)}.{inside} Decide what to do: wait, cancel it and reassign, or ask.", task=t["id"])
-                log("hub", f"told {t['requester']} that {tref(t['id'])} is silent")
-        # tasks that never started: the owner's machine may be offline
-        for t in q("SELECT * FROM tasks WHERE state='submitted' AND nudge_level=0"):
-            if active_hold(t["id"]) or active_limit(t["owner"]) or release_applying():
-                continue        # a held task, an agent at its limit, or an update run that holds every start
-            if t0 - max(t["created"], limit_ended(t["owner"])) > CFG["silence"]:
-                q("UPDATE tasks SET nudge_level=2 WHERE id=?", (t["id"],))
-                emit(t["requester"], "say", f"[hub] {tref(t['id'])} has not started after {span(t0 - t['created'])}. "
-                     f"{t['owner']}'s machine or helper may be offline. Consider cancel_task and another worker.", task=t["id"])
-                log("hub", f"told {t['requester']} that {tref(t['id'])} never started")
-        # Unanswered questions: nudge the requester. A question asked with a default is not chased: its task is not
-        # waiting, its message already said "answer only if that is wrong", and chasing it would turn the cheap way
-        # of asking into the noisy one.
-        for r in q(f"SELECT * FROM questions WHERE answer IS NULL AND nudged=0 AND assumed IS NULL "
-                   f"AND task IN (SELECT id FROM tasks WHERE {OPEN_TASK})"):     # an ended task waits for nothing
-            if t0 - r["asked"] > CFG["question_wait"]:
-                q("UPDATE questions SET nudged=1 WHERE id=?", (r["id"],))
-                emit(r["requester"], "say", f"[hub] Question Q-{r['id']} from {r['asker']} has waited "
-                     f"{span(t0 - r['asked'])}: {r['text']}", task=r["task"])
+        # plan C9: no clock nudges a task. Each stored turn end decides once, at intake and here after a restart.
+        turn_end_sweep(t0)
         liveness(t0)
         restart_sweep(t0)
         try:
             goal_sweep(t0)
             duty_sweep(t0)              # owner API 1.13: the duties that are not in order
             memory_sweep(t0)            # a lifetime memory: what leaves the shelf, keeping every word
-            report_sweep(t0)            # the reports that wait for a decision
             circle_sweep(t0)            # what looks like running in circles
             allowance_sweep(t0)         # the manager's own allowance, while it can still act on it
             integrity_check(t0)
@@ -19143,7 +19493,7 @@ def validate_team(team):
         if not isinstance(conf, dict) or set(conf) != {"max_send_per_day"} or isinstance(cap, bool) \
                 or not isinstance(cap, int) or not 0 <= cap <= 100000:
             raise ValueError('google must be {"max_send_per_day": a whole number from 0 to 100000}')
-    if "triggers" in team:
+    if "triggers" in team:      # the fleet's wake-up budget until plan C12; still read as valid, and used by nothing
         conf = team["triggers"]
         cap = conf.get("max_tasks_per_day") if isinstance(conf, dict) else None
         if not isinstance(conf, dict) or set(conf) != {"max_tasks_per_day"} or isinstance(cap, bool) \
@@ -22234,16 +22584,16 @@ def health_view():
         warn("allowance_spent" if spent else "allowance_pace",
              f"The {g['runtime']} account of {', '.join(a.capitalize() for a in g['agents'])} " + said, fix,
              agent=manager_name() if stops else (g["agents"][0] if len(g["agents"]) == 1 else None))
-    # The two findings of the fleet's own sweeps, on the owner's screen (his rule, 19 October 2026: a screen that
-    # reports something wrong must carry the way to put it right). He is told only what the manager has already had
-    # and not settled: a circle the hub noticed a minute ago is the manager's to decide, and interrupting the owner
-    # with it is the drowning this work set out to stop. The hub still changes nothing about either.
-    hours = int(CIRCLE_OWNER_WAIT // 3600)
+    # The findings of the fleet's own sweeps, on the owner's screen (his rule, 19 October 2026: a screen that reports
+    # something wrong must carry the way to put it right). He is told only what the manager has already had and is
+    # not acting on: it had a turn after the notice and left the notice unread (plan C10). A circle the hub noticed a
+    # minute ago is the manager's to decide, and interrupting the owner with it is the drowning this work set out to
+    # stop. The hub still changes nothing about either.
     stuck = circles_waiting(t0)
     if stuck:
         warn("circles_stuck",
-             f"{len(stuck)} thing(s) have looked like running in circles for more than {hours} hours, and "
-             f"{manager_name().capitalize()} was told: " + " | ".join(line for _, line in stuck[:2])
+             f"{len(stuck)} thing(s) look like running in circles, and {manager_name().capitalize()} had a turn "
+             f"after it was told and did not read it: " + " | ".join(line for _, line in stuck[:2])
              + (f" | and {len(stuck) - 2} more." if len(stuck) > 2 else ""),
              f"Open {manager_name().capitalize()} and tell it what to do about them. The hub reports a circle and "
              f"changes nothing by itself, because the third attempt is sometimes the right one.",
@@ -22251,8 +22601,8 @@ def health_view():
     wedged = tasks_stuck(t0)
     if wedged:
         warn("tasks_stuck",
-             f"{len(wedged)} open task(s) are stuck and nothing is moving them. "
-             f"{manager_name().capitalize()} was told about each and has settled none: "
+             f"{len(wedged)} open task(s) are stuck and nothing is moving them. Their requester was told about each, "
+             f"had a turn since and did not read it: "
              + " | ".join(line for _, line in wedged[:2])
              + (f" | and {len(wedged) - 2} more." if len(wedged) > 2 else ""),
              f"Open {manager_name().capitalize()} and tell it what to do about them: wait, cancel each and give the "
@@ -22264,8 +22614,8 @@ def health_view():
         oldest, leads = waiting[0], {r["to_agent"] for r in waiting if r["to_agent"] != manager_name()
                                      and not report_for_manager(r)}
         warn("reports_undecided",
-             f"{len(waiting)} report(s) from your agents have waited more than "
-             f"{int(REPORT_OWNER_WAIT // 3600)} hours for a decision. The oldest is {upref(oldest['id'])} from "
+             f"{len(waiting)} report(s) from your agents wait for a decision, and the agent that decides each had a "
+             f"turn after it was named to it and did not read it. The oldest is {upref(oldest['id'])} from "
              f"{oldest['from_agent']} to {oldest['to_agent']}, {ago(oldest['created'])} ago: "
              + clip(oldest["text"], 160),
              f"Open {manager_name().capitalize()} and have it decide them with decide_report"
@@ -24011,7 +24361,6 @@ class Handler(BaseHTTPRequestHandler):
             t0 = now()
             rows = q("SELECT * FROM triggers WHERE state<>'deleted' ORDER BY id")
             result = {"db": generation,
-                      "fleet": {"max_tasks_per_day": trigger_fleet_limit(), "tasks_24h": fleet_wakes_24h(t0)},
                       "triggers": [trigger_view(t, t0) for t in rows]}
         return self.json(200, scrub(result), {"Cache-Control": "no-store"})
 
@@ -24083,10 +24432,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(409, {"error": "this claim already has another result"})
             if r["state"] != "sent" or r["token"] != body["token"]:
                 return self.json(409, {"error": "this claim is obsolete"})
-            t0 = now()
-            if t0 > r["expires"]:
-                return self.json(409, {"error": "this claim expired"})
-            answer = check_result(t, r, body, t0, stored)
+            answer = check_result(t, r, body, now(), stored)
         return self.json(200, dict(answer, replayed=False))
 
     def helper_trigger_code(self, agent, run_id, query):
@@ -24102,8 +24448,7 @@ class Handler(BaseHTTPRequestHandler):
             if spec.get("code") != "saved" or runner_of(t) != agent:
                 return self.json(404, {"error": "no such saved check run for this agent"})
             t0 = now()
-            if r["state"] != "sent" or r["token"] != query.get("token") or t0 > r["expires"] \
-                    or r["revision"] != t["revision"]:
+            if r["state"] != "sent" or r["token"] != query.get("token") or r["revision"] != t["revision"]:
                 return self.json(409, {"error": "this claim is not open"})
             valid, why = wakeups.still_valid(wake_org(), trigger_view(t, t0))    # the grant now, before the code runs
             if not valid:
@@ -26851,6 +27196,10 @@ class Handler(BaseHTTPRequestHandler):
         after = int(query.get("after") or 0)
         wait = max(0, min(int(query.get("wait") or 25), 50))
         touch(agent)
+        if "checks" in query and CHECK_RUNS in helper_features(agent):
+            # plan C12: the check runs that the helper holds; one it acked and no longer holds, with no result, is lost
+            with LOCK:
+                lost_checks(agent, {int(x) for x in str(query["checks"]).split(",") if x.isdigit()}, now())
         if "jobs" in query and JOB_RUNS in helper_features(agent):
             # plan C7: the jobs that the helper holds; one it acked and no longer holds, with no report, is lost
             with LOCK:
@@ -27073,6 +27422,7 @@ class Handler(BaseHTTPRequestHandler):
                 with area("activity"):         # a usage reading comes every 30 s: the apps read it on their clock
                     q("INSERT INTO agent_usage(name,data) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET data=excluded.data",
                       (agent, json.dumps(data)))
+                limit_reading(agent, data.get("limits"), now())
             return self.json(200, {"ok": True})
         if parts == ["ui", "messages"]:
             return self.ui_submit()
@@ -27244,6 +27594,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.helper_limit(parts[2])
         if parts[:2] == ["helper", "presence"] and len(parts) == 3:         # plan C2: a helper inside one step
             return self.helper_presence(parts[2])
+        if parts[:2] == ["helper", "turn"] and len(parts) == 3:             # plan C1: the manager's turns
+            return self.helper_turn(parts[2])
         if parts[:1] == ["mcp"] and len(parts) in (2, 5):
             return self.mcp(parts[1], parts[2:] if len(parts) == 5 else None)
         if parts[:2] == ["hook", "permission"] and len(parts) == 4:
@@ -27500,6 +27852,12 @@ class Handler(BaseHTTPRequestHandler):
             with area("quiet"):
                 kv_set(f"untaken:{agent}:{task}", now())
             log("hub", f"{agent}'s {task} did not take its line, told twice")
+            try:
+                t = q1("SELECT * FROM tasks WHERE id=? AND owner=?", (parse_task(task), agent))
+            except ToolError:
+                t = None
+            if t:           # plan C9: unread messages are no live reason any more, so its last turn end decides again
+                turn_end_check(t, turn_state(t["id"], t["attempt"]), now(), force=True)
             return self.json(200, {})
         if agent == manager_name():
             if kind is None:
@@ -28269,9 +28627,18 @@ class Handler(BaseHTTPRequestHandler):
                     activity(tid)
             for data in limits:
                 start_limit(agent, data["resets_at"], tid)
+            same = (before or {}).get("session") == session
+            started = not (before or {}).get("running") and (state.get("running") or
+                                                               state["turns"] > ((before or {}).get("turns", 0) if same else 0))
+            if attempt == t["attempt"] and started:
+                q("UPDATE tasks SET nudge_level=0 WHERE id=? AND nudge_level=2", (tid,))     # plan C9: a new turn
+                for r in q("SELECT id, created FROM reminders WHERE task=? AND done=0", (tid,)):
+                    if (before or {}).get("at") and before["at"] > r["created"]:
+                        kv_set(f"park_ended:{r['id']}", now())      # a turn after the one that set it: awake
             if attempt == t["attempt"] and state["turns"] > ((before or {}).get("turns", 0)
                                                              if (before or {}).get("session") == session else 0):
                 unanswered(agent, now(), tid)       # plan C8: a turn of the task's session ended
+                turn_end_check(q1("SELECT * FROM tasks WHERE id=?", (tid,)), state, now())      # plan C9
             if not failed and app_server_task(agents()[agent], t["needs"]) and attempt == t["attempt"]:
                 # The hub can stop after it stores the terminal record but before it saves the hold. The reader
                 # reconnects with an empty batch to get last_seq; recover the hold before acknowledging that record.
@@ -28307,6 +28674,25 @@ class Handler(BaseHTTPRequestHandler):
                 start_limit(agent, reset)
             lim = active_limit(agent)
         return self.json(200, {"ok": True, "until": lim["until"] if lim else None})
+
+    def helper_turn(self, agent):
+        """The turn starts and ends of the manager's own session, with no content (plan C1): the newest of each in one
+        batch of its records. The hub keeps the newest of each, never one later than its own clock, so a helper that
+        reads the whole transcript again after a restart moves nothing back. No screen shows them."""
+        if agent not in agents():
+            return self.json(404, {"error": "unknown agent"})
+        if not self.allowed(agent):
+            return
+        f = self.form()
+        marks = {k: f.get(k) for k in ("started", "ended")}
+        if all(v is None for v in marks.values()) or any(v is not None and not finite(v) for v in marks.values()):
+            return self.json(400, {"error": "started or ended must be a time in seconds"})
+        t0 = now()
+        with LOCK, area("quiet"):
+            for k, v in marks.items():
+                if v is not None and min(v, t0) > float(kv_get(f"turn_{k}:{agent}") or 0):
+                    kv_set(f"turn_{k}:{agent}", min(v, t0))
+        return self.json(200, {"ok": True})
 
     def helper_presence(self, agent):
         """A ping of the helper's presence thread (plan C2): its main loop is inside one named step, so it cannot poll,
@@ -28680,7 +29066,8 @@ def main():
     ap.add_argument("--team", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "team.json"))
     ap.add_argument("--silence", type=float, default=180, help="seconds of no activity before the first nudge")
     ap.add_argument("--question-wait", type=float, default=120, help="seconds before a waiting question is chased")
-    ap.add_argument("--manager-silence", type=float, default=120, help="seconds before the hub tells the owner itself")
+    ap.add_argument("--manager-silence", type=float, default=120, help="not read since plan C10: the manager's flag "
+                    "rests on facts; kept so that an existing service command still starts")
     ap.add_argument("--hook-wait", type=float, default=240, help="seconds a permission prompt waits for a decision")
     ap.add_argument("--job-wait", type=float, default=50, help="seconds a sign-in or handover waits for the helper")
     ap.add_argument("--request-wait", type=float, default=API_WAIT,
