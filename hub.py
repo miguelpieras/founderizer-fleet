@@ -22611,12 +22611,13 @@ def validate_status(data):
                  "places": _optional(vault.get("places"), bool),            # vault.py `place`: unused here
                  "place_key": place_key, "broker_source": source}
     features = data.get("features") or []
-    # 32: a helper names each feature it has (lifecycle.FEATURES), fifteen of them (sixteen with secret_places, which
-    # a helper from before 24 October 2026 still names), and a report with one name too many is refused whole, which
-    # would take the machine's broker and its deliveries with it.
-    if not isinstance(features, list) or len(features) > 32 or \
+    # 128: a helper names each feature it has (lifecycle.FEATURES, 32 of them on 27 October 2026), and a report with
+    # one name too many is refused whole, which takes the machine's broker and its deliveries with it. So this limit
+    # rises in a release of its own, before a helper names more than the release before it takes: a rolled-back hub
+    # refuses the longer list.
+    if not isinstance(features, list) or len(features) > 128 or \
             not all(isinstance(f, str) and re.fullmatch(r"[a-z_]{1,40}", f) for f in features):
-        raise ValueError("features must be a list of at most 32 names of a-z and _")
+        raise ValueError("features must be a list of at most 128 names of a-z and _")
     settings = data.get("settings")
     if settings is not None and (
             not isinstance(settings, dict) or set(settings) != {"model", "effort", "can"}
