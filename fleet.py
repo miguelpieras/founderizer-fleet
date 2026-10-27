@@ -355,6 +355,12 @@ CHOICE = re.compile(r"^[^\w\n]*[1-9]\.\s+\S", re.M)
 PICKED = re.compile(r"^[^\w\n]*[\u276f\u203a\u25b8\u25b6\u2192>][^\w\n]*[1-9]\.\s+\S", re.M)
 YES_FIRST = re.compile(r"^[^\w\n]*1\.\s+Yes\b", re.I | re.M)
 FOOTER = re.compile(r"\b(Enter to confirm|Esc to cancel)\b", re.I)     # under Claude Code's own questions
+# The last line of Claude Code's own panels and lists (/config, /resume, …), read on 2.1.285 with /config open in a
+# task window (27 October 2026): how to move, then how to leave, as "Type to filter · Enter/↓ to select · ↑ to tabs ·
+# Esc to clear" or "Enter/Space to change · / to search · Esc to close". The prompt's own hints are never that pair
+# ("double tap esc to clear input", "shift+tab to cycle · esc to interrupt"), so an open panel is a question: nothing
+# is typed into it, and it is told.
+PANEL = re.compile(r"\bto \w+[^\n]*·[^\n]*\besc to (?:cancel|clear|close|back|go back)\b", re.I)
 # Claude Code's workspace trust question at the first start in a folder: no numbers, and "No, exit" is picked, so the
 # Enter of a typed line would answer it. Both of its choices on the screen make it a question.
 TRUST_NO = re.compile(r"^[^\w\n]*(?:[1-9]\.\s+)?No, exit\b", re.I | re.M)
@@ -486,7 +492,7 @@ def screen_class(screen):
 
 def shows_question(screen):
     tail = "\n".join(screen.rstrip().split("\n")[-15:])
-    if FOOTER.search(tail) or (TRUST_NO.search(tail) and TRUST_YES.search(tail)):
+    if FOOTER.search(tail) or PANEL.search(tail.split("\n")[-1]) or (TRUST_NO.search(tail) and TRUST_YES.search(tail)):
         return True
     return bool((PICKED.search(tail) or YES_FIRST.search(tail)) and len(CHOICE.findall(tail)) >= 2)
 

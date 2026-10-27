@@ -27642,8 +27642,10 @@ class Handler(BaseHTTPRequestHandler):
             agent = parts[2]
             if agent not in agents() or not self.allowed(agent):
                 return
+            # A message's or a chat's delivery ends only with its session's read. A task's ack says that its helper
+            # started that attempt once (plan C6, attempt_started), and its delivery still waits for the read.
             for eid in self.form().get("ids", []):
-                q("UPDATE events SET helper_ack=? WHERE id=? AND agent=? AND kind NOT IN ('say','task','chat')", (now(), eid, agent))
+                q("UPDATE events SET helper_ack=? WHERE id=? AND agent=? AND kind NOT IN ('say','chat')", (now(), eid, agent))
             return self.json(200, {"ok": True})
         if parts == ["cases"]:
             if not self.allowed("owner"):
