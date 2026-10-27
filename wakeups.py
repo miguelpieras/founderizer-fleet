@@ -12,10 +12,12 @@ so its tests need no hub:
   fleet manager directly, or a lead through a parent task in its own task session;
 - saved check code: an agent writes a check as text; the hub keeps each version by its SHA-256 and never changes it,
   without a repository commit or an owner pin for each change;
-- where saved code runs (machine placement, apart from the logical team): only on an agent with the execution
-  grant (execution_grant: its existing runtime already runs any command without asking, and every restriction that
-  the runtime still applies is applied to the check too), and that the code's author has authority over. The same
-  rule holds for every runtime; Claude Code does not qualify yet (see execution_grant);
+- where saved code runs (plan P4): only on its own agent's machine, as that agent's user and with that agent's read
+  keys, and only where that agent's runtime already runs any command without asking (execution_grant), so a check
+  adds no capability. There is no other runner and no approval of each code version;
+- what a check says (plan P4): the value form prints {"value", "summary"} and wakes the agent when the value matches
+  its condition (owner API 1.8); the line form prints one line for each item that needs the agent now, and the hub
+  wakes the agent only for the lines that the last accepted run did not print (AUTONOMY.md 6.5);
 - authority is always the current one: a rule is checked again at each send, each claim, each result and each
   prompt run (still_valid), with its author's current authority, so a reporting-line or grant change makes a
   stale rule or claim start nothing. A check result is data: it never changes a rule or an authority;
@@ -36,8 +38,11 @@ ACTIONS = ("pause", "resume", "delete", "check_now")
 RULE_FIELDS = ("agent", "schedule", "task")      # the hub checks them (1.7); no late window and no cap (plan C12)
 SAVE_KEYS = {"request_id", "trigger_id", "base_revision", "check", "task_id"} | set(RULE_FIELDS)
 CHANGE_KEYS = {"request_id", "trigger_id", "base_revision", "action", "task_id"}    # call_tool adds task_id
-CHECK_KEYS = {"code", "run_on", "args", "timeout_seconds", "condition", "repeat_minutes"}
+CHECK_KEYS = {"code", "args", "timeout_seconds", "condition", "repeat_minutes"}
+VALUE_KEYS = ("condition", "repeat_minutes")      # the value form's own fields (owner API 1.8)
+LINE_FORM = "lines"         # plan P4: the `form` of a check that prints lines
 SAVED = ("code", "sha256", "bytes")       # the fields of a stored saved check that come from its code
+PROGRESS = re.compile(r"progress[ \t]+([-+]?(?:\d+(?:\.\d*)?|\.\d+))")    # AUTONOMY.md 6.5: a target's progress line
 REQUEST = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,63}")
 OWNER, FLEET, SELF, NONE = 3, 2, 1, 0       # levels; OWNER is only the owner's own rules
 OPS = {">": "more than", ">=": "at least", "<": "less than", "<=": "at most", "==": "equal to", "!=": "not equal to"}
@@ -45,17 +50,6 @@ OPS = {">": "more than", ">=": "at least", "<": "less than", "<=": "at most", "=
 
 class Refused(Exception):
     """A request that the caller may not make, or that is not valid. The hub answers it as a tool error."""
-
-
-class NeedsCodeApproval(Refused):
-    """A save of saved code that is valid in every point except one: its author has no authority over the runner,
-    which has the execution grant. `subject` (code_subject) is the exact revision that the requester of the author's
-    task can approve with a code prompt; after an allow, the hub calls plan_save again with the approval. Without
-    that, it is a refusal like any other, and nothing is saved."""
-
-    def __init__(self, message, subject):
-        super().__init__(message)
-        self.subject = subject
 
 
 class Org:
@@ -281,124 +275,71 @@ def execution_grant(conf):
     return False, f"There is no known execution grant for the runtime {runtime}."
 
 
-def runner_of(rule_or_target, check):
-    """The agent whose helper runs the check: check.run_on, or the rule's target."""
-    target = rule_or_target["agent"] if isinstance(rule_or_target, dict) else rule_or_target
-    return (check or {}).get("run_on") or target
+def runner_of(rule_or_target, check=None):
+    """The agent whose helper runs a rule's check: always the rule's own agent (plan P4). A check runs only on its own
+    agent's machine, with that agent's read keys; a stored check that names another machine in run_on (from before
+    plan P4) does not run at all (still_valid)."""
+    return rule_or_target["agent"] if isinstance(rule_or_target, dict) else rule_or_target
 
 
-def code_subject(target, check):
-    """The exact revision that a code approval covers: the code's author, the rule's target, the runner, the SHA-256
-    of the code and of its args, and its time limit. Any other change keeps the approval; a change of one of these
-    needs a new one."""
-    args = check.get("args")
-    canonical = json.dumps({} if args is None else args, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    timeout = check.get("timeout_seconds")
-    return {"author": check.get("code_by"), "target": target, "runner": runner_of(target, check),
-            "code_sha256": check.get("sha256"), "args_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
-            "timeout_seconds": 30 if timeout is None else timeout}
-
-
-def runner_problem(org, runner, author):
-    """Why `runner` cannot run saved code at all, or None: it is not in the team, is in setup, or has no execution
-    grant. An approval never changes this."""
-    conf = org.agents.get(runner)
+def runner_problem(org, agent):
+    """Why `agent`'s own machine cannot run its saved checks, or None: it is not in the team, is in setup, or its
+    runtime asks before commands (execution_grant), so a check would add a capability."""
+    conf = org.agents.get(agent)
     if conf is None:
-        return f"There is no agent {runner} in the team to run the check."
+        return f"There is no agent {agent} in the team to run the check."
     if conf.get("active", True) is False:
-        return f"{runner} is in setup and cannot run checks."
+        return f"{agent} is in setup and cannot run checks."
     granted, why = execution_grant(conf)
     if not granted:
-        return (f"{runner} cannot run saved code: {why} Saved code runs only on an agent with the execution grant "
-                f"that you control. {runner_hint(org, author)}")
+        return (f"{agent} cannot run saved code: {why} A check runs only on its own agent's machine, and only where "
+                f"that agent's sessions already run any command without asking.")
     return None
 
 
-def approval_holds(org, author, runner, approval, subject):
-    """(True, None), or (False, why): a code approval that the hub stored ({"prompt", "approver", "subject"}) covers
-    this exact revision now. Its subject must equal this one, and its approver must still give the author work and
-    still control the runner. A failed approval is never renewed here: the author saves the check again, and its
-    current requester decides."""
-    again = "Save the check again, so that the requester of your task can decide it."
-    if not isinstance(approval, dict) or subject is None or approval.get("subject") != subject:
-        return False, f"The code approval does not cover this code, its args, its runner or its time limit. {again}"
-    approver = approval.get("approver")
-    if approver not in org.agents:
-        return False, f"{approver}, who approved this code, is no longer in the team. {again}"
-    if not org.authority(approver, author, "task")[0]:
-        return False, f"{approver} approved this code and no longer gives {author} work. {again}"
-    if level(org, approver, runner) < SELF:
-        return False, f"{approver} approved this code and no longer controls {runner}. {again}"
-    return True, None
-
-
-def code_grant(org, author, runner, approval=None, subject=None):
-    """(allowed, reason): may code that `author` saved run as a check on `runner`'s machine? The code runs as that
-    machine's user, outside every AI session, so two things must hold:
-
-    1. the runner has the execution grant (execution_grant), with the features that its helper reports now;
-    2. the author may set rules for the runner now (the one authority function), or a code approval (approval_holds)
-       covers this exact revision (`subject`): its approver gives the author work and controls the runner now. The
-       author gets no authority over the runner from it.
-
-    Routine changes of the code inside this grant need no new approval. If several agents share one machine user
-    later, the grant must hold for that user, because the code gets the access of the user."""
-    problem = runner_problem(org, runner, author)
+def code_grant(org, author, target):
+    """(allowed, reason): may code that `author` saved run as `target`'s check? It runs on target's own machine, as
+    target's user and with target's read keys (plan P4), so two things must hold now: target's runtime already runs
+    any command without asking (execution_grant), and the author may set target's rules (the one authority
+    function). Nothing else grants it."""
+    problem = runner_problem(org, target)
     if problem:
         return False, problem
-    if level(org, author, runner) >= SELF:
+    if level(org, author, target) >= SELF:
         return True, None
-    if approval is not None:
-        return approval_holds(org, author, runner, approval, subject)
-    return False, (f"{author} has no authority over {runner}, so the check cannot run there. "
-                   f"{runner_hint(org, author)}")
+    return False, f"{author} saved this check's code and may no longer set {target}'s rules."
 
 
-def eligible_runners(org, author):
-    """The agents that `author` can name in check.run_on now: active, with the execution grant (with the features
-    that their helpers report now), and under the author's existing authority. The module only names them: it never
-    selects one, and the list gives no authority."""
-    return sorted(name for name, conf in org.agents.items()
-                  if conf.get("active", True) is not False and level(org, author, name) >= SELF
-                  and execution_grant(conf)[0])
-
-
-def runner_hint(org, author):
-    """The end of a refusal of saved code: the runners that the author already controls, or what it can do without
-    one. Asking for a check gives the asker no code access: the check and its code stay the author's."""
-    names = eligible_runners(org, author)
-    if names:
-        return f"Runners that you control: {', '.join(names)}. Name one in check.run_on."
-    text = "You control no runner with the execution grant."
-    if author != org.manager:
-        text += (" In a task session, you can name in check.run_on a runner that the requester of your task controls: "
-                 "that requester then decides this exact code revision, and each new revision needs its decision "
-                 "again. You get no code access of your own.")
-    return text
+def foreign_runner(check, target):
+    """The other agent that a stored check names in run_on (from before plan P4), or None."""
+    run_on = (check or {}).get("run_on")
+    return run_on if run_on not in (None, target) else None
 
 
 def saved_check(value, author, old=None):
     """(stored check, source): an agent's check, with its code kept by SHA-256. A stored version never changes: new
-    code is a new SHA-256 and a new trigger revision. In an edit, a check without "code" keeps the code of `old` (the
-    stored check), so a new condition, new args or a new runner need no resend; source is then None. The caller
-    becomes code_by, the agent that answers for where the code runs. The hub checks args, timeout_seconds, condition
-    and repeat_minutes with its 1.8 rules. An agent cannot pin a repository check: path and commit are not agent
+    code is a new SHA-256 and a new trigger revision. The fields say the form: with condition and repeat_minutes it is
+    the value form (owner API 1.8), without them the line form (plan P4, "form": "lines"). In an edit, a check without
+    "code" keeps the code of `old` (the stored check), so new args need no resend; source is then None. The caller
+    becomes code_by, the agent that answers for the code. The hub checks args, timeout_seconds, condition and
+    repeat_minutes with its own rules. An agent cannot pin a repository check: path and commit are not agent
     fields."""
     if not isinstance(value, dict):
-        raise Refused("check must be an object: code, condition and repeat_minutes, and optional run_on, args and "
-                      "timeout_seconds. Use null to remove the check.")
+        raise Refused("check must be an object: code, and optional args and timeout_seconds (and condition and "
+                      "repeat_minutes for the value form). Use null to remove the check.")
     extra = sorted(set(value) - CHECK_KEYS)
     if extra:
-        raise Refused(f"check has no field {extra[0]}. Its fields are code, condition, repeat_minutes, run_on, args "
-                      f"and timeout_seconds.")
-    rest = {k: v for k, v in value.items() if k not in ("code", "run_on")}
-    run_on = value.get("run_on")
-    if run_on is not None and not isinstance(run_on, str):
-        raise Refused("check.run_on must be an agent name, or absent for the rule's agent.")
+        if extra[0] == "run_on":
+            raise Refused("check has no field run_on: a check runs only on its own agent's machine.")
+        raise Refused(f"check has no field {extra[0]}. Its fields are code, args and timeout_seconds, and condition "
+                      f"and repeat_minutes for the value form.")
+    rest = {k: v for k, v in value.items() if k != "code"}
+    if not any(k in value for k in VALUE_KEYS):
+        rest["form"] = LINE_FORM
     if "code" not in value:
         if not old or old.get("code") != "saved":
             raise Refused("check.code is required: the text of the Python program that the check runs.")
-        return dict(rest, **{k: old[k] for k in SAVED}, code_by=author, run_on=run_on), None
+        return dict(rest, **{k: old[k] for k in SAVED}, code_by=author), None
     code = value["code"]
     if not isinstance(code, str) or not code.strip():
         raise Refused("check.code must be the text of a Python program.")
@@ -410,16 +351,15 @@ def saved_check(value, author, old=None):
         raise Refused("check.code must be valid Unicode text.") from None
     if len(data) > CODE_MAX:
         raise Refused(f"check.code has {len(data)} bytes; the limit is {CODE_MAX} bytes (64 KiB).")
-    return dict(rest, code="saved", sha256=hashlib.sha256(data).hexdigest(), bytes=len(data), code_by=author,
-                run_on=run_on), code
+    return dict(rest, code="saved", sha256=hashlib.sha256(data).hexdigest(), bytes=len(data), code_by=author), code
 
 
 def still_valid(org, rule):
     """(True, None), or (False, why), with the current team and authority. The hub asks before each send of a check,
     at each claim, before each decision of a result and at each prompt run, so a rule or a claim that became stale
-    starts nothing: the author lost its authority, the code's author lost authority over the runner, the runner lost
-    its grant, or the target went into setup. The run then ends without a task or a message, and the hub pauses the
-    rule with the reason. The owner's own rules keep the hub's 1.7 and 1.8 rules."""
+    starts nothing: the author lost its authority, the code's author may no longer set the target's rules, the
+    target's runtime lost its grant, or the target went into setup. The run then ends without a task or a message,
+    and the hub pauses the rule with the reason. The owner's own rules keep the hub's 1.7 and 1.8 rules."""
     target = rule["agent"]
     if target not in org.agents:
         return False, f"{target} is no longer in the team."
@@ -437,9 +377,11 @@ def still_valid(org, rule):
         return False, why
     check = rule.get("check")
     if check and check.get("code") == "saved":
-        # A stored approval counts only while it covers this revision and its approver still has the authority.
-        allowed, why = code_grant(org, check.get("code_by"), runner_of(rule, check), check.get("approval"),
-                                  code_subject(target, check))
+        other = foreign_runner(check, target)
+        if other:
+            return False, (f"This check was saved to run on {other}'s machine. A check runs only on its own agent's "
+                           f"machine now: save the check again, without run_on.")
+        allowed, why = code_grant(org, check.get("code_by"), target)
         if not allowed:
             return False, why
     return True, None
@@ -463,7 +405,7 @@ def revision_of(args):
     return base
 
 
-def plan_save(org, caller, args, rule=None, rules=(), approval=None):
+def plan_save(org, caller, args, rule=None, rules=()):
     """The plan of one save_trigger call, or Refused. The hub then checks the 1.7 fields with trigger_fields and the
     1.8 check fields with trigger_check_spec, and applies the plan in one transaction, with a trigger_history row.
 
@@ -476,10 +418,8 @@ def plan_save(org, caller, args, rule=None, rules=(), approval=None):
     the code text to keep by its SHA-256, or None when the code is not new. by becomes the rule's author
     (created_by), also in an edit. The hub first looks up command_identity(caller, "save_trigger", args).
 
-    approval: a code approval that the hub stored ({"prompt", "approver", "subject"}): a consumed allow of a code
-    prompt, or the rule's own approval when its subject is identical. It counts only where the code's author has no
-    authority over the runner, and the stored check then carries it. Without a valid one there, the save raises
-    NeedsCodeApproval (with the subject) when the runner can run code and the caller wrote that code."""
+    Saved code runs only on the target's own machine (code_grant): a save that would run it anywhere else, or on a
+    machine whose runtime asks before commands, is refused. Nothing approves an exception."""
     if not isinstance(args, dict):
         raise Refused("save_trigger needs an object of fields.")
     extra = sorted(set(args) - SAVE_KEYS)
@@ -528,23 +468,14 @@ def plan_save(org, caller, args, rule=None, rules=(), approval=None):
     check = plan["check"] if "check" in plan else old
     moved = editing and target != rule["agent"]
     if check and check.get("code") == "saved" and ("check" in plan or moved):
-        author, runner = check["code_by"], runner_of(target, check)
-        subject = code_subject(target, check)
-        allowed, why = code_grant(org, author, runner, approval, subject)
-        controls = level(org, author, runner) >= SELF
+        if foreign_runner(check, target):
+            raise Refused(f"This check runs on {check['run_on']}'s machine (run_on), and a check runs only on its own "
+                          f"agent's machine now. Give the check again, without run_on.")
+        allowed, why = code_grant(org, check["code_by"], target)
         if not allowed:
-            if author == caller and not controls and runner_problem(org, runner, author) is None:
-                kept = f" Trigger {tid} stays unchanged until a save goes through." if editing else ""
-                raise NeedsCodeApproval(
-                    f"{author} has no authority over {runner}. The requester of your task can "
-                    f"approve this exact code revision for {runner}: save it from a task session, and save it again "
-                    f"after the decision.{kept}", subject)
             raise Refused(why)
-        stored = {k: v for k, v in check.items() if k != "approval"}      # only the hub gives an approval
-        if not controls:
-            stored["approval"] = approval
-        if "check" in plan or stored != check:
-            plan["check"] = stored
+        if "check" not in plan and ("approval" in check or "run_on" in check):     # what plan P4 took away goes
+            plan["check"] = {k: v for k, v in check.items() if k not in ("approval", "run_on")}
     if not editing:
         have = sum(1 for r in rules if r.get("created_by") == caller and r.get("state") in ("active", "paused"))
         if have >= RULES_MAX:
@@ -690,17 +621,73 @@ def manager_message(trigger_id, fields, line):
     return "\n".join(parts)
 
 
-def parent_fields(trigger_id, fields, route, line):
-    """The task fields of the parent task of a route with a parent: the requester's own task, in whose session the
-    target's result arrives. The hub inserts it first, then the target's task with parent = its id, in one
-    transaction with the run."""
-    owner, requester = route["owner"], route["requester"]
-    return {"owner": requester, "title": f"Wake-up for {owner} from trigger {trigger_id}: {fields['title']}"[:200],
-            "details": (f"Trigger {trigger_id} started a subtask of this task for {owner}: {fields['title']}. Its "
-                        f"result, its questions and its permission prompts arrive in this session. Check the result "
-                        f"with check_result and answer with answer; then deliver this task.\n\n{line}"),
-            "done_when": f"The subtask for {owner} has ended and you have checked its result.",
-            "needs": "none", "goal_id": fields.get("goal_id")}
+def batch_fields(lead):
+    """The task fields of a lead's one open task for its team's waiting results (plan P9.11). A wake-up, a case or a
+    duty review of an agent under the lead is a subtask of it, so their results arrive in one session of the lead,
+    which checks them together. The hub starts a new one when the lead has delivered the last."""
+    return {"owner": lead, "title": "Your team's wake-up and case results",
+            "details": ("The wake-ups, duty cases and duty reviews of the agents that you lead are subtasks of this "
+                        "task, and more join it while it is open. Their results, questions and permission prompts "
+                        "arrive in this session. Check each result with check_result: closely where an agent's record "
+                        "is weak, by sample where it is good; you decide. Answer with answer. Deliver this task when "
+                        "no subtask is open."),
+            "done_when": "Every subtask has ended and you have checked its result.", "needs": "none"}
+
+
+# ---------------------------------------------------------------- the lines of a check (AUTONOMY.md 6.5)
+
+def progress_of(lines):
+    """(progress or None, the other lines): a first line "progress <number>" is the progress of a target that names
+    the check (AUTONOMY.md 6.5), and never a wake line."""
+    found = PROGRESS.fullmatch(lines[0]) if lines else None
+    if not found:
+        return None, list(lines)
+    return float(found.group(1)), list(lines[1:])
+
+
+def new_lines(printed, accepted):
+    """The lines of a run that the last accepted run did not print, each once, in the run's order: the only lines
+    that wake the agent. So a line is never told twice, and one that the hub could not deliver yet is still new at
+    the next run, because only a run whose lines were delivered is accepted."""
+    seen, out = set(accepted or ()), []
+    for line in printed:
+        if line not in seen:
+            seen.add(line)
+            out.append(line)
+    return out
+
+
+def lines_decision(new, check_now, wake_open, held):
+    """(state, reason) of one run of a line check: "quiet" when no line is new; "not_started" for Check now, which
+    never wakes; "joined" when the check's wake is still open, and the new lines go into it as a message (one open
+    wake for each check); "waiting" with the one reason that holds the lines, such as a usage limit, and they wait with
+    their run; else "started", one new wake with the new lines."""
+    if not new:
+        return "quiet", None
+    if check_now:
+        return "not_started", "Check now never starts a wake-up."
+    if wake_open:
+        return "joined", None
+    if held:
+        return "waiting", held
+    return "started", None
+
+
+def lines_text(lines):
+    """Lines of a check as they go into a text that an agent reads: one JSON array, so a quote or a bracket in a line
+    cannot end it, and a reader sees where each line begins and ends."""
+    return json.dumps(list(lines), ensure_ascii=False)
+
+
+def split_lines(lines, budget):
+    """(the first lines whose JSON fits in `budget` characters, the rest): a wake text keeps its size, and the rest
+    goes into a message of the same wake, so no line is dropped."""
+    head = []
+    for line in lines:
+        if head and len(lines_text(head + [line])) > budget:
+            break
+        head.append(line)
+    return head, list(lines[len(head):])
 
 
 # ---------------------------------------------------------------- tool texts
@@ -716,17 +703,21 @@ def schedule_text(s):
     return f"day {s['day']} of each month at {s['time']} {s['timezone']} (a month without that day is skipped)"
 
 
-def approval_ref(approval):
-    """P-<n>: the code prompt of a stored approval."""
-    prompt = approval.get("prompt")
-    return prompt if isinstance(prompt, str) else f"P-{prompt}"
+def is_lines(check):
+    """True for a check of the line form (plan P4)."""
+    return isinstance(check, dict) and check.get("form") == LINE_FORM
 
 
 def check_known(check):
-    """True when this release reads a stored check (plan P0): it has no `form`, which a later release sets on a check
-    of its own form, and it has the condition and the repeat rule that the hub decides a value with. A check of any
-    other form reads as quiet: the hub opens no run of it and starts nothing from it."""
-    if not isinstance(check, dict) or "form" in check or "repeat_minutes" not in check:
+    """True when this release reads a stored check (plan P0): the value form, which has no `form` and has the
+    condition and the repeat rule that the hub decides a value with, or the line form of plan P4 (saved code with
+    "form": "lines"). A check of any other form reads as quiet: the hub opens no run of it and starts nothing from
+    it."""
+    if not isinstance(check, dict):
+        return False
+    if "form" in check:
+        return is_lines(check) and check.get("code") == "saved"
+    if "repeat_minutes" not in check:
         return False
     cond = check.get("condition")
     if not isinstance(cond, dict) or cond.get("op") not in OPS:
@@ -740,11 +731,12 @@ def check_text(c, target):
         return "none: the task starts at each time"
     if not check_known(c):
         return "a check of a newer form, which this release does not run: it reads as quiet"
-    a = c.get("approval")
-    approved = f", approved by {a.get('approver')} in {approval_ref(a)}" if isinstance(a, dict) else ""
-    code = (f"saved code {c['sha256'][:12]} ({c['bytes']} bytes, by {c['code_by']}, runs on "
-            f"{c.get('run_on') or target}{approved})" if c.get("code") == "saved"
-            else f"{c['path']} at {c['commit'][:7]}, pinned by the owner")
+    if c.get("code") == "saved":
+        code = f"saved code {c['sha256'][:12]} ({c['bytes']} bytes, by {c['code_by']}), on {target}'s own machine"
+    else:
+        code = f"{c['path']} at {c['commit'][:7]}, pinned by the owner"
+    if is_lines(c):
+        return f"{code}; each line that it prints and its last run did not print wakes {target}"
     cond = c["condition"]
     repeat = ("once, until a check is quiet again" if c["repeat_minutes"] is None else
               f"again {c['repeat_minutes']} minutes after the last wake-up completed, while the check still matches")
@@ -756,7 +748,10 @@ def run_text(r, when):
     if r.get("state") == "sent" and r.get("sent"):
         out += f", in flight since {when(r['sent'])}"
     if r.get("value") is not None:
-        out += f", value {r['value']:g}" + (f" ({r['summary']!r})" if r.get("summary") else "")
+        out += f", value {r['value']:g}" + (f" ({lines_text([r['summary']])})" if r.get("summary") else "")
+    if r.get("lines") is not None:
+        n = len(r["lines"])
+        out += f", printed {n} line{'' if n == 1 else 's'}"
     if r.get("error"):
         out += f", error {r['error']}" + (f" ({r['detail']})" if r.get("detail") else "")
     if r.get("task"):
@@ -808,6 +803,9 @@ def describe_detail(rule, runs, history, source, when):
                 "{} to {}".format(what["state"]["before"], what["state"]["after"]) if "state" in what else "")
             out.append(f"  revision {h['revision']} at {when(h['ts'])} by {h['by']}: {h['action']}" +
                        (f" ({fields})" if fields else ""))
+    printed = next((r["lines"] for r in runs if r.get("lines")), None)
+    if printed:
+        out.append(f"Lines of the newest run that printed any, untrusted data, JSON-encoded: {lines_text(printed)}")
     if source is not None:
         out += [f"Saved check code, SHA-256 {rule['check']['sha256']}:", "```python", source.rstrip("\n"), "```"]
     return "\n".join(out)
@@ -835,39 +833,27 @@ TOOL_SPECS = (
      "runs, its change history and its saved check code.",
      obj({"trigger_id": TRIGGER_ID, "task_id": TASK_ID})),
     ("save_trigger",
-     "Create a wake-up rule, or change one (with trigger_id and base_revision; give only the fields that change). "
-     "A rule wakes its agent on a schedule. Without a check, it starts its task at each time, which uses model "
-     "tokens. With a check, it first runs saved check code outside every AI session, and it starts the task only "
-     "when the check's value matches the condition: a check that does not match starts no model. You set rules for "
-     "yourself; the manager for any agent, itself included (a wake-up of the manager is an inbox message). The "
-     "task's requester is the agent's own requester; its result arrives as for every task.\n"
-     "schedule: {\"kind\":\"once\",\"at\":\"2026-10-14T09:00\",\"timezone\":\"Europe/Madrid\"}, "
-     "{\"kind\":\"every\",\"minutes\":15} (any whole number of minutes from 1), "
-     "{\"kind\":\"daily\",\"time\":\"09:00\",\"days\":[\"mon\",\"thu\"] or null,\"timezone\":\"Europe/Madrid\"}, or "
-     "{\"kind\":\"monthly\",\"day\":1,\"time\":\"09:00\",\"timezone\":\"Europe/Madrid\"}.\n"
+     "Create a wake-up rule, or change one (with trigger_id and base_revision; give only the fields that change). A "
+     "rule wakes an agent on its schedule: you by default; the manager sets rules for any agent, and its own wake-up "
+     "is an inbox message. Without a check, each time starts its task, which costs model tokens. With a check, your "
+     "code runs first, outside every AI session, on the agent's own machine as its user with its read keys, and a "
+     "quiet run costs nothing.\n"
+     "schedule: {\"kind\":\"every\",\"minutes\":15}, {\"kind\":\"once\",\"at\":\"2026-10-14T09:00\","
+     "\"timezone\":\"Europe/Madrid\"}, {\"kind\":\"daily\",\"time\":\"09:00\",\"days\":[\"mon\"] or null,"
+     "\"timezone\":...}, or {\"kind\":\"monthly\",\"day\":1,\"time\":\"09:00\",\"timezone\":...}.\n"
      "task: {\"title\", \"details\", \"done_when\", \"needs\": \"none\", \"browser\" or \"screen\", \"goal_id\": a "
      "goal number or null}.\n"
-     "check: {\"code\": a Python 3 program, \"condition\": {\"op\": \">\", \">=\", \"<\", \"<=\", \"==\" or \"!=\", "
-     "\"value\": a number}, \"repeat_minutes\": null (once, until a check is quiet again) or a whole number from 0 "
-     "(again that many minutes after the last task completed, while the check still matches), \"run_on\": an optional "
-     "agent whose machine runs the check, \"args\": an optional JSON object of at most 4 KiB, \"timeout_seconds\": "
-     "your own whole number of seconds from 1, default 30}. Give the check's network calls their own timeouts, "
-     "inside timeout_seconds. A run that waits says its one reason in see_triggers and goes on when that reason ends; "
-     "no count of wake-ups and no late window stops a rule. The check runs on your own machine, as your own user, "
-     "when your runtime already runs any command without asking (Codex with full access, or Claude Code that runs "
-     "Bash without asking and keeps every built-in tool). Otherwise name in run_on an agent with such a runtime that "
-     "you control; a refusal lists the ones that you control. If you control none, save the check from a "
-     "task session with run_on naming a runner that the requester of your task controls: the hub asks that requester "
-     "to approve this exact code, its args, its runner and its time limit, and you save the same check again after "
-     "the decision. Until a save goes through, nothing is saved, and an existing rule stays as it is. Each new code "
-     "revision needs a new decision; you get no code access of your own. The program gets one argument, the JSON "
-     "{\"trigger\", \"run\", "
-     "\"args\"}, and must print exactly one JSON object and exit with 0: {\"value\": a number, \"summary\": at most "
-     "200 characters} or {\"error\": a code of a-z and _, \"detail\": text, \"retry_after\": seconds from 1, for a "
-     "failure that passes; never 0}. "
-     "It runs with python3 -I as that machine's user, in an empty folder, with no Fleet token and no login. Never put "
-     "a login, a token or another secret in the code or the args. In a change, a check without code keeps the saved "
-     "code, and \"check\": null removes the check.",
+     "check: {\"code\": a Python 3 program, \"args\": an optional JSON object of at most 4 KiB, "
+     "\"timeout_seconds\": optional}. The program prints one line for each item that needs the agent now, beginning "
+     "with the item's own id. Only lines that its last run did not print wake the agent: as a new task, or as a "
+     "message to the check's open wake. Nothing printed wakes nobody. A check that a target names may print "
+     "\"progress <number>\" as its first line. When the source cannot be read, end with an error: the third failed "
+     "run in a row wakes the agent with the end of its error output. The value form, for a fleet that does not take "
+     "line checks yet, adds \"condition\": {\"op\": \">\", \">=\", \"<\", \"<=\", \"==\" or \"!=\", \"value\": a "
+     "number} and \"repeat_minutes\": null or minutes, and prints one JSON object {\"value\": a number, "
+     "\"summary\": text}. The program gets one argument, the JSON {\"trigger\", \"run\", \"args\"}, and runs with "
+     "python3 -I in an empty folder. Never put a secret in the code or the args. In a change, a check without code "
+     "keeps the saved code, and \"check\": null removes it.",
      obj({"request_id": REQUEST_ID, "trigger_id": TRIGGER_ID, "base_revision": BASE,
           "agent": {"type": "string", "description": "The agent that the rule wakes. Default: you."},
           "schedule": {"type": "object", "description": "When the rule runs. See the forms above."},

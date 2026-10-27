@@ -2101,6 +2101,10 @@ def save_place(path, db, cursor):
 
 CHECK_SLOTS = threading.BoundedSemaphore(4)     # checks that run at the same time on this machine
 CHECK_SOURCE_MAX, CHECK_OUTPUT_MAX = 65536, 4096
+# plan P4: a check that prints lines prints at most this many bytes, unless its event gives the fleet's own limit; and
+# the end of a check's error output, which goes to the hub with a failed run, so its third failure in a row can say why
+CHECK_LINES_MAX = 16384
+CHECK_TAIL_KEEP = 4096
 # plan C12: the check's own process ends at its time too, a little after the helper's own end of it, so a check whose
 # helper died does not run on. Its arguments stay as a check reads them: sys.argv[1] is the JSON it is given.
 CHECK_WRAPPER = ("import signal, sys\n"
@@ -2131,18 +2135,18 @@ def _no_constant(name):
     raise ValueError(f"{name} is not a number")
 
 
-def run_check(extra, kit=KIT, agent=None):
+def run_check(extra, kit=KIT, agent=None, keys=None):
     """Run one approved check outside every AI session: the verified bytes of the pinned commit (never the working
     tree), or of an agent's saved code from the hub (owner API 1.10), in a new process group, in an empty folder that
-    is also its HOME, with no Fleet value or token in its environment. Returns the result body for the hub, without
-    the token."""
+    is also its HOME, with no Fleet value or token in its environment. keys: the agent's own read keys (plan P4), the
+    ones its sessions read, as variables. Returns the result body for the hub, without the token."""
     started = time.monotonic()
 
     def result(**body):
         return dict(body, elapsed_ms=int((time.monotonic() - started) * 1000))
 
-    def fail(code, detail):
-        return result(ok=False, error=code, detail=detail[:200])
+    def fail(code, detail, tail=""):
+        return result(ok=False, error=code, detail=detail[:200], **({"tail": tail} if tail else {}))
 
     if extra.get("code") == "saved":        # an agent's saved code: from the hub, for this open claim only
         try:
@@ -2155,7 +2159,7 @@ def run_check(extra, kit=KIT, agent=None):
         data = got["source"].encode("utf-8")
         if len(data) > CHECK_SOURCE_MAX or hashlib.sha256(data).hexdigest() != extra["sha256"]:
             return fail("changed", "the saved code does not have the approved SHA-256")
-        return run_source(extra, data.decode("utf-8"), result, fail)
+        return run_source(extra, data.decode("utf-8"), result, fail, keys)
     spec = f"{extra['commit']}:{extra['path']}"
     data = git_blob(kit, spec)
     if data is None:                    # a commit that this checkout does not have yet
@@ -2173,24 +2177,47 @@ def run_check(extra, kit=KIT, agent=None):
         source = data.decode("utf-8")
     except UnicodeDecodeError:
         return fail("changed", f"{extra['path']} is not UTF-8 text")
-    return run_source(extra, source, result, fail)
+    return run_source(extra, source, result, fail, keys)
 
 
-def run_source(extra, source, result, fail):
-    """Run checked check source with python3 -I, as run_check describes, and read its one JSON answer."""
+def run_source(extra, source, result, fail, keys=None):
+    """Run checked check source with python3 -I, as run_check describes, and read what it printed: one JSON object in
+    the value form, one line for each item in the line form (plan P4, "form": "lines"; nothing printed is a quiet run).
+    The end of its error output goes with a failed run, so the hub can show the agent why it fails."""
     given = json.dumps({"trigger": extra["trigger"], "run": extra["run"], "args": extra.get("args") or {}})
+    lines = extra.get("form") == "lines"
+    limit = CHECK_OUTPUT_MAX
+    if lines:
+        try:
+            limit = max(1, int(extra.get("output_max") or CHECK_LINES_MAX))
+        except (TypeError, ValueError):
+            limit = CHECK_LINES_MAX
     with tempfile.TemporaryDirectory(prefix="fleet-check-") as folder:
-        env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": folder, "LANG": os.environ.get("LANG", "C.UTF-8")}
+        env = dict(keys or {})
+        env.update({"PATH": os.environ.get("PATH", os.defpath), "HOME": folder, "LANG": os.environ.get("LANG", "C.UTF-8")})
         try:
             wrapper = CHECK_WRAPPER.format(alarm=int(extra["timeout_seconds"]) + 5)
             proc = subprocess.Popen([sys.executable, "-I", "-c", wrapper, source, given], cwd=folder, env=env,
-                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     start_new_session=True)
         except OSError as e:
             return fail("exit", f"the check did not start: {e}")
-        out = []
-        reader = threading.Thread(target=lambda: out.append(proc.stdout.read(CHECK_OUTPUT_MAX + 1)), daemon=True)
+        out, err = [], [b""]
+
+        def drain():            # all of the error output is read, and only its end is kept
+            try:
+                while True:
+                    chunk = proc.stderr.read1(65536)
+                    if not chunk:
+                        return
+                    err[0] = (err[0] + chunk)[-CHECK_TAIL_KEEP:]
+            except (OSError, ValueError):       # closed under it: a process that escaped its group holds the pipe
+                return
+
+        reader = threading.Thread(target=lambda: out.append(proc.stdout.read(limit + 1)), daemon=True)
+        errors = threading.Thread(target=drain, daemon=True)
         reader.start()
+        errors.start()
         try:
             proc.wait(timeout=extra["timeout_seconds"])
             late = False
@@ -2202,22 +2229,32 @@ def run_source(extra, source, result, fail):
             pass
         proc.wait()
         reader.join(5)
+        errors.join(5)
         proc.stdout.close()
+        proc.stderr.close()
         printed = out[0] if out else b""
-    if len(printed) > CHECK_OUTPUT_MAX:
-        return fail("too_large", "the check printed more than 4 KiB")
+    tail = err[0].decode("utf-8", "replace").strip()
+    if len(printed) > limit:
+        return fail("too_large", f"the check printed more than {limit} bytes" if lines else
+                    "the check printed more than 4 KiB", tail)
     if late:
-        return fail("timeout", f"no answer in {extra['timeout_seconds']} seconds")
+        return fail("timeout", f"no answer in {extra['timeout_seconds']} seconds", tail)
     if proc.returncode != 0:
-        return fail("exit", f"the check ended with exit code {proc.returncode}")
+        return fail("exit", f"the check ended with exit code {proc.returncode}", tail)
+    if lines:
+        try:
+            text = printed.decode("utf-8")
+        except UnicodeDecodeError:
+            return fail("bad_output", "the check printed text that is not UTF-8", tail)
+        return result(ok=True, lines=[x.strip() for x in text.splitlines() if x.strip()])
     try:
         found = json.loads(printed.decode("utf-8"), parse_constant=_no_constant)
     except (UnicodeDecodeError, ValueError):
-        return fail("bad_output", "the check did not print exactly one JSON object")
+        return fail("bad_output", "the check did not print exactly one JSON object", tail)
     if isinstance(found, dict) and "value" in found and set(found) <= {"value", "summary"}:
         summary = found.get("summary", "")
         if not finite_number(found["value"]) or not isinstance(summary, str) or len(summary) > 200:
-            return fail("bad_output", "value must be a finite number, and summary text of at most 200 characters")
+            return fail("bad_output", "value must be a finite number, and summary text of at most 200 characters", tail)
         return result(ok=True, value=found["value"], summary=summary)
     if isinstance(found, dict) and "error" in found and set(found) <= {"error", "detail", "retry_after"}:
         code, detail, retry = found["error"], found.get("detail", ""), found.get("retry_after")
@@ -2225,9 +2262,21 @@ def run_source(extra, source, result, fail):
                 or len(detail) > 200 or (retry is not None and (isinstance(retry, bool) or not isinstance(retry, int)
                                                                 or not 1 <= retry <= 10 ** 7)):
             return fail("bad_output", "error must be a code of a-z and _, detail text of at most 200 characters, and "
-                                      "retry_after a whole number of seconds from 1")
-        return result(ok=False, error=code, detail=detail, **({} if retry is None else {"retry_after": retry}))
-    return fail("bad_output", "the check must print {value, summary} or {error, detail, retry_after}")
+                                      "retry_after a whole number of seconds from 1", tail)
+        body = result(ok=False, error=code, detail=detail, **({} if retry is None else {"retry_after": retry}))
+        return dict(body, tail=tail) if tail else body
+    return fail("bad_output", "the check must print {value, summary} or {error, detail, retry_after}", tail)
+
+
+def check_grants(agent):
+    """The agent's read grants in this checkout's team.json, as one comparable text: a change of them is when the
+    helper reads the agent's keys for its checks again (plan P4)."""
+    try:
+        with open(os.path.join(KIT, "team.json"), encoding="utf-8") as f:
+            grants = (json.load(f)["agents"].get(agent) or {}).get("secrets") or {}
+    except (OSError, ValueError, KeyError, AttributeError):
+        grants = (TEAM["agents"].get(agent) or {}).get("secrets") or {}
+    return json.dumps(grants, sort_keys=True, default=str)
 
 
 # ---------------------------------------------------------------- task outputs (helper feature task_outputs)
@@ -2353,6 +2402,8 @@ class Helper:
         # (jobs=), and {job: (pause, due)} for a report that the hub did not take yet
         self.jobs_held, self.report_waits = {}, {}
         self.check_runs = set()         # plan C12: the check runs this helper holds, until the hub took their result
+        # plan P4: the agent's read keys for its checks, kept in memory, and the grants they were read for (check_keys)
+        self.check_env, self.check_env_grants, self.check_env_lock = None, None, threading.Lock()
         self.screen_attempts = {}       # {task: (attempt, told)} of the runners (app_server_task) that this helper started
         self.start_waits = {}           # {event id: (seconds, monotonic time of the next try)} of failed task events
         self.step = None                # (name, task or None, monotonic start) of the main loop's step now (doing)
@@ -3429,14 +3480,27 @@ class Helper:
     def check_thread(self, extra):
         try:
             try:
-                result = run_check(extra, agent=self.agent)
+                result = run_check(extra, agent=self.agent, keys=self.check_keys())
             except Exception as e:
                 result = {"ok": False, "error": "exit", "detail": f"the runner failed: {type(e).__name__}", "elapsed_ms": 0}
             finally:
                 CHECK_SLOTS.release()
+            if not result.get("ok"):
+                self.check_env = None           # a failed run reads the keys again: one may have changed
             self.post_check(extra, result)
         finally:
             self.end_outside()
+
+    def check_keys(self):
+        """The agent's own read keys for its checks (plan P4): the API keys that its sessions read (read_env), read
+        from the vault once and kept in memory, and read again after a failed run or when the agent's grants in
+        team.json change. A check runs only on its own agent's machine, so these are that agent's keys and no
+        other's. Its sessions already hold the same keys, shell and network, so a check adds no capability."""
+        grants = check_grants(self.agent)
+        with self.check_env_lock:
+            if self.check_env is None or grants != self.check_env_grants:
+                self.check_env, self.check_env_grants = read_env(self.agent, None, "check"), grants
+            return dict(self.check_env)
 
     def begin_outside(self):
         """A check or a login job starts. They run in this process outside every task window, so no Fleet update may
