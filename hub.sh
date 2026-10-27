@@ -40,9 +40,10 @@ set -eu
 HUB_USER=fleet
 HUB_PORT=8765
 PACKAGES="git tmux python3 curl ca-certificates ufw unattended-upgrades sudo"
-# The Founderizer files this installer needs in the copy it runs from. RULES.md and the manager's profile are in the list
-# because the manager reads both at every start: a hub without them runs but has no manager worth the name.
-NEEDED="hub.py fleet.py hubsetup.py selftest.py config-ref.sh team.json RULES.md profiles/manager.md"
+# The Founderizer files this installer needs in the copy it runs from. The rules, the manager's parts of them and its
+# profile are in the list because the manager reads them at every start: a hub without them runs but has no manager
+# worth the name.
+NEEDED="hub.py fleet.py hubsetup.py selftest.py config-ref.sh team.json RULES.md rules/lead.md rules/manager.md profiles/manager.md"
 
 check=no
 source=""

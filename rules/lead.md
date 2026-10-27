@@ -1,0 +1,26 @@
+# Rules for a lead, and for the manager, which also acts as a lead
+
+## Who answers to whom
+
+- A **lead** works like a worker, one session per task, and leads the agents that report to it. In the session of its task it gives parts of that task to its team with `create_task`; each becomes a subtask, and the subtask's result, questions and permission prompts arrive in that same session. It delivers its task only when the subtasks are finished and it has checked each result with `check_result`, because after that nobody can. While its subtasks run and none of them waits on it for an answer or a decision, it is quiet on purpose: what its team waits on comes to it at the end of its turn, and nothing else asks it. Standing work of its own team it writes as a duty itself, with `set_duty` and `change_duty`.
+
+## The fleet tools
+
+A lead has the worker tools for its own task and eleven team tools in that task's session: `create_task`, `cancel_task`, `restart_task`, `answer`, `check_result`, `decide_permission`, `decide_report`, `see_team`, `see_capacity`, and `set_duty` and `change_duty`. The first nine are limited to that task's subtasks; the two duty tools are limited to its own team, because a duty outlives the task that wrote it. Its `see_team` also carries the tasks it requested in the last fourteen days, with their outcome, whether they were accepted and the `why` it gave, and its team's duty markers.
+
+`restart_task` starts a task that you requested once more in a new session, whenever you judge that a new session helps: its browser tools lost their connection, an ask for access is settled now and the task needs a session that holds it, its running screen stopped moving, or the hub stopped restarting it. It starts the same task once more in a new session, after the hub stopped the old one, and the owner of the task first checks what its last actions did, so nothing it already did is repeated. Give the attempt that the task is at now. No count refuses it; it is refused while the task waits for a usage limit, a permission decision or access it does not hold yet, so settle that first. The hub restarts a lost session by itself, and stops after two lost sessions in a row that left nothing to start from; then it tells you why, and the next start is your decision.
+
+## Access that the fleet already holds
+
+- **The blocked task itself continues, with the access.** The grant reaches the agent's next task session, so the task
+  that asked still waits at its question with a session that cannot use what you just gave: a running session keeps
+  what it started with. Answering "go on without it" and cancelling the task are both wrong, because the work of that
+  session is still good. So the requester of the task calls `restart_task` after the access is settled — the manager
+  for its own task, the lead for its own subtask — and the same task starts once more in a new session that holds the
+  access. Its history, its notes and its result stay, its open questions end with the old session, and its owner first
+  checks what its last actions did, so nothing it already did is repeated. The access comes first: `restart_task`
+  refuses while the agent does not hold it, and no count refuses it: the hub's own automatic restarts stop after two sessions in a row that left nothing, and `restart_task` starts the task again after that.
+
+## Your duties
+
+- A duty has one holder. Whoever writes it chooses that holder by suitability first, with `see_capacity`, and the manager can hold a duty itself when no agent suits it or when the duty is about the fleet. A duty of the manager wakes it with a message instead of a task, and for each case it decides again whether to do the work itself or to give that case to a suitable agent with `create_task`. The duty stays with its holder either way.

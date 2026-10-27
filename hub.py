@@ -1916,7 +1916,7 @@ def holdings_start_text(agent):
 # repositories, the services, the machine each one can reach -- were shown to the manager alone.
 # What a colleague holds is a fact about the team. Its allowance, its workload, its accounts, its logins and its
 # helper are not: those are how the manager chooses who works, and an agent that read them would be routing.
-TEAM_CHARS = 700                # the most that the team block adds to a session's opening text
+TEAM_CHARS = 2000               # the most that the team directory adds to a session's opening text
 TEAM_ITEMS = 4                  # named things of one kind about a colleague, before the rest become a count
 
 
@@ -1943,30 +1943,39 @@ def colleague_facts(name):
     return out
 
 
-def colleague_line(name, who=""):
-    """One other agent in one line: who it is, how it stands to the reader, and what it holds. The two readers of it
-    are a session's opening text and message_agent's own directory, so the fact that tells two agents apart is in
-    both."""
+def colleague_line(name, who="", looks=""):
+    """One other agent in one line: who it is, how it stands to the reader, what it holds, and what it looks after
+    (looks_after). The two readers of it are a session's opening text and message_agent's own directory, so the fact
+    that tells two agents apart is in both."""
     a = agents().get(name) or {}
     facts = colleague_facts(name)
     return (f"{name}" + (f" ({a['title']})" if a.get("title") else "")
             + f" [{a.get('role')}" + (f", {runtime_label(a['runtime'])}" if a.get("runtime") else "") + "]" + who
-            + ": " + ("; ".join(facts) or "no repository, service or server of its own"))
+            + ": " + ("; ".join(facts) or "no repository, service or server of its own")
+            + (f"; looks after: {looks}" if looks else ""))
 
 
 def team_start_text(agent):
-    """The rest of the fleet as the session that has to work with it reads it, and the two routes to a colleague by
-    use. team.json only: start_text runs inside admit_task's transaction, so no q, no q1 and no git show -- which is
-    also why the duties and the owner's own sentence are not here, and see_responsibilities and message_agent's
-    directory still carry those."""
+    """The team directory (AUTONOMY.md P9.1): the rest of the fleet as the session that has to work with it reads
+    it -- how each colleague stands to this agent, what the fleet's own record says it holds, and what it looks after
+    (its owner's "Responsible for" line and the duties it holds now) -- and the two routes to a colleague by use. It
+    opens every session kind: a task's start, the manager's brief and the owner chat's start. message_agent's
+    description carried it until then, and so every duty given changed the fixed text of every session.
+
+    Reads only (read_rows, and git for the profiles): start_text runs inside admit_task's transaction."""
+    rev, duties = kit_revision(), {}
+    for r in read_rows("SELECT agent, text FROM responsibilities WHERE state!='retired' ORDER BY id"):
+        duties.setdefault(r["agent"], []).append(duty_name(r["text"]))
     requester, mine = reports_to(agent), \
-        [n for n in agents() if reports_to(n) == agent] if role_of(agent) == "lead" else []
+        [n for n in agents() if reports_to(n) == agent] if role_of(agent) in ("lead", "manager") else []
     kept, left = [], 0
     for name in agents():
         if name == agent or not agent_active(name):
             continue
         line = colleague_line(name, " -- it gives you your tasks" if name == requester else
-                              " -- you give it tasks" if name in mine else "")
+                              " -- you give it tasks" if name in mine else "",
+                              looks_after_text(name, rev, duties.get(name, []))
+                              if responsible_line(name, rev) or duties.get(name) else "")
         if sum(len(x) + 3 for x in kept) + len(line) <= TEAM_CHARS:
             kept.append(line)
         else:
@@ -1974,11 +1983,12 @@ def team_start_text(agent):
     if not kept:
         return ""
     return ("\nYOUR TEAM, from the fleet's own record and not from profiles: " + " | ".join(kept)
-            + (f" | and {left} more, which {manager_name()} knows." if left else "")
-            + ". Work that needs a colleague's access or machine: name the thing in ask_my_requester's needs_access "
-              "and say who you think holds it; your requester reads the holder itself. A question for one of them: "
-              "message_agent: a message between linked tasks reaches the colleague's task, and any other its chat, "
-              "which can talk and not act. None of this gives you their access.\n")
+            + (f" | and {left} more, which {manager_name()} knows" if left else "")
+            + (". Work that needs a colleague's access or machine: name the thing in ask_my_requester's needs_access "
+               "and say who you think holds it; your requester reads the holder itself" if agent != manager_name()
+               else "")
+            + ". A question for one of them: message_agent: a message between linked tasks reaches the colleague's "
+              "task, and any other its chat, which can talk and not act. None of this gives you their access.\n")
 
 
 def allowance_start_text(agent, task_id):
@@ -2034,46 +2044,92 @@ RULE_FOUR = (" Never contact the owner: if you are blocked, use ask_my_requester
              "time your requester is told.")
 
 
-def start_text(agent, task_id, resume=False):
-    head = (f'You are agent "{agent}" in Founderizer. Read RULES.md and '
+def start_text(agent, task_id, resume=False, note="", row=None):
+    """The per-task block that a task session opens with (AUTONOMY.md 6.4): one function of each owning lane, in the
+    contract's order, and nothing else. A lane that lands later puts its own call in its own place below, never at the
+    end, and returns "" when it has nothing to say. Every part reads with read_row or read_rows only: admit_task runs
+    this inside the transaction that writes the task, and a read that commits there commits half a task.
+
+    resume: a new attempt of the same task, with `note` (why it starts again) and `row`, the task row as the attempt
+    before it left it (attempt_event). Masked on the way out, not only where each part was written: this text carries
+    the agent's own notes, its lessons and its holdings, and a login registered after any of them was stored was
+    never masked at the write."""
+    return mask_secrets(
+        task_start_text(agent, task_id, resume, note, row)            # 1. the task or wake (L8)
+        + holdings_team_text(agent, task_id)                            # 2. holdings and the team directory (L8)
+        + standing_start_text(agent)                                    # 3. standing items (L3)
+        + notes_start_text(agent) + memory_start_text(agent, task_id)   # 4. matching lessons (L6)
+        # 5. the agent's checks (L4): its call goes here
+    )
+
+
+# The rules split by role (AUTONOMY.md P9.3): RULES.md is the core that every agent reads, and each part of
+# rules/<part>.md loads only for the agents it is about, in this order.
+RULES_PARTS = ("lead", "manager", "conversations", "logins", "github")
+
+
+def rules_parts(agent):
+    """The parts of the rules beside RULES.md that apply to this agent, in RULES_PARTS order: the lead's for a lead
+    and for the manager, which acts as a lead too; the manager's; the part on conversations for an agent that people
+    write to and for the manager, which gets their work requests; the part on logins for an agent that holds a login
+    or a key; the part on GitHub for an agent with a repository. Reads only: start_text runs inside admit_task's
+    transaction."""
+    a, role = agents().get(agent) or {}, role_of(agent)
+    wanted = {"lead": role in ("lead", "manager"), "manager": role == "manager",
+              "conversations": role == "manager" or bool(read_row("SELECT 1 FROM person_agents WHERE agent=? LIMIT 1",
+                                                                  (agent,))),
+              "logins": bool(granted_logins(agent) or a.get("vault_create") is True or a.get("vault") == "broker"),
+              "github": bool(a.get("repos"))}
+    return [part for part in RULES_PARTS if wanted[part]]
+
+
+def rules_files(parts):
+    """The files of the rules that a session of these parts reads: RULES.md, then its parts."""
+    return ["RULES.md"] + [f"rules/{part}.md" for part in parts]
+
+
+def task_start_text(agent, task_id, resume=False, note="", row=None):
+    """Part 1 of the per-task block: which task this session is for, how it starts and ends, the part of a split step
+    it is, the team that a lead gives parts to, what came before it, and what came of the agent's own reports."""
+    said = (f'You are agent "{agent}" in Founderizer. Read {", ".join(rules_files(rules_parts(agent)))} and '
             f'profiles/{agent}.md in this folder first, but RULES.md only if your context does not hold it yet: '
             f'Claude Code loads it through CLAUDE.md. Your helper brought this folder up to date just before this '
-            f'session; do not pull at the start. Call read_messages with task_id \"{tref(task_id)}\" now and whenever signalled. '
-            # What the fleet's own record says this agent holds, who else is on the fleet and what each of them
-            # holds, and what is left of its allowance: the facts that change its first action, so they are here
-            # and not behind a tool. The team comes straight after the holdings because the two read as one thing:
-            # what you hold, what the others hold, and how to name the one you lack.
-            + holdings_start_text(agent) + team_start_text(agent) + allowance_start_text(agent, task_id)
-            # What this agent worked out for itself, the way its profile is here: its own notes on how it works, and
-            # the lessons it wrote about the things it works on. agent_notes_text is the reader the notes left for
-            # this shelf; both are carried AS the agent's own words, never as rules, so a later session weighs them.
-            + notes_start_text(agent) + memory_start_text(agent, task_id)
-            # manager_as_lead: and, when this task is one part of a split piece of work, which piece and who holds
-            # the other parts -- a part that does not know it is a part does the whole piece.
-            + part_start_text(task_id)
-            # L3: the standing items that steer this agent (AUTONOMY.md 6.4). L8's structure moves this call.
-            + standing_start_text(agent))
-    # Masked on the way out, not only where each part was written: this text carries the agent's own notes, its
-    # lessons and its holdings, and a login registered after any of them was stored was never masked at the write.
+            f'session; do not pull at the start. Call read_messages with task_id \"{tref(task_id)}\" now and whenever '
+            f'signalled. ')
+    said += (f'You are RESUMING task {tref(task_id)} after your earlier session stopped. '
+             f'Call the fleet tool list_my_tasks with task_id "{tref(task_id)}". First check what '
+             f'was already done (rule 9: check before repeating), then continue and finish with '
+             f'deliver_result.' if resume else
+             f'Your task is {tref(task_id)}. Call the fleet tool list_my_tasks with task_id '
+             f'"{tref(task_id)}", do the task, report progress as you go, and finish with deliver_result.') + RULE_FOUR
+    # manager_as_lead: when this task is one part of a split piece of work, which piece and who holds the other
+    # parts -- a part that does not know it is a part does the whole piece.
+    part = part_start_text(task_id)
+    said += " " + part.rstrip() if part else ""
     if role_of(agent) == "lead":
         team = ", ".join(n for n in agents() if reports_to(n) == agent) or "nobody yet"
-        head += (f'You lead {team}. Give parts of {tref(task_id)} to them with create_task: each becomes a subtask of '
+        said += (f' You lead {team}. Give parts of {tref(task_id)} to them with create_task: each becomes a subtask of '
                  f'{tref(task_id)}. Their results, questions and permission prompts arrive in this session: check each '
                  f'result with check_result, answer with answer, and decide prompts with decide_permission. Deliver '
                  f'{tref(task_id)} only when its subtasks are finished. Standing work of your team is yours to write '
                  f'as a duty, with set_duty and change_duty: your team\'s and your own, and nobody else\'s. '
                  f'{manager_name()} stays the authority over every duty of the fleet, so it reads what you write and '
-                 f'it writes a duty outside your team. ')
+                 f'it writes a duty outside your team.')
     if resume:
-        return mask_secrets(head + (
-            f'You are RESUMING task {tref(task_id)} after your earlier session stopped. '
-            f'Call the fleet tool list_my_tasks with task_id "{tref(task_id)}". First check what '
-            f'was already done (rule 9: check before repeating), then continue and finish with '
-            f'deliver_result.' + RULE_FOUR))
-    return mask_secrets(head + (
-        f'Your task is {tref(task_id)}. Call the fleet tool list_my_tasks with task_id '
-        f'"{tref(task_id)}", do the task, report progress as you go, and finish with deliver_result.'
-        + RULE_FOUR))
+        t = row or read_row("SELECT * FROM tasks WHERE id=?", (task_id,))
+        said += (" " + note if note else "") + (warm_attempt(t) if t else "")
+    else:
+        t = read_row("SELECT follows FROM tasks WHERE id=?", (task_id,))
+        said += warm_follows(t["follows"] if t else None)
+    return said + report_feedback(agent) + "\n"
+
+
+def holdings_team_text(agent, task_id):
+    """Part 2 of the per-task block: what the fleet's own record says this agent holds, who else is on the fleet and
+    what each of them holds, and what is left of its allowance -- the facts that change its first action, so they
+    are here and not behind a tool. The team comes straight after the holdings because the two read as one thing:
+    what you hold, what the others hold, and how to name the one you lack."""
+    return holdings_start_text(agent) + team_start_text(agent) + allowance_start_text(agent, task_id)
 
 
 def part_start_text(task_id):
@@ -2433,9 +2489,7 @@ def session_alive(agent, task_id):
 
 def attempt_event(t, note=""):
     """emit's row for the start of the next attempt of task row `t` (see event_rows)."""
-    return (t["owner"], "task", t["id"],
-            start_text(t["owner"], t["id"], resume=True) + (" " + note if note else "") + warm_attempt(t)
-            + report_feedback(t["owner"]),
+    return (t["owner"], "task", t["id"], start_text(t["owner"], t["id"], resume=True, note=note, row=t),
             {"needs": t["needs"], "resume": True, "attempt": t["attempt"] + 1, "generation": kv_get("db_id")})
 
 
@@ -4458,8 +4512,7 @@ def admit_task(requester, f, trigger_id=None, trigger_run=None):
                       trigger_id, trigger_run, f.get("why"), f.get("responsibility"), f.get("duty_case"))).lastrowid
     DB.execute("INSERT INTO attempts(task,attempt,created,reason) VALUES(?,1,?,'created')", (tid, t0))
     DB.execute("INSERT INTO events(agent,kind,task,text,created,extra) VALUES(?,?,?,?,?,?)",     # emit's row
-               (f["owner"], "task", tid,
-                start_text(f["owner"], tid) + warm_follows(f["follows"]) + report_feedback(f["owner"]), t0,
+               (f["owner"], "task", tid, start_text(f["owner"], tid), t0,
                 json.dumps({"needs": f["needs"], "resume": False, "attempt": 1,
                             "generation": generation[0] if generation else None})))
     waiting_say_rows(f["owner"], tid)
@@ -5077,12 +5130,17 @@ def looks_after(agent, rev, duties=None):
     writes the moment it gives standing work. So nobody has to keep this sentence current - the two things the fleet
     already forces to be written are the sentence, and a duty given today is in it today. It ends without a stop, so
     a caller sets it in its own line the way that line reads."""
-    said = responsible_line(agent, rev)
-    if len(said) > LOOKS_AFTER_MAX:
-        said = said[:LOOKS_AFTER_MAX].rsplit(" ", 1)[0] + "..."
     if duties is None:
         duties = [duty_name(r["text"]) for r in q("SELECT text FROM responsibilities WHERE agent=? AND "
                                                   "state!='retired' ORDER BY id", (agent,))]
+    return looks_after_text(agent, rev, duties)
+
+
+def looks_after_text(agent, rev, duties):
+    """looks_after with the duties already read: no read of the database, so it is safe inside a transaction."""
+    said = responsible_line(agent, rev)
+    if len(said) > LOOKS_AFTER_MAX:
+        said = said[:LOOKS_AFTER_MAX].rsplit(" ", 1)[0] + "..."
     said = (said or (agents().get(agent) or {}).get("title") or "nothing that its profile says yet").rstrip(".")
     return said + (". Duties: " + ", ".join(duties) if duties else "")
 
@@ -9813,7 +9871,7 @@ def profile_view(agent, rev):
 
 
 _code_diffs = {}
-FLEET_FILES = re.compile(r"(?:^|/)[^/]+\.py$|^team\.json$|^bws\.toml$|^profiles/|^(?:RULES|CLAUDE|AGENTS)\.md$")
+FLEET_FILES = re.compile(r"(?:^|/)[^/]+\.py$|^team\.json$|^bws\.toml$|^profiles/|^rules/|^(?:RULES|CLAUDE|AGENTS)\.md$")
 OWNER_ONLY = re.compile(r"(?:^|/)(?:test_[^/]*|ui_fixture|selftest|verify|pilot|vault)\.py$")  # never run by helpers
 
 
@@ -15340,16 +15398,24 @@ def resume_lines(t0):
     return out
 
 
+def manager_parts_line():
+    """The brief's first line (plan P9.3): the parts of the rules that the manager reads beside RULES.md. The start
+    that its helper writes names RULES.md and its profile only."""
+    return (f"Read {' and '.join(rules_files(rules_parts(manager_name()))[1:])} too, the parts of the rules for the "
+            f"manager, if your context does not hold them yet.\n")
+
+
 def manager_resume_text():
     """Where the fleet stood at the moment this session started, for the first prompt of the standing session. It
     carries no plan of its own: every line of it is written down somewhere the next session can read again."""
     t0 = now()
     # Masked on the way out, as start_text is: these lines carry what agents wrote — report texts, task titles,
     # question texts — and a login registered after any of them was stored was never masked at the write.
-    return mask_secrets("Where the fleet stands, as the hub has it (nothing here is only in this session):\n"
+    return mask_secrets(manager_parts_line()
+                        + "Where the fleet stands, as the hub has it (nothing here is only in this session):\n"
                         + "\n".join(resume_lines(t0))
-                        # L3: its standing items (AUTONOMY.md 6.4). L8's structure moves this call.
-                        + standing_start_text(manager_name()).rstrip("\n")
+                        + team_start_text(manager_name())               # the team directory (P9.1)
+                        + standing_start_text(manager_name()).rstrip("\n")   # its standing items (L3, 6.4)
                         + "\nThen call read_messages: its read is the receipt.")
 
 
@@ -16203,7 +16269,9 @@ def tools_for(agent, context=None):
     role = agents()[agent].get("role")
     read_only = ("list_my_tasks", "see_team", "see_goals", "see_capacity", "see_triggers", "search_knowledge",
                  "see_responsibilities", "see_earlier_work", "see_history", "recall", "see_standing", *GOOGLE_READS)
-    return [{"name": name, "description": described(agent, name, desc), "inputSchema": schema,
+    chat = chat_context(agent, context)
+    return [{"name": name, "description": described(agent, name, desc) + (
+                 f" {agent_directory(agent)}" if chat and name == "message_agent" else ""), "inputSchema": schema,
              "annotations": {"readOnlyHint": name in read_only, "destructiveHint": False,
                              "idempotentHint": name in read_only, "openWorldHint": False}}
             for r, name, fn, desc, schema in TOOLS if
@@ -16221,8 +16289,10 @@ def tools_for(agent, context=None):
 
 def described(agent, name, desc):
     """A tool's description with what this session's agent needs inside it: the Google account that a Google tool
-    uses, and for message_agent the agents it can write to and what each of them looks after."""
-    return f"{desc} {agent_directory(agent)}" if name == "message_agent" else google_described(agent, name, desc)
+    uses. No description changes at run time (AUTONOMY.md P9.1): the team directory is in the start block of every
+    session (team_start_text). The one session it does not reach yet is an owner chat, whose start the helper writes,
+    so tools_for adds the directory to message_agent's description there."""
+    return google_described(agent, name, desc)
 
 
 def google_described(agent, name, desc):
@@ -24174,23 +24244,32 @@ def rules_sections(text):
 
 
 def rules_news(old, new):
-    """One sentence for the manager: which sections of RULES.md changed from revision `old` to `new`, and their
-    lines now, so that it reads those and not the whole file. A revision that cannot be read says so."""
-    texts = []
-    for rev in (old, new):
-        code, out, _ = git_kit("show", f"{rev}:RULES.md") if rev else (1, "", "")
-        if code != 0:
-            return ("RULES.md may have changed: read it again before you act on a rule you hold from memory. "
-                    "No release changes a profile.")
-        texts.append(rules_sections(out))
-    before = {head: body for head, _, _, body in texts[0]}
-    changed = [(head or "the opening", first, last) for head, first, last, body in texts[1] if before.get(head) != body]
-    gone = [head or "the opening" for head in before if head not in {h for h, *_ in texts[1]}]
-    if not changed and not gone:
-        return "RULES.md did not change, and no release changes a profile: there is nothing to read again."
-    return ("RULES.md changed in " + ", ".join(f'"{head}" (lines {first}-{last})' for head, first, last in changed)
-            + (("; " if changed else "") + "it no longer has " + ", ".join(f'"{h}"' for h in gone) if gone else "")
-            + ". Read those lines again; the rest of RULES.md is as it was, and no release changes a profile.")
+    """One sentence for the manager: which sections of the rules (RULES.md and each part of rules/, P9.3) changed
+    from revision `old` to `new`, and their lines now, so that it reads those and not every file. A file that one
+    revision has and the other not is all new or all gone. A revision that cannot be read says so."""
+    if not old or git_kit("cat-file", "-e", f"{old}^{{commit}}")[0] != 0 or \
+            git_kit("cat-file", "-e", f"{new}^{{commit}}")[0] != 0:
+        return ("The rules may have changed: read RULES.md and your parts of rules/ again before you act on a rule "
+                "you hold from memory. No release changes a profile.")
+    said = []
+    for path in rules_files(RULES_PARTS):
+        texts = []
+        for rev in (old, new):
+            code, out, _ = git_kit("show", f"{rev}:{path}")
+            texts.append(rules_sections(out) if code == 0 else [])
+        before = {head: body for head, _, _, body in texts[0]}
+        changed = [(head or "the opening", first, last) for head, first, last, body in texts[1]
+                   if before.get(head) != body]
+        gone = [head or "the opening" for head in before if head not in {h for h, *_ in texts[1]}]
+        if changed or gone:
+            said.append(f"{path} changed in " + ", ".join(f'"{head}" (lines {first}-{last})'
+                                                          for head, first, last in changed)
+                        + (("; " if changed else "") + "it no longer has " + ", ".join(f'"{h}"' for h in gone)
+                           if gone else ""))
+    if not said:
+        return "The rules did not change, and no release changes a profile: there is nothing to read again."
+    return ("; ".join(said) + ". Read those lines again; the rest of the rules is as it was, and no release changes "
+            "a profile.")
 
 
 def restart_hub_soon(pinned, reached, always=False):

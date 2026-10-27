@@ -545,7 +545,7 @@ MOTION = "CLAUDE_AX_SCREEN_READER=0"
 PRESENCE = 30           # seconds between two presence pings while the main loop is inside one step (Helper.presence)
 # Fleet's deny list for worker and lead Claude sessions.
 DENY = ["Read(~/.fleet/**)", "Edit(~/.fleet/**)", "Bash(*.fleet/*)"] + UNSEEN_TOOLS
-PROTECTED = ("fleet.py", "lifecycle.py", "onboard.py", "vault.py", "acp_runner.py", "screen_runner.py", "desktop.py", "FleetWorker.swift", "worker_install.py", "install-worker.sh", "Install Fleet Worker.command", "hub.py", "wakeups.py", "usage.py", "threads.py", "selftest.py", "test_logins.py", "verify.py", "verify_case.py", "pilot.py", "publish.py", "publish/**", "team.json", "bws.toml", "RULES.md", "CLAUDE.md", "AGENTS.md", "profiles/**")
+PROTECTED = ("fleet.py", "lifecycle.py", "onboard.py", "vault.py", "acp_runner.py", "screen_runner.py", "desktop.py", "FleetWorker.swift", "worker_install.py", "install-worker.sh", "Install Fleet Worker.command", "hub.py", "wakeups.py", "usage.py", "threads.py", "selftest.py", "test_logins.py", "verify.py", "verify_case.py", "pilot.py", "publish.py", "publish/**", "team.json", "bws.toml", "RULES.md", "rules/**", "CLAUDE.md", "AGENTS.md", "profiles/**")
 
 
 def settings_arg(agent, conf, task, tools=()):
