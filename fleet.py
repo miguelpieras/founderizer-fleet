@@ -63,8 +63,8 @@ import uuid
 from threads import MARKER, THREAD_ID, CodexFiles, Tailer, Translator, complete_rows, manager_transcript, text_of
 from usage import Collector, local_model, timestamp
 from lifecycle import (GITHUB_TOKEN, MCP_PROGRAM, REPO_ACCESS, REPO_NAME, RUNTIMES, TOOL_CATALOG, Lifecycle,
-                       Updating, app_server_task, exe, follow_config_ref, mcp_variable, no_sign_in, reuse_settings,
-                       runtime_fact, runtimes_with, session_reuse, tool_catalog, tool_needs)
+                       Updating, app_server_task, exe, facts_now, follow_config_ref, mcp_variable, no_sign_in,
+                       reuse_settings, runtime_fact, runtimes_with, session_reuse, tool_catalog, tool_needs)
 from desktop import Publisher
 
 KIT = os.path.dirname(os.path.abspath(__file__))
@@ -785,8 +785,8 @@ def codex_server(name, catalog=None):
 # carries as RULES.md itself (publish.COPIED), and the parts, its profile and then its task as its first prompt.
 RULES_PARTS = ("lead", "manager", "conversations", "logins", "github")     # hub.RULES_PARTS, in that order
 STABLE_TASK = ('You are agent "{agent}" in Founderizer, in a session for one task of yours. {where} Your helper '
-               'brought this folder up to date just before this session; do not pull at the start. {rules} are '
-               'in your context, so do not read them again.')
+               'brought this folder up to date just before this session; do not pull at the start. ')
+STABLE_RULES = "{rules} are in your context, so do not read them again."
 STABLE_WHERE = {"read": ("The task is the first answer of read_messages.",
                          "The fleet's rules for you (RULES.md and your parts of rules/) and your profile follow: they"),
                 "prompt": ("The task is at the end of this text.",
@@ -795,11 +795,12 @@ STABLE_WHERE = {"read": ("The task is the first answer of read_messages.",
 CODEX_RULES_BYTES = 32 * 1024   # Codex's own default project_doc_max_bytes, which a longer AGENTS.md would be cut at
 
 
-def stable_text(agent, opening, parts):
-    """The stable start of a task session of `agent` that gets its task by `opening` (plan P9.2), or None when this
-    checkout cannot give it: a file is missing, or for a session that reads RULES.md as its folder's AGENTS.md, that
-    AGENTS.md is not RULES.md byte for byte (a checkout of the code repository, whose AGENTS.md is the developers').
-    The same files give the same bytes."""
+def stable_text(agent, opening, parts, head=None):
+    """The stable start of a session of `agent` whose runtime reads its rules by `opening` (plan P9.2), or None when
+    this checkout cannot give it: a file is missing, or for a session that reads RULES.md as its folder's AGENTS.md,
+    that AGENTS.md is not RULES.md byte for byte (a checkout of the code repository, whose AGENTS.md is the
+    developers'). head: what comes first, a task session's line by default, the owner chat's instructions, or ""
+    for the standing manager session, whose first prompt says who it is. The same files give the same bytes."""
     def read(name):
         with open(os.path.join(KIT, name), encoding="utf-8") as f:
             return f.read().strip()
@@ -812,7 +813,21 @@ def stable_text(agent, opening, parts):
     except OSError:
         return None
     where, rules = STABLE_WHERE[opening]
-    return "\n\n".join([STABLE_TASK.format(agent=agent, where=where, rules=rules)] + texts) + "\n"
+    head = STABLE_TASK.format(agent=agent, where=where) if head is None else head + (" " if head else "")
+    return "\n\n".join([head + STABLE_RULES.format(rules=rules)] + texts) + "\n"
+
+
+def standing_opening(conf, rules):
+    """How a standing session (the manager's, an owner chat) of this runtime reads its rules when it starts with its
+    stable text first (plan P9.2): its runtime's task_opening, or None to start as before."""
+    opening = runtime_fact(conf.get("runtime"), "task_opening")
+    return opening if isinstance(rules, list) and opening in STABLE_WHERE and \
+        runtime_fact(conf.get("runtime"), "driver") == "terminal" else None
+
+
+def codex_rules_limit():
+    """Codex's project_doc_max_bytes for a session that reads all of RULES.md as this folder's AGENTS.md."""
+    return max(CODEX_RULES_BYTES, os.path.getsize(os.path.join(KIT, "AGENTS.md")) + 4096)
 
 
 def stable_start(conf, needs, opening, rules):
@@ -845,7 +860,11 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
     runtime = conf.get("runtime")
     tools = [] if not runtime_fact(runtime, "mcp_servers") or app_server_task(conf, needs) else \
         [t for t in values.get("FLEET_TOOLS", "").split() if t in catalog]
-    stable = stable_text(agent, opening, rules) if task and stable_start(conf, needs, opening, rules) else None
+    if task:
+        stable = stable_text(agent, opening, rules) if stable_start(conf, needs, opening, rules) else None
+    else:           # the standing manager session (helper feature stable_standing): its first prompt stays its own
+        opening = standing_opening(conf, rules)
+        stable = stable_text(agent, opening, rules, head="") if opening else None
     if task and stable is None:
         prompt += github_text(values, tools)
     if runtime_fact(runtime, "driver") == "acp":
@@ -888,17 +907,21 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
         ("--append-system-prompt " if idle else "") + shlex.quote(prompt)
     if stable is not None:
         # The stable text first, then what is this session's own: its repositories' line, and for Codex its task.
-        # Claude's task comes with its first read_messages, so no task text is in its start at all.
-        stable += github_text(values, tools)
+        # Claude's task comes with its first read_messages, so no task text is in its start at all; the standing
+        # manager session keeps its first prompt, the brief, after it.
+        stable += github_text(values, tools) if task else ""
+        window = task or "manager"
         if opening == "read":
             first = "--setting-sources user --append-system-prompt-file " + \
-                shlex.quote(session_file(agent, task, "md", stable))
+                shlex.quote(session_file(agent, window, "md", stable)) + \
+                ("" if task or resume else " " + shlex.quote(prompt))
+        elif resume:
+            first = f"-c project_doc_max_bytes={codex_rules_limit()} " + shlex.quote(session)   # its thread
         else:
             # A first prompt longer than a tmux command can carry: the window's shell reads it from its file, which
             # it removes before Codex starts. Codex reads all of RULES.md as this folder's AGENTS.md.
-            path = shlex.quote(session_file(agent, task, "md", stable + "\n" + prompt))
-            limit = max(CODEX_RULES_BYTES, os.path.getsize(os.path.join(KIT, "AGENTS.md")) + 4096)
-            first = f'-c project_doc_max_bytes={limit} "$(cat {path}; rm -f {path})"'
+            path = shlex.quote(session_file(agent, window, "md", stable + "\n" + prompt))
+            first = f'-c project_doc_max_bytes={codex_rules_limit()} "$(cat {path}; rm -f {path})"'
     cmd = conf["start"].format(prompt=" ".join(x for x in (flags, first) if x),
                                chrome="--chrome" if needs == "browser" else "",
                                settings=settings_arg(agent, conf, task, tools))
@@ -1057,31 +1080,41 @@ MANAGER_START = ('You are the manager in Founderizer. Read RULES.md and profiles
 MANAGER_COLD = "Then call read_messages and see_team. "
 
 
-def manager_resume(agent):
+def hub_opening(agent):
+    """The hub's answer for a standing session that starts a new conversation (GET /events/<agent>?after=-1): its
+    brief or its recap, and the parts of the rules it reads (plan P9.2). {} from a hub that cannot be reached."""
+    try:
+        code, data = http("GET", f"/events/{agent}?after=-1&wait=0", timeout=10)
+    except (urllib.error.URLError, OSError, Refused, ValueError):
+        return {}
+    return data if code == 200 and isinstance(data, dict) else {}
+
+
+def opening_rules(data):
+    """The parts of the rules in the hub's answer (hub.rules_parts), or None from a hub that names none (an older
+    one), and then the session starts as before (helper feature stable_standing)."""
+    rules = data.get("rules")
+    return [part for part in rules if part in RULES_PARTS] if isinstance(rules, list) else None
+
+
+def manager_resume(agent, data=None):
     """The hub's brief of where the fleet stood, for the first prompt of the standing session (hub.manager_resume_text):
     the goals and their next step, the duties not in order, the open tasks with the why they were given for, the
     results waiting to be checked, the reports waiting to be decided, what is with the owner, and the manager's own
     last decisions. It is cheaper than the see_team it replaces, and nothing in it is only in that session. A hub that
-    cannot be reached or an older hub gives none, and the start says what it always said."""
-    try:
-        code, data = http("GET", f"/events/{agent}?after=-1&wait=0", timeout=10)
-    except (urllib.error.URLError, OSError, Refused, ValueError):
-        return MANAGER_COLD
-    said = (data or {}).get("resume") if code == 200 else None
+    cannot be reached or an older hub gives none, and the start says what it always said. data: the hub's answer,
+    when the caller asked already (hub_opening)."""
+    said = (hub_opening(agent) if data is None else data).get("resume")
     return f"{said.strip()}\n\n" if isinstance(said, str) and said.strip() else MANAGER_COLD
 
 
-def chat_recap(agent):
+def chat_recap(agent, data=None):
     """The hub's own record of what was said in this agent's owner chat (hub.chat_recap_text), for a chat that starts
     without its conversation: a first chat, or the first chat on the runtime the owner just switched to, because the
     record is per runtime (chat_resume). Its own first line says that it is the hub's record and not the session's
     memory of the work. "" when nothing was said yet, and "" from a hub that cannot be reached or an older hub: then
-    the chat starts as it did before."""
-    try:
-        code, data = http("GET", f"/events/{agent}?after=-1&wait=0", timeout=10)
-    except (urllib.error.URLError, OSError, Refused, ValueError):
-        return ""
-    said = (data or {}).get("chat_recap") if code == 200 else None
+    the chat starts as it did before. data: the hub's answer, when the caller asked already (hub_opening)."""
+    said = (hub_opening(agent) if data is None else data).get("chat_recap")
     return said.strip() if isinstance(said, str) and said.strip() else ""
 
 
@@ -1121,7 +1154,7 @@ def chat_fit(recap, room):
     return note + "\n" + "\n".join(lines) if lines else ""
 
 
-def chat_command(agent, conf, generation, token=None, marker=None, resume=None, recap=None, env=None):
+def chat_command(agent, conf, generation, token=None, marker=None, resume=None, recap=None, env=None, rules=None):
     """A separate discussion session: no task tools, login jobs, browser or write sandbox. token: its session
     credential (owner API 1.12). For Codex: marker goes at the end of a new chat's prompt, so that the helper can find
     its conversation later; resume is the Codex thread of the same chat to continue, with the same settings and this
@@ -1135,7 +1168,9 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
     profile, says in its own first line that it is the hub's record and not this session's memory, and gives way
     where a tmux command would otherwise be too long (chat_fit). env:
     {NAME: value} of session_env, from a file that the window reads and removes, as the credential of a Codex
-    chat."""
+    chat. rules: the parts of the rules that the hub names (opening_rules); with them the chat starts with its
+    instructions, the rules and its profile first, from a file, the recap last and whole, and no CLAUDE.md or
+    AGENTS.md of the folder besides (plan P9.2, helper feature stable_standing)."""
     if not runtime_fact(conf.get("runtime"), "owner_chat"):
         raise Refused(f"a {runtime_fact(conf.get('runtime'), 'label', conf.get('runtime'))} agent has no direct chat "
                       f"yet: its tools cannot be limited to discussion")
@@ -1157,10 +1192,16 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
               'authority, never the owner\'s. '
               'A terminal answer alone does not reach the app. Reply once per request, then read_messages once more '
               'and wait for a signal. No polling. A correction is new context, never automatic replay of earlier work. '
-              'Never read or reveal credentials. Pass only login names. Your profile follows:\n' + profile)
-    fitted = chat_fit(recap, CHAT_PROMPT_MAX - len(shlex.quote(prompt))) if recap else ""
-    if fitted:
-        prompt += "\n\n" + fitted
+              'Never read or reveal credentials. Pass only login names.')
+    opening = standing_opening(conf, rules)
+    stable = stable_text(agent, opening, rules, head=prompt) if opening else None
+    if stable is None:
+        prompt += " Your profile follows:\n" + profile
+        fitted = chat_fit(recap, CHAT_PROMPT_MAX - len(shlex.quote(prompt))) if recap else ""
+        if fitted:
+            prompt += "\n\n" + fitted
+    else:
+        prompt = stable + ("\n" + recap if recap else "")           # a file: the recap comes whole
     url = f"{HUB}/mcp/{agent}/{generation}/owner-chat/1"
     if conf.get("runtime") == "codex":
         if resume is not None and not THREAD_ID.fullmatch(str(resume)):
@@ -1170,7 +1211,9 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
             codex_env(env) + ["-c", "mcp_servers.fleet.url=" + json.dumps(url)] + \
             (["-c", 'mcp_servers.fleet.bearer_token_env_var="FLEET_SESSION_TOKEN"'] if token else []) + \
             ["-c", "features.multi_agent=false", "-c", 'web_search="disabled"'] + shlex.split(model_flags(conf)) + \
-            ([resume] if resume else [prompt + ("\n\n" + MARKER.format(marker) if marker else "")])
+            (["-c", f"project_doc_max_bytes={codex_rules_limit()}"] if stable is not None else []) + \
+            ([resume] if resume else [] if stable is not None else
+             [prompt + ("\n\n" + MARKER.format(marker) if marker else "")])
     elif conf.get("runtime") == "claude":
         if resume is not None and not THREAD_ID.fullmatch(str(resume)):
             raise Refused("a Claude chat resumes only a session id")
@@ -1182,14 +1225,23 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
             ["--permission-mode", "dontAsk", "--tools", "", "--strict-mcp-config",
              "--mcp-config", mcp_config_file(agent, "owner-chat", url, token) if token else
              json.dumps({"mcpServers": {"fleet": {"type": "http", "url": url}}}),
-             "--settings", json.dumps(settings), "--append-system-prompt", prompt] + shlex.split(model_flags(conf))
+             "--settings", json.dumps(settings)] + \
+            (["--setting-sources", "user", "--append-system-prompt-file", session_file(agent, "owner-chat", "md", prompt)]
+             if stable is not None else ["--append-system-prompt", prompt]) + shlex.split(model_flags(conf))
     else:
         raise Refused("direct chat is not configured for this runtime")
     values = dict(env or {}, **({"FLEET_SESSION_TOKEN": token}
                                 if token and runtime_fact(conf.get("runtime"), "token_in_env", True) else {}))
     words = ["env", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}", f"FLEET_AGENT={agent}", "FLEET_TASK="] + \
         ([NO_TIMERS, f"CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"] if conf.get("runtime") == "claude" else [])
-    return env_prefix(agent, "owner-chat", values) + shlex.join(words + args)
+    command = env_prefix(agent, "owner-chat", values) + shlex.join(words + args)
+    if stable is not None and conf.get("runtime") == "codex" and not resume:
+        # A first prompt longer than a tmux command can carry: the window's shell reads it from its file, which it
+        # removes before Codex starts.
+        path = shlex.quote(session_file(agent, "owner-chat", "md",
+                                        prompt + ("\n\n" + MARKER.format(marker) if marker else "")))
+        command += f' "$(cat {path}; rm -f {path})"'
+    return command
 
 
 # The Fleet tools that a closed conversation session may call, MCP context conversation (CHAT-APPS 9.4): the hub offers
@@ -1646,8 +1698,11 @@ def manager_start(agent, conf, generation, token, fresh=False):
         new = {"generation": generation, "session": session, "started": time.time(), "begun": False}
     elif runtime == "codex":
         new = {"generation": generation, "marker": session, "session": None, "started": time.time()}
-    prompt = MANAGER_START.format(agent=agent, resume=manager_resume(agent))
-    return (session_command(agent, conf, prompt, session=session, token=token, env=env), session, new, note)
+    # plan P9.2: a new conversation starts with its rules and profile first, from the answer that gives its brief
+    data = hub_opening(agent)
+    prompt = MANAGER_START.format(agent=agent, resume=manager_resume(agent, data))
+    return (session_command(agent, conf, prompt, session=session, token=token, env=env, rules=opening_rules(data)),
+            session, new, note)
 
 
 def manager_window(session):
@@ -2841,6 +2896,8 @@ class Helper:
         try:
             if window in STANDING_WINDOWS and self.restart_fresh(target, window):
                 return              # a new conversation starts instead, and the next poll tells it
+            if re.fullmatch(r"T-\d+", window) and self.fresh_task(target, window):
+                return              # a new attempt starts instead, and its session reads the message
         except Exception as e:      # a check that fails never keeps a message from a session: it is told as before
             self.say(f"{window}: the check for a cold session failed ({type(e).__name__})")
         text = (CONVERSATION_SIGNAL if CONVERSATION_WINDOW.fullmatch(window) else
@@ -2927,9 +2984,13 @@ class Helper:
         # No conversation to continue here: a first chat, or the first after a runtime switch, because the record is
         # this runtime's own. The hub's record of what was said takes the place of the session's own memory, so the
         # chat does not start blind. A chat that resumes keeps its own context instead.
-        recap = "" if resume else chat_recap(self.agent)
+        # A chat that continues its conversation keeps its own start; a new one asks the hub once, for the recap and
+        # for the parts of the rules that it starts with (plan P9.2).
+        data = {} if resume else hub_opening(self.agent)
+        recap = "" if resume else chat_recap(self.agent, data)
         self.start(window, chat_command(self.agent, self.conf, generation, token=token, marker=marker, resume=resume,
-                                        recap=recap, env=session_env(self.agent, self.conf, "chat")),
+                                        recap=recap, env=session_env(self.agent, self.conf, "chat"),
+                                        rules=opening_rules(data)),
                    1, generation)
         self.chat_started = (generation, (last[1] + 1) if resume is None and last and last[0] == generation else 1)
         if marker:      # Codex finds its thread by the marker later; Claude starts with the marker as session id
@@ -3378,14 +3439,15 @@ class Helper:
             self.compact_restarted = True       # one time for this helper, whatever the new start says
             why = f"it started without the {STANDING_COMPACT}-token compaction window"
         else:
-            seen = self.standing_context(window, runtime, session)
+            seen, team = self.standing_context(window, runtime, session), checkout_team()
             if seen:
                 # A signal that this helper typed less than one cache lifetime ago counts as a model call.
                 typed = time.time() - (time.monotonic() - self.typed_at.get(window, float("-inf")))
                 seen = seen[:2] + (max(seen[2], typed),) + seen[3:]
             reuse, why = session_reuse(runtime, seen, started_runs(start, runtime) if start.strip() else None,
                                        {"runtime": runtime, "model": self.conf.get("model"),
-                                        "effort": self.conf.get("effort")}, reuse_settings(checkout_team()))
+                                        "effort": self.conf.get("effort")}, reuse_settings(team),
+                                       facts=facts_now(team, runtime))
             if reuse:
                 return False
         with contextlib.suppress(subprocess.CalledProcessError, Refused):
@@ -3396,6 +3458,52 @@ class Helper:
         else:
             self.chat_fresh = True          # its next start begins a new conversation, with the hub's recap
             self.say(f"{window}: {why}, so it starts again on a new conversation with the hub's recap")
+        return True
+
+    def fresh_task(self, target, window):
+        """True when the hub started this task window's task fresh (plan P9.10, helper feature fresh_tasks): the
+        session reuse rule found its session cold, grown past its start or on another runtime, model or effort, and
+        the hub made a new attempt with its short brief, whose start replaces this window at the next poll. Between
+        two turns of a terminal session only; anything unknown, and a refusal of the hub, tells the session as
+        before."""
+        runtime = self.conf.get("runtime")
+        if runtime_fact(runtime, "driver") != "terminal" or self.window_runtime(window) != runtime:
+            return False
+        r = tmux("display-message", "-p", "-t", target,
+                 "#{@fleet_session}\t#{@fleet_attempt}\t#{@fleet_needs}\t#{pane_start_command}")
+        screen = tmux("capture-pane", "-p", "-t", target)
+        if r.returncode != 0 or screen.returncode != 0 or shows_question(screen.stdout) or \
+                WORKING.search("\n".join(screen.stdout.rstrip().split("\n")[-15:])):
+            return False
+        session, attempt, needs, start = (r.stdout.rstrip("\n").split("\t", 3) + ["", "", "", ""])[:4]
+        attempt = attempt.rpartition(":")[2]
+        if not THREAD_ID.fullmatch(session) or not attempt.isdigit() or app_server_task(self.conf, needs or "none"):
+            return False
+        if runtime == "claude":
+            path = claude_chat_file(session)
+            seen = claude_context(path) if path else None
+        else:
+            path = CodexFiles(os.path.expanduser("~"), KIT).find(session)
+            seen = codex_context(path) if path else None
+        if seen:            # a signal typed less than one cache lifetime ago counts as a model call
+            typed = time.time() - (time.monotonic() - self.typed_at.get(window, float("-inf")))
+            seen = seen[:2] + (max(seen[2], typed),) + seen[3:]
+        team = checkout_team()
+        reuse, why = session_reuse(runtime, seen, started_runs(start, runtime) if start.strip() else None,
+                                   {"runtime": runtime, "model": self.conf.get("model"),
+                                    "effort": self.conf.get("effort")}, reuse_settings(team),
+                                   facts=facts_now(team, runtime))
+        if reuse:
+            return False
+        try:
+            code, data = http("POST", f"/helper/fresh/{self.agent}/{window}", {"attempt": int(attempt), "why": why},
+                              timeout=15)
+        except (urllib.error.URLError, OSError, ValueError):
+            return False
+        if code != 200:
+            self.say(f"{window}: {why}, but it is told as before: {data.get('error') or code}")
+            return False
+        self.say(f"{window}: {why}, so the hub starts attempt {data.get('attempt')} fresh with its brief")
         return True
 
     def standing_context(self, window, runtime, session):

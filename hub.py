@@ -1854,6 +1854,7 @@ def t_read_messages(agent, a):
             kv_set("mgr_screen", None)
             kv_set("mgr_screen_shown", None)        # a session that reads has no question in front of it
             kv_set("mgr_screen_frozen", None)       # and is not frozen
+        team = chat_team_once(agent) if chat_context(agent) else ""      # plan P9.1
         if not rows:
             if chat_context(agent) or agents()[agent].get("role") == "manager":
                 unanswered(agent, now())            # plan C8: a standing session's closing empty read ends its turn
@@ -1861,7 +1862,7 @@ def t_read_messages(agent, a):
                 chase = requester_chase(agent, now())   # plan C9: what it read and left open, once each
                 if chase:
                     chased(agent, chase[1], emit(agent, "say", chase[0]))
-            return "No unread messages. Wait for the next signal."
+            return team + "No unread messages. Wait for the next signal."
         # A task's start event is the text that its session began with, as its first prompt or its appended system
         # prompt (fleet.session_command), so its first read gave the same thousands of characters a second time. A
         # Claude session that began with its stable text instead (opening "read", plan P9.2) reads it here.
@@ -1874,7 +1875,20 @@ def t_read_messages(agent, a):
             messages = ("Unread messages: " + ", ".join(f"M-{r['id']}" for r in rows) + ".\n\n"
                         + (OWNER_CHAT_GUIDANCE if any(r["text"].startswith("[owner") for r in rows) else "")
                         + messages)
-        return messages
+        return team + messages
+
+
+def chat_team_once(agent):
+    """The team directory for the first read of each owner chat session (plan P9.1), then "". A new chat session is a
+    new count of its window's tool listings (listed_window), so a chat that starts again, a new one or one that
+    continues its conversation, reads it once, whatever its helper wrote at its start; and no tool's description
+    carries it, so a duty given changes no session's fixed text."""
+    listed = str(kv_get(f"listed:{agent}:owner-chat") or 0)
+    if kv_get(f"chat_team:{agent}") == listed:
+        return ""
+    kv_set(f"chat_team:{agent}", listed)
+    team = team_start_text(agent).strip()
+    return team + "\n\n" if team else ""
 
 
 START_READ = ("The start of this task attempt: the text that this session began with, so it is not repeated here. "
@@ -2642,6 +2656,46 @@ def new_attempt(t, reason, note="", counted=False):
     event = attempt_event(t, note)
     with transaction():
         attempt_rows(t, reason, event, now(), counted)
+
+
+# Plan P9.10: a task's session that the session reuse rule finds cold, grown past its start or on another runtime,
+# model or effort (lifecycle.session_reuse) is not told of its new message: the task starts fresh, in a new attempt
+# with the hub's short brief, and that session reads the message. The helper asks with POST /helper/fresh (helper
+# feature fresh_tasks); a lane whose message would wake an open session can call fresh_attempt the same way.
+FRESH_REASON = "fresh"
+
+
+def fresh_refusal(t, attempt):
+    """Why the session of task row `t` at `attempt` may not start fresh now, or None: what that session holds open
+    would be lost with it, or the hub already decides its next start."""
+    if t["state"] in TERMINAL:
+        return f"{tref(t['id'])} is {t['state']}"
+    if attempt != t["attempt"]:
+        return f"{tref(t['id'])} is at attempt {t['attempt']}, not {attempt}"
+    if active_hold(t["id"]):
+        return f"{tref(t['id'])} is held"
+    if active_limit(t["owner"]):
+        return f"{t['owner']} is at a usage limit"
+    if q1("SELECT 1 FROM prompts WHERE task=? AND decision IS NULL LIMIT 1", (t["id"],)):
+        return "a permission prompt of its session waits for a decision"
+    if open_job(t["id"]):
+        return "a job of its machine runs for it"
+    state = turn_state(t["id"], t["attempt"]) or {}
+    if state.get("running"):
+        return "a turn of its session runs"
+    if any(call[2] for call in (state.get("calls") or {}).values()):
+        return "a command of its session runs in the background"
+    return None
+
+
+def fresh_attempt(t, why):
+    """Start the task of row `t` once more in a new session (plan P9.10): its start is the hub's short brief of what
+    the attempt before it did (attempt_event), and its unread messages wait for it. Not a restart that counts, because
+    nothing was lost. Check fresh_refusal first. Returns the new attempt."""
+    new_attempt(t, FRESH_REASON, note=f"Its session was {why}, so this session starts fresh, with what the attempt "
+                                      f"before it did.")
+    log("hub", f"{tref(t['id'])} starts fresh in attempt {t['attempt'] + 1}: its session was {why}")
+    return t["attempt"] + 1
 
 
 def control_extra(t, hid, kind):
@@ -5214,7 +5268,6 @@ def allowance_ahead(agent, route="primary"):
 
 
 LOOKS_AFTER_MAX = 200           # characters of one agent's own words: enough to recognise it, short enough to list
-DIRECTORY_MAX = 2000            # characters of the whole directory in message_agent's description
 _responsible = {}               # (revision, agent) -> that profile's line, which only a commit of the ref changes
 
 
@@ -5250,36 +5303,6 @@ def looks_after_text(agent, rev, duties):
         said = said[:LOOKS_AFTER_MAX].rsplit(" ", 1)[0] + "..."
     said = (said or (agents().get(agent) or {}).get("title") or "nothing that its profile says yet").rstrip(".")
     return said + (". Duties: " + ", ".join(duties) if duties else "")
-
-
-def agent_directory(agent):
-    """The fleet as one agent reads it in message_agent: every other active agent, with the sentence that says what
-    it looks after and what the fleet's own record says it holds. So an agent that is blocked finds the one that
-    looks after the machines, the shop or the mail by what it looks after, instead of having to know a name by
-    chance.
-
-    The holdings are here as well as in a task session's start text, and the duplication is deliberate: a chat
-    window has no start text of the hub's, so this description is the only roster it ever gets, and the sentence
-    alone cannot tell two agents apart while their profiles keep the line they were installed with."""
-    rev, duties, kept, left = kit_revision(), {}, [], 0
-    for r in q("SELECT agent, text FROM responsibilities WHERE state!='retired' ORDER BY id"):
-        duties.setdefault(r["agent"], []).append(duty_name(r["text"]))
-    for name, a in agents().items():
-        if name == agent or not agent_active(name) or not runtime_fact(a.get("runtime"), "agent_messages"):
-            continue            # plan C11: a runtime with no agent messages reads none, so it is not listed
-        facts = colleague_facts(name)
-        line = (f"{name} ({a.get('role')}) looks after: {looks_after(name, rev, duties.get(name, []))}."
-                + (" It holds: " + "; ".join(facts) + "." if facts else ""))
-        if sum(len(x) + 3 for x in kept) + len(line) <= DIRECTORY_MAX:
-            kept.append(line)
-        else:
-            left += 1
-    if not kept:
-        return "There is no other active agent to write to."
-    return ("The agents you can write to, and what each looks after -- " + " | ".join(kept) +
-            (f" | and {left} more, which the manager knows." if left else "") +
-            ". A message to a colleague whose task the hub links to yours (your requester, your lead, a part of the "
-            "same step) reaches that task; any other reaches its chat window.")
 
 
 def capacity_view(names=None, expertise=None, needs=None, login=None):
@@ -17559,13 +17582,14 @@ def manager_parts_line():
             f"manager, if your context does not hold them yet.\n")
 
 
-def manager_resume_text():
+def manager_resume_text(parts=True):
     """Where the fleet stood at the moment this session started, for the first prompt of the standing session. It
-    carries no plan of its own: every line of it is written down somewhere the next session can read again."""
+    carries no plan of its own: every line of it is written down somewhere the next session can read again. parts:
+    name the manager's parts of the rules first, for a session whose start does not hold them (stable_standing)."""
     t0 = now()
     # Masked on the way out, as start_text is: these lines carry what agents wrote — report texts, task titles,
     # question texts — and a login registered after any of them was stored was never masked at the write.
-    return mask_secrets(manager_parts_line()
+    return mask_secrets((manager_parts_line() if parts else "")
                         + "Where the fleet stands, as the hub has it (nothing here is only in this session):\n"
                         + "\n".join(resume_lines(t0))
                         + team_start_text(manager_name())               # the team directory (P9.1)
@@ -18442,8 +18466,7 @@ def tools_for(agent, context=None):
                  "search_history", "read_history", *GOOGLE_READS)
     chat = chat_context(agent, context)
     conversation = conversation_tools(agent, context) if conversation_context(agent, context) else None
-    return [{"name": name, "description": described(agent, name, desc) + (
-                 f" {agent_directory(agent)}" if chat and name == "message_agent" else ""), "inputSchema": schema,
+    return [{"name": name, "description": described(agent, name, desc), "inputSchema": schema,
              "annotations": {"readOnlyHint": name in read_only, "destructiveHint": False,
                              "idempotentHint": name in read_only, "openWorldHint": False}}
             for r, name, fn, desc, schema in TOOLS if
@@ -18463,9 +18486,8 @@ def tools_for(agent, context=None):
 
 def described(agent, name, desc):
     """A tool's description with what this session's agent needs inside it: the Google account that a Google tool
-    uses. No description changes at run time (AUTONOMY.md P9.1): the team directory is in the start block of every
-    session (team_start_text). The one session it does not reach yet is an owner chat, whose start the helper writes,
-    so tools_for adds the directory to message_agent's description there."""
+    uses. No description changes at run time (AUTONOMY.md P9.1): the team directory is in the start of every session
+    (team_start_text): a task's block, the manager's brief, and an owner chat's first read (chat_team_once)."""
     return google_described(agent, name, desc)
 
 
@@ -31011,10 +31033,13 @@ class Handler(BaseHTTPRequestHandler):
             # session says where the fleet stood instead of starting cold with see_team. An owner chat that starts
             # without its conversation asks the same question (fleet.chat_recap), and chat_recap rides with it for
             # the same reason: the chat's record is per runtime, so the first chat after a switch has none.
+            # plan P9.2: the parts of the rules that a standing session reads, for a helper that starts it with them
             return self.json(200, {"events": [], "last": newest, "db": kv_get("db_id"),
-                                   "resume": manager_resume_text() if role_of(agent) == "manager" else None,
+                                   "resume": manager_resume_text("stable_standing" not in helper_features(agent))
+                                   if role_of(agent) == "manager" else None,
                                    "chat_recap": chat_recap_text(agent)
-                                   if role_of(agent) in ("worker", "lead") else None})
+                                   if role_of(agent) in ("worker", "lead") else None,
+                                   "rules": rules_parts(agent)})
         if query.get("delivery") == "1" and agent != "owner":
             deadline, told = now() + wait, None
             while True:
@@ -31413,6 +31438,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.hook_activity(parts[2], parts[3])
         if parts[:2] == ["helper", "dialog"] and len(parts) == 4:
             return self.helper_dialog(parts[2], parts[3])
+        if parts[:2] == ["helper", "fresh"] and len(parts) == 4:            # plan P9.10
+            return self.helper_fresh(parts[2], parts[3])
         if parts[:2] == ["helper", "job"] and len(parts) == 4:
             return self.helper_job_done(parts[2], parts[3])
         if parts[:2] == ["helper", "deposit"] and len(parts) == 4 and re.fullmatch(r"[1-9][0-9]{0,17}", parts[3]):
@@ -31630,6 +31657,30 @@ class Handler(BaseHTTPRequestHandler):
         if "json" in (self.headers.get("Accept") or ""):
             return self.json(200, {"ok": True})
         self.send(303, b"", headers={"Location": "/board"})
+
+    def helper_fresh(self, agent, task):
+        """Plan P9.10 (helper feature fresh_tasks): the helper found the session of a task window cold, grown past its
+        start or on another runtime, model or effort when a message came for it, so the task starts fresh in a new
+        attempt (fresh_attempt) instead. 409 with the reason when what its session holds open would be lost, and the
+        helper then tells the session as before."""
+        if agent not in agents():
+            return self.json(404, {"error": "unknown agent"})
+        if not self.allowed(agent):
+            return
+        body = self.form() if self.body() else {}
+        try:
+            tid, attempt = parse_task(task), int(body.get("attempt"))
+        except (ToolError, TypeError, ValueError):
+            return self.json(400, {"error": "a task window and its attempt"})
+        why = text_field(body.get("why"), 300, False) or "cold"
+        with LOCK:
+            t = q1("SELECT * FROM tasks WHERE id=? AND owner=?", (tid, agent))
+            if not t:
+                return self.json(404, {"error": f"{agent} has no {tref(tid)}"})
+            refused = fresh_refusal(t, attempt)
+            if refused:
+                return self.json(409, {"error": refused})
+            return self.json(200, {"attempt": fresh_attempt(t, why)})
 
     def helper_dialog(self, agent, task):
         """The helper found a question on a session's own screen and did not type over it. kind (plan C2, the screen

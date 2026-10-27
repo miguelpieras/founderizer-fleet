@@ -59,6 +59,8 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "update_between_turns",     # its update waits for the turns that run in its task windows (plan P0)
             "stable_start",             # a task session opens with its rules and profile, and its task last (P9.2)
             "session_reuse",            # a cold, grown or switched standing session starts fresh (P9.10)
+            "fresh_tasks",              # a cold, grown or switched task window asks for a fresh attempt (P9.10)
+            "stable_standing",          # the manager and an owner chat start with their rules and profile first
             # AUTONOMY.md P2, P10 (lane L2): a conversation with the agent's own tools (conversation_work_command), a
             # closed one on the chosen runtime at its pinned version, and the records of a conversation's session
             "conversation_tasks",
@@ -324,7 +326,7 @@ def reuse_settings(team):
         return dict(REUSE_SETTINGS)
 
 
-def session_reuse(runtime, context, started, now_runs, settings=None, at=None):
+def session_reuse(runtime, context, started, now_runs, settings=None, at=None, facts=None):
     """The session reuse rule (AUTONOMY.md P9.10), for every kind of session and every provider: (True, "") to tell a
     session of a new message of its own thread, or (False, why) to start it fresh with the hub's short brief.
 
@@ -336,7 +338,8 @@ def session_reuse(runtime, context, started, now_runs, settings=None, at=None):
     context: its own records, (tokens now, tokens at its first call, time of its last model call, cache seconds or
     None), or None for a session that made no call yet, which has no context to read again. started and now_runs:
     {"runtime", "model", "effort"} that it started with and that the agent has now; started is None when its start
-    cannot be read, and then nothing is compared."""
+    cannot be read, and then nothing is compared. facts: the runtime's facts as the owner set them (facts_now), else
+    the table's."""
     settings = dict(REUSE_SETTINGS, **(settings or {}))
     if not settings["on"]:
         return True, ""
@@ -345,14 +348,16 @@ def session_reuse(runtime, context, started, now_runs, settings=None, at=None):
     if not context:
         return True, ""
     tokens, first, last, cache = context
-    lifetime = cache or runtime_fact(runtime, "cache_seconds")
+    facts = facts if facts is not None else {fact: runtime_fact(runtime, fact) for fact in ("cache_seconds",
+                                                                                           "compact_tokens")}
+    lifetime = cache or facts.get("cache_seconds")
     idle = (time.time() if at is None else at) - last
     if lifetime is not None and idle > lifetime - settings["margin"]:
         return False, (f"its cache is cold after {idle / 60:.0f} quiet minutes, and a new session costs only its "
                        f"start")
     if first and tokens > settings["growth"] * first:
         return False, f"its context grew from {first // 1000}K to {tokens // 1000}K tokens since its start"
-    room = runtime_fact(runtime, "compact_tokens")
+    room = facts.get("compact_tokens")
     if room and tokens > REUSE_ROOM * room:
         return False, f"its {tokens // 1000}K tokens leave no room before its compaction at {room // 1000}K"
     return True, ""
