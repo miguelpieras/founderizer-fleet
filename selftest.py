@@ -76,7 +76,9 @@ EVERY_AGENT = ["read_messages", "search_knowledge", "write_knowledge", "see_resp
                "forget", "see_triggers", "save_trigger", "change_trigger", "set_reminder", "message_owner",
                "message_agent",
                # AUTONOMY.md P3: standing instructions and targets, in every session with the agent's tools
-               "keep_instruction", "set_target", "end_standing", "see_standing"]
+               "keep_instruction", "set_target", "end_standing", "see_standing",
+               # AUTONOMY.md P6: everything an agent took part in, searched and read back
+               "search_history", "read_history"]
 MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "answer", "check_result",
                                "decide_permission", "see_team", "see_capacity", "see_goals",
                                "update_goal", "record_spend", "raise_needs_you", "request_secret", "tell_owner",

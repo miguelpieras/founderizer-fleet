@@ -114,6 +114,7 @@ would read as an empty fleet instead of as a mistake.
 | --- | --- | --- |
 | `fleet_overview` | `/ui/state`, `/ui/health`, `/ui/releases`, `/ui/servers` | What is my fleet doing. Start here. |
 | `fleet_read` | every owner `GET` route, by page name | Every check the app reads. |
+| `search_history` | `/ui/history` | Search what one agent, or every agent, took part in, by words, dates, person, task and kind; with `ref`, one record in full. |
 | `which_hub` / `use_hub` | `/ui/state` | Which hub, on what authority; and point at one. |
 | `install_hub` | SSH, `hub.sh` (INSTALL-PROMPT.md A1–A5) | Install a hub on a server the owner names. |
 | `install_log` | SSH, `tail` | The install's own log, with the claim code read out of it. |

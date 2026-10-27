@@ -104,6 +104,8 @@ FROM_THE_HUB = {
     "lifecycle.MCP_AUTH": ("none", "oauth", "key"),
     "lifecycle.REPO_ACCESS": ("read", "write", "deploy"),
     "hub.PERSON_ROLES": ("customer", "employee", "supervisor", "deputy"),
+    "hub.HISTORY_KINDS": ("conversation", "owner_chat", "message", "task", "result", "note", "question", "report",
+                          "case", "step", "duty", "memory", "standing", "tool"),
 }
 
 
@@ -352,6 +354,15 @@ def read_page(args):
             route, args = route.replace(mark, urllib.parse.quote(value, safe="")), \
                 {k: v for k, v in args.items() if k != word}
     return get(route, what, **{k: args[k] for k in PAGE_QUERY if args.get(k) is not None}).data
+
+
+def history(args):
+    """GET /ui/history: one agent's history, or every agent's, searched (AUTONOMY.md P6). The words are the route's
+    own, so every one of them is passed through and the hub answers for each."""
+    return get("/ui/history", "the history search", **{k: args.get(k) for k in HISTORY_WORDS}).data
+
+
+HISTORY_WORDS = ("agent", "query", "from", "to", "person", "task", "kind", "ref", "limit")
 
 
 def overview(_args):
@@ -850,6 +861,16 @@ def tools():
               **{k: {"type": "string"} for k in PAGE_WORDS},
               **{k: {"type": "integer"} for k in PAGE_QUERY if k not in PAGE_WORDS}},
              ("page",), read_page),
+        tool("search_history", "Search what one agent took part in, or every agent with no agent: its conversations "
+                               "with people, its chats with you, its messages with other agents, its tasks with their "
+                               "results, notes and questions, its reports, duties, lessons and its own tool records. "
+                               "query is a few words and their other forms (a record with more of them comes first); "
+                               "from and to are dates or dates and times in the fleet's time zone; person is a "
+                               "person's name, an agent or owner; task is T-7; kind is one or more of "
+                               + ", ".join(FROM_THE_HUB["hub.HISTORY_KINDS"]) + ", with commas; limit is 1 to 100. "
+                               "With ref, one record in full, as a search gave it.",
+             {"agent": S["text"], "query": S["text"], "from": S["text"], "to": S["text"], "person": S["text"],
+              "task": S["text"], "kind": S["text"], "ref": S["text"], "limit": S["int"]}, (), history),
         tool("which_hub", "Which hub this server reads, and on what authority.", {}, (), which_hub),
         tool("use_hub", "Point this server at a hub that runs already. It proves the address by reading the owner "
                         "API from this Mac, and stores nothing but the address.",

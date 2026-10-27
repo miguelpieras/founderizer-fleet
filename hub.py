@@ -233,6 +233,17 @@ CREATE INDEX IF NOT EXISTS memory_agent ON memories(agent, dropped, id);
 CREATE TABLE IF NOT EXISTS memory_folds(summary INTEGER NOT NULL, member INTEGER NOT NULL, created REAL NOT NULL,
   by TEXT NOT NULL, PRIMARY KEY(summary, member));
 CREATE INDEX IF NOT EXISTS memory_fold_member ON memory_folds(member);
+-- History search (AUTONOMY.md P6): one row for each record and each agent that took part in it, made by the streams
+-- of HISTORY_STREAMS from the rows above. Its words are indexed in history_fts, which migrate makes where sqlite3 has
+-- FTS5 (history_search_probe). `src` and `src_id` name the row it came from; `text` keeps its words, except a tool
+-- record's where the index holds them, which are read back from that row. `person` is P-<id>, an agent, or owner.
+CREATE TABLE IF NOT EXISTS history(id INTEGER PRIMARY KEY, agent TEXT NOT NULL, kind TEXT NOT NULL, ref TEXT NOT NULL,
+  person TEXT, task INTEGER, at REAL NOT NULL, owner_chat INTEGER NOT NULL DEFAULT 0, src TEXT NOT NULL,
+  src_id INTEGER, text TEXT);
+CREATE INDEX IF NOT EXISTS history_agent_at ON history(agent, at);
+CREATE INDEX IF NOT EXISTS history_of_task ON history(task, at) WHERE task IS NOT NULL;
+CREATE INDEX IF NOT EXISTS history_of_person ON history(person, at) WHERE person IS NOT NULL;
+CREATE INDEX IF NOT EXISTS history_of_ref ON history(ref, agent) WHERE kind<>'tool';
 CREATE TABLE IF NOT EXISTS tool_commands(agent TEXT NOT NULL, request_id TEXT NOT NULL, tool TEXT NOT NULL,
   digest TEXT NOT NULL, receipt TEXT NOT NULL, created REAL NOT NULL, PRIMARY KEY(agent, request_id));
 CREATE TABLE IF NOT EXISTS chat_in(id INTEGER PRIMARY KEY, account TEXT NOT NULL, msg_id TEXT NOT NULL, chat TEXT NOT NULL,
@@ -351,7 +362,6 @@ CREATE TABLE IF NOT EXISTS place_hosts(machine TEXT NOT NULL, host TEXT NOT NULL
   PRIMARY KEY(machine, host, port, user));
 
 """
-EVENT_CAP = 5000                                    # thread records kept per task attempt
 TOOL_KINDS = ("read", "edit", "delete", "move", "search", "execute", "think", "fetch", "other")
 EFFECTFUL = ("execute", "edit", "delete", "move", "other")
 UUID_TEXT = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -743,7 +753,7 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "manager_start", "agent_notes", "edit_in_place", "machine_access", "push",
                "attachment_knowledge", "asking_and_waiting", "account_limits", "secret_requests",
                "secret_deliveries", "agent_rename", "agent_memory", "live_changes",
-               "standing"]
+               "standing", "history"]
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # One name is not here because it is not always true: central_vault, which ui_features() adds only while the central
 # vault answers (central_ok).
@@ -1662,11 +1672,19 @@ def migrate():
         "WHERE prevents_key IS NOT NULL",
         # The shelf's own order (MEMORY_SHELF) and the archive sweep, which both run on a lifetime store.
         "CREATE INDEX IF NOT EXISTS memory_shelf ON memories(agent, dropped, folded_into, contradicted)",
+        # The history's streams of a moment (HISTORY_STREAMS `at`): what was delivered, checked, answered, decided
+        # or forgotten since their cursor, read from these and never by a scan of the whole table.
+        "CREATE INDEX IF NOT EXISTS task_delivered ON tasks(delivered) WHERE delivered IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS task_checked ON tasks(checked_at) WHERE checked_at IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS question_answered ON questions(answered) WHERE answered IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS report_decided ON reports(decided) WHERE decided IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS memory_dropped ON memories(dropped) WHERE dropped IS NOT NULL",
     ]:
         sql_step(statement, problems)
     # Not through sql_step and not in SCHEMA: a machine without FTS5 searches with a scan, and must not have that
-    # recorded as a refused step, which is what a release reads (memory_search_probe).
+    # recorded as a refused step, which is what a release reads (memory_search_probe, history_search_probe).
     memory_search_probe()
+    history_search_probe()
     return problems
 
 
@@ -2273,8 +2291,7 @@ def stuck_told(task_id, event_id):
 
 def turn_records(state, session, records, t0):
     """The attempt's turn state after these records (clean_record's (seq, ts, kind, data)). Every record counts
-    once, also one past EVENT_CAP that the hub no longer stores: the state keeps the newest seq of its session, and
-    a new session of the attempt starts it again. A record of a subagent (parent) neither starts nor ends a turn of
+    once: the state keeps the newest seq of its session, and a new session of the attempt starts it again. A record of a subagent (parent) neither starts nor ends a turn of
     the main session, and its calls are open calls like any other."""
     if not state or state.get("session") != session:
         state = {"session": session, "seq": 0, "turns": 0, "running": False, "how": None, "at": None, "calls": {},
@@ -3739,7 +3756,8 @@ def t_see_earlier_work(agent, a):
         hits = earlier_hits(t, chain, find)
         if not hits:
             return (f'Nothing that came before {tref(t["id"])} says "{find}". The search is a plain text match over '
-                    f'the result and the notes of each task it follows and of each of its earlier attempts.')
+                    f'the result and the notes of each task it follows and of each of its earlier attempts. '
+                    f'search_history looks over everything else you ever took part in, by topic and date.')
         return "\n".join([f'What came before {tref(t["id"])} and says "{find}" ({len(hits)}):'] + hits +
                           ['task="T-<id>" or attempt=<n> gives one of them in full.'])
 
@@ -7593,6 +7611,7 @@ def owner_message_replace(previous, value, request_id, t0):
     DB.execute("UPDATE events SET text=? WHERE id=?", (text, previous["event_id"]))
     DB.execute("UPDATE ui_requests SET text=?,edits=? WHERE request_id=?",
                (value, json.dumps(edits), previous["request_id"]))
+    history_rewrite_message(previous["request_id"])     # AUTONOMY.md P6: the history reads it as it stands now
     DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, "owner", f"UI message {request_id} replaced the "
                f"words of {previous['request_id']} (M-{previous['event_id']} for {previous['recipient']}), which "
                f"nothing had read. It said: {previous['text']}"))
@@ -8965,6 +8984,7 @@ def person_remove(pid, t0):
             DB.execute("UPDATE session_credentials SET revoked=? WHERE kind='conversation' AND task=? AND "
                        "revoked IS NULL", (t0, cid))
         DB.execute("DELETE FROM conversations WHERE person=?", (pid,))
+        history_forget_person(pid)          # AUTONOMY.md P6: and their words leave the history's index with them
         DB.execute("DELETE FROM person_handles WHERE person=?", (pid,))
         DB.execute("DELETE FROM person_agents WHERE person=?", (pid,))
         DB.execute("DELETE FROM people WHERE id=?", (pid,))
@@ -13333,7 +13353,9 @@ def t_recall(agent, a):
         hits = memory_found(agent, words, MEMORY_SHOWN * page)
         if not hits:
             return (f'No lesson of yours has "{words}" in its tag, its text or what it prevents. The search reaches '
-                    f'every lesson you have ever written — forgotten, folded and archived ones too.')
+                    f'every lesson you have ever written — forgotten, folded and archived ones too. What you did and '
+                    f'were told, beyond your lessons, search_history finds: every task, message, conversation and '
+                    f'tool record you took part in.')
         rows = hits[(page - 1) * MEMORY_SHOWN:page * MEMORY_SHOWN]
         if not rows:
             return f'Page {page} of the lessons with "{words}" is past the end: {len(hits)} were found.'
@@ -13529,6 +13551,914 @@ def memory_start_text(agent, task_id):
                "these was borne out again, and forget drops one that turned out wrong, with its reason. Nothing you "
                "have written is ever deleted.\n")
     return "\n".join(out)
+
+
+# ---------------------------------------------------------------- history search (AUTONOMY.md P6, lane L5)
+#
+# The owner, 27 October 2026: keep everything, and make it searchable by date and topic "very easily (and fast)". One
+# search for each agent over everything it took part in: its conversations, its chats with the owner, its messages
+# with other agents, its tasks with their results, notes and questions, its reports, its duties' cases and steps, its
+# lessons, and its own tool records.
+#
+# Nothing is copied that does not have to be. `history` holds one row for each record and each agent that took part
+# in it -- its kind, its ref, the other party, the task, the time, and whether it is the owner's own chat -- and
+# `history_fts` (FTS5, contentless) indexes the row's words beside the agent's key, so one agent's search ranks only
+# its own rows. A tool record, which is most of any history, is read back from the session record it came from; every
+# other row keeps its words in `history.text`, which is also what lets a record leave the index exactly when the owner
+# removes a person. Measured on 200,000 records of 424 characters: 314 bytes for each instead of 780 with a copy, and a
+# broad search of one agent in 20 ms instead of 118 without the agent's key.
+#
+# Rows go in by pulling, as everything in this fleet does: one cursor for each stream of records (HISTORY_STREAMS),
+# moved in the transaction that indexed its rows. The tick moves them, every search moves them before it reads, and at
+# the hub's start a thread of its own takes the older records in (history_indexer), a few milliseconds at a time. So
+# no writer has to remember to index, a release that is rolled back and forward again leaves no gap, and a search
+# finds every record that was written before it. A lane whose records have no stream here calls history_note.
+HISTORY_KINDS = ("conversation", "owner_chat", "message", "task", "result", "note", "question", "report", "case",
+                 "step", "duty", "memory", "standing", "tool")
+HISTORY_SHOWN = 15              # records in one answer of search_history
+HISTORY_READ = 40               # records of one ref in one answer of read_history
+HISTORY_TEXT = 20000            # characters of one record's words that the index takes
+HISTORY_FULL = 8000             # characters of one record that read_history gives
+HISTORY_SNIPPET = 200           # characters of the line that a search shows of each record
+HISTORY_PHRASES = 12            # words or "phrases" of one search
+HISTORY_CHUNK = 400             # rows of one stream that one indexing step reads
+HISTORY_SPAN = 20000            # and the ids it looks through at most, so a filter that keeps few rows is a short read
+HISTORY_STEP = 0.05             # seconds of indexing that one pass of the tick or of the start's thread does at most
+HISTORY_SEARCH_STEP = 0.25      # and that a search does first, so that what was just written is in it
+HISTORY_FTS = [None]            # None until probed, then True or False for this process
+HISTORY_FAILED = [None]         # the last indexing error, told once until a pass succeeds again
+HISTORY_TOKEN = re.compile(r"[^\W_]+")      # the letters and digits that FTS5's unicode61 makes one token of
+HISTORY_REF = re.compile(r"(?i)^\s*(TR|CR|AM|CM|OM|OR|UP|N|Q|T|M|I)-?([1-9][0-9]{0,17})\s*$")
+HISTORY_DUTY_REF = re.compile(r"(?i)^\s*R-?([1-9][0-9]{0,17})(?:\s*/\s*C-?([1-9][0-9]{0,17}))?\s*$")
+HISTORY_CASE = re.compile(r"R-\d+/C-\d+")
+HISTORY_OWNER_TASK = "The owner asked for this in his own words, in "     # how t_start_task's details begin
+# A fleet tool call that acted outside the hub's own rows, which no other stream has: what it was given is the record.
+HISTORY_CALLS = tuple(t for t in OUTWARD_TOOLS if t not in ("message_owner", "reply")) + \
+    ("write_knowledge", "save_trigger", "change_trigger", "set_reminder")
+# A tool call whose output says what happened. A read's or a search's output is the text of a file it read, which is
+# that file's and not the agent's.
+HISTORY_OUTPUTS = ("execute", "fetch", "edit", "delete", "move", "other")
+HISTORY_CALL_CACHE = collections.OrderedDict()     # (task, attempt, session, tool_call_id) -> that call's record
+HISTORY_CALL_CACHE_MAX = 4096
+HISTORY_DUTY_WORDS = {"created": "written", "edited": "changed", "case_opened": "case opened",
+                      "case_closed": "case closed", "step": "step", "pause": "paused", "resume": "resumed",
+                      "retire": "retired", "reopen": "reopened", "watch_attached": "watch attached",
+                      "watch_detached": "watch detached"}
+
+
+def history_search_probe():
+    """Make the index if this machine's sqlite3 has FTS5, and record which it was. Called once from migrate, for the
+    reasons memory_search_probe gives: a missing FTS5 is a fact about the machine and never a refused schema step, and
+    the probe commits, so it runs outside every transaction. Without the index, every history row keeps its words in
+    `text` and a search reads them linearly. An index made on a hub that had none takes in the rows it already has."""
+    try:
+        made = not DB.execute("SELECT 1 FROM sqlite_master WHERE name='history_fts'").fetchone()
+        DB.execute("CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(text, agent, content='', "
+                   "tokenize='unicode61 remove_diacritics 2')")
+        if made:
+            DB.execute("INSERT INTO history_fts(rowid, text, agent) SELECT h.id, h.text, 'a' || k.v FROM history h "
+                       "JOIN kv k ON k.k='history_agent:' || h.agent WHERE h.text IS NOT NULL")
+        commit()
+        HISTORY_FTS[0] = True
+    except sqlite3.Error as e:
+        rollback()
+        log("hub", f"history search runs without FTS5 on this machine: {e}")
+        HISTORY_FTS[0] = False
+    return HISTORY_FTS[0]
+
+
+def history_key(agent, create=False):
+    """The index's token for one agent: `a<n>`, a number of its own that a rename keeps (AGENT_KV moves
+    `history_agent:<name>`), so a renamed agent's index needs no rewrite. With create, inside the caller's
+    transaction, an agent without one gets the next number. None for an agent with no history."""
+    row = read_row("SELECT v FROM kv WHERE k=?", ("history_agent:" + agent,))
+    if row or not create:
+        return "a" + row["v"] if row else None
+    in_transaction("history_key")
+    last = DB.execute("SELECT v FROM kv WHERE k='history_agent_count'").fetchone()
+    n = int(last["v"]) + 1 if last else 1
+    DB.execute("INSERT INTO kv(k,v) VALUES('history_agent_count',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+               (str(n),))
+    DB.execute("INSERT INTO kv(k,v) VALUES(?,?)", ("history_agent:" + agent, str(n)))
+    return f"a{n}"
+
+
+def history_who(*names):
+    """The agents among these names, each once: a record is in the history of every agent that took part in it."""
+    out = []
+    for name in names:
+        if isinstance(name, str) and AGENT_NAME.match(name) and name not in ("owner", "hub") and name not in out:
+            out.append(name)
+    return out
+
+
+def history_rec(agent, kind, ref, text, at, person=None, task=None, owner_chat=False):
+    """One history row as a stream builds it."""
+    return {"agent": agent, "kind": kind, "ref": ref, "text": str(text or ""), "at": float(at or 0),
+            "person": person, "task": task, "owner_chat": 1 if owner_chat else 0}
+
+
+def history_pairs(one, two):
+    """[(agent, the other party)] for each agent of a record between two parties."""
+    return [(a, two if a == one else one) for a in history_who(one, two)]
+
+
+def history_conversation(m):
+    """A message of a conversation with a person, in the history of the agent that has the conversation. The owner's
+    own words in it are the owner's chat: a session that a contact drives never finds them, whosever conversation
+    they are in."""
+    agent, name = m["c_agent"], m["p_name"] or f"P-{m['c_person']}"
+    said = {"person": f"{name}: ", "agent": f"{agent} to {name}: ",
+            "owner": f"The owner, in the conversation with {name}: ",
+            "action": f"{agent}, in the conversation with {name}: "}.get(m["who"], f"{m['who']}: ")
+    return [history_rec(a, "conversation", cm_ref(m["id"]), said + (m["text"] or ""), m["created"],
+                        person=f"P-{m['c_person']}", task=m["task"] if "task" in m.keys() else None,
+                        owner_chat=m["who"] == "owner") for a in history_who(agent)]
+
+
+def history_owner_message(u):
+    """The owner's message to an agent in its chat, or his answer to a Needs-you item the agent raised."""
+    if u["kind"] == "answer" and u["need_id"] is not None:
+        if u["n_conversation"]:
+            return []           # it went back into the conversation that asked, and that stream has it
+        text = f"The owner answered N-{u['need_id']}" + (f" ({u['n_title']})" if u["n_title"] else "") + \
+            f": {u['text'] or ''}"
+        return [history_rec(a, "owner_chat", f"N-{u['need_id']}", text, u["created"], person="owner",
+                            owner_chat=True) for a in history_who(u["recipient"])]
+    return [history_rec(a, "owner_chat", f"OM-{u['_id']}", f"The owner: {u['text'] or ''}", u["created"],
+                        person="owner", owner_chat=True) for a in history_who(u["recipient"])]
+
+
+def history_owner_report(r):
+    """An agent's own words to the owner: a reply in his chat, a message it wrote first, a grant's record."""
+    text = f"{r['agent']} to the owner" + (f" ({r['about']})" if r["about"] else "") + f": {r['text'] or ''}"
+    return [history_rec(a, "owner_chat", f"OR-{r['id']}", text, r["created"], person="owner", owner_chat=True)
+            for a in history_who(r["agent"])]
+
+
+def history_need(n):
+    """A Needs-you item an agent raised for the owner. One that a conversation raised is that conversation's."""
+    if n["conversation"]:
+        return []
+    text = f"N-{n['id']} {n['title'] or ''}: {n['why'] or ''}" + (f" To do: {n['todo']}" if n["todo"] else "")
+    return [history_rec(a, "owner_chat", f"N-{n['id']}", text, n["raised"], person="owner", owner_chat=True)
+            for a in history_who(n["by"])]
+
+
+def history_steer(s):
+    """The owner's guidance on a task, in the history of the agent that does it: his own words."""
+    return [history_rec(a, "owner_chat", tref(s["task"]), f"The owner, on {tref(s['task'])}: {s['text'] or ''}",
+                        s["created"], person="owner", task=s["task"], owner_chat=True)
+            for a in history_who(s["t_owner"])]
+
+
+def history_message(m):
+    """A message between two agents, in the history of both."""
+    text = f"{m['sender']} to {m['recipient']}" + \
+        (f" (answering {am_ref(m['in_reply_to'])})" if m["in_reply_to"] else "") + f": {m['text'] or ''}"
+    return [history_rec(a, "message", am_ref(m["id"]), text, m["created"], person=other,
+                        task=m["sender_task"] if a == m["sender"] else None)
+            for a, other in history_pairs(m["sender"], m["recipient"])]
+
+
+def history_standing(r):
+    """A standing item (AUTONOMY.md P3), in the history of the agent that holds it. One the owner gave is his own
+    words, so it is the owner's chat as well."""
+    text = f"{iref(r['id'])} {r['kind']}" + (" for the team" if r["scope"] == "team" else "") + \
+        f" from {r['author']}: {r['words']}" + \
+        (f"\nMeasure: {r['measure']}" + (f", {r['number']:g}" if r["number"] is not None else "") if r["measure"]
+         else "") + (f"\nHow: {r['how']}" if r["how"] else "")
+    return [history_rec(a, "standing", iref(r["id"]), text, r["created"],
+                        person=r["author"] if r["author"] != a else None, owner_chat=r["author_kind"] == "owner")
+            for a in history_who(r["agent"])]
+
+
+def history_standing_end(r):
+    """The end of a standing item: who asked for it, and why."""
+    text = f"{iref(r['id'])} ended, as {r['ended_by']} asked" + (f": {r['ended_why']}" if r["ended_why"] else "") + \
+        f" ({clip(r['words'], 160)})"
+    return [history_rec(a, "standing", iref(r["id"]), text, r["ended"],
+                        person=r["ended_by"] if r["ended_by"] != a else None,
+                        owner_chat="owner" in (r["author_kind"], r["ended_by"])) for a in history_who(r["agent"])]
+
+
+def history_task(t):
+    """A task, in the history of the agent that does it and of the one that asked for it. A task the owner asked for
+    in an agent's own chat carries his words (t_start_task), so it is the owner's chat as well."""
+    text = "\n".join(x for x in (f"{tref(t['id'])} {t['title'] or ''}", t["details"] or "",
+                                 f"Done when: {t['done_when']}" if t["done_when"] else "",
+                                 f"Why: {t['why']}" if t["why"] else "") if x)
+    owners = str(t["details"] or "").startswith(HISTORY_OWNER_TASK)
+    return [history_rec(a, "task", tref(t["id"]), text, t["created"], person=other, task=t["id"], owner_chat=owners)
+            for a, other in history_pairs(t["owner"], t["requester"])]
+
+
+def history_result(t):
+    """How a task ended: its result, or why it failed or was canceled."""
+    text = f"{tref(t['id'])} {t['outcome'] or t['state']}: {t['what'] or ''}" + \
+        (f"\nOutput: {t['where_']}" if t["where_"] else "") + (f"\nChecked: {t['how']}" if t["how"] else "")
+    return [history_rec(a, "result", tref(t["id"]), text, t["delivered"], person=other, task=t["id"])
+            for a, other in history_pairs(t["owner"], t["requester"])]
+
+
+def history_check(t):
+    """Whether whoever asked for a task accepted its result, and why not."""
+    text = f"{t['requester']} {'accepted' if t['accepted'] else 'did not accept'} the result of {tref(t['id'])}" + \
+        (f": {t['check_note']}" if t["check_note"] else ".")
+    return [history_rec(a, "result", tref(t["id"]), text, t["checked_at"], person=other, task=t["id"])
+            for a, other in history_pairs(t["owner"], t["requester"])]
+
+
+def history_progress(n):
+    """A progress note, in the history of the agent that wrote it."""
+    return [history_rec(a, "note", tref(n["task"]), f"{tref(n['task'])} progress: {n['text'] or ''}", n["ts"],
+                        task=n["task"]) for a in history_who(n["agent"])]
+
+
+def history_question(qu):
+    """A question about a task, in the history of the agent that asked and of the one it asked."""
+    text = f"Q-{qu['id']} on {tref(qu['task'])}, {qu['asker']} asked {qu['requester']}: {qu['text'] or ''}" + \
+        (f"\nGoing on with: {qu['assumed']}" if qu["assumed"] else "") + \
+        (f"\nIt needs: {qu['access']}" if qu["access"] else "")
+    return [history_rec(a, "question", f"Q-{qu['id']}", text, qu["asked"], person=other, task=qu["task"])
+            for a, other in history_pairs(qu["asker"], qu["requester"])]
+
+
+def history_answer(qu):
+    """The answer to a question, in the history of both."""
+    return [history_rec(a, "question", f"Q-{qu['id']}", f"Q-{qu['id']} answered by {qu['requester']}: "
+                        f"{qu['answer'] or ''}", qu["answered"], person=other, task=qu["task"])
+            for a, other in history_pairs(qu["asker"], qu["requester"])]
+
+
+def history_report(r):
+    """What an agent said upward (report_up), in the history of the sender and of the one it reached."""
+    text = f"{upref(r['id'])} {r['from_agent']} to {r['to_agent']}, {r['kind']}" + \
+        (f" about {r['about']}" if r["about"] else "") + f": {r['text'] or ''}"
+    return [history_rec(a, "report", upref(r["id"]), text, r["created"], person=other,
+                        task=r["from_task"] if a == r["from_agent"] else None)
+            for a, other in history_pairs(r["from_agent"], r["to_agent"])]
+
+
+def history_decision(r):
+    """What became of a report: its receiver's decision."""
+    text = f"{upref(r['id'])} decided by {r['decided_by']}: {r['decision'] or ''}" + \
+        (f". {r['note']}" if r["note"] else "") + (f" It became {tref(r['became_task'])}." if r["became_task"] else "")
+    return [history_rec(a, "report", upref(r["id"]), text, r["decided"], person=other)
+            for a, other in history_pairs(r["from_agent"], r["to_agent"])]
+
+
+def history_duty(h):
+    """One line of a duty's own history, in the history of the agent that holds the duty and of the one that wrote
+    the line. A lesson learned in a case is the memory stream's."""
+    if h["kind"] == "learned":
+        return []
+    kind = "case" if h["kind"] in ("case_opened", "case_closed") else "step" if h["kind"] == "step" else "duty"
+    case = HISTORY_CASE.match(h["detail"] or "")
+    text = f"{rref(h['responsibility'])} {HISTORY_DUTY_WORDS.get(h['kind'], h['kind'])} by {h['by']}: " \
+           f"{h['detail'] or ''}" + (f"\nThe duty: {h['r_text']}" if h["kind"] in ("created", "edited") and
+                                     h["r_text"] else "")
+    return [history_rec(a, kind, case.group(0) if case and kind != "duty" else rref(h["responsibility"]), text,
+                        h["ts"]) for a in history_who(h["r_agent"], h["by"])]
+
+
+def history_memory(m):
+    """A lesson an agent wrote."""
+    text = f"{mref(m['id'])} {'dead end' if m['kind'] == 'dead_end' else 'lesson'} about {m['about']}: {m['text']}" + \
+        (f"\nIt prevents: {m['prevents']}" if m["prevents"] else "") + \
+        (f"\nTo check it again: {m['recheck']}" if m["recheck"] else "")
+    return [history_rec(a, "memory", mref(m["id"]), text, m["created"], task=m["by_task"])
+            for a in history_who(m["agent"])]
+
+
+def history_forgotten(m):
+    """A lesson that stopped standing, with why."""
+    return [history_rec(a, "memory", mref(m["id"]), f"{mref(m['id'])} forgotten by {m['dropped_by']}: "
+                        f"{m['drop_reason'] or ''}", m["dropped"], task=m["by_task"])
+            for a in history_who(m["agent"])]
+
+
+def history_flat(value):
+    """One argument of a tool call as plain words."""
+    if isinstance(value, (list, tuple)):
+        return ", ".join(history_flat(v) for v in value)
+    if isinstance(value, dict):
+        return ", ".join(f"{k}={history_flat(v)}" for k, v in value.items())
+    return str(value)[:2000]
+
+
+def history_call(c):
+    """A fleet tool call that acted outside the hub's own rows (HISTORY_CALLS): what it was given and what the hub
+    answered, in the history of the agent that made it."""
+    try:
+        args = json.loads(c["args"]) if c["args"] and c["args"] != "[blocked]" else {}
+    except ValueError:
+        args = {}
+    said = "; ".join(f"{k}: {history_flat(v)}" for k, v in (args if isinstance(args, dict) else {}).items()
+                     if k not in ("request_id", "task_id"))
+    text = c["name"] + (f" — {said}" if said else "") + (f"\nAnswer: {clip(c['detail'], 600)}" if c["detail"] else "")
+    return [history_rec(a, "tool", f"CR-{c['id']}", text, c["ts"], task=c["task"]) for a in history_who(c["agent"])]
+
+
+def history_call_cached(key, record):
+    with LOCK:
+        HISTORY_CALL_CACHE[key] = record
+        HISTORY_CALL_CACHE.move_to_end(key)
+        while len(HISTORY_CALL_CACHE) > HISTORY_CALL_CACHE_MAX:
+            HISTORY_CALL_CACHE.popitem(last=False)
+
+
+def history_call_of(e, call_id):
+    """The tool_call record that a tool_call_update of a session belongs to: kept from the step that indexed it, or
+    read. {} when the session has none, and then the update is not indexed: an unknown call may be the fleet's."""
+    key = (e["task"], e["attempt"], e["session"], call_id)
+    with LOCK:
+        found = HISTORY_CALL_CACHE.get(key)
+    if found is None:
+        row = read_row("SELECT data FROM thread_events WHERE task=? AND attempt=? AND session=? AND id<? AND "
+                       "type='tool_call' AND json_extract(data, '$.tool_call_id')=? ORDER BY id DESC LIMIT 1",
+                       (e["task"], e["attempt"], e["session"], e["id"], call_id))
+        found = json.loads(row["data"]) if row else {}
+        history_call_cached(key, found)
+    return found
+
+
+def history_fleet_call(d):
+    return d.get("server") == "fleet" or str(d.get("title") or "").startswith("fleet: ")
+
+
+def history_tool(e):
+    """One record of an agent's own session (thread_events), in the history of the task's owner: what the session
+    said, each call it made with what it touched, and what a command answered. Not what was typed into the session
+    (the task, the messages and the answers are indexed where they were written) and not its thinking. Not the fleet's
+    own tools either: their records are the hub's own rows above, and what read_messages answered can hold the
+    owner's words."""
+    d = json.loads(e["data"])
+    if e["type"] == "agent_message":
+        text = d.get("text") or ""
+    elif e["type"] == "error":
+        text = f"Error {d.get('code')}: {d.get('message') or ''}"
+    elif e["type"] == "tool_call":
+        history_call_cached((e["task"], e["attempt"], e["session"], d.get("tool_call_id")), d)
+        if history_fleet_call(d) or d.get("kind") == "think":
+            return []
+        paths = list(dict.fromkeys([c["path"] for c in d.get("changes") or [] if isinstance(c, dict)] +
+                                   [x["path"] for x in d.get("locations") or [] if isinstance(x, dict)]))
+        text = (d.get("title") or "") + (" — " + ", ".join(paths) if paths else "") + \
+            (f"\n{d['output']}" if d.get("output") and d.get("kind") in HISTORY_OUTPUTS else "")
+    elif e["type"] == "tool_call_update" and d.get("output"):
+        call = history_call_of(e, d.get("tool_call_id"))
+        if not call or history_fleet_call(call) or call.get("kind") not in HISTORY_OUTPUTS:
+            return []
+        text = f"{call.get('title') or ''} → {d['output']}"
+    else:
+        return []
+    return [history_rec(a, "tool", f"TR-{e['id']}", text, e["ts"] or e["created"], task=e["task"])
+            for a in history_who(e["t_owner"])] if text.strip() else []
+
+
+class HistoryStream:
+    """One stream of records: the rows of one table, or one moment of them (`at`: a task's delivery, a question's
+    answer), that become history rows. `select` names its row `_id` and, for a moment, its time `_at`."""
+
+    def __init__(self, name, table, select, key, build, at=None, where=""):
+        self.name, self.table, self.select, self.key, self.build, self.at, self.where = \
+            name, table, select, key, build, at, where
+
+
+def history_streams():
+    """The streams, in the order a backfill takes them in: what agents ask about most, first, and the tool records,
+    which are most of any history, last. It reads an agent's lessons for that agent's own search and decides nothing
+    (test_invariants.MemoryIsNotAPermission names it)."""
+    return [
+        HistoryStream("conversation", "conversation_messages",
+                      "SELECT cm.*, cm.id AS _id, c.agent AS c_agent, c.person AS c_person, p.name AS p_name "
+                      "FROM conversation_messages cm JOIN conversations c ON c.id=cm.conversation "
+                      "LEFT JOIN people p ON p.id=c.person", "cm.id", history_conversation),
+        HistoryStream("owner_message", "ui_requests",
+                      "SELECT u.*, u.rowid AS _id, n.conversation AS n_conversation, n.title AS n_title "
+                      "FROM ui_requests u LEFT JOIN needs n ON n.id=u.need_id", "u.rowid", history_owner_message),
+        HistoryStream("owner_report", "owner_reports", "SELECT r.*, r.id AS _id FROM owner_reports r", "r.id",
+                      history_owner_report),
+        HistoryStream("need", "needs", "SELECT n.*, n.id AS _id FROM needs n", "n.id", history_need),
+        HistoryStream("steer", "steers", "SELECT s.*, s.id AS _id, t.owner AS t_owner FROM steers s "
+                      "LEFT JOIN tasks t ON t.id=s.task", "s.id", history_steer),
+        HistoryStream("message", "agent_messages", "SELECT m.*, m.id AS _id FROM agent_messages m", "m.id",
+                      history_message),
+        HistoryStream("standing", "standing", "SELECT s.*, s.id AS _id FROM standing s", "s.id", history_standing),
+        HistoryStream("ended", "standing", "SELECT s.*, s.id AS _id, s.ended AS _at FROM standing s", "s.id",
+                      history_standing_end, at="s.ended"),
+        HistoryStream("task", "tasks", "SELECT t.*, t.id AS _id FROM tasks t", "t.id", history_task),
+        HistoryStream("result", "tasks", "SELECT t.*, t.id AS _id, t.delivered AS _at FROM tasks t", "t.id",
+                      history_result, at="t.delivered"),
+        HistoryStream("check", "tasks", "SELECT t.*, t.id AS _id, t.checked_at AS _at FROM tasks t", "t.id",
+                      history_check, at="t.checked_at"),
+        HistoryStream("progress", "notes", "SELECT n.*, n.id AS _id FROM notes n", "n.id", history_progress),
+        HistoryStream("question", "questions", "SELECT q.*, q.id AS _id FROM questions q", "q.id",
+                      history_question),
+        HistoryStream("answer", "questions", "SELECT q.*, q.id AS _id, q.answered AS _at FROM questions q", "q.id",
+                      history_answer, at="q.answered"),
+        HistoryStream("report", "reports", "SELECT r.*, r.id AS _id FROM reports r", "r.id", history_report),
+        HistoryStream("decision", "reports", "SELECT r.*, r.id AS _id, r.decided AS _at FROM reports r", "r.id",
+                      history_decision, at="r.decided"),
+        HistoryStream("duty", "duty_history", "SELECT h.*, h.id AS _id, r.agent AS r_agent, r.text AS r_text "
+                      "FROM duty_history h LEFT JOIN responsibilities r ON r.id=h.responsibility", "h.id",
+                      history_duty),
+        HistoryStream("memory", "memories", "SELECT m.*, m.id AS _id FROM memories m", "m.id", history_memory),
+        HistoryStream("forgotten", "memories", "SELECT m.*, m.id AS _id, m.dropped AS _at FROM memories m", "m.id",
+                      history_forgotten, at="m.dropped"),
+        HistoryStream("call", "calls", "SELECT c.*, c.id AS _id FROM calls c", "c.id", history_call,
+                      where="c.ok=1 AND c.name IN (" + ",".join(f"'{t}'" for t in HISTORY_CALLS) + ")"),
+        HistoryStream("tool", "thread_events", "SELECT e.*, e.id AS _id, t.owner AS t_owner FROM thread_events e "
+                      "LEFT JOIN tasks t ON t.id=e.task", "e.id", history_tool,
+                      where="e.type IN ('agent_message','error','tool_call','tool_call_update')"),
+    ]
+
+
+HISTORY_STREAMS = history_streams()
+HISTORY_BY_NAME = {s.name: s for s in HISTORY_STREAMS}
+
+
+def history_insert(src, src_id, recs, keys, keep=False):
+    """Inside the caller's transaction: the records of one source row into history and its index. The words are
+    masked on the way in and kept in the row, except a tool record's on a machine with the index: those are read
+    back from their session record. `keys` caches the agents' index keys for the caller's step."""
+    for r in recs:
+        text = mask_secrets(r["text"])[:HISTORY_TEXT]
+        hid = DB.execute("INSERT INTO history(agent,kind,ref,person,task,at,owner_chat,src,src_id,text) "
+                         "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                         (r["agent"], r["kind"], r["ref"], r["person"], r["task"], r["at"], r["owner_chat"], src,
+                          src_id, text if keep or r["kind"] != "tool" or not HISTORY_FTS[0] else None)).lastrowid
+        if HISTORY_FTS[0]:
+            if r["agent"] not in keys:
+                keys[r["agent"]] = history_key(r["agent"], create=True)
+            DB.execute("INSERT INTO history_fts(rowid,text,agent) VALUES(?,?,?)", (hid, text, keys[r["agent"]]))
+
+
+def history_step(s, keys):
+    """One step of one stream, in one transaction: up to HISTORY_CHUNK of its rows into the index and its cursor past
+    them, or neither. True when more may wait. A stream of a moment (`at`) keeps the time and the id it reached; a
+    stream of rows keeps the id, and moves to the end of the ids it looked through when the step was not full, so rows
+    that its filter leaves out are not read again."""
+    where = f" AND {s.where}" if s.where else ""
+    with area("quiet"), transaction():
+        cursor = DB.execute("SELECT v FROM kv WHERE k=?", ("history:" + s.name,)).fetchone()
+        if s.at:
+            at, last = (float(cursor["v"].split(":")[0]), int(cursor["v"].split(":")[1])) if cursor else (0.0, 0)
+            rows = DB.execute(f"{s.select} WHERE {s.at} IS NOT NULL AND {s.at}>=? AND ({s.at}>? OR {s.key}>?){where} "
+                              f"ORDER BY {s.at}, {s.key} LIMIT ?", (at, at, last, HISTORY_CHUNK)).fetchall()
+            moved = f"{float(rows[-1]['_at'])!r}:{rows[-1]['_id']}" if rows else None
+        else:
+            last = int(cursor["v"]) if cursor else 0
+            top = DB.execute(f"SELECT MAX(rowid) m FROM {s.table}").fetchone()["m"] or 0
+            upper = min(top, last + HISTORY_SPAN)
+            rows = DB.execute(f"{s.select} WHERE {s.key}>? AND {s.key}<=?{where} ORDER BY {s.key} LIMIT ?",
+                              (last, upper, HISTORY_CHUNK)).fetchall()
+            moved = str(rows[-1]["_id"] if len(rows) == HISTORY_CHUNK else upper) if upper > last else None
+        for row in rows:
+            try:
+                recs = s.build(row)
+            except (ValueError, TypeError, KeyError, IndexError, AttributeError) as e:
+                # One record the builder cannot read must not hold back the stream behind it. The record itself
+                # stays where it is.
+                log_row("hub", f"history: {s.name} {row['_id']} was not indexed: {e!r}")
+                continue
+            history_insert(s.name, row["_id"], recs, keys)
+        if moved is not None:
+            DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                       ("history:" + s.name, moved))
+    return len(rows) == HISTORY_CHUNK or (not s.at and upper < top)
+
+
+def history_catch_up(budget=HISTORY_STEP):
+    """Index what was written since the last pass, stream by stream, for about `budget` seconds of work at most.
+    True when every stream has caught up. Each step is a transaction of its own, so the hub answers between two."""
+    end, keys = time.monotonic() + budget, {}
+    for s in HISTORY_STREAMS:
+        while history_step(s, keys):
+            if time.monotonic() >= end:
+                return False
+    return True
+
+
+def history_behind():
+    """Up to how many records the index has not taken in yet: the rows past each stream's cursor, counted from ids,
+    so a stream with a filter counts some rows it will leave out."""
+    n = 0
+    for s in HISTORY_STREAMS:
+        if not s.at:
+            cursor = read_row("SELECT v FROM kv WHERE k=?", ("history:" + s.name,))
+            n += max(0, (read_row(f"SELECT MAX(rowid) m FROM {s.table}")["m"] or 0) - int(cursor["v"] if cursor else 0))
+    return n
+
+
+def history_sweep(t0):
+    """The tick's pass over the history: what was written since the last one, a few milliseconds at most. An error
+    is told once, until a pass succeeds again: the records themselves are untouched, and the next pass tries again."""
+    try:
+        history_catch_up(HISTORY_STEP)
+        HISTORY_FAILED[0] = None
+    except sqlite3.Error as e:
+        if HISTORY_FAILED[0] != str(e):
+            HISTORY_FAILED[0] = str(e)
+            log("hub", f"the history index could not take in new records: {e}")
+
+
+def history_indexer():
+    """At the hub's start, and until the history has caught up: the backfill of older records, one short step at a
+    time, so the hub answers between two. Then the tick keeps it current."""
+    first = True
+    while True:
+        try:
+            if first:
+                history_orphans()
+                first = False
+            done = history_catch_up(HISTORY_STEP)
+            HISTORY_FAILED[0] = None
+        except sqlite3.Error as e:
+            done = None
+            if HISTORY_FAILED[0] != str(e):
+                HISTORY_FAILED[0] = str(e)
+                log("hub", f"the history index could not take in older records: {e}")
+        if done:
+            return
+        time.sleep(0.01 if done is False else 5)
+
+
+def history_note(agent, kind, ref, text, at=None, task=None, person=None, owner_chat=False):
+    """Inside the caller's transaction: one record that has no stream here, in the agent's history with its words
+    kept. For a lane's own event that is not a row of its own, such as the end of a standing item or the removal of a
+    lesson. `ref` is what read_history opens it by, and `person` the other party (P-<id>, an agent, or owner)."""
+    in_transaction("history_note")
+    if kind not in HISTORY_KINDS:
+        raise ValueError(f"a history record's kind is one of {', '.join(HISTORY_KINDS)}")
+    history_insert("note", None, [history_rec(agent, kind, ref, text, now() if at is None else at, person=person,
+                                              task=task, owner_chat=owner_chat)], {}, keep=True)
+
+
+def history_forget_person(person_id):
+    """Inside the caller's transaction: every record of one person's conversations leaves the history, words and
+    all. The owner removed the person, and person_remove deletes their messages, so the index forgets them too."""
+    in_transaction("history_forget_person")
+    for h in DB.execute("SELECT id, agent, text FROM history WHERE person=?", (f"P-{person_id}",)).fetchall():
+        key = history_key(h["agent"])
+        if HISTORY_FTS[0] and key and h["text"] is not None:
+            DB.execute("INSERT INTO history_fts(history_fts,rowid,text,agent) VALUES('delete',?,?,?)",
+                       (h["id"], h["text"], key))
+        DB.execute("DELETE FROM history WHERE id=?", (h["id"],))
+
+
+def history_rewrite(src, src_id, ref):
+    """Inside the caller's write (a transaction, or the `committed()` of the owner's message route): a record whose
+    words changed where it stands is indexed again as it reads now, in the same write, so the index keeps no word the
+    record lost. The owner edits a message that nothing has read (owner_message_replace), and its old words are in
+    the hub's log and nowhere else. A record the stream has not reached yet needs nothing: the stream takes it in as
+    it reads then."""
+    s = HISTORY_BY_NAME[src]
+    old = DB.execute("SELECT id, agent, text FROM history WHERE ref=? AND kind<>'tool' AND src=? AND src_id=?",
+                     (ref, src, src_id)).fetchall()
+    if not old:
+        return
+    for h in old:
+        key = history_key(h["agent"])
+        if HISTORY_FTS[0] and key and h["text"] is not None:
+            DB.execute("INSERT INTO history_fts(history_fts,rowid,text,agent) VALUES('delete',?,?,?)",
+                       (h["id"], h["text"], key))
+        DB.execute("DELETE FROM history WHERE id=?", (h["id"],))
+    row = DB.execute(f"{s.select} WHERE {s.key}=?", (src_id,)).fetchone()
+    if row:
+        history_insert(src, src_id, s.build(row), {})
+
+
+def history_rewrite_message(request_id):
+    """history_rewrite for one owner message, by its request id."""
+    row = DB.execute("SELECT rowid FROM ui_requests WHERE request_id=?", (request_id,)).fetchone()
+    if row:
+        history_rewrite("owner_message", row["rowid"], f"OM-{row['rowid']}")
+
+
+def history_orphans():
+    """At the start: the records of a person the owner removed while a release without this history ran."""
+    with transaction():
+        for r in DB.execute("SELECT DISTINCT person FROM history WHERE person>='P-' AND person<'P.'").fetchall():
+            if r["person"][2:].isdigit() and not DB.execute("SELECT 1 FROM people WHERE id=?",
+                                                            (int(r["person"][2:]),)).fetchone():
+                history_forget_person(int(r["person"][2:]))
+
+
+def contact_session(agent, context=None):
+    """True for a session that a contact drives (AUTONOMY.md P6): a conversation window, or a task that a
+    conversation opened (tasks.source_conversation, lane L2), or a part of one. Such a session never finds the
+    owner's chats. Before that column exists no task is a contact's, so this reads False there."""
+    context = context if context is not None else getattr(CALL, "context", None)
+    if conversation_context(agent, context):
+        return True
+    if not context or len(context) != 3 or not re.fullmatch(r"T-[1-9][0-9]{0,17}", str(context[1])):
+        return False
+    tid, seen = parse_task(context[1]), set()
+    while tid and tid not in seen and len(seen) < 100:
+        seen.add(tid)
+        try:
+            row = read_row("SELECT source_conversation, parent FROM tasks WHERE id=?", (tid,))
+        except sqlite3.OperationalError:
+            return False
+        if not row:
+            return False
+        if row["source_conversation"] is not None:
+            return True
+        tid = row["parent"]
+    return False
+
+
+def history_terms(query):
+    """The phrases of a query for FTS5: each word, or each "quoted phrase", one phrase of its letters and digits, so
+    T-12 is the phrase "t 12". A word of four characters or more also finds the words it begins. They are
+    alternatives: a record with more of them, and with the rarer ones, ranks first."""
+    out = []
+    for m in re.finditer(r'"([^"]*)"|(\S+)', str(query or "")):
+        quoted = m.group(1) is not None
+        part = m.group(1) if quoted else m.group(2)
+        tokens = HISTORY_TOKEN.findall(part.lower()) if quoted or part not in ("OR", "AND") else []
+        if tokens:
+            phrase = '"' + " ".join(tokens) + '"' + ("*" if not quoted and len(tokens[-1]) >= 4 else "")
+            if phrase not in out:
+                out.append(phrase)
+    return out[:HISTORY_PHRASES]
+
+
+def history_when(value, field, end=False):
+    """A time from a date, a date and time, today or yesterday, in the fleet's own time zone. With end, a date alone
+    is the end of that day, so from=2026-10-26 to=2026-10-26 is that whole day."""
+    import datetime
+    zone, text = goal_settings()[2], str(value).strip().lower()
+    try:
+        if text in ("today", "yesterday"):
+            day = datetime.datetime.fromtimestamp(now(), zone).date() - datetime.timedelta(days=text == "yesterday")
+            text = day.isoformat()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            at = datetime.datetime.fromisoformat(text).replace(tzinfo=zone)
+            return (at + datetime.timedelta(days=1) if end else at).timestamp()
+        at = datetime.datetime.fromisoformat(text.upper().replace("Z", "+00:00"))
+        return (at if at.tzinfo else at.replace(tzinfo=zone)).timestamp()
+    except (ValueError, OverflowError):
+        raise ToolError(f"{field} is a date or a date and time, for example 2026-10-26 or 2026-10-26 14:00, in the "
+                        f"fleet's own time zone ({zone.key}); today and yesterday work too.") from None
+
+
+def history_time(ts):
+    import datetime
+    return datetime.datetime.fromtimestamp(ts, goal_settings()[2]).strftime("%Y-%m-%d %H:%M") if ts else "no time"
+
+
+def history_kinds(value):
+    """The kinds a search keeps: one, or several with commas. None for every kind."""
+    if value in (None, ""):
+        return None
+    kinds = [k.strip().lower() for k in str(value).split(",") if k.strip()]
+    wrong = [k for k in kinds if k not in HISTORY_KINDS]
+    if wrong or not kinds:
+        raise ToolError(f"kind is one of {', '.join(HISTORY_KINDS)}, or several of them with commas.")
+    return kinds
+
+
+def history_people(value):
+    """The `person` values that one name stands for: the owner, an agent, a person by P-<id>, or the people whose
+    name is this one, else whose name holds it, in any case and with or without accents. None when nobody is called
+    that. The people are the owner's few contacts, so they are compared here and not in SQL, which folds no accent."""
+    text = str(value or "").strip()
+    if text.lower() == "owner":
+        return ["owner"]
+    found = re.fullmatch(r"(?i)P-?([1-9][0-9]{0,17})", text)
+    if found:
+        return [f"P-{int(found.group(1))}"]
+    out = [text.lower()] if text.lower() in agents() or (AGENT_NAME.match(text.lower()) and read_row(
+        "SELECT 1 FROM history WHERE person=? LIMIT 1", (text.lower(),))) else []
+    folded, everyone = history_fold(" ".join(text.split()))[0], read_rows("SELECT id, name FROM people ORDER BY id")
+    names = {p["id"]: history_fold(" ".join(str(p["name"]).split()))[0] for p in everyone}
+    people = [i for i, name in names.items() if name == folded] or [i for i, name in names.items() if folded in name]
+    return out + [f"P-{i}" for i in people] or None
+
+
+def history_party(person, names):
+    """The other party of a record in words: a person's name as it stands now, an agent's name, or the owner."""
+    if not person:
+        return ""
+    if person == "owner":
+        return "the owner"
+    if person.startswith("P-") and person[2:].isdigit():
+        if person not in names:
+            row = read_row("SELECT name FROM people WHERE id=?", (int(person[2:]),))
+            names[person] = row["name"] if row else f"a person removed since ({person})"
+        return names[person]
+    return person
+
+
+def history_ref(value):
+    """The one form of a ref that a search gave: CM-12, T-7, R-1/C-3."""
+    text = str(value or "").strip()
+    found = HISTORY_REF.match(text)
+    if found:
+        return f"{found.group(1).upper()}-{int(found.group(2))}"
+    found = HISTORY_DUTY_REF.match(text)
+    if found:
+        return f"R-{int(found.group(1))}" + (f"/C-{int(found.group(2))}" if found.group(2) else "")
+    raise ToolError("ref is one that search_history gave, for example CM-12, T-7, Q-3, AM-5, OM-4, R-1/C-3 or "
+                    "TR-120.")
+
+
+def history_query(agent, phrases, since, until, people, task, kinds, owner_chats, limit):
+    """The history rows that match, best first, or the newest first when there are no words; at most limit + 1, so
+    the caller knows whether there are more. agent None is every agent's (the owner's search)."""
+    where, args = [], []
+    for sql, arg, on in (("h.agent=?", agent, agent), ("h.at>=?", since, since is not None),
+                         ("h.at<?", until, until is not None), ("h.task=?", task, task)):
+        if on:
+            where.append(sql)
+            args.append(arg)
+    if people:
+        where.append(f"h.person IN ({','.join('?' * len(people))})")
+        args += people
+    if kinds:
+        where.append(f"h.kind IN ({','.join('?' * len(kinds))})")
+        args += kinds
+    if not owner_chats:
+        where.append("h.owner_chat=0")
+    cond = " AND ".join(where) or "1=1"
+    if not phrases:
+        return read_rows(f"SELECT h.* FROM history h WHERE {cond} ORDER BY h.at DESC, h.id DESC LIMIT ?",
+                         (*args, limit + 1))
+    if HISTORY_FTS[0]:
+        key = history_key(agent) if agent else None
+        if agent and not key:
+            return []
+        words = " OR ".join(f"text : {p}" for p in phrases)
+        try:
+            return read_rows(f"SELECT h.* FROM history_fts f JOIN history h ON h.id=f.rowid WHERE history_fts MATCH ? "
+                             f"AND {cond} ORDER BY f.rank LIMIT ?",
+                             (f"agent : {key} AND ({words})" if key else words, *args, limit + 1))
+        except sqlite3.OperationalError:
+            return []           # a query the index cannot read, which the phrases above are made never to be
+    # No FTS5 on this machine: the same words, read linearly, the record with more of them first.
+    likes = ["%" + "%".join(HISTORY_TOKEN.findall(p.lower())) + "%" for p in phrases]
+    score = " + ".join("(h.text LIKE ?)" for _ in likes)
+    return read_rows(f"SELECT h.* FROM history h WHERE {cond} AND ({score}) > 0 ORDER BY ({score}) DESC, h.at DESC "
+                     f"LIMIT ?", (*args, *likes, *likes, limit + 1))
+
+
+def history_words(h):
+    """The words of one history row: its own, or a tool record's, read again from the record it came from."""
+    if h["text"] is not None:
+        return h["text"]
+    s = HISTORY_BY_NAME.get(h["src"])
+    row = read_row(f"{s.select} WHERE {s.key}=?", (h["src_id"],)) if s else None
+    recs = s.build(row) if row else []
+    return recs[0]["text"] if recs else "(this record is gone)"
+
+
+def history_fold(text):
+    """(the text in lower case and without accents, the place in text of each of its characters)"""
+    folded, at = [], []
+    for i, c in enumerate(text):
+        for f in unicodedata.normalize("NFKD", c):
+            if not unicodedata.combining(f):
+                for g in f.lower():
+                    folded.append(g)
+                    at.append(i)
+    return "".join(folded), at
+
+
+def history_snippet(text, phrases, width=HISTORY_SNIPPET):
+    """One line of a record, around the first of the searched words that it holds, or from its start."""
+    flat = " ".join(str(text or "").split())
+    folded, at = history_fold(flat)
+    hits = [folded.find(w) for p in phrases for w in HISTORY_TOKEN.findall(history_fold(p)[0])]
+    hits = [h for h in hits if h >= 0]
+    start = max(0, at[min(hits)] - width // 3) if hits else 0
+    if start:
+        space = flat.find(" ", start)
+        start = space + 1 if 0 < space < start + 20 else start
+    return ("…" if start else "") + flat[start:start + width] + ("…" if start + width < len(flat) else "")
+
+
+def history_found(agent, a, owner_chats, limit):
+    """(the rows, the words, the filters in words, whether more matched) of one search's arguments, for an agent's
+    search or the owner's (agent None)."""
+    phrases = history_terms(a.get("query"))
+    since = history_when(a["from"], "from") if a.get("from") not in (None, "") else None
+    until = history_when(a["to"], "to", end=True) if a.get("to") not in (None, "") else None
+    people = history_people(a["person"]) if a.get("person") not in (None, "") else None
+    if a.get("person") not in (None, "") and not people:
+        raise ToolError(f"Nobody is called {a['person']} here: give a person's name as it stands in their "
+                        f"conversation, an agent's name, or owner.")
+    task = parse_task(a["task"]) if a.get("task") not in (None, "") else None
+    kinds = history_kinds(a.get("kind"))
+    rows = history_query(agent, phrases, since, until, people, task, kinds, owner_chats, limit)
+    said = [x for x in (f"from {a['from']}" if since is not None else "", f"to {a['to']}" if until is not None else "",
+                        f"with {a['person']}" if people else "", f"in {tref(task)}" if task else "",
+                        f"of kind {', '.join(kinds)}" if kinds else "") if x]
+    return rows[:limit], phrases, said, len(rows) > limit
+
+
+def t_search_history(agent, a):
+    """search_history: the agent's own history, best first."""
+    behind = not history_catch_up(HISTORY_SEARCH_STEP)
+    contact = contact_session(agent)
+    rows, phrases, said, more = history_found(agent, a, not contact, HISTORY_SHOWN)
+    zone = goal_settings()[2].key
+    asked = (f'"{str(a.get("query")).strip()}"' if phrases else "your filters") + \
+        (f" ({'; '.join(said)})" if said else "")
+    if rows and not phrases and not said:
+        out = [f"Your {len(rows)} newest record{'s' if len(rows) != 1 else ''}" + (", and there are more" if more
+                                                                                 else "") + ":"]
+    elif rows:
+        out = [f"{len(rows)}{' or more' if more else ''} record{'s' if len(rows) != 1 or more else ''} of yours "
+               f"match {asked}, {'the best first' if phrases else 'the newest first'}:"]
+    else:
+        out = [f"Nothing in your history matches {asked}. Try other forms of the words, or fewer of the filters."]
+    names = {}
+    for n, h in enumerate(rows, 1):
+        party = history_party(h["person"], names)
+        out.append(f"{n}. {h['ref']} · {history_time(h['at'])} · {h['kind'].replace('_', ' ')}"
+                   + (f" with {party}" if party else "")
+                   + (f" · {tref(h['task'])}" if h["task"] and h["ref"] != tref(h["task"]) else "")
+                   + " — " + history_snippet(mask_secrets(history_words(h)), phrases))
+    if more:
+        out.append("There are more: narrow it with from, to, person, task or kind.")
+    if rows:
+        out.append(f'read_history ref="{rows[0]["ref"]}" opens one in full. Times are in {zone}.')
+    if contact:
+        out.append("A person drives this session, so the owner's chats are not searched from it.")
+    if behind:
+        out.append(f"The history is still taking in older records: up to {history_behind()} are not in it yet, so an "
+                   f"older one may be missing. Ask again in a few minutes for those.")
+    return "\n".join(out)
+
+
+def history_records(agent, ref, owner_chats=True):
+    """The records of one ref as history holds them, oldest first: the agent's own (every agent's for the owner,
+    agent None). A tool record is read from its session record, which also opens one the index has not reached."""
+    prefix, _, number = ref.partition("-")
+    if prefix in ("TR", "CR"):
+        s = HISTORY_BY_NAME["tool" if prefix == "TR" else "call"]
+        row = read_row(f"{s.select} WHERE {s.key}=?" + (f" AND {s.where}" if s.where else ""), (int(number),))
+        return [dict(r, ref=ref, owner_chat=0) for r in (s.build(row) if row else [])
+                if agent is None or r["agent"] == agent]
+    rows = read_rows("SELECT * FROM history WHERE ref=? AND kind<>'tool'" + (" AND agent=?" if agent else "") +
+                     ("" if owner_chats else " AND owner_chat=0") + " ORDER BY at, id LIMIT ?",
+                     (ref, *([agent] if agent else []), HISTORY_READ))
+    return [dict(r, text=history_words(r)) for r in rows]
+
+
+def t_read_history(agent, a):
+    """read_history: one record of the agent's own history in full, or every record of one task or question."""
+    ref = history_ref(a.get("ref"))
+    behind = not history_catch_up(HISTORY_SEARCH_STEP)
+    recs = history_records(agent, ref, not contact_session(agent))
+    if not recs:
+        return (f"{ref} is not in your history: you took no part in it, or it does not exist. search_history finds "
+                f"what you took part in." + (" The history is still taking in older records, so it may be one of "
+                                             "those: ask again in a few minutes." if behind else ""))
+    names = {}
+    out = [f"{ref}: {len(recs)} record{'s' if len(recs) != 1 else ''} of yours, the oldest first. Times are in "
+           f"{goal_settings()[2].key}." if len(recs) > 1 else f"{ref}, in your history:"]
+    for r in recs:
+        party = history_party(r["person"], names)
+        text = mask_secrets(r["text"])
+        out.append(f"— {r['kind'].replace('_', ' ')} · {history_time(r['at'])}" + (f" · with {party}" if party else "")
+                   + (f" · {tref(r['task'])}" if r["task"] and ref != tref(r["task"]) else ""))
+        out.append(text if len(text) <= HISTORY_FULL else text[:HISTORY_FULL] + f" … (cut at {HISTORY_FULL} "
+                                                                                  f"characters)")
+    return "\n".join(out)
+
+
+def history_view(query):
+    """GET /ui/history: one agent's history, or every agent's, for the owner: the search, or with ref one record in
+    full. The owner reads every record, his own chats included."""
+    agent = query.get("agent") or None
+    if agent is not None and not AGENT_NAME.match(agent):
+        raise ToolError("agent must be an agent's name, or left out for every agent")
+    try:
+        limit = int(query.get("limit") or 20)
+        if not 1 <= limit <= 100:
+            raise ValueError()
+    except ValueError:
+        raise ToolError("limit must be 1 to 100") from None
+    history_catch_up(HISTORY_SEARCH_STEP)
+    index = {"full_text": bool(HISTORY_FTS[0]), "behind": history_behind(), "zone": goal_settings()[2].key}
+    names = {}
+    if query.get("ref"):
+        ref = history_ref(query["ref"])
+        return {"agent": agent, "ref": ref, "index": index,
+                "records": [{"ref": r["ref"], "kind": r["kind"], "agent": r["agent"], "at": r["at"],
+                             "person": r["person"], "person_name": history_party(r["person"], names) or None,
+                             "task": tref(r["task"]) if r["task"] else None, "owner_chat": bool(r["owner_chat"]),
+                             "text": mask_secrets(r["text"])} for r in history_records(agent, ref)]}
+    rows, phrases, _, more = history_found(agent, query, True, limit)
+    return {"agent": agent, "query": query.get("query") or "", "index": index, "more": more,
+            "results": [{"ref": h["ref"], "kind": h["kind"], "agent": h["agent"], "at": h["at"], "person": h["person"],
+                         "person_name": history_party(h["person"], names) or None,
+                         "task": tref(h["task"]) if h["task"] else None, "owner_chat": bool(h["owner_chat"]),
+                         "snippet": history_snippet(mask_secrets(history_words(h)), phrases)} for h in rows]}
 
 
 # ---------------------------------------------------------------- knowledge/, written by the agent that reads it
@@ -15979,6 +16909,30 @@ TOOLS = [
         "memory": {"type": "string", "description": "The memory to drop, for example M-1"},
         "reason": {"type": "string", "description": "Why it no longer stands, in one line"}, "task_id": TASK_ID},
        ["request_id", "memory", "reason"])),
+    # History search (AUTONOMY.md P6): everything an agent took part in, kept for ever and found by topic and date.
+    ("all", "search_history", t_search_history,
+     "Search everything you took part in: your conversations with people, your chats with the owner, your messages "
+     "with other agents, your tasks with their results, progress notes and questions, your reports, your duties' "
+     "cases and steps, your lessons, and your own tool records. query is a few words of the topic, not a sentence, "
+     "with the other forms you want found together (refund refunds reembolso): a record with more of them, and with "
+     "the rarer ones, comes first, a word of four letters or more also finds the words it begins, and \"words in "
+     "quotes\" are found as they stand. Narrow it with from and to (2026-10-26, or 2026-10-26 14:00, in the fleet's "
+     "own time zone; today and yesterday work too; to with a date alone is the end of that day), person (a person's "
+     "name, another agent's name, or owner), task (T-7) and kind. With no words, the newest records of those come "
+     "first. Each record comes with its date, who else took part, and its ref; read_history opens one in full.",
+     S({"query": {"type": "string", "description": "A few words of the topic, and their other forms"},
+        "from": {"type": "string", "description": "From this date, or date and time, for example 2026-10-26"},
+        "to": {"type": "string", "description": "To this date (all of it), or date and time"},
+        "person": {"type": "string", "description": "A person's name, another agent's name, or owner"},
+        "task": {"type": "string", "description": "Only the records of this task, for example T-7"},
+        "kind": {"type": "string", "description": "Only these kinds, with commas: " + ", ".join(HISTORY_KINDS)},
+        "task_id": TASK_ID})),
+    ("all", "read_history", t_read_history,
+     "One record of your history in full, by the ref that search_history gave: CM-12, T-7, Q-3, AM-5, TR-120 and the "
+     "like. A task's ref gives every record of yours about it, oldest first: the task, its notes, its result and "
+     "its check; a question's gives the question and its answer.",
+     S({"ref": {"type": "string", "description": "The ref of a record, as search_history gave it"},
+        "task_id": TASK_ID}, ["ref"])),
     ("all", "write_knowledge", t_write_knowledge,
      "Write one of the fleet's shared knowledge files, knowledge/<name>.md: a fact with no repository, such as an "
      "account, a customer or a supplier, that another agent may need. You write it directly, without asking; the "
@@ -16268,7 +17222,8 @@ def tool_contract(agent, context=None):
 def tools_for(agent, context=None):
     role = agents()[agent].get("role")
     read_only = ("list_my_tasks", "see_team", "see_goals", "see_capacity", "see_triggers", "search_knowledge",
-                 "see_responsibilities", "see_earlier_work", "see_history", "recall", "see_standing", *GOOGLE_READS)
+                 "see_responsibilities", "see_earlier_work", "see_history", "recall", "see_standing",
+                 "search_history", "read_history", *GOOGLE_READS)
     chat = chat_context(agent, context)
     return [{"name": name, "description": described(agent, name, desc) + (
                  f" {agent_directory(agent)}" if chat and name == "message_agent" else ""), "inputSchema": schema,
@@ -16394,9 +17349,11 @@ def call_tool(agent, name, args, context=None):
         for r, tname, fn, desc, schema in TOOLS:
             if tname == name and role_offers(role, r, name):
                 # These wait for an answer, a helper or Google, or read many files (search_knowledge): not under LOCK.
-                # deliver_result waits for the helper to send the task's files (deliver_outputs).
+                # deliver_result waits for the helper to send the task's files (deliver_outputs). The history's two
+                # take the lock for each step of their own, so the hub answers between the steps of a long search.
                 if name in ("ask_my_requester", "sign_in", "hand_over", "create_login", "save_key", "call_api",
-                            "message_agent", "search_knowledge", "write_knowledge", "deliver_result") or \
+                            "message_agent", "search_knowledge", "write_knowledge", "deliver_result",
+                            "search_history", "read_history") or \
                         name in GOOGLE_TOOLS:
                     text = fn(agent, args)
                 else:
@@ -19074,6 +20031,7 @@ def tick():
             attachment_sweep(t0)            # owner feature attachments: the files that the hub may let go
             release_sweep(t0)               # owner feature releases: the automatic poll, when the owner opted in
             names_sweep(t0)                 # devops task 1.1: the Tailscale names, when the start found none
+            history_sweep(t0)               # AUTONOMY.md P6: what was written since the last pass, into the history
         except Exception:
             traceback.print_exc()           # a goal or database check must not stop the timers below
         # close sessions of finished tasks
@@ -21484,12 +22442,15 @@ AGENT_COLUMNS = (
     ("agent_messages", "recipient"), ("person_agents", "agent"), ("conversations", "agent"), ("server_jobs", "agent"),
     ("signin_jobs", "agent"), ("resource_grants", "agent"), ("resource_grants", "by"), ("deposits", "agent"),
     ("withdrawals", "agent"), ("placements", "agent"),
-    ("standing", "agent"), ("standing", "author"), ("standing", "ended_by"))     # 'owner' and 'P-<id>' are no agent
+    ("standing", "agent"), ("standing", "author"), ("standing", "ended_by"),     # 'owner' and 'P-<id>' are no agent
+    # history search (AUTONOMY.md P6): whose history a row is, and the other party, which can be an agent. Its index
+    # holds the agent's key and not its name (history_key), so a rename leaves the index as it is.
+    ("history", "agent"), ("history", "person"))
 # The tables with one row for each agent. A row under the new name is what an agent of that name left before it
 # was removed by hand, so it goes first, and the renamed agent's own row takes the name.
 AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent", "machine_updates": "agent"}
 # The hub's own notes about one agent in kv, each kept under a prefix and the agent's name.
-AGENT_KV = ("tools:", "offline_told:", "runtime_since:", "switched:", "switching:")
+AGENT_KV = ("tools:", "offline_told:", "runtime_since:", "switched:", "switching:", "history_agent:")
 
 
 def renamed_team(team, old, new):
@@ -26517,6 +27478,21 @@ class Handler(BaseHTTPRequestHandler):
             result = dict(memory_view(agent), db=generation)
         return self.json(200, scrub(result), {"Cache-Control": "no-store"})
 
+    def ui_history(self, query):
+        """GET /ui/history (owner feature history, AUTONOMY.md P6): one agent's history, or every agent's, searched by
+        words, dates, person, task and kind, the best first; with ref, that record in full. The owner reads every
+        record, his own chats included. A read changes nothing he sees: the index it brings up to date is quiet."""
+        if not self.ui_allowed():
+            return
+        generation = kv_get("db_id")
+        if query.get("db") != generation:
+            return self.json(409, {"error": "hub generation changed; refresh state"})
+        try:
+            result = history_view(query)
+        except ToolError as e:
+            return self.json(400, {"error": str(e)})
+        return self.json(200, scrub(dict(result, db=generation)), {"Cache-Control": "no-store"})
+
     def ui_responsibilities(self, query):
         """Every duty with its watches, its counters, its open cases and its marker (owner API 1.13)."""
         if not self.ui_allowed():
@@ -27966,6 +28942,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_notes(parts[2], query)
         if len(parts) == 3 and parts[:2] == ["ui", "memory"] and AGENT_NAME.match(parts[2]):
             return self.ui_memory(parts[2], query)
+        if parts == ["ui", "history"]:              # AUTONOMY.md P6
+            return self.ui_history(query)
         if parts == ["ui", "responsibilities"]:
             return self.ui_responsibilities(query)
         if len(parts) == 3 and parts[:2] == ["ui", "responsibilities"] and re.fullmatch(r"[1-9][0-9]*", parts[2]):
@@ -29558,7 +30536,6 @@ class Handler(BaseHTTPRequestHandler):
         error, failed = None, None      # the error of the turn that is read now; (seq, error) of a turn that failed
         with LOCK:
             last = q1("SELECT COALESCE(MAX(seq),0) m FROM thread_events WHERE task=? AND attempt=? AND session=?", key)["m"]
-            count = q1("SELECT COUNT(*) n FROM thread_events WHERE task=? AND attempt=?", (tid, attempt))["n"]
             before = turn_state(tid, attempt)
             state = turn_records(before, session, records, now())
             with area("activity"), committed():         # thread records: the apps read them on their own clock
@@ -29573,14 +30550,11 @@ class Handler(BaseHTTPRequestHandler):
                         error = data
                     elif kind == "result":
                         failed, error = ((seq, error) if data["stop_reason"] == "error" else failed), None
-                    if count >= EVENT_CAP:      # one marker, then no more stored records for this attempt
-                        DB.execute("INSERT OR IGNORE INTO thread_events(task,attempt,session,seq,ts,type,data,created) "
-                                   "VALUES(?,?,?,0,?,'truncated','{}',?)", (*key, ts, now()))
-                        continue
+                    # Every record is kept, however long the attempt (AUTONOMY.md P6): the cap of 5,000 and its
+                    # `truncated` marker are gone, and a marker an older release wrote stays where it is.
                     if DB.execute("INSERT OR IGNORE INTO thread_events(task,attempt,session,seq,ts,type,data,created) "
                                   "VALUES(?,?,?,?,?,?,?,?)", (*key, seq, ts, kind, json.dumps(data), now())).rowcount:
                         stored += 1
-                        count += 1
             last = max([last] + [e["seq"] for e in events if isinstance(e, dict) and isinstance(e.get("seq"), int)
                                  and not isinstance(e["seq"], bool)])      # skipped records count as taken
             if stored and attempt == t["attempt"] and t["state"] not in TERMINAL:
@@ -29981,7 +30955,10 @@ def leak_scan():
               "agent_messages": ("text",), "thread_events": ("data",), "holds": ("note", "detail"),
               "outcomes": ("title", "note"),
               "ui_controls": ("body", "result"), "chat_out": ("text", "error"), "chat_ignored": ("name", "preview"),
-              "standing": ("words", "measure", "how", "ended_why")}
+              "standing": ("words", "measure", "how", "ended_why"),
+              # AUTONOMY.md P6: the words the history keeps, masked when they were indexed but not for a login the
+              # owner registered after that
+              "history": ("text",)}
     for table, cols in tables.items():
         for row in q(f"SELECT rowid AS rid, {', '.join(cols)} FROM {table}"):
             if secret_hit(*[row[c] for c in cols]):
@@ -30099,6 +31076,8 @@ def main():
     threading.Thread(target=central_timer, name="central-vault", daemon=True).start()
     threading.Thread(target=knowledge_refresher, name="knowledge-pages", daemon=True).start()
     threading.Thread(target=ping_sender, name="pings", daemon=True).start()
+    # AUTONOMY.md P6: the records written before this start, into the history, a short step at a time (the backfill)
+    threading.Thread(target=history_indexer, name="history-index", daemon=True).start()
     TAILNET_NAMES["names"] = tailnet_names()        # devops task 1.1: the names that a client may call this hub by
     server = ThreadingHTTPServer((host, port), Handler)
     server.daemon_threads = True
