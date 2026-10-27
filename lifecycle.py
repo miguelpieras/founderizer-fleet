@@ -51,7 +51,9 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "chat_warm",            # it starts the owner chat before a message when the hub says so (keep_chat)
             "conversation_reads",   # a conversation's event stays until its session reads it (plan C5)
             "turn_close",           # a delivered task's window closes at the end of its turn (plan C5)
-            "start_once"]           # it starts each attempt once and says why a start failed (plan C6)
+            "start_once",           # it starts each attempt once and says why a start failed (plan C6)
+            "prompt_polls",         # its hooks and runners ask again for a permission prompt until it is decided (C7)
+            "job_runs"]             # it acks a job before it runs it and lists the jobs it holds in each poll (C7)
 # ---------------------------------------------------------------- the runtimes
 #
 # What the fleet knows about a runtime is here, in one entry for each provider, and nowhere else. hub.py, fleet.py and

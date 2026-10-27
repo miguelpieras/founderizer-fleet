@@ -203,7 +203,7 @@ SENT_UNKNOWN = "The request may have been sent. Its answer is not known. It is n
 CANCELED = "The request was stopped before its answer. The service can have received it. It is not sent again."
 REPEATED = "This request was already started. It is not sent again."
 NO_PROOF = "The vault cannot prove that its request ended."
-REQUEST_LIMIT = 60          # seconds that the curl child of a request gets; a test gives less
+REQUEST_LIMIT = 60          # seconds that the curl child of a request gets when the agent names none; a test gives less
 ANSWER_LIMIT = 65536        # bytes of an answer's body that the helper gets; the child is ended when more come
 HEAD_LIMIT = 262144         # bytes of an answer before its body: the status line and the headers
 PATIENCE = 5                # seconds that a cancel waits for the end of a child that it ended
@@ -1472,9 +1472,13 @@ def request_of(data):
             and (auth in ("bearer", "basic") or (named and named.group(1).lower() not in API_AUTH_FIXED))
             and 0 <= size <= API_BODY):
         raise Refused("The hub did not confirm this vault job.")
+    limit = data.get("timeout")         # plan C7: the agent's own time for the service's answer
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, (int, float)) or not 0 < limit < 1e7):
+        raise Refused("The hub did not confirm this vault job.")
     return {"request_id": request, "db": db, "task": task, "attempt": attempt, "method": method, "path": path,
             "auth": auth, "headers": dict(sorted(headers.items())),
-            "body": body.encode() if size else None}      # no body: absent, null or empty
+            "body": body.encode() if size else None,      # no body: absent, null or empty
+            "limit": limit}
 
 
 def private_host(host):
@@ -1541,8 +1545,9 @@ def curl_config(call, login, body=None):
         raise Refused(NO_HEADER)        # a line end or another control character cannot be in a header line
     else:
         header = ("Authorization: Bearer " if call["auth"] == "bearer" else call["auth"][7:] + ": ") + login["password"]
+    limit = call.get("limit") or REQUEST_LIMIT
     lines = ['proto = "-all"', "silent", "globoff", "include", "no-buffer", "http1.1", 'noproxy = "*"', "max-redirs = 0",
-             f"max-time = {REQUEST_LIMIT}", f"connect-timeout = {min(REQUEST_LIMIT, 15)}",
+             f"max-time = {limit}", f"connect-timeout = {min(limit, 15)}",
              f'request = "{call["method"]}"', 'header = "Accept: application/json"']
     own = call.get("headers") or {}
     if body is not None:
@@ -1603,11 +1608,11 @@ class Child:
                     return self.proc.returncode
             time.sleep(0.01)
 
-    def answer(self, config, most):
+    def answer(self, config, most, limit=None):
         """Give the child its options and read its output: (the child's status, the status of the service's answer or
         None, at most `most` bytes of its body). The broker ends the child when the body has `most` bytes, when the
         head is longer than a head can be, and at the time limit. It never reads more and never waits longer."""
-        limit = threading.Timer(REQUEST_LIMIT, self.end)
+        limit = threading.Timer(limit or REQUEST_LIMIT, self.end)
         limit.daemon = True
         limit.start()
         data, found = b"", None
@@ -1770,7 +1775,7 @@ def send(conf, job):
     most = ANSWER_LIMIT + max((3 * len(value.encode("utf-16-le")) for value in values), default=1)
     calls.lock.release()                # only here: a cancel and a status are served while the child runs
     try:
-        code, status, got = child.answer(config, most)
+        code, status, got = child.answer(config, most, call["limit"])
     finally:
         calls.lock.acquire()
         calls.running.remove(child)

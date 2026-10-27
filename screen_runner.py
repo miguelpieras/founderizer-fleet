@@ -177,12 +177,11 @@ class Runner:
             shown = {"server": params.get("serverName"), "message": params.get("message"),
                      "tool": meta.get("tool_name"), "tool_input": meta.get("tool_params"),
                      "risk": meta.get("riskLevel"), "scope": "this Fleet task's native app session"}
-        try:
-            code, result = self.http("POST", f"/hook/permission/{self.agent}/{self.task}",
-                dict(self.context, tool_name="Codex " + method, tool_input=shown), timeout=270)
-            allowed = (code == 200 and result.get("hookSpecificOutput", {}).get("decision", {}).get("behavior") == "allow")
-        except (OSError, ValueError):
-            allowed = False
+        # plan C7: asked again until a decision, a hold or the end of the task, with no limit of its own
+        result = fleet.ask_permission(f"/hook/permission/{self.agent}/{self.task}",
+                                      dict(self.context, tool_name="Codex " + method, tool_input=shown),
+                                      stopped=lambda: self.stopping, send=self.http)
+        allowed = bool(result) and result.get("hookSpecificOutput", {}).get("decision", {}).get("behavior") == "allow"
         return {"id": message["id"], "result": permission_reply(method, params, allowed)}
 
     def ask(self, message):
@@ -458,8 +457,6 @@ class Runner:
             while not self.stopping:
                 while not self.replies.empty():
                     self.send(self.replies.get_nowait())
-                if self.turn_started and time.monotonic()-self.turn_started > 1800:
-                    raise RuntimeError("Screen turn exceeded 30 minutes; no automatic replay")
                 for key, _ in selector.select(0.5):
                     if key.data == "server":
                         part = os.read(self.child.stdout.fileno(),65536)

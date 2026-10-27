@@ -369,6 +369,8 @@ IDLE_PROMPT = re.compile(r"^\s*[\u276f>]\s*$", re.M)
 # at the soonest when its tools are not listed, and a line it left unread told again after RESIGNAL_FIRST seconds,
 # doubling up to RESIGNAL_MAX.
 SIGNAL_GAP = 20
+HOOK_TIMEOUT = 2_000_000    # seconds: Claude Code's limit for the permission hook, which asks until a decision (C7)
+HOOK_ASK = 45               # seconds for one ask of the hook; the hub answers `pending` after 25
 IDLE_READINGS = 3           # a session whose tools never list gets its first line after this many idle readings
 RESIGNAL_FIRST = 60
 RESIGNAL_MAX = 900
@@ -547,7 +549,9 @@ def settings_arg(agent, conf, task, tools=()):
         # Command hooks, because Claude Code will not send an HTTP hook to a private address.
         hook = f"{shlex.quote(sys.executable)} {shlex.quote(os.path.join(KIT, 'fleet.py'))} hook"
         settings["hooks"] = {
-            "PermissionRequest": [{"hooks": [{"type": "command", "timeout": 280,
+            # plan C7: the hook asks the hub again until a decision, so Claude Code's own limit must never decide.
+            # Its Node timers turn a number above 2,147,483 s into 1 ms, so this stays below that.
+            "PermissionRequest": [{"hooks": [{"type": "command", "timeout": HOOK_TIMEOUT,
                                               "command": f"{hook} permission {agent} {task}"}]}],
             "PostToolUse": [{"hooks": [{"type": "command", "async": True, "timeout": 10,
                                         "command": f"{hook} activity {agent} {task}"}]}],
@@ -1209,9 +1213,33 @@ def cmd_chat_session(args):
     print(f"recorded: the next owner chat of {agent} in generation {data['db']} continues conversation {args.session}")
 
 
+def ask_permission(path, body, stopped=lambda: False, send=None):
+    """The decision of one permission request (plan C7): the hub's answer with hookSpecificOutput, or None when it
+    refused the request. Each ask is held for a moment and answered `pending` with the prompt's id, and this asks
+    again for that prompt, with no limit of its own, until a decision, a hold or the end of the task (both of which
+    the hub answers with a denial). No answer at all, as while the hub restarts, is asked again after a pause."""
+    body, pause = dict(body, poll=True), 2
+    while not stopped():
+        try:
+            code, data = (send or http)("POST", path, dict(body), timeout=HOOK_ASK)
+        except (urllib.error.URLError, OSError, ValueError):
+            code, data = None, {}
+        data = data if isinstance(data, dict) else {}
+        if code == 200 and data.get("hookSpecificOutput"):
+            return data
+        if code == 200 and data.get("pending"):
+            body["prompt"], pause = data.get("prompt"), 2
+            continue
+        if code is not None and code < 500:
+            return None
+        time.sleep(pause)
+        pause = min(pause * 2, 30)
+    return None
+
+
 def cmd_hook(args):
-    """Run by Claude Code as a hook: pass what it sends to the hub and print the hub's answer.
-    Whatever goes wrong, stay silent: then Claude Code simply shows its own question."""
+    """Run by Claude Code as a hook: pass what it sends to the hub and print the hub's decision, however long it
+    takes (ask_permission). When the hub refuses, stay silent: then Claude Code simply shows its own question."""
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except ValueError:
@@ -1221,12 +1249,19 @@ def cmd_hook(args):
         if args.kind == "activity":
             http("POST", f"/hook/activity/{args.agent}/{args.task}", dict(context, tool_name=payload.get("tool_name")), timeout=8)
             return
-        code, data = http("POST", f"/hook/permission/{args.agent}/{args.task}",
-                          dict(context, tool_name=payload.get("tool_name"), tool_input=payload.get("tool_input")), timeout=270)
-        if code == 200 and data.get("hookSpecificOutput"):
+        data = ask_permission(f"/hook/permission/{args.agent}/{args.task}",
+                              dict(context, tool_name=payload.get("tool_name"), tool_input=payload.get("tool_input")))
+        if data:
             print(json.dumps(data))
     except (urllib.error.URLError, OSError, ValueError):
         pass
+
+
+def hook_waits(agent, task):
+    """True when a permission hook of this task runs on this machine (plan C7): a question on its screen is then the
+    one that the hub carries as a permission prompt, which decide_permission answers."""
+    mark = f" hook permission {agent} {task}"
+    return any(args.rstrip().endswith(mark) for _, _, args, _ in process_table(task, ""))
 
 
 # ---------------------------------------------------------------- the helper
@@ -2096,6 +2131,9 @@ class Helper:
         self.logins = set()             # the sign-ins that run now, by id (begin_signin)
         self.loop_wake = threading.Event()      # ends the loop's pause, so an owner's request acts at once
         self.requests = {}              # call_api: {job: task} of the requests that run now, each in its own thread
+        # plan C7: {job: its report or None} from the job's ack until the hub took its report, which each poll lists
+        # (jobs=), and {job: (pause, due)} for a report that the hub did not take yet
+        self.jobs_held, self.report_waits = {}, {}
         self.screen_attempts = {}       # {task: (attempt, told)} of the runners (app_server_task) that this helper started
         self.start_waits = {}           # {event id: (seconds, monotonic time of the next try)} of failed task events
         self.step = None                # (name, task or None, monotonic start) of the main loop's step now (doing)
@@ -2150,6 +2188,8 @@ class Helper:
             kind = "shown" if reading == "question" else "gone"
             if seen["told"] == kind:
                 continue
+            if kind == "shown" and window != "manager" and hook_waits(self.agent, window):
+                continue                # plan C7: the hub carries this question as a permission prompt
             try:
                 code, _ = http("POST", f"/helper/dialog/{self.agent}/{window}", {"kind": kind}, timeout=10)
             except (urllib.error.URLError, OSError, ValueError):
@@ -2740,10 +2780,22 @@ class Helper:
                     raise Refused(f"processes of {task} still run: {left}")
                 if ended:
                     self.say(f"{task}: ended {ended} process(es) that the finished task left")
-        elif kind in ("signin", "handover") or kind in SAVES:
-            self.login_job(kind, task, extra)
-        elif kind == "request":
-            self.request_job(task, extra)
+        elif kind in JOB_KINDS:
+            # plan C7: the ack comes first, so a helper that starts again never runs this job a second time, and the
+            # job is in each poll's list from here until the hub took its report
+            job = extra.get("job")
+            self.jobs_held[job] = None
+            try:
+                code, _ = http("POST", f"/helper/ack/{self.agent}", {"ids": [ev["id"]]})
+            except (urllib.error.URLError, OSError, ValueError):
+                code = None
+            if code != 200:
+                self.jobs_held.pop(job, None)
+                raise Refused("the hub did not take the ack of a job, so it does not run; the next poll tries again")
+            if kind == "request":
+                self.request_job(task, extra)
+            else:
+                self.login_job(kind, task, extra)
         elif kind == "deposit":
             self.deposit(extra)
         elif kind == "withdraw":
@@ -2778,7 +2830,7 @@ class Helper:
             self.mcp_program(extra)
         elif kind == "outputs":
             self.send_outputs(extra)
-        if kind not in ("say", "task", "chat", "conversation"):
+        if kind not in ("say", "task", "chat", "conversation") and kind not in JOB_KINDS:
             code, data = http("POST", f"/helper/ack/{self.agent}", {"ids": [ev["id"]]})
             if code != 200:
                 raise Refused("the hub did not acknowledge helper work")
@@ -3990,12 +4042,14 @@ class Helper:
         self.begin_outside()
         with self.outside_lock:
             self.requests[job] = task
-        threading.Thread(target=self.request_thread, args=(task, job), daemon=True, name=f"request-{job}").start()
+        limit = extra.get("timeout")       # plan C7: the request's own time for the service, which the vault gives it
+        limit = limit if isinstance(limit, (int, float)) and not isinstance(limit, bool) and limit > 0 else None
+        threading.Thread(target=self.request_thread, args=(task, job, limit), daemon=True, name=f"request-{job}").start()
 
-    def request_thread(self, task, job):
+    def request_thread(self, task, job, limit=None):
         try:
             try:
-                report = do_request(self.agent, job)
+                report = do_request(self.agent, job, limit)
             except Unknown as e:        # the request can have gone out
                 report = {"ok": False, "unknown": True, "text": str(e)}
             except Refused as e:        # the vault proved that nothing went out, or it was never asked
@@ -4013,17 +4067,40 @@ class Helper:
             self.end_outside()
 
     def post_job(self, job, report):
-        """Send the report of a request job. Without an answer of the hub, send the same report again, at most three
-        times: the vault keeps no answer, so a report that is lost here cannot be had again."""
-        for pause in (0, 2, 5, 15):
+        """Send the report of a request job, in its own thread. Without an answer of the hub, send the same report
+        again after a pause, for as long as the helper runs (plan C7): the vault keeps no answer, so a report that is
+        lost here cannot be had again."""
+        self.jobs_held[job] = report
+        pause = 2
+        while (took := self.report_job(job, report)) is False:
             time.sleep(pause)
-            try:
-                code, _ = http("POST", f"/helper/job/{self.agent}/{job}", report, timeout=15)
-            except Exception:           # no answer in any form, also an answer that was cut: the same report goes again
+            pause = min(pause * 2, 60)
+        return bool(took)
+
+    def report_job(self, job, report):
+        """One try to give the hub a job's report: True when it took it or has one already (409), False to try again,
+        None when the hub refuses this report and never takes it. Then the job leaves the poll's list, and the hub
+        settles its outcome as unknown (lost_jobs)."""
+        try:
+            code, _ = http("POST", f"/helper/job/{self.agent}/{job}", report, timeout=15)
+        except Exception:           # no answer in any form, also an answer that was cut: the same report goes again
+            return False
+        if code not in (200, 409) and not (400 <= code < 500 and code not in (408, 429)):
+            return False
+        self.jobs_held.pop(job, None)
+        self.report_waits.pop(job, None)
+        return code in (200, 409) or None
+
+    def send_reports(self):
+        """The reports of the main loop's jobs that the hub did not take: each is sent again when its pause is over,
+        the pause doubled each time up to a minute (plan C7). The job stays in each poll's list until then."""
+        for job, report in list(self.jobs_held.items()):
+            pause, due = self.report_waits.get(job, (0, 0))
+            if report is None or job in self.requests or time.monotonic() < due:     # a request's thread sends its own
                 continue
-            if code in (200, 409):      # 409: the hub already has a report of this job
-                return True
-        return False
+            if self.report_job(job, report) is False:
+                pause = min(pause * 2 or 2, 60)
+                self.report_waits[job] = (pause, time.monotonic() + pause)
 
     def end_requests(self, task, extra):
         """(proved, ended): have this machine's vault end every request of this task attempt (call_api), and wait
@@ -4154,8 +4231,10 @@ class Helper:
             except Exception as e:      # never pass details on: they could hold a login
                 ok, text = False, f"the helper hit an error ({type(e).__name__}). Ask your requester."
                 unknown = kind in SAVES         # after the request went out, an error here proves nothing either
-            http("POST", f"/helper/job/{self.agent}/{extra.get('job')}",
-                 dict({"ok": ok, "text": text}, **({"unknown": True} if unknown else {})))
+            report = dict({"ok": ok, "text": text}, **({"unknown": True} if unknown else {}))
+            self.jobs_held[extra.get("job")] = report
+            if self.report_job(extra.get("job"), report) is False:
+                self.report_waits[extra.get("job")] = (2, time.monotonic() + 2)     # send_reports sends it again
         finally:
             self.end_outside()
         self.say(f"{task}: {kind}" + (f" with {login}" if login else "") +
@@ -4218,7 +4297,9 @@ def cmd_run(args):
             names = h.look_known()
             # plan C6: a list only when tmux answered; an empty one would read as every window lost
             listed = f"alive={urllib.parse.quote(','.join(names))}" if names is not None else "alive_unknown=1"
-            code, data = http("GET", f"/events/{agent}?delivery=1&after=0&wait=8&{listed}")
+            h.send_reports()
+            held = ",".join(str(j) for j in list(h.jobs_held) if isinstance(j, int))    # plan C7: the jobs it holds
+            code, data = http("GET", f"/events/{agent}?delivery=1&after=0&wait=8&{listed}&jobs={held}")
             if code == 403 and data.get("auth") == "no_key" and load_agent_key(agent):
                 os.remove(key_file(agent))      # the owner removed this agent's key: legacy again until it enrolls
                 keyed, enrolled_at = False, 0.0
@@ -4708,6 +4789,7 @@ def broker_job_request(agent, request, timeout=90):
 
 
 SAVES = {"create": "creates", "capture": "captures"}     # the vault operations that save an item, and their status field
+JOB_KINDS = ("signin", "handover", "create", "capture", "request")     # the hub's jobs that a helper acks first (C7)
 NO_ANSWER_IS_UNKNOWN = set(SAVES) | {"request"}          # after one of these went to the vault, silence proves nothing
 REPLY_LIMIT = 1 << 20           # bytes of one vault answer: a request's answer has a body
 
@@ -5315,7 +5397,7 @@ def do_save(agent, job, op):
             f"The vault made {done['login'].lower()}. Its password never left the vault.")
 
 
-def do_request(agent, job):
+def do_request(agent, job, limit=None):
     """call_api: have this machine's vault send the request of a hub job. Only the job number goes to the vault: it
     takes the request and the login from the hub's confirmation of the job, and the key never comes here. Returns the
     report for the hub: the status of the service's answer and the body that the vault gave. Refused: the vault
@@ -5325,7 +5407,9 @@ def do_request(agent, job):
     status = broker_status()
     if not (status and status.get("callers") is True and status.get("requests") is True) or not load_agent_key(agent):
         raise Refused("this machine's vault cannot send an API request")
-    done = broker_job_request(agent, {"op": "request", "job": broker_job(agent, job)})
+    # the vault answers after its curl, which has the request's own time: this waits for that and the vault's steps
+    done = broker_job_request(agent, {"op": "request", "job": broker_job(agent, job)},
+                              timeout=max(90, (limit or 0) + 30))
     code = done.get("status")
     if done.get("job") != job or not isinstance(code, int) or isinstance(code, bool) or not 100 <= code <= 599:
         raise Unknown("the vault gave no status for the request")

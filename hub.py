@@ -1540,8 +1540,11 @@ def migrate():
         "agent_limits": {"cause": "INTEGER", "route": "TEXT"},
         # plan C1: the attempt's turn state, as JSON (turn_state), kept from every record the helper sends
         "attempts": {"turn": "TEXT"},
+        # plan C8: the sender's task waits for the answer, and why that wait ended
+        "agent_messages": {"waits": "INTEGER", "wait_end": "TEXT"},
         "events": {"read_at": "REAL", "helper_ack": "REAL"},
-        "prompts": {"kind": "TEXT NOT NULL DEFAULT 'tool'", "subject": "TEXT", "used": "REAL"},
+        "prompts": {"kind": "TEXT NOT NULL DEFAULT 'tool'", "subject": "TEXT", "used": "REAL",
+                    "polls": "INTEGER"},        # plan C7: its asker asks again until a decision, so it never expires
         "sealed": {"bound_task": "INTEGER", "expired": "REAL", "login": "TEXT", "job": "INTEGER"},
         "rules": {"by": "TEXT"},
         "jobs": {"released": "REAL", "request_id": "TEXT", "label": "TEXT", "username": "TEXT", "url": "TEXT",
@@ -1549,7 +1552,10 @@ def migrate():
                  "selector": "TEXT", "source_url": "TEXT",                           # save_key
                  "method": "TEXT", "path": "TEXT", "body": "TEXT", "auth": "TEXT",   # call_api: the request
                  "headers": "TEXT",                                                  # and the agent's own headers
-                 "status": "INTEGER", "response": "TEXT"},                           # and the service's answer
+                 "status": "INTEGER", "response": "TEXT",                            # and the service's answer
+                 # plan C7: call_api's own time for the service; the call answered "still running"; and the
+                 # outcome told to the task since then
+                 "timeout": "REAL", "returned": "REAL", "told": "TEXT"},
         # attachment_knowledge: the day the owner said this one matters, and the knowledge file made from it
         "attachments": {"kept": "REAL", "knowledge": "TEXT"},
         "ui_requests": {"recipient": "TEXT NOT NULL DEFAULT 'manager'", "replaces_request_id": "TEXT",
@@ -1775,6 +1781,8 @@ def t_read_messages(agent, a):
             kv_set("mgr_screen", None)
             kv_set("mgr_screen_shown", None)        # a session that reads has no question in front of it
         if not rows:
+            if chat_context(agent) or agents()[agent].get("role") == "manager":
+                unanswered(agent, now())            # plan C8: a standing session's closing empty read ends its turn
             return "No unread messages. Wait for the next signal."
         # A task's start event is the text that its session began with, as its first prompt or its appended system
         # prompt (fleet.session_command), so its first read gave the same thousands of characters a second time.
@@ -2063,7 +2071,8 @@ def part_start_text(task_id):
     return (f'This task is ONE PART of step {s["n"]} of {gref(s["goal"])}: "{clip(s["text"], 200)}". '
             + (("The other parts: " + "; ".join(f"{tref(r['id'])} with {r['owner']} ({clip(r['title'], 60)})"
                                                 for r in others) + ". Do your part only, and leave theirs alone: "
-                "write to them with message_agent when your part needs something of theirs. ")
+                "write to them with message_agent when your part needs something of theirs, with waits=true when "
+                "your part cannot go on without the answer. ")
                if others else "No other part has been given out yet. ")
             + f"{manager_name()} holds the whole piece together and checks each part. ")
 
@@ -2227,8 +2236,18 @@ def attempt_rows(t, reason, event, t0, counted=False):
                (1 if counted else 0, t0 if counted else None, t0, t["id"]))
     DB.execute("UPDATE attempts SET ended=COALESCE(ended,?) WHERE task=? AND attempt=?", (t0, t["id"], t["attempt"]))
     DB.execute("INSERT INTO attempts(task,attempt,created,reason) VALUES(?,?,?,?)", (t["id"], t["attempt"] + 1, t0, reason))
+    # The session that asked is gone, and a prompt never expires by itself (plan C7): it ends here, unanswered.
+    DB.execute("UPDATE prompts SET decision='expired', decided=?, reason=? WHERE task=? AND decision IS NULL AND "
+               "kind<>'code'", (t0, PROMPT_REPLACED, t["id"]))
+    DB.execute("UPDATE tasks SET state='working', waiting_on=NULL WHERE id=? AND state='input-required' AND "
+               "waiting_on LIKE 'P-%'", (t["id"],))
     event_rows([event], t0)
     waiting_say_rows(t["owner"], t["id"])
+
+
+PROMPT_REPLACED = "The session that asked was replaced before a decision reached it, so it did not run."
+HOOK_POLL = 25      # seconds one ask of a polling hook is held before its `pending` answer: a transport step (plan C7)
+PROMPT_POLLS = "prompt_polls"       # the helper feature: its hooks and runners ask again until a decision
 
 
 def new_attempt(t, reason, note="", counted=False):
@@ -2985,6 +3004,10 @@ def describe_task(t):
     if park:
         lines.append(f"  WAITING until {clock(park['due'])} (R-{park['id']}: {park['note']}). Nothing nudges this "
                      f"task until then, and the hub brings it back to you itself.")
+    asked = waits_on_message(t["id"])
+    if asked:       # plan C8
+        lines.append(f"  WAITING for {asked['recipient']}'s answer to AM-{asked['id']} (sent {clock(asked['created'])}): "
+                     f"it comes as a message, and the hub tells you if it will not come.")
     hold = active_hold(t["id"])
     if hold:
         lines.append(f"  HELD: {held_word(hold)}. Do not work on it until a message says that it resumes.")
@@ -3137,6 +3160,15 @@ def warm_attempt(t):
     if sent:
         lines.append(f"It already sent these outside ({len(sent)}). Never do one of them a second time (rule 9):")
         lines += [f"  - {outward_line(c)}" for c in sent[-WARM_ACTIONS:]]
+    # plan C8: the named waits of the session before, on both sides
+    for m in read_rows("SELECT id, recipient FROM agent_messages WHERE sender_task=? AND waits=1 AND wait_end IS NULL "
+                       "ORDER BY id", (t["id"],)):
+        lines.append(f"It waits for {m['recipient']}'s answer to AM-{m['id']}: the answer comes to this task as a "
+                     f"message, and the hub tells you if it will not come.")
+    for m in read_rows("SELECT m.id, m.sender FROM agent_messages m JOIN events e ON e.id=m.event_id WHERE e.task=? AND "
+                       "m.waits=1 AND m.wait_end IS NULL AND m.read_at IS NOT NULL ORDER BY m.id", (t["id"],)):
+        lines.append(f"It read AM-{m['id']} from {m['sender']}, which waits for the answer, and did not answer it: "
+                     f'answer with message_agent(in_reply_to="AM-{m["id"]}").')
     return "\n\n" + "\n".join(capped(lines) + [
         f'Read the rest yourself: see_earlier_work with attempt={attempt} gives that attempt in full, with no '
         f'argument names every attempt before this one, and with search="<words>" looks over them.'])
@@ -3724,7 +3756,7 @@ def deliver_outputs(agent, t):
         return ""           # a helper from before this: it updates when it is idle, and until then sends nothing
     token = secrets.token_urlsafe(16)
     with OUTPUTS_LOCK:
-        OUTPUTS[token] = {"agent": agent, "task": t["id"], "answer": None, "gave_up": False}
+        OUTPUTS[token] = {"agent": agent, "task": t["id"], "answer": None, "gave_up": False, "late": False}
     try:
         emit(agent, "outputs", f"Send the files of {folder}", extra={"outputs": token, "task": ref})
         deadline = time.monotonic() + OUTPUTS_WAIT      # not now(): a test's frozen clock would wait for ever
@@ -3732,21 +3764,49 @@ def deliver_outputs(agent, t):
             with OUTPUTS_LOCK:
                 o = OUTPUTS[token]
                 if o["answer"] is None and time.monotonic() >= deadline:
-                    o["gave_up"] = True         # an answer that comes later is refused, so nothing lands unsaid
-                if o["answer"] is not None or o["gave_up"]:
+                    # plan C7: no clock refuses them. The delivery goes on, and files that come later are committed
+                    # for it and named to its requester (late_outputs).
+                    o["late"] = True
+                if o["answer"] is not None or o["late"]:
                     break
             time.sleep(OUTPUTS_STEP)
     finally:
         with OUTPUTS_LOCK:
-            o = OUTPUTS.pop(token)
-    if o["answer"] is None:
-        return f"{agent}'s helper did not answer within {OUTPUTS_WAIT} seconds, so no file of {folder} was committed."
-    files, skipped = o["answer"]["files"], o["answer"]["skipped"]
+            o = OUTPUTS[token] if OUTPUTS[token]["late"] else OUTPUTS.pop(token)
+    if o["late"]:
+        return (f"Its files are on their way from {agent}'s helper: the hub commits them when they come, and "
+                f"{t['requester']} gets a message that names the commit.")
+    return outputs_sentence(agent, t, o["answer"])
+
+
+def late_outputs(token):
+    """The files of a delivery that came after deliver_outputs stopped waiting (plan C7): committed for the delivered
+    task, and named to its requester in one message. A task that was canceled, or never delivered, takes none."""
+    with OUTPUTS_LOCK:
+        o = OUTPUTS.get(token)
+        if not o or not o["late"] or o["answer"] is None:
+            return
+        OUTPUTS.pop(token)
+    t = q1("SELECT * FROM tasks WHERE id=?", (o["task"],))
+    if not t or not t["delivered"] or t["state"] == "canceled":
+        return
+    said = outputs_sentence(o["agent"], t, o["answer"], delivered=True)
+    if said:
+        emit(t["requester"], "say", f"[hub] The files of {tref(t['id'])} ({t['title']}) came after its delivery. {said}",
+             task=t["id"])
+
+
+def outputs_sentence(agent, t, answer, delivered=False):
+    """Commit the files of one delivery's answer and say where they are."""
+    ref = tref(t["id"])
+    folder = f"outputs/{ref}/"
+    files, skipped = answer["files"], answer["skipped"]
     left = ("Not sent: " + "; ".join(f"{s['path']} ({s['why']})" for s in skipped[:10])
             + (f"; and {len(skipped) - 10} more" if len(skipped) > 10 else "") + ".") if skipped else ""
     if not files:
         return left
-    if (q1("SELECT state FROM tasks WHERE id=?", (t["id"],)) or {"state": "canceled"})["state"] in TERMINAL:
+    now_state = (q1("SELECT state FROM tasks WHERE id=?", (t["id"],)) or {"state": "canceled"})["state"]
+    if not delivered and now_state in TERMINAL:
         return left                     # ended while the files came: the delivery is refused, so nothing is committed
     try:
         commit = commit_outputs(agent, t, files)
@@ -3821,6 +3881,7 @@ def deliver_result(agent, a, files_said=None):
     q("UPDATE tasks SET state=?, outcome=?, what=?, where_=?, how=?, delivered=?, waiting_on=NULL WHERE id=?",
       (outcome, outcome, what, where, how, now(), tid))
     unfile_notices(tid)
+    end_waits(tid)
     q("UPDATE attempts SET ended=? WHERE task=? AND attempt=?", (now(), tid, t["attempt"]))
     end_holds(tid)
     activity(tid, "deliver_result")
@@ -3929,6 +3990,7 @@ def cancel_subtasks(task_id, reason):
         q("UPDATE tasks SET state='canceled', outcome='canceled', what=?, delivered=?, waiting_on=NULL WHERE id=?",
           (f"Canceled with its parent {tref(task_id)}: {reason}", now(), sub["id"]))
         unfile_notices(sub["id"])
+        end_waits(sub["id"])
         emit(sub["owner"], "say", f"[hub] {tref(sub['id'])} was canceled because its parent {tref(task_id)} was canceled: "
              f"{reason}. Stop working on it now.", task=sub["id"])
         cancel_subtasks(sub["id"], reason)
@@ -3993,6 +4055,8 @@ def lead_overview(agent, parent):
         out.append(f"  {tref(t['id'])} [{t['state']}] {t['title']} -- owner {t['owner']}" +
                    (f"; result to check: {t['what']}" if t["state"] in TERMINAL and t["accepted"] is None else "") +
                    (f"; NO LIVE PATH: {t['stalled_reason']}" if t["stalled_since"] else "") +
+                   (f"; waits for {w['recipient']}'s answer to AM-{w['id']}"       # plan C8: a named wait
+                    if t["state"] not in TERMINAL and (w := waits_on_message(t["id"])) else "") +
                    (f"; you gave it to {t['owner']} because: {t['why']}" if t["why"] else ""))
     out += ["  none"] if not rows else []
     # A lead's second task had no memory of its first, so it gave the same work out twice and asked a worker what
@@ -4212,6 +4276,7 @@ def t_cancel_task(agent, a):
     q("UPDATE tasks SET state='canceled', outcome='canceled', what=?, delivered=?, waiting_on=NULL WHERE id=?",
       (f"Canceled: {reason}", now(), tid))
     unfile_notices(tid)
+    end_waits(tid)
     emit(t["owner"], "say", f"[hub] {tref(tid)} was canceled by your requester: {reason}. Stop working on it now.", task=tid)
     cancel_subtasks(tid, reason)
     left = case_left_open(case_id=t["duty_case"]) if t["duty_case"] else None
@@ -4221,8 +4286,9 @@ def t_cancel_task(agent, a):
 def end_holds(task_id):
     q("UPDATE holds SET state='released', released=?, released_by='hub', resume_mode='task ended' "
       "WHERE task=? AND state<>'released'", (now(), task_id))
+    # A decided code prompt stays: one use. An open prompt of any kind ends here: none expires by itself (plan C7).
     q("UPDATE prompts SET decision='expired', reason='The task ended before a decision.', decided=? "
-      "WHERE task=? AND kind='code' AND decision IS NULL", (now(), task_id))     # a decided one stays: one use
+      "WHERE task=? AND decision IS NULL", (now(), task_id))
 
 
 def t_resolve_outcome(agent, a):
@@ -4338,6 +4404,9 @@ def late_permission_word(by, p, decision, reason):
     A closed task has no session to tell, and a code approval is for one exact revision, so both keep the plain
     refusal."""
     pid = p["id"]
+    if p["polls"] or p["reason"] == PROMPT_REPLACED:     # it ended with its session or its task (plan C7)
+        return (f"P-{pid} ended before a decision reached it: {p['reason'] or 'its session is gone.'} The command did "
+                f"not run, and nothing can be decided on it now.")
     plain = (f"P-{pid} expired: no decision came in time, so {p['agent']} was told no and the command did not run. "
              f"Nothing can be decided on it now.")
     t = q1("SELECT * FROM tasks WHERE id=?", (p["task"],))
@@ -4386,6 +4455,10 @@ def t_decide_permission(agent, a):
             in_scope(agent, t)
         if p["decision"] == "expired":
             raise ToolError(late_permission_word(agent, p, decision, reason))
+        if p["decision"] == "screen":
+            raise ToolError(f"P-{pid} is no longer with the hub: {p['reason']} decide_permission cannot answer a "
+                            f"question on a screen. Someone must look at that machine: raise a Needs-you item, or "
+                            f"cancel the task.")
         if p["decision"]:
             raise ToolError(f"P-{pid} was already decided: {p['decision']}.")
         code = p["kind"] == "code"
@@ -5626,7 +5699,8 @@ def save_job(agent, a, kind):
                       (agent, tid, kind, now(), request, label, username, url, t["attempt"], selector, source))
     activity(tid, "save_key" if kind == "capture" else "create_login")
     emit(agent, kind, f"{'save a key' if kind == 'capture' else 'make a login'} ({label})", task=tid, extra={"job": jid})
-    deadline = now() + CFG["job_wait"]
+    runs = JOB_RUNS in helper_features(agent)
+    deadline = now() + (JOB_CALL_WAIT if runs else CFG["job_wait"])
     while now() < deadline:
         row = q1("SELECT finished, unknown FROM jobs WHERE id=?", (jid,))
         if row["finished"] or row["unknown"]:
@@ -5635,6 +5709,8 @@ def save_job(agent, a, kind):
     with LOCK:
         fence(agent, tid)
         job = q1("SELECT * FROM jobs WHERE id=?", (jid,))
+        if not job["finished"] and not job["unknown"] and runs:
+            return still_running(job)       # plan C7: no clock decides; the outcome comes as a message
         if not job["finished"] and not job["unknown"]:
             # No word from the helper is no failure here: the vault can have made the item. The job stays open.
             q("UPDATE jobs SET unknown=?, result=? WHERE id=?",
@@ -5668,6 +5744,102 @@ REQUEST_UNKNOWN = ("The outcome of this request is not known: it can have reache
 REQUEST_OLD_ATTEMPT = ("This request_id belongs to an earlier attempt of this task. It is not asked for again and never "
                        "sent again. Its outcome is in the task's record: check it and record what you found with "
                        "resolve_outcome. A new request needs a new request_id.")
+
+
+# ---- plan C7: a call that waits on a machine (call_api, sign_in, hand_over, create_login, save_key) waits at most
+# JOB_CALL_WAIT, just under Claude Code's 60 seconds for one MCP request, for a helper that names job_runs. Then it
+# answers "still running", the job stays open, and its outcome comes to the task as one message (job_told). No clock
+# marks a job failed: a job that its helper lost is settled "unknown" from the helper's own list (lost_jobs).
+JOB_RUNS = "job_runs"
+JOB_CALL_WAIT = 50
+JOB_EVENT_KINDS = ("signin", "handover", "create", "capture", "request")
+STILL_RUNNING = ("Still running on this machine: {what}. Its outcome comes to this task as a message. Do not start it "
+                 "again{again}.")
+
+
+def job_what(job):
+    """A job in a few words, for the agent."""
+    if job["kind"] == "request":
+        return f"call_api {job['method']} {job['path'][:120]} with {job['login']} (request_id {job['request_id']})"
+    if job["kind"] in ("create", "capture"):
+        return f"{'save_key' if job['kind'] == 'capture' else 'create_login'} \"{job['label']}\" (request_id {job['request_id']})"
+    return f"{'sign_in' if job['kind'] == 'signin' else 'hand_over'} with {job['login']}" + \
+        (f" to {job['target']}" if job["kind"] == "handover" and job["target"] else "")
+
+
+def still_running(job):
+    """The answer of a call whose job is still with the machine (plan C7), written down so its outcome is told."""
+    q("UPDATE jobs SET returned=COALESCE(returned, ?) WHERE id=?", (now(), job["id"]))
+    again = ("; the same call with the same request_id reads its outcome once it is there"
+             if job["kind"] in ("request", "create", "capture") else "")
+    return STILL_RUNNING.format(what=job_what(job), again=again)
+
+
+def job_told(job_id):
+    """The outcome of a job whose call answered "still running", told once to its task for each state it reaches:
+    done, failed, or not known (plan C7). Called with LOCK held."""
+    job = q1("SELECT * FROM jobs WHERE id=?", (job_id,))
+    if not job or not job["returned"]:
+        return
+    state = ("done" if job["ok"] else "failed") if job["finished"] else "unknown" if job["unknown"] else None
+    if not state or job["told"] == state:
+        return
+    t = q1("SELECT * FROM tasks WHERE id=?", (job["task"],))
+    if not t or t["state"] in TERMINAL:
+        return
+    what = job_what(job)
+    if job["kind"] == "request":
+        said = (f"{what} finished: {clip(api_text(job), 3000)} The same call with the same request_id gives this "
+                f"again; nothing is sent again." if state == "done" else
+                f"{what} was not sent: {job['result'] or 'the vault refused it.'}" if state == "failed" else
+                f"{what}: {REQUEST_UNKNOWN}")
+    elif job["kind"] in ("create", "capture"):
+        said = (f"{what}: {created_text(job)}" if state == "done" else
+                f"{what} saved nothing: {job['result'] or 'the vault refused it.'}" if state == "failed" else
+                f"{what}: {unknown_text(job)}")
+    else:
+        said = (f"{what} is done: {job['result']}" if state == "done" else
+                f"{what} failed: {job['result']}" if state == "failed" else
+                f"{what}: its outcome is not known. Check before you act again, and record what you found with "
+                f"resolve_outcome.")
+    filed = filed_under(job["agent"], "say", job["task"])     # its reads commit, so before the transaction
+    with transaction():
+        DB.execute("UPDATE jobs SET told=? WHERE id=?", (state, job_id))
+        event_rows([(job["agent"], "say", filed, f"[hub] {said}", None)], now())
+
+
+def lost_jobs(agent, held):
+    """The helper's poll lists the jobs that it holds: running, or with a report that the hub has not taken (helper
+    feature job_runs). A job whose event it acked, that this list leaves out and that has no report, is lost: a helper
+    that started again does not run it again, and its outcome is not known (plan C7). Called with LOCK held."""
+    t0, ended = now(), []
+    for job in read_rows("SELECT j.* FROM jobs j JOIN events e ON e.agent=j.agent AND e.kind=j.kind AND "
+                         "json_extract(e.extra, '$.job')=j.id WHERE j.agent=? AND j.finished IS NULL AND "
+                         "j.unknown IS NULL AND e.helper_ack IS NOT NULL AND e.helper_ack < ? AND j.kind IN "
+                         "('signin','handover','create','capture','request')", (agent, t0)):
+        if job["id"] in held:
+            continue
+        why = f"{agent}'s helper lost it before it reported."
+        with transaction():
+            if job["kind"] == "request":
+                request_unknown_rows(job, why)
+            else:
+                DB.execute("UPDATE jobs SET unknown=?, result=? WHERE id=?", (t0, why, job["id"]))
+                if job["kind"] in ("signin", "handover"):       # the outcome gate asks for a check before the next one
+                    DB.execute("INSERT OR IGNORE INTO outcomes(task,attempt,hold,tool_call_id,title,kind,state,created) "
+                               "VALUES(?,(SELECT attempt FROM tasks WHERE id=?),0,?,?,'other','unknown',?)",
+                               (job["task"], job["task"], f"job-{job['id']}", f"{job_what(job)}: {why}", t0))
+        ended.append(job["id"])
+        log("hub", f"{agent}'s {job['kind']} job {job['id']} was lost: its outcome is not known")
+    for jid in ended:
+        q("UPDATE jobs SET returned=COALESCE(returned, ?) WHERE id=?", (t0, jid))     # the task is told either way
+        job_told(jid)
+
+
+def open_job(task_id):
+    """True while a job of this task runs on its machine: its agent waits on it on purpose (plan C7)."""
+    return bool(q1("SELECT 1 FROM jobs WHERE task=? AND finished IS NULL AND unknown IS NULL AND kind IN "
+                   "('signin','handover','create','capture','request') LIMIT 1", (task_id,)))
 
 
 def api_text(job):
@@ -5795,6 +5967,9 @@ def t_call_api(agent, a):
                         "at most 64 characters, and not Host, Authorization, Content-Type, Content-Length, "
                         "Transfer-Encoding or Connection.")
     headers = api_headers(a.get("headers"), named.group(1) if named else None)
+    limit = a.get("timeout_seconds")        # plan C7: the agent's own time for the service's answer, no fleet ceiling
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, (int, float)) or not 0 < limit < 1e7):
+        raise ToolError("timeout_seconds must be a number of seconds above 0: how long the service may take to answer.")
     guard(agent, path, body, auth, *sum(sorted(headers.items()), ()))
     t = get_task(tid, owner=agent)
     if t["state"] in TERMINAL:
@@ -5824,13 +5999,15 @@ def t_call_api(agent, a):
                 raise ToolError(f"This machine's vault cannot call an API now ({', '.join(missing)}). Ask your requester.")
             jid, again = ins(
                 "INSERT INTO jobs(agent,task,kind,login,target,created,request_id,attempt,method,path,body,auth,"
-                "headers) VALUES(?,?,'request',?,'',?,?,?,?,?,?,?,?)",
+                "headers,timeout) VALUES(?,?,'request',?,'',?,?,?,?,?,?,?,?,?)",
                 (agent, tid, login, now(), request, t["attempt"], method, path, body, auth,
-                 json.dumps(headers, sort_keys=True))), False
+                 json.dumps(headers, sort_keys=True), limit)), False
     activity(tid, "call_api")
     if not again:               # one event for one request: the vault is asked once
-        emit(agent, "request", f"call an API with {login}", task=tid, extra={"job": jid})
-    wait = CFG.get("request_wait", API_WAIT)
+        emit(agent, "request", f"call an API with {login}", task=tid,
+             extra=dict({"job": jid}, **({"timeout": limit} if limit else {})))
+    runs = JOB_RUNS in helper_features(agent)
+    wait = JOB_CALL_WAIT if runs else CFG.get("request_wait", API_WAIT)
     deadline = now() + wait
     while now() < deadline:
         row = q1("SELECT finished, unknown FROM jobs WHERE id=?", (jid,))
@@ -5840,6 +6017,8 @@ def t_call_api(agent, a):
     with LOCK:
         fence(agent, tid)
         job = q1("SELECT * FROM jobs WHERE id=?", (jid,))
+        if not job["finished"] and not job["unknown"] and runs:
+            return still_running(job)       # plan C7: no clock decides; the outcome comes as a message
         if not job["finished"] and not job["unknown"]:
             silent = f"this machine's helper did not answer in {int(wait)} seconds."
             if job["released"]:         # the vault asked for the job: the request can have gone out
@@ -5888,14 +6067,21 @@ def helper_job(agent, tid, kind, login, target=""):
               (agent, tid, kind, login, target, now()))
     activity(tid, "sign_in" if kind == "signin" else "hand_over")
     emit(agent, kind, f"{kind} with {login}", task=tid, extra={"job": jid, "login": login, "to": target})
-    deadline = now() + CFG["job_wait"]
+    runs = JOB_RUNS in helper_features(agent)
+    deadline = now() + (JOB_CALL_WAIT if runs else CFG["job_wait"])
     while now() < deadline:
-        if q1("SELECT finished FROM jobs WHERE id=?", (jid,))["finished"]:
+        row = q1("SELECT finished, unknown FROM jobs WHERE id=?", (jid,))
+        if row["finished"] or row["unknown"]:
             break
         time.sleep(0.3)
     with LOCK:
         fence(agent, tid)
         job = q1("SELECT * FROM jobs WHERE id=?", (jid,))
+        if not job["finished"] and job["unknown"]:      # its helper lost it (lost_jobs)
+            raise ToolError(f"{job_what(job)}: its outcome is not known. Check before you act again, and record "
+                            f"what you found with resolve_outcome.")
+        if not job["finished"] and runs:
+            return still_running(job)       # plan C7: no clock marks it failed; the outcome comes as a message
         if not job["finished"]:
             q("UPDATE jobs SET ok=0, result='no word from the helper', finished=? WHERE id=?", (now(), jid))
             raise ToolError(f"This machine's helper did not answer in {int(CFG['job_wait'])} seconds. "
@@ -7616,7 +7802,8 @@ def agent_delivery(m, parent, t0):
     A message from a chat window belongs to no task and names none. It is the sender's task and never the reader's
     authority: the header says who is asking about what, and nothing more."""
     on = f" on {tref(m['sender_task'])}" if m["sender_task"] else ""
-    text = f"[message from {m['sender']}{on} id=AM-{m['id']}] {m['text']}"
+    waits = ", waits for your answer" if m["waits"] else ""         # plan C8
+    text = f"[message from {m['sender']}{on} id=AM-{m['id']}{waits}] {m['text']}"
     to = m["recipient"]
     if role_of(to) == "manager":
         return DB.execute(EVENT, (to, "say", None, text, t0, "{}")).lastrowid
@@ -7643,6 +7830,8 @@ def agent_message_refusal(agent, to, parent_id, t0):
     parent = q1("SELECT * FROM agent_messages WHERE id=?", (parent_id,)) if parent_id else None
     if parent_id and (not parent or parent["sender"] != to or parent["recipient"] != agent):
         return None, f"in_reply_to must name a message that {to} sent to you."
+    if parent and parent["waits"] and not parent["wait_end"]:
+        return parent, None     # plan C8: the answer to a message that waits for it is never refused by the guard
     return parent, agent_limit(agent, to, parent, t0)
 
 
@@ -7714,6 +7903,7 @@ def t_message_agent(agent, a):
             raise ToolError("in_reply_to must be the id of the message that you answer, for example AM-12, or null.")
         parent_id = int(m.group(1))
     guard(agent, text)
+    waits = a.get("waits") is True
     chat = chat_context(agent)
     tid = parse_task(a.get("task_id")) if role_of(agent) in ("worker", "lead") and not chat else None
     with LOCK:
@@ -7721,24 +7911,93 @@ def t_message_agent(agent, a):
             chat_fence(agent)
         elif tid:
             fence(agent, tid)
-        command, old = agent_write(agent, "message_agent", a, {"agent": to, "text": text, "in_reply_to": parent_id})
+        if waits and not tid:
+            raise ToolError("waits=true is for a task session whose task cannot go on without the answer.")
+        if waits and q1("SELECT 1 FROM tasks WHERE id=? AND requester=?", (tid, to)):
+            raise ToolError(f"{to} gave you {tref(tid)}: to wait for its answer, use ask_my_requester, which pauses "
+                            f"the task until the answer comes.")
+        command, old = agent_write(agent, "message_agent", a, dict({"agent": to, "text": text, "in_reply_to": parent_id},
+                                                                    **({"waits": True} if waits else {})))
         if old:
             am = q1("SELECT * FROM agent_messages WHERE id=?", (old["message"],))
         else:
             t0 = now()
+            if parent_id is None:
+                # plan C8: a message to an agent whose waited message you read and did not answer yet is its
+                # answer, also without in_reply_to, for its route and its depth
+                asked = q1("SELECT id FROM agent_messages WHERE sender=? AND recipient=? AND waits=1 AND "
+                           "wait_end IS NULL AND read_at IS NOT NULL ORDER BY id LIMIT 1", (to, agent))
+                parent_id = asked["id"] if asked else None
             parent, why = agent_message_refusal(agent, to, parent_id, t0)
             if why:
                 raise ToolError(why)
             with transaction():
                 n = DB.execute("INSERT INTO agent_messages(sender,sender_task,recipient,text,in_reply_to,created,"
-                               "request_id,depth) VALUES(?,?,?,?,?,?,?,?)",
-                               (agent, tid, to, text, parent_id, t0, command[1], parent["depth"] + 1 if parent else 0)
-                               ).lastrowid
+                               "request_id,depth,waits) VALUES(?,?,?,?,?,?,?,?,?)",
+                               (agent, tid, to, text, parent_id, t0, command[1], parent["depth"] + 1 if parent else 0,
+                                1 if waits else None)).lastrowid
                 am = DB.execute("SELECT * FROM agent_messages WHERE id=?", (n,)).fetchone()
                 DB.execute("UPDATE agent_messages SET event_id=? WHERE id=?", (agent_delivery(am, parent, t0), n))
+                if parent and parent["waits"] and not parent["wait_end"]:
+                    DB.execute("UPDATE agent_messages SET wait_end=? WHERE id=?", (f"answered by AM-{n}", parent["id"]))
                 DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, agent, f"sent AM-{n} to {to}"))
                 keep_command(command, {"message": n}, t0)
         return json.dumps(message_landing(am))
+
+
+# ---- plan C8: a named wait. A task that cannot go on without a colleague's answer says so (message_agent waits=true),
+# and the wait ends only on events the hub records: the answer, the end of the task that holds the message, the end
+# of the recipient's turn after it read the message, or a recipient that is no longer active. It is a live reason
+# for the task, and it never writes the task's state or waiting_on, which the app draws.
+
+def waits_on_message(task_id):
+    """The open waited message that this task sent, or None: the newest one."""
+    return q1("SELECT * FROM agent_messages WHERE sender_task=? AND waits=1 AND wait_end IS NULL ORDER BY id DESC "
+              "LIMIT 1", (task_id,))
+
+
+def wait_over(m, end, said):
+    """End the wait of one waited message and tell its asking task once, while that task is open. Committing."""
+    with LOCK:
+        ended = DB.execute("UPDATE agent_messages SET wait_end=? WHERE id=? AND wait_end IS NULL",
+                           (end, m["id"])).rowcount
+        commit()
+    if not ended:
+        return
+    if q1(f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (m["sender_task"],)):
+        emit(m["sender"], "say", f"[hub] {said}", task=m["sender_task"])
+    log("hub", f"the wait of AM-{m['id']} ended: {end}")
+
+
+def unanswered(agent, t0, task_id=None):
+    """The end of a turn of the agent's session that read waited messages and did not answer them: its owner chat's
+    or the manager's closing empty read (task_id None), or a turn end of a task session (task_id). Each asker is told
+    once that its message was read and not answered."""
+    where = "e.task=?" if task_id else "e.task IS NULL"
+    for m in q(f"SELECT m.* FROM agent_messages m JOIN events e ON e.id=m.event_id WHERE m.recipient=? AND m.waits=1 "
+               f"AND m.wait_end IS NULL AND m.read_at IS NOT NULL AND m.read_at < ? AND {where}",
+               (agent, t0, *((task_id,) if task_id else ()))):
+        wait_over(m, "read and not answered", f"{agent} read AM-{m['id']} and did not answer it. Go on without it, "
+                                              f"ask {agent} again, or ask your requester.")
+
+
+def end_waits(task_id):
+    """A task that ended: a waited message that its session held will get no answer, and each asker is told once;
+    the waits of its own messages end with it."""
+    for m in q("SELECT m.* FROM agent_messages m JOIN events e ON e.id=m.event_id WHERE e.task=? AND m.waits=1 AND "
+               "m.wait_end IS NULL", (task_id,)):
+        wait_over(m, f"{tref(task_id)} ended", f"AM-{m['id']} will get no answer: {tref(task_id)} ended first. Go on "
+                                               f"without it, or ask your requester.")
+    q("UPDATE agent_messages SET wait_end=? WHERE sender_task=? AND waits=1 AND wait_end IS NULL",
+      (f"{tref(task_id)} ended", task_id))
+
+
+def wait_sweep(t0):
+    """A waited message to an agent that is no longer active will get no answer: its asker is told once."""
+    for m in q("SELECT * FROM agent_messages WHERE waits=1 AND wait_end IS NULL"):
+        if not agent_active(m["recipient"]):
+            wait_over(m, f"{m['recipient']} is not active", f"AM-{m['id']} will get no answer: {m['recipient']} is "
+                                                          f"not active any more. Go on without it, or ask your requester.")
 
 
 # ---------------------------------------------------------------- people and conversations (CHAT-APPS.md section 7)
@@ -14016,7 +14275,8 @@ def tasks_stuck(t0):
                     f"may be signed out, or its session may be failing to start")
         elif t["state"] == "working":
             quiet = t0 - max(t["last_activity"] or t["created"], limit_ended(t["owner"]), STARTED)
-            if quiet <= STUCK_SILENT or busy_in_a_call(t, t0) or waits_on_parts(t["id"]):
+            if quiet <= STUCK_SILENT or busy_in_a_call(t, t0) or waits_on_parts(t["id"]) or open_job(t["id"]) or \
+                    waits_on_message(t["id"]):
                 continue        # the fourth kind of quiet on purpose: one call of its own that has not finished,
                                 # and the fifth: a lead that waits for its open subtasks
             since = t0 - quiet
@@ -14316,8 +14576,9 @@ TOOLS = [
      "Have this machine's vault send one HTTP request to the site of a saved login, with that login's key. You give "
      "the method, the path, any headers the service asks for and, when the request has one, a body. The site comes "
      "only from the saved login, and you never see or pass the key. One request_id is one request: it is never sent "
-     "twice. If the outcome is not known, check the service before you send anything new, and record what you found "
-     "with resolve_outcome.",
+     "twice. A request that is still running after a moment answers so, and its outcome comes to this task as a "
+     "message. If the outcome is not known, check the service before you send anything new, and record what you "
+     "found with resolve_outcome.",
      S({"task_id": TASK_ID, "request_id": {"type": "string", "description": "A new UUID for each new request"},
         "login": {"type": "string", "description": "bws://<secret-id>: the saved login whose site and key are used"},
         "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"]},
@@ -14329,7 +14590,9 @@ TOOLS = [
                     "description": "Your own headers, at most 16, for example Content-Type, Idempotency-Key or an API "
                                    "version. Host, Authorization, Content-Length, Transfer-Encoding and Connection "
                                    "are the vault's and are refused; every other header is yours"},
-        "auth": {"type": "string", "description": "How the key is sent: bearer, basic, or header:<Name>"}},
+        "auth": {"type": "string", "description": "How the key is sent: bearer, basic, or header:<Name>"},
+        "timeout_seconds": {"type": "number", "description": "How long the service may take to answer, in seconds; "
+                                                             "60 when you name none"}},
        ["task_id", "request_id", "login", "method", "path", "auth"])),
     ("worker", "see_earlier_work", t_see_earlier_work,
      "Read the work that came before this task: the task it follows, what that one followed, and your own earlier "
@@ -14855,14 +15118,18 @@ TOOLS = [
      "Send a message to another agent: a question, an answer or coordination. It has your authority, never the "
      "owner's, and a message that you get has its sender's authority. Work that needs tools is still a task, through "
      "the line above. Answer a message with in_reply_to set to its id (AM-<n>). The call returns at once and says "
-     "where the message landed and whether that session runs now; an answer comes later as a message. Two agents "
-     "that send each other 20 messages with no work of either between them send no more until one of them works. "
-     "One request_id is one message: the same request_id again sends nothing more.",
+     "where the message landed and whether that session runs now; an answer comes later as a message. In a task "
+     "session, waits=true says that your task cannot go on without the answer: the hub tells you if the answer will "
+     "not come, and nothing nudges the task while it waits. Two agents that send each other 20 messages with no work "
+     "of either between them send no more until one of them works; an answer to a message that waits is never "
+     "refused. One request_id is one message: the same request_id again sends nothing more.",
      S({"request_id": {"type": "string", "description": "A new UUID for each message"},
         "agent": {"type": "string", "description": "The agent that gets the message"},
         "text": {"type": "string", "description": "The message, 1 to 8,000 characters"},
         "in_reply_to": {"type": "string", "description": "The id of the message that this one answers, for example "
-                                                        "AM-12. Leave it out for a new message."}},
+                                                        "AM-12. Leave it out for a new message."},
+        "waits": {"type": "boolean", "description": "true only when your task cannot go on without the answer. Not "
+                                                     "for your own requester: ask it with ask_my_requester"}},
        ["request_id", "agent", "text"])),
     # owner feature google: only the tools of the agent's level in team.json now (tools_for)
     ("worker", "drive_search", t_drive_search,
@@ -15167,6 +15434,8 @@ def overview_text():
                    + (f"; HELD: {held_word(hold)} ({hold['state']})" if hold else "")
                    + (f"; WAITING until {clock(park['due'])}, as {t['owner']} asked (R-{park['id']}: {park['note']})"
                       if (park := parked(t["id"])) else "")
+                   + (f"; waits for {w['recipient']}'s answer to AM-{w['id']}"      # plan C8: a named wait
+                      if (w := waits_on_message(t["id"])) else "")
                    + (f"; {unknown} unknown outcome(s)" if unknown else "")
                    + (f"; NO LIVE PATH: {t['stalled_reason']}" if t["stalled_since"] else "")
                    # why this agent got this task: the requester's own reasoning, asked for by create_task and
@@ -17345,7 +17614,9 @@ def liveness(t0):
             path = ((f"waiting for {owner} to load its new settings" if settings_pending(owner) else
                      "waiting for its session to start") if online else None)
         elif alive or (online and not has_list) or starting:
-            path = "live session" if alive else "helper online"
+            asked = waits_on_message(tid) if alive else None        # plan C8: a named wait, in the path's own words
+            path = (f"waiting for {asked['recipient']}'s answer to AM-{asked['id']}" if asked else
+                    "live session" if alive else "helper online")
         elif once and not launched:
             path = "waiting for its session to start"           # the helper has not started this attempt yet
         elif question:
@@ -17531,9 +17802,14 @@ def offline_sweep(t0):
             continue                    # this episode was reported, or a flapping machine was reported just now
         kv_set("offline_told:" + name, t0)
         tasks = [tref(r["id"]) for r in q(f"SELECT id FROM tasks WHERE owner=? AND {OPEN_TASK} ORDER BY id", (name,))]
+        waiting = [f"{tref(r['sender_task'])} (AM-{r['id']})" for r in q(   # plan C8: the tasks that wait on it
+            "SELECT id, sender_task FROM agent_messages WHERE recipient=? AND waits=1 AND wait_end IS NULL ORDER BY id",
+            (name,))]
         emit(mgr, "say", f"[hub] {name}'s machine went offline: its helper last checked in at {clock(seen)}. "
-             f"Its open tasks: {', '.join(tasks) or 'none'}. Give it no new work until it checks in again; the hub "
-             f"keeps its tasks and reports any that lose their live path.")
+             f"Its open tasks: {', '.join(tasks) or 'none'}. " +
+             (f"Waiting for its answer: {', '.join(waiting)}. " if waiting else "") +
+             f"Give it no new work until it checks in again; the hub keeps its tasks and reports any that lose their "
+             f"live path.")
         log("hub", f"{name} went offline (last check-in {clock(seen)}); the manager was told")
 
 
@@ -17635,6 +17911,7 @@ def tick():
         # Before the clocks, and for the same reason end_limits is: both bring work back, and a task whose park has
         # just ended is not a silent task. Run after the silence loop it was nudged at the very tick it came back.
         reminder_sweep(t0)      # what an agent asked to come back to, at the time it named
+        wait_sweep(t0)          # plan C8: a waited message to an agent that is no longer active
         chat_sweep(t0)          # owner feature chat_apps: a message item without a report for 120 seconds
         # Silence on working tasks: nudge the owner, then the requester. Four kinds of task are quiet on purpose and
         # none of them is nudged -- a held one, one whose agent is at its usage limit, one that is parked until the
@@ -17642,7 +17919,8 @@ def tick():
         # STARTED is in the measure because the hub's own restart is not a task's silence: without it one outage
         # made every healthy task look silent at the first tick (both rungs, five seconds apart).
         for t in q("SELECT * FROM tasks WHERE state='working'"):
-            if active_hold(t["id"]) or active_limit(t["owner"]) or parked(t["id"]) or waits_on_parts(t["id"]):
+            if active_hold(t["id"]) or active_limit(t["owner"]) or parked(t["id"]) or waits_on_parts(t["id"]) or \
+                    open_job(t["id"]) or waits_on_message(t["id"]):     # C7: a job runs; C8: a named wait
                 continue
             quiet = t0 - max(t["last_activity"] or t["created"], limit_ended(t["owner"]), STARTED)
             # The second rung is measured from the first nudge and not from the same quiet time: after a hub outage
@@ -26573,6 +26851,10 @@ class Handler(BaseHTTPRequestHandler):
         after = int(query.get("after") or 0)
         wait = max(0, min(int(query.get("wait") or 25), 50))
         touch(agent)
+        if "jobs" in query and JOB_RUNS in helper_features(agent):
+            # plan C7: the jobs that the helper holds; one it acked and no longer holds, with no report, is lost
+            with LOCK:
+                lost_jobs(agent, {int(x) for x in str(query["jobs"]).split(",") if x.isdigit()})
         if "alive_unknown" in query:        # plan C6: tmux did not answer, so the hub reads no list until the next one
             with area("quiet"):
                 q("UPDATE agents SET alive_ts=NULL WHERE name=?", (agent,))
@@ -27241,7 +27523,15 @@ class Handler(BaseHTTPRequestHandler):
                 q("UPDATE tasks SET waiting_on=? WHERE id=?", (f"Q-{asked['id']}" if asked else None, tid))
                 log("hub", f"{tref(tid)} on {agent}: the question on its screen went")
             return self.json(200, {})
-        if q1("SELECT id FROM prompts WHERE task=? AND decision IS NULL", (tid,)):
+        carried = q1("SELECT id FROM prompts WHERE task=? AND decision IS NULL AND kind<>'code'", (tid,))
+        if carried and PROMPT_POLLS in helper_features(agent):
+            # plan C7: this helper tells a question only when no permission hook of the task runs, so this one is
+            # Claude Code's own question, shown after its hook ended: the prompt moved to the screen
+            q("UPDATE prompts SET decision='screen', decided=?, reason=? WHERE task=? AND decision IS NULL AND "
+              "kind<>'code'", (now(), f"its hook ended, and {agent}'s session shows the question on its own screen.",
+                               tid))
+            log("hub", f"P-{carried['id']} of {tref(tid)} moved to {agent}'s screen")
+        elif q1("SELECT id FROM prompts WHERE task=? AND decision IS NULL", (tid,)):
             return self.json(200, {})       # that question is a permission prompt the hub is already carrying
         if t and t["state"] not in TERMINAL and t["waiting_on"] != "its screen":
             q("UPDATE tasks SET waiting_on='its screen' WHERE id=?", (tid,))
@@ -27427,7 +27717,10 @@ class Handler(BaseHTTPRequestHandler):
             if path and why:
                 skipped.append({"path": "a file whose name holds a registered secret" if secret_hit(path) else path,
                                 "why": "a registered secret" if secret_hit(why) else why})
-        return self.json(200, {"taken": outputs_answer(agent, token, ref, files, skipped)})
+        taken = outputs_answer(agent, token, ref, files, skipped)
+        if taken:
+            late_outputs(token)         # plan C7: files that came after the delivery stopped waiting
+        return self.json(200, {"taken": taken})
 
     def ui_agent_key(self, agent):
         """The owner registers, replaces or removes an agent's key (owner API 1.12), also for an agent that team.json
@@ -27687,7 +27980,8 @@ class Handler(BaseHTTPRequestHandler):
                 answer.update(db=kv_get("db_id"), attempt=row["attempt"], request_id=row["request_id"],
                               method=row["method"], path=row["path"], auth=row["auth"],
                               headers=json.loads(row["headers"] or "{}"),
-                              **({"body": row["body"]} if row["body"] is not None else {}))
+                              **({"body": row["body"]} if row["body"] is not None else {}),
+                              **({"timeout": row["timeout"]} if row["timeout"] else {}))   # plan C7
             q("UPDATE jobs SET released=? WHERE id=?", (now(), job))
         log(agent, f"vault broker opened {row['login']} for {kind} job {job}" +
             (f" (made by {made['kind']} job {made['id']})" if made else ""))
@@ -27878,8 +28172,14 @@ class Handler(BaseHTTPRequestHandler):
                     # nothing about it. The job stays open: only the same request looks for the outcome again.
                     q("UPDATE jobs SET unknown=?, result=? WHERE id=?", (now(), text, row["id"]))
                     log(agent, f"helper, {row['kind']} job {row['id']}: outcome not known")
+                    job_told(row["id"])
                     return self.json(200, {"ok": True})
             q("UPDATE jobs SET ok=?, result=?, finished=? WHERE id=?", (1 if ok else 0, text, now(), row["id"]))
+            lost = q1("SELECT id FROM outcomes WHERE task=? AND tool_call_id=? AND state='unknown'",
+                      (row["task"], f"job-{row['id']}"))
+            if lost:        # a job that lost_jobs settled as unknown reported after all: its outcome is known now
+                settle_outcome(lost["id"], "done" if ok else "not_done", "hub", f"the helper reported it: {text[:200]}")
+            job_told(row["id"])
         log(agent, f"helper, {row['kind']} with {row['login']}: {'done' if ok else 'refused'}")
         self.json(200, {"ok": True})
 
@@ -27909,6 +28209,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             request_unknown(row, text)
             log(agent, f"helper, request job {row['id']}: outcome not known")
+        job_told(row["id"])
         return self.json(200, {"ok": True})
 
     def helper_events(self, agent):
@@ -27968,6 +28269,9 @@ class Handler(BaseHTTPRequestHandler):
                     activity(tid)
             for data in limits:
                 start_limit(agent, data["resets_at"], tid)
+            if attempt == t["attempt"] and state["turns"] > ((before or {}).get("turns", 0)
+                                                             if (before or {}).get("session") == session else 0):
+                unanswered(agent, now(), tid)       # plan C8: a turn of the task's session ended
             if not failed and app_server_task(agents()[agent], t["needs"]) and attempt == t["attempt"]:
                 # The hub can stop after it stores the terminal record but before it saves the hold. The reader
                 # reconnects with an empty batch to get last_seq; recover the hold before acknowledging that record.
@@ -28088,12 +28392,17 @@ class Handler(BaseHTTPRequestHandler):
         self.json(200, {})
 
     def hook_permission(self, agent, task):
-        """Claude Code PermissionRequest hook: hold the request until the requester decides."""
+        """Claude Code's PermissionRequest hook, and the runners' permission requests: hold the request until the
+        requester decides. A hook that names `poll` (plan C7) gets the decision, or `pending` with the prompt's id
+        within HOOK_POLL, and asks again for that prompt until a decision, a hold or the end of its task: a prompt
+        never expires, and no hub thread is held between the asks. A hook from before plan C7 keeps the old wait of
+        hook_wait and its expiry."""
         if agent not in agents():
             return self.json(404, {"error": "unknown agent"})
         if not self.allowed(agent):
             return
         data = self.form()
+        poll = data.get("poll") is True
         tool = str(data.get("tool_name") or "tool")[:80]
         tool_input = data.get("tool_input") or {}
         whole = json.dumps(tool_input, sort_keys=True)
@@ -28137,15 +28446,25 @@ class Handler(BaseHTTPRequestHandler):
             if rule:
                 log("hub", f"answered {agent}'s permission prompt from memory: {rule['decision']}")
                 return reply(rule["decision"])
-            pid = ins("INSERT INTO prompts(task,agent,tool,input,key,created) VALUES(?,?,?,?,?,?)",
-                      (tid, agent, tool, shown, key, now()))
-            if t and t["state"] == "working":
-                q("UPDATE tasks SET state='input-required', waiting_on=? WHERE id=?", (f"P-{pid}", tid))
-            emit(requester, "say",
-                 f"[hub] Permission prompt P-{pid} from {agent} on {tref(tid)}: it wants to use {tool}: {shown} "
-                 f"-- Decide with decide_permission(prompt_id=\"P-{pid}\", decision=\"allow\" or \"deny\", always=true or false).",
-                 task=tid or None)
-        deadline = now() + CFG["hook_wait"]
+            p = None
+            if poll:        # the same prompt again: the one this hook was given, or the open one of this request
+                asked = re.fullmatch(r"P-(\d+)", str(data.get("prompt") or ""))
+                p = (q1("SELECT * FROM prompts WHERE id=? AND agent=? AND task=? AND kind<>'code'",
+                        (int(asked.group(1)), agent, tid)) if asked else None) or \
+                    q1("SELECT * FROM prompts WHERE agent=? AND task=? AND key=? AND decision IS NULL AND "
+                       "kind<>'code' ORDER BY id DESC", (agent, tid, key))
+            if p:
+                pid = p["id"]
+            else:
+                pid = ins("INSERT INTO prompts(task,agent,tool,input,key,created,polls) VALUES(?,?,?,?,?,?,?)",
+                          (tid, agent, tool, shown, key, now(), 1 if poll else None))
+                if t and t["state"] == "working":
+                    q("UPDATE tasks SET state='input-required', waiting_on=? WHERE id=?", (f"P-{pid}", tid))
+                emit(requester, "say",
+                     f"[hub] Permission prompt P-{pid} from {agent} on {tref(tid)}: it wants to use {tool}: {shown} "
+                     f"-- Decide with decide_permission(prompt_id=\"P-{pid}\", decision=\"allow\" or \"deny\", always=true or false).",
+                     task=tid or None)
+        deadline = now() + (HOOK_POLL if poll else CFG["hook_wait"])
         while now() < deadline:
             if q1("SELECT decision FROM prompts WHERE id=?", (pid,))["decision"]:
                 break
@@ -28164,17 +28483,18 @@ class Handler(BaseHTTPRequestHandler):
                 # never asked (late_permission_word).
                 gone = q1("SELECT decision FROM prompts WHERE id=?", (pid,))["decision"]
                 q("UPDATE prompts SET decision=COALESCE(decision, 'expired'), decided=COALESCE(decided, ?), "
-                  "reason=COALESCE(NULLIF(reason, ''), ?) WHERE id=?",
-                  (now(), "The session that asked was replaced before a decision reached it, so it did not run.", pid))
+                  "reason=COALESCE(NULLIF(reason, ''), ?) WHERE id=?", (now(), PROMPT_REPLACED, pid))
                 q("UPDATE tasks SET state='working', waiting_on=NULL WHERE id=? AND state='input-required' "
                   "AND waiting_on=?", (tid, f"P-{pid}"))
                 still = q1("SELECT state FROM tasks WHERE id=?", (tid,))
-                if gone and still and still["state"] not in TERMINAL:
+                if gone in ("allow", "deny") and still and still["state"] not in TERMINAL:
                     emit(requester, "say", f"[hub] Your {gone} on P-{pid} reached no session: the session of "
                          f"{tref(tid)} that asked was replaced before it came, so {tool} did not run. The new session "
                          f"asks again if it needs it.", task=tid)
                 return reply("deny", str(e))
             row = q1("SELECT decision, reason FROM prompts WHERE id=?", (pid,))
+            if not row["decision"] and poll:        # no decision yet: the hook asks again for the same prompt
+                return self.json(200, {"pending": True, "prompt": f"P-{pid}"})
             if not row["decision"]:
                 q("UPDATE prompts SET decision='expired', decided=? WHERE id=?", (now(), pid))
             if t:
@@ -28197,6 +28517,8 @@ class Handler(BaseHTTPRequestHandler):
             fence(agent, tid, (data.get("generation"), task, data.get("attempt")))
         except ToolError as e:
             return reply("deny", str(e))
+        if row["decision"] not in ("allow", "deny"):    # it ended before a decision: replaced, or moved to the screen
+            return reply("deny", row["reason"] or f"P-{pid} ended without a decision, so {tool} did not run.")
         reply(row["decision"], "Denied by your requester" + (f": {row['reason']}" if row["reason"] else "."))
 
     def mcp(self, agent, context=None):
@@ -28327,8 +28649,10 @@ def settle_stopped_calls():
     prompt nothing could answer, so its silence was never nudged and every list said it waited on P-<id> for the
     rest of its life. A question is different: it is still asked, and its answer still reaches the task."""
     q("UPDATE questions SET waiting=0")
-    q("UPDATE prompts SET decision='expired', decided=? WHERE decision IS NULL", (now(),))
-    q("UPDATE tasks SET state='working', waiting_on=NULL WHERE state='input-required' AND waiting_on LIKE 'P-%'")
+    # A hook that polls (plan C7) asks again after the hub's start, so its prompt is still open and is still decided.
+    q("UPDATE prompts SET decision='expired', decided=? WHERE decision IS NULL AND IFNULL(polls, 0)=0", (now(),))
+    q("UPDATE tasks SET state='working', waiting_on=NULL WHERE state='input-required' AND waiting_on LIKE 'P-%' AND "
+      "waiting_on NOT IN (SELECT 'P-' || id FROM prompts WHERE decision IS NULL)")
     # A request or a login that the vault had taken can have taken effect while the hub was down. It used to be
     # finished as not done, the vault's own report of it was refused, and the agent was free to send it again with a
     # new request_id -- a payment twice. Its outcome is unknown instead, as when its helper does not answer in time:

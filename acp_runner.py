@@ -230,15 +230,19 @@ class Runner:
 
     def run(self):
         self.client = Client(self.argv, self.cwd, self.records.update, self.request)
+        # plan C7: no clock on the start. The screen says that it waits, so the helper's screen watch sees a start
+        # that hangs; a stop or the agent's own exit ends the wait.
+        print("Fleet: waiting for the agent to start", flush=True)
+        gone = lambda: self.stopping.is_set() or self.client.proc.poll() is not None
         try:
             init = self.client.call("initialize", {"protocolVersion": 1, "clientCapabilities": {
-                "fs": {"readTextFile": False, "writeTextFile": False}, "terminal": False}}, timeout=60)
+                "fs": {"readTextFile": False, "writeTextFile": False}, "terminal": False}}, stop=gone)
             if not ((init.get("agentCapabilities") or {}).get("mcpCapabilities") or {}).get("http"):
                 raise RuntimeError("the agent cannot reach the fleet tools over HTTP (mcpCapabilities.http)")
             if "cached_token" in [m.get("id") for m in init.get("authMethods") or [] if isinstance(m, dict)]:
-                self.client.call("authenticate", {"methodId": "cached_token", "_meta": {"headless": True}}, timeout=60)
+                self.client.call("authenticate", {"methodId": "cached_token", "_meta": {"headless": True}}, stop=gone)
             self.sid = self.client.call("session/new", {"cwd": self.cwd, "mcpServers": [
-                {"type": "http", "name": "fleet", "url": self.mcp_url, "headers": self.headers}]}, timeout=60)["sessionId"]
+                {"type": "http", "name": "fleet", "url": self.mcp_url, "headers": self.headers}]}, stop=gone)["sessionId"]
             self.records.add({"type": "session", "runtime": self.runtime, "session_id": str(self.sid)[:80]})
             text = self.prompt
             while text is not None and not self.stopping.is_set():
@@ -320,9 +324,11 @@ def main(argv=None):
         "task": task, "attempt": attempt, "generation": generation, "session": args.session, "events": batch}, timeout=15))
 
     def permission(tool, tool_input):
-        code, data = fleet.http("POST", f"/hook/permission/{agent}/{task}", {
-            "attempt": attempt, "generation": generation, "tool_name": tool, "tool_input": tool_input}, timeout=270)
-        decision = (((data or {}).get("hookSpecificOutput") or {}).get("decision") or {}) if code == 200 else {}
+        # plan C7: asked again until a decision, a hold or the end of the task, with no limit of its own
+        data = fleet.ask_permission(f"/hook/permission/{agent}/{task}", {
+            "attempt": attempt, "generation": generation, "tool_name": tool, "tool_input": tool_input},
+            stopped=lambda: runner.stopping.is_set())
+        decision = ((data or {}).get("hookSpecificOutput") or {}).get("decision") or {}
         return decision.get("behavior") == "allow"
 
     runner = Runner(shlex.split(args.agent_command), args.prompt, args.mcp_url, fleet.KIT, args.runtime, records,
