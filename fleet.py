@@ -363,6 +363,12 @@ WORKING = re.compile(r"\besc to interrupt\b|^Fleet: the agent is working\b", re.
 # Claude Code's empty input line, between the two rules of its input box (2.1, read on a fleet machine, 26 October
 # 2026): "❯" alone on its line. Text after it is a line the session has not taken yet, and no idle prompt.
 IDLE_PROMPT = re.compile(r"^\s*[\u276f>]\s*$", re.M)
+# A running Claude Code turn repaints its elapsed counters every second: the spinner line, the running command and its
+# step title (read on 2.1.285, 2.1.308 and 2.1.311 while a foreground `sleep 300` ran, 27 October 2026). So a running
+# screen that is the same FROZEN_GAP seconds later, counter included, with no new record of its session, is a runtime
+# whose own loop stopped (plan C2, "frozen"). A runner's own lines have no counter and are never frozen.
+COUNTER = re.compile(r"\((?:\d+h\s*)?(?:\d+m\s*)?\d+s\b")
+FROZEN_GAP = 2
 # The helper's new-message signals (Helper.signal, plan C5). A Claude session's lines follow its own facts: its first
 # line when its session listed its tools, one untaken line at a time, and one more at its next idle screen. A runtime
 # whose idle screen the helper cannot read yet keeps the old clock: its first line SIGNAL_GAP seconds after its start
@@ -525,6 +531,11 @@ def type_into(session, name, text):
 # command or file.
 UNSEEN_TOOLS = ["CronCreate", "CronDelete", "CronList", "ScheduleWakeup", "RemoteTrigger", "PushNotification"]
 NO_TIMERS = "CLAUDE_CODE_DISABLE_CRON=1"
+# Plan C2: Claude Code's screen-reader mode draws "no decorative borders or animations", and its "Reduce motion"
+# (prefersReducedMotion) stops the spinner's timer. Either would still the counters by which the screen watch tells a
+# frozen runtime from a working one, so a task or manager session starts with both off: this variable wins over the
+# machine's own axScreenReader, and settings_arg's --settings over its own prefersReducedMotion.
+MOTION = "CLAUDE_AX_SCREEN_READER=0"
 PRESENCE = 30           # seconds between two presence pings while the main loop is inside one step (Helper.presence)
 # Fleet's deny list for worker and lead Claude sessions.
 DENY = ["Read(~/.fleet/**)", "Edit(~/.fleet/**)", "Bash(*.fleet/*)"] + UNSEEN_TOOLS
@@ -545,6 +556,7 @@ def settings_arg(agent, conf, task, tools=()):
         deny = DENY + [f"Edit(/{KIT}/{name})" for name in PROTECTED]
         settings = {"permissions": {"allow": conf.get("allow", ["mcp__fleet__*"]) + [f"mcp__{t}__*" for t in tools],
                                     "deny": deny}}
+    settings["prefersReducedMotion"] = False        # the screen watch reads its counters (MOTION)
     if conf.get("role") in ("worker", "lead") and task:
         # Command hooks, because Claude Code will not send an HTTP hook to a private address.
         hook = f"{shlex.quote(sys.executable)} {shlex.quote(os.path.join(KIT, 'fleet.py'))} hook"
@@ -837,7 +849,7 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
         cmd = cmd.replace("codex ", "codex resume ", 1)     # last, so that it comes first: codex resume [options] <thread>
     env = f"FLEET_ATTEMPT={attempt} FLEET_GENERATION={shlex.quote(generation)} FLEET_HUB={shlex.quote(HUB)} FLEET_AGENT={shlex.quote(agent)} FLEET_TASK={shlex.quote(task or '')}"
     if conf.get("runtime") == "claude":
-        env += f" {NO_TIMERS}"
+        env += f" {NO_TIMERS} {MOTION}"
     if not task and conf.get("runtime") == "claude":
         env += f" CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"
     return f"{prefix}env {env} {cmd}"
@@ -2175,7 +2187,8 @@ class Helper:
         is told to the hub once, and once again when it goes (Handler.helper_dialog), so the requester learns of it
         when it shows and not only when a message must be typed, and the manager's banner goes when the question does.
         The first agreed reading of a window says its state either way, so a hub that holds a question from before
-        this helper started hears that it went."""
+        this helper started hears that it went. A running screen that stopped moving is told the same way: "frozen"
+        once, and "moving" once when it changes again."""
         live = [w for w in windows(self.session) if w != "home"]
         for window in [w for w in self.screens if w not in live]:
             self.last_class[window] = self.screens.pop(window).get("class")     # for report_start
@@ -2185,6 +2198,17 @@ class Helper:
                 continue
             seen = self.screens.setdefault(window, {"last": None, "class": None, "told": None})
             reading = screen_class(r.stdout)
+            # "frozen" (plan C2): the same running screen as the reading kept in `still`, FROZEN_GAP seconds or more
+            # after it, with its counter and no new record, on a runtime whose counter was read live
+            # (lifecycle.RUNTIMES "screen_counter"). A change of screen or of records starts the comparison again.
+            at, records, still = time.monotonic(), self.records_at(window), seen.get("still")
+            tail = "\n".join(r.stdout.rstrip().split("\n")[-15:])
+            if reading == "running" and runtime_fact(self.conf.get("runtime"), "screen_counter") and \
+                    COUNTER.search(tail) and still and still[0] == r.stdout and still[2] == records:
+                if at - still[1] >= FROZEN_GAP:
+                    reading = "frozen"
+            else:
+                seen["still"] = (r.stdout, at, records)
             agreed, seen["last"] = reading == seen["last"], reading
             if not agreed:
                 seen["idle_run"] = 0
@@ -2195,6 +2219,16 @@ class Helper:
                 self.idle_at[window] = time.monotonic()
             if window != "manager" and not re.fullmatch(r"T-\d+", window):
                 continue
+            if seen.get("frozen") != (reading == "frozen"):
+                # told once when it stops moving, and once when it moves again (Handler.helper_dialog); the first
+                # agreed reading says it either way, so a mark from before this helper started clears
+                try:
+                    code, _ = http("POST", f"/helper/dialog/{self.agent}/{window}",
+                                   {"kind": "frozen" if reading == "frozen" else "moving"}, timeout=10)
+                except (urllib.error.URLError, OSError, ValueError):
+                    code = None         # told at the next round
+                if code in (200, 400):  # 400: a hub without these kinds, which is not asked again
+                    seen["frozen"] = reading == "frozen"
             kind = "shown" if reading == "question" else "gone"
             if seen["told"] == kind:
                 continue
@@ -2206,6 +2240,19 @@ class Helper:
                 continue                # told at the next round
             if code == 200:
                 seen["told"] = kind
+
+    def records_at(self, window):
+        """When a record file of this window's sessions last changed, or None when it has none yet: a screen that does
+        not change is frozen only when its session wrote nothing between the two readings (watch_screens)."""
+        tailer = getattr(self, "tailer", None)
+        if not tailer:
+            return None
+        with tailer.lock:
+            paths = [f.path for f in tailer.feeds.values() if f.name == window and f.path]
+        try:
+            return max((os.path.getmtime(p) for p in paths), default=None)
+        except OSError:
+            return None
 
     def presence(self):
         """The presence thread: a ping while the main loop is inside a step, with the window list when tmux answers.

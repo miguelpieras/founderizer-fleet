@@ -1781,6 +1781,7 @@ def t_read_messages(agent, a):
         if agents()[agent].get("role") == "manager":
             kv_set("mgr_screen", None)
             kv_set("mgr_screen_shown", None)        # a session that reads has no question in front of it
+            kv_set("mgr_screen_frozen", None)       # and is not frozen
         if not rows:
             if chat_context(agent) or agents()[agent].get("role") == "manager":
                 unanswered(agent, now())            # plan C8: a standing session's closing empty read ends its turn
@@ -2429,8 +2430,9 @@ def attempt_rows(t, reason, event, t0, counted=False):
     start event would leave a task that no helper starts."""
     DB.execute("UPDATE tasks SET attempt=attempt+1, restarts=restarts+?, missing_since=?, started=?, nudge_level=0 "
                "WHERE id=?", (1 if counted else 0, t0 if counted else None, t0, t["id"]))
-    # plan C10: a new attempt moves the task again, so what its stuck notice said is over (tasks_stuck)
-    DB.execute("DELETE FROM kv WHERE k=?", (f"stuck_notice:{t['id']}",))
+    # plan C10: a new attempt moves the task again, so what its stuck notice said is over (tasks_stuck), and a new
+    # session has no frozen screen (C2)
+    DB.execute("DELETE FROM kv WHERE k IN (?,?)", (f"stuck_notice:{t['id']}", f"screen_frozen:{t['id']}"))
     DB.execute("UPDATE attempts SET ended=COALESCE(ended,?) WHERE task=? AND attempt=?", (t0, t["id"], t["attempt"]))
     DB.execute("INSERT INTO attempts(task,attempt,created,reason) VALUES(?,?,?,?)", (t["id"], t["attempt"] + 1, t0, reason))
     # The session that asked is gone, and a prompt never expires by itself (plan C7): it ends here, unanswered.
@@ -18227,6 +18229,11 @@ def manager_flag_update(t0):
                 kind = "silent"
                 flag = (f"The manager's helper is inside one step ({step['step']}) since {clock(step['since'])}, and "
                         f"a message waits behind it. Look at its machine.")
+        frozen = kv_get("mgr_screen_frozen")
+        if frozen:          # plan C2: a frozen runtime takes nothing, whether or not a message waits for it now
+            kind = "silent"
+            flag = (f"The manager's session is in the middle of a turn, and its screen stopped moving at "
+                    f"{clock(float(frozen))}. Look at its machine.")
         lim = active_limit(mgr)
         if lim:
             kind = "limited"
@@ -27823,14 +27830,15 @@ class Handler(BaseHTTPRequestHandler):
     def helper_dialog(self, agent, task):
         """The helper found a question on a session's own screen and did not type over it. kind (plan C2, the screen
         watch): "shown" when it appeared, "gone" when it went, each told once; none is a helper without the watch,
-        which tells only when a message waits to be typed, and again each minute for the manager."""
+        which tells only when a message waits to be typed, and again each minute for the manager. "frozen" and
+        "moving" are the same watch's running screen that stopped moving, and its moving again."""
         if agent not in agents():
             return self.json(404, {"error": "unknown agent"})
         if not self.allowed(agent):
             return
         kind = self.form().get("kind") if self.body() else None
-        if kind not in (None, "shown", "gone", "untaken", "start_failed"):
-            return self.json(400, {"error": "kind is shown, gone, untaken or start_failed"})
+        if kind not in (None, "shown", "gone", "untaken", "start_failed", "frozen", "moving"):
+            return self.json(400, {"error": "kind is shown, gone, untaken, start_failed, frozen or moving"})
         if kind == "start_failed":
             # plan C6: why the start of a task's session failed, once for each distinct reason: kept for the loss
             # that it causes, and told to the requester once
@@ -27860,7 +27868,10 @@ class Handler(BaseHTTPRequestHandler):
                 turn_end_check(t, turn_state(t["id"], t["attempt"]), now(), force=True)
             return self.json(200, {})
         if agent == manager_name():
-            if kind is None:
+            if kind in ("frozen", "moving"):        # plan C2: a fact of the manager's flag (C10)
+                kv_set("mgr_screen_frozen", now() if kind == "frozen" else None)
+                manager_flag_update(now())
+            elif kind is None:
                 kv_set("mgr_screen", now())         # the timers turn this into a banner and a notification
             else:       # the watch says when it goes, so the banner stays until then and not for 90 seconds
                 kv_set("mgr_screen_shown", now() if kind == "shown" else None)
@@ -27873,13 +27884,33 @@ class Handler(BaseHTTPRequestHandler):
         except ToolError:
             return self.json(200, {})
         t = q1("SELECT * FROM tasks WHERE id=?", (tid,))
-        if kind == "gone":
+        if kind == "frozen":
+            # plan C2: its runtime may have stopped in the middle of a turn. The requester is told once, and the task
+            # waits on its screen until it moves again; nothing is ended
+            if t and t["state"] not in TERMINAL and not kv_get(f"screen_frozen:{tid}"):
+                kv_set(f"screen_frozen:{tid}", now())
+                q("UPDATE tasks SET waiting_on='its screen' WHERE id=?", (tid,))
+                emit(t["requester"], "say",
+                     f"[hub] {agent}'s session for {tref(tid)} ({t['title']}) is in the middle of a turn, and its screen "
+                     f"stopped moving: its runtime may be frozen. Look at that machine, or start the task again with "
+                     f"restart_task.", task=tid)
+                log("hub", f"{tref(tid)} on {agent}: its running screen stopped moving")
+            return self.json(200, {})
+        if kind in ("gone", "moving"):
+            if kind == "moving":
+                if not kv_get(f"screen_frozen:{tid}"):
+                    return self.json(200, {})
+                kv_set(f"screen_frozen:{tid}", None)
+                log("hub", f"{tref(tid)} on {agent}: its screen moves again")
+            elif kv_get(f"screen_frozen:{tid}"):
+                return self.json(200, {})           # it still waits on its frozen screen
             if t and t["state"] not in TERMINAL and t["waiting_on"] == "its screen":
                 # what the task waits on again: the question it asked, if one is open, else nothing on its screen
                 asked = q1("SELECT id FROM questions WHERE task=? AND answer IS NULL AND assumed IS NULL ORDER BY id",
                            (tid,))
                 q("UPDATE tasks SET waiting_on=? WHERE id=?", (f"Q-{asked['id']}" if asked else None, tid))
-                log("hub", f"{tref(tid)} on {agent}: the question on its screen went")
+                if kind == "gone":
+                    log("hub", f"{tref(tid)} on {agent}: the question on its screen went")
             return self.json(200, {})
         carried = q1("SELECT id FROM prompts WHERE task=? AND decision IS NULL AND kind<>'code'", (tid,))
         if carried and PROMPT_POLLS in helper_features(agent):

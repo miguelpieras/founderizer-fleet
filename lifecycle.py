@@ -114,6 +114,9 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
 #                     None when it drives one
 #   sandbox           how its start command says what it may touch, as the owner reads it; None when Fleet cannot
 #                     read it
+#   screen_counter    a running turn of its terminal session repaints an elapsed counter every second, read live on
+#                     the fleet's machines, so the screen watch takes a running screen that stopped changing for a
+#                     frozen runtime (fleet.Helper.watch_screens, plan C2); False where nobody has read it
 #
 # What is NOT here, because it is code and not a fact: how a runtime's records become a transcript (threads.py), how
 # its allowance is read (usage.py), what its own installer is (onboard.py), and how its sign-in window is driven to
@@ -157,6 +160,7 @@ RUNTIMES = {
                               "workspace-write": "the runtime limits writes to the workspace",
                               "read-only": "the runtime allows reads only"},
                     "otherwise": "see the Codex settings"},
+        "screen_counter": False,
     },
     "claude": {
         "label": "Claude Code",
@@ -195,6 +199,8 @@ RUNTIMES = {
         "sandbox": {"name": "Claude", "flag": "--permission-mode", "value": "[A-Za-z]+", "unset": "default",
                     "words": {},
                     "otherwise": "the session settings allow and deny tools; they are not an OS boundary"},
+        # read on 2.1.285, 2.1.308 and 2.1.311 while a foreground `sleep 300` ran, 27 October 2026
+        "screen_counter": True,
     },
     "grok": {
         "label": "Grok",
@@ -221,13 +227,14 @@ RUNTIMES = {
         "no_sign_in": ("Fleet drives no Grok sign-in: xAI's terms do not let a third party run it this way. "
                        "Sign in to Grok yourself on {where} machine."),
         "sandbox": None,
+        "screen_counter": False,
     },
 }
 # Every fact above in one list, so that a new entry cannot quietly leave one out (test_runtime_table).
 RUNTIME_FACTS = ("label", "driver", "acp_command", "can", "full_access", "manager_access", "first_worker", "manager",
                  "owner_chat", "agent_messages", "conversation", "conversation_why", "mcp_servers", "app_server",
                  "switch", "session_settings", "token_in_env", "model_flags", "local_model", "sign_in", "sign_out",
-                 "no_sign_in", "sandbox")
+                 "no_sign_in", "sandbox", "screen_counter")
 
 
 def runtime_fact(runtime, fact, otherwise=None):
