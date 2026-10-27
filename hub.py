@@ -15038,18 +15038,11 @@ def plain_words(text):
     return " ".join(str(text or "").translate(PLAIN_QUOTES).split()).casefold()
 
 
-def contact_driven(task_id):
-    """True when a person's message drives this task: AUTONOMY.md P2's tasks.source_conversation, which lane L2 adds.
-    Read by name, so this holds before that column exists. A read that commits nothing."""
-    t = read_row("SELECT * FROM tasks WHERE id=?", (task_id,)) if task_id else None
-    return bool(t and "source_conversation" in t.keys() and t["source_conversation"])
-
-
-def standing_source(agent, source, words=None, task_id=None):
+def standing_source(agent, source, words=None):
     """(author_kind, author, conversation, message) of what `agent` keeps or ends on the word of `source`, or a
     ToolError (AUTONOMY.md 6.2). No source: the agent itself. M-<n>: the owner's own words, a message of his or a
     steer, that went to this agent or to an agent above it in its line, which passes his words on; never in a session
-    that a person's message drives, which must not learn what the owner said. CM-<n>: a person's message in this
+    that a person's message drives (contact_session), which must not learn what the owner said. CM-<n>: a person's message in this
     agent's own conversation, while contacts.v2 is on. Words, when given, must be part of that message: a line inside
     a customer's email cannot pass for another person's wish."""
     if source in (None, ""):
@@ -15060,7 +15053,7 @@ def standing_source(agent, source, words=None, task_id=None):
                         "Leave it out for an item of your own, which is also how you keep another agent's wish.")
     prefix, n = m.group(1).upper(), int(m.group(2))
     if prefix == "M":
-        if contact_driven(task_id):
+        if contact_session(agent):
             raise ToolError("A session that a person's message drives keeps nothing on the owner's word.")
         said = read_row("SELECT text, recipient FROM ui_requests WHERE event_id=?", (n,)) or read_row(
             "SELECT s.text, t.owner recipient FROM steers s JOIN tasks t ON t.id=s.task WHERE s.event_id=?", (n,))
@@ -15371,7 +15364,7 @@ def t_keep_instruction(agent, a):
     scope = item_scope(agent, a.get("scope"))
     task = session_task(agent, a)
     guard(agent, words)
-    kind, author, conversation, message = standing_source(agent, a.get("source"), words, task)
+    kind, author, conversation, message = standing_source(agent, a.get("source"), words)
     return standing_keep(agent, task, {"scope": scope, "kind": "instruction", "words": words, "author_kind": kind,
                                        "author": author, "conversation": conversation, "message": message})
 
@@ -15393,7 +15386,7 @@ def t_set_target(agent, a):
         raise ToolError("A target from a message gives words: its author's own words of it, as written there.")
     words = item_words(a["words"]) if a.get("words") not in (None, "") else target_words(measure, number, due)
     guard(agent, words, measure, how)
-    kind, author, conversation, message = standing_source(agent, a.get("source"), words if sourced else None, task)
+    kind, author, conversation, message = standing_source(agent, a.get("source"), words if sourced else None)
     return standing_keep(agent, task, {"scope": scope, "kind": "target", "words": words, "measure": measure,
                                        "number": number, "due": due, "how": how, "check": check, "progress": progress,
                                        "author_kind": kind, "author": author, "conversation": conversation,
@@ -15465,7 +15458,7 @@ def t_end_standing(agent, a):
                 f"Nothing changed.")
     guard(agent, why)
     task = session_task(agent, a)
-    asked_by = standing_source(agent, a.get("asked_by"), None, task)[1] if a.get("asked_by") not in (None, "") else agent
+    asked_by = standing_source(agent, a.get("asked_by"))[1] if a.get("asked_by") not in (None, "") else agent
     with transaction():
         standing_end_rows(r, agent, asked_by, why, now(), task)
     return (f"{iref(item)} ended" + (f", as {standing_who(asked_by, agent)} asked" if asked_by != agent else "")
