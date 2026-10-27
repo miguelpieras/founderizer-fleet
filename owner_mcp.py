@@ -307,6 +307,8 @@ PAGES = {
     "trigger": ("/ui/triggers/{id}", "one wake-up rule with its next due times and its runs"),
     "responsibilities": ("/ui/responsibilities", "every duty with its watches, open cases and counters"),
     "responsibility": ("/ui/responsibilities/{id}", "one duty with its cases, newest first"),
+    "standing": ("/ui/standing", "the standing instructions and targets that steer agents, newest first, ended ones "
+                                 "included (give agent for the ones that steer one agent)"),
     "goal": ("/ui/goals/{id}", "one goal with its recorded spending and its history"),
     "resources": ("/ui/resources", "the grantable pool: each resource, the owner's standing for it, who holds it"),
     "profiles": ("/ui/profiles", "every agent's profile at the hub revision"),
@@ -1140,6 +1142,10 @@ def tools():
               "note": S["note"], **rid}, ("id", "action"),
              with_revision("/ui/responsibilities/{id}/state", "responsibility", ("action", "note"),
                            "this duty change")),
+        tool("end_standing", "End one standing item (an instruction or a target) of any agent, with why. Its agent's "
+                             "running sessions are told at once, and its new sessions no longer start with it.",
+             {"id": S["int"], "why": S["note"], **rid}, ("id",),
+             plain("/ui/standing/{id}/end", ("why",), "the end of this standing item")),
         tool("trigger_state", "Pause, resume, delete, run now or check now one wake-up rule.",
              {"id": S["int"], "action": {"type": "string",
                                          "enum": ["pause", "resume", "delete", "run_now", "check_now"]}, **rid},

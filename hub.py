@@ -99,6 +99,17 @@ CREATE TABLE IF NOT EXISTS reports(id INTEGER PRIMARY KEY, from_agent TEXT NOT N
   UNIQUE(from_agent, request_id));
 CREATE INDEX IF NOT EXISTS report_open ON reports(to_agent, decided, id);
 CREATE INDEX IF NOT EXISTS report_from ON reports(from_agent, id);
+-- Standing items (AUTONOMY.md P3): a lasting wish that steers an agent from then on, an instruction or a target. agent
+-- holds it, for itself (scope agent) or for every agent of its team as well (scope team). author is an agent
+-- (author_kind agent), 'owner' (owner) or 'P-<id>' (person); message is the message its words are part of: the owner's
+-- event (M-), an agent message (AM-) or a conversation message (CM-), by author_kind. A target also has its measure,
+-- number, due, how, the wake-up rule of the check that measures it and its newest progress. ended_by is who asked
+-- for the end: 'owner', 'P-<id>' or an agent.
+CREATE TABLE IF NOT EXISTS standing(id INTEGER PRIMARY KEY, agent TEXT NOT NULL, scope TEXT NOT NULL, kind TEXT NOT NULL,
+  words TEXT NOT NULL, measure TEXT, number REAL, due REAL, how TEXT, "check" INTEGER, progress REAL,
+  author_kind TEXT NOT NULL, author TEXT NOT NULL, conversation INTEGER, message INTEGER, created REAL NOT NULL,
+  ended REAL, ended_by TEXT, ended_why TEXT);
+CREATE INDEX IF NOT EXISTS standing_of ON standing(agent, ended, id);
 CREATE TABLE IF NOT EXISTS prompts(id INTEGER PRIMARY KEY, task INTEGER, agent TEXT, tool TEXT, input TEXT,
   key TEXT, created REAL, decision TEXT, reason TEXT, decided REAL, by TEXT);
 CREATE TABLE IF NOT EXISTS rules(id INTEGER PRIMARY KEY, agent TEXT, tool TEXT, key TEXT, input TEXT, decision TEXT);
@@ -731,7 +742,8 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "releases", "entitlement", "agent_signin", "github_app", "need_options", "restore",
                "manager_start", "agent_notes", "edit_in_place", "machine_access", "push",
                "attachment_knowledge", "asking_and_waiting", "account_limits", "secret_requests",
-               "secret_deliveries", "agent_rename", "agent_memory", "live_changes"]
+               "secret_deliveries", "agent_rename", "agent_memory", "live_changes",
+               "standing"]
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # One name is not here because it is not always true: central_vault, which ui_features() adds only while the central
 # vault answers (central_ok).
@@ -2038,7 +2050,9 @@ def start_text(agent, task_id, resume=False):
             + notes_start_text(agent) + memory_start_text(agent, task_id)
             # manager_as_lead: and, when this task is one part of a split piece of work, which piece and who holds
             # the other parts -- a part that does not know it is a part does the whole piece.
-            + part_start_text(task_id))
+            + part_start_text(task_id)
+            # L3: the standing items that steer this agent (AUTONOMY.md 6.4). L8's structure moves this call.
+            + standing_start_text(agent))
     # Masked on the way out, not only where each part was written: this text carries the agent's own notes, its
     # lessons and its holdings, and a login registered after any of them was stored was never masked at the write.
     if role_of(agent) == "lead":
@@ -8885,6 +8899,7 @@ def person_remove(pid, t0):
     if not p:
         raise Refusal(404, "no such person")
     with transaction():
+        standing_person_rows(pid, f"{p['name']} was removed", t0)    # L3 (AUTONOMY.md P3), while the name is there
         convs = [r["id"] for r in DB.execute("SELECT id FROM conversations WHERE person=?", (pid,)).fetchall()]
         for cid in convs:
             DB.execute("DELETE FROM conversation_messages WHERE conversation=?", (cid,))
@@ -13969,13 +13984,551 @@ def t_grant_access(agent, a):
     return text
 
 
+# ---------------------------------------------------------------- standing items (AUTONOMY.md P3)
+#
+# A standing item is a lasting wish that steers an agent from then on: an instruction (how to behave, what to decide)
+# or a target (what to reach: a measure, a number, a date and how it is measured). The agent keeps it itself -- from
+# its own data, or because the owner, a person whose role allows it or another agent asked -- and ends it when its
+# author, such a person or the owner asks, or when a target is reached. When the words came in a message, the hub
+# checks that they are that message's own words, so a line inside a customer's email cannot pass for the manager
+# contact's wish. An item steers work inside the agent's access: it never gives access, money or a credential. Every
+# new session of the agent starts with its active items (standing_start_text), a running session gets a new or an
+# ended one as a message at once, and the owner reads one quiet line in his chat with the fleet manager for each new
+# and each ended item (AUTONOMY.md section 5, element 2, which he approved).
+
+STANDING_SCOPES = ("agent", "team")
+STANDING_WORDS_MAX = 600        # characters of an item's words
+STANDING_FIELD_MAX = 300        # characters of a target's measure and of how it is measured
+STANDING_WHY_MAX = 500          # characters of why an item ended
+STANDING_CHARS = 1500           # the most that the items add to a session's opening text
+STANDING_LINE = 360             # characters of one item there
+STANDING_PAGE = 200             # items of one owner read
+ITEM_REF = re.compile(r"(?i)^\s*I-?([1-9][0-9]{0,17})\s*$")
+SOURCE_REF = re.compile(r"(?i)^\s*(M|CM)-?([1-9][0-9]{0,17})\s*$")
+SOURCE_PREFIX = {"owner": "M", "person": "CM"}         # author_kind: the message its words are part of
+PLAIN_QUOTES = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u00a0": " "})
+
+
+def iref(item_id):
+    return f"I-{item_id}"
+
+
+def parse_item(value):
+    m = ITEM_REF.match(str(value or ""))
+    if not m:
+        raise ToolError(f"'{value}' is not a standing item. Use the form I-7.")
+    return int(m.group(1))
+
+
+def people_items_on():
+    """Items that people give need conversations that act (AUTONOMY.md P2), so the person path stays unused until the
+    fleet setting contacts.v2 is on."""
+    settings = TEAM.get("settings")
+    return isinstance(settings, dict) and settings.get("contacts.v2") is True
+
+
+def line_above(agent):
+    """The agents whose team `agent` is in, nearest first: its lead, that lead's lead, and so on up to the fleet
+    manager. team.json only."""
+    out, at = [], agent
+    while True:
+        up = reports_to(at)
+        if not up or up == agent or up in out:
+            return out
+        out.append(up)
+        at = up
+
+
+def team_below(holder):
+    """Every agent whose reporting line goes up to `holder`: a lead's team, a nested lead's team included, and the
+    whole fleet for the fleet manager."""
+    return [name for name in agents() if name != holder and holder in line_above(name)]
+
+
+def plain_words(text):
+    """Text as the provenance check compares it: one space between words, straight quotes, no case."""
+    return " ".join(str(text or "").translate(PLAIN_QUOTES).split()).casefold()
+
+
+def contact_driven(task_id):
+    """True when a person's message drives this task: AUTONOMY.md P2's tasks.source_conversation, which lane L2 adds.
+    Read by name, so this holds before that column exists. A read that commits nothing."""
+    t = read_row("SELECT * FROM tasks WHERE id=?", (task_id,)) if task_id else None
+    return bool(t and "source_conversation" in t.keys() and t["source_conversation"])
+
+
+def standing_source(agent, source, words=None, task_id=None):
+    """(author_kind, author, conversation, message) of what `agent` keeps or ends on the word of `source`, or a
+    ToolError (AUTONOMY.md 6.2). No source: the agent itself. M-<n>: the owner's own words, a message of his or a
+    steer, that went to this agent or to an agent above it in its line, which passes his words on; never in a session
+    that a person's message drives, which must not learn what the owner said. CM-<n>: a person's message in this
+    agent's own conversation, while contacts.v2 is on. Words, when given, must be part of that message: a line inside
+    a customer's email cannot pass for another person's wish."""
+    if source in (None, ""):
+        return "agent", agent, None, None
+    m = SOURCE_REF.match(str(source))
+    if not m:
+        raise ToolError("source names the message the words came from: M-12 (the owner's) or CM-41 (a person's). "
+                        "Leave it out for an item of your own, which is also how you keep another agent's wish.")
+    prefix, n = m.group(1).upper(), int(m.group(2))
+    if prefix == "M":
+        if contact_driven(task_id):
+            raise ToolError("A session that a person's message drives keeps nothing on the owner's word.")
+        said = read_row("SELECT text, recipient FROM ui_requests WHERE event_id=?", (n,)) or read_row(
+            "SELECT s.text, t.owner recipient FROM steers s JOIN tasks t ON t.id=s.task WHERE s.event_id=?", (n,))
+        if not said or said["recipient"] not in [agent] + line_above(agent):
+            raise ToolError(f"M-{n} is no message of the owner's to you or to an agent above you in your line.")
+        found = ("owner", "owner", None, n, said["text"])
+    else:
+        if not people_items_on():
+            raise ToolError("Items from people start with the fleet setting contacts.v2, which is off. Keep this one "
+                            "as your own, or not at all.")
+        said = read_row("SELECT m.text, m.who, c.id conversation, c.agent, c.person FROM conversation_messages m "
+                        "JOIN conversations c ON c.id=m.conversation WHERE m.id=?", (n,))
+        person = read_row("SELECT * FROM people WHERE id=?", (said["person"],)) if said else None
+        if not said or said["agent"] != agent or said["who"] != "person" or not person or \
+                person["blocked"] is not None or not person_may(person["id"], agent):
+            raise ToolError(f"CM-{n} is no message of a person's in your own conversation.")
+        found = ("person", f"P-{person['id']}", said["conversation"], n, said["text"])
+    if words is not None:
+        quoted = plain_words(words).strip(" .,;:!?\"'()")
+        if not quoted or quoted not in plain_words(found[4]):
+            raise ToolError(f"These words are not part of {prefix}-{n}. Give the author's own words as they are "
+                            f"written there, or keep the item as your own, without source.")
+    return found[:4]
+
+
+def item_source(r):
+    """The message that item `r`'s words are part of, as its readers name it, or None."""
+    prefix = SOURCE_PREFIX.get(r["author_kind"])
+    return f"{prefix}-{r['message']}" if prefix and r["message"] else None
+
+
+def person_name(ref):
+    """The name of the person P-<id>, or None for one who is gone. A read that commits nothing."""
+    m = re.fullmatch(r"P-([1-9][0-9]*)", str(ref or ""))
+    p = read_row("SELECT name FROM people WHERE id=?", (int(m.group(1)),)) if m else None
+    return p["name"] if p else None
+
+
+def standing_who(author, reader=None):
+    """'owner', 'P-<id>' or an agent, as its reader reads it."""
+    if author == "owner":
+        return "the owner"
+    if str(author or "").startswith("P-"):
+        return person_name(author) or "a person who is gone"
+    return "you" if author == reader else author
+
+
+def item_number(x):
+    return f"{int(x)}" if float(x).is_integer() else f"{x:g}"
+
+
+def item_day(ts):
+    import datetime
+    return datetime.datetime.fromtimestamp(ts, goal_settings()[2]).strftime("%Y-%m-%d")
+
+
+def target_words(measure, number, due):
+    """A target's words when nobody gave any: the agent's own target, from its own fields."""
+    return f"{measure}: reach {item_number(number)}" + (f" by {item_day(due)}" if due else "")
+
+
+def target_detail(r, t0):
+    """How a target is measured, in words: its number and date, how, its check and its newest progress."""
+    return (f"measure: {r['measure']}; reach {item_number(r['number'])}"
+            + (f" by {item_day(r['due'])}" + (" (passed)" if r["due"] < t0 else "") if r["due"] else "")
+            + f"; how: {r['how']}"
+            + (f"; its check is the one of wake-up rule {r['check']}" if r["check"] else "")
+            + (f"; progress {item_number(r['progress'])}" if r["progress"] is not None else "; no progress yet"))
+
+
+def standing_line(r, reader, t0):
+    """One active item in one line, for an agent that it steers."""
+    scope = "" if r["scope"] != "team" else " for your team" if r["agent"] == reader else f" for {r['agent']}'s team"
+    source = item_source(r)
+    line = (f"{iref(r['id'])} {r['kind']}{scope}, from {standing_who(r['author'], reader)}"
+            + (f" ({source})" if source else "") + f", {ago(r['created'])} ago: {r['words']}"
+            + (f" [{target_detail(r, t0)}]" if r["kind"] == "target" else ""))
+    return clip(line, STANDING_LINE)
+
+
+def steering_items(agent):
+    """The active items that steer `agent`, nearest first: its own, then the team items of each agent above it. A read
+    that commits nothing: start_text runs inside admit_task's transaction."""
+    above = line_above(agent)
+    rows = read_rows(f"SELECT * FROM standing WHERE ended IS NULL AND (agent=? OR (scope='team' AND agent IN "
+                     f"({','.join('?' * len(above)) or 'NULL'}))) ORDER BY id", (agent, *above))
+    order = {name: i for i, name in enumerate([agent] + above)}
+    return sorted(rows, key=lambda r: (order.get(r["agent"], len(order)), r["id"]))
+
+
+def standing_start_text(agent):
+    """L3's part of the per-task block (AUTONOMY.md 6.4): the active items that steer `agent`, for every new session of
+    it. Until L8's structure is on main, start_text and manager_resume_text call it at their end."""
+    rows = steering_items(agent)
+    if not rows:
+        return ""
+    t0, kept, left = now(), [], 0
+    for r in rows:
+        line = standing_line(r, agent, t0)
+        if sum(len(x) + 3 for x in kept) + len(line) <= STANDING_CHARS:
+            kept.append(line)
+        else:
+            left += 1
+    return ("\nSTANDING ITEMS, lasting wishes that steer your work from now on, inside your access and never beyond it: "
+            + " | ".join(kept) + (f" | and {left} more: see_standing" if left else "")
+            + ". End one of yours with end_standing when its author, a person whose role allows it or the owner asks, "
+              "or when a target is reached.\n")
+
+
+def standing_said(r, actor=None, asked_by=None, why=None):
+    """The owner's one quiet line about a new item, or with `actor` about an ended one (AUTONOMY.md section 5, element
+    2): "Africa gave hgr-manager I-7: decide refunds up to one month's fee. Say 'end I-7' to stop it." actor is the
+    agent that ended it, or 'owner' for his own end and for a person he blocked or removed."""
+    ref, holder = iref(r["id"]), r["agent"] + ("'s team" if r["scope"] == "team" else "")
+    if actor is None:
+        if r["author"] == r["agent"]:
+            head = f"{r['agent']} set {'its team' if r['scope'] == 'team' else 'itself'} {ref}"
+        else:
+            head = f"{'You' if r['author'] == 'owner' else standing_who(r['author'])} gave {holder} {ref}"
+        return head + (", a target" if r["kind"] == "target" else "") + f": {r['words']}. Say 'end {ref}' to stop it."
+    said = (f"You ended {ref}" if actor == "owner" else f"{actor} ended {ref}") + f" ({clip(r['words'], 120)})"
+    if asked_by not in (None, actor):
+        said += f", as {'you' if asked_by == 'owner' else standing_who(asked_by)} asked"
+    return said + (f": {why}" if why else "") + "."
+
+
+def standing_news_rows(r, said, by_agent, by_task, t0):
+    """Inside the transaction that keeps or ends item `r`: one message to each running session that it steers, at once.
+    A worker's or a lead's session reads only its own task's messages, so each open task of each agent it reaches gets
+    its own, and the fleet manager's standing session gets one. The session that made the change knows it already.
+    said(reader) is the message for one reader."""
+    in_transaction("standing_news_rows")
+    for name in [r["agent"]] + (team_below(r["agent"]) if r["scope"] == "team" else []):
+        if role_of(name) == "manager":
+            if name != by_agent:
+                DB.execute(EVENT, (name, "say", None, said(name), t0, "{}"))
+            continue
+        for t in DB.execute(f"SELECT id FROM tasks WHERE owner=? AND {OPEN_TASK}", (name,)).fetchall():
+            if t["id"] != by_task:
+                DB.execute(EVENT, (name, "say", t["id"], said(name), t0, "{}"))
+
+
+def standing_new_rows(agent, fields, by_task, t0):
+    """Inside a transaction: one new item of `agent`, its quiet line in the owner's chat with the fleet manager and a
+    message to each running session that it steers. Returns its id."""
+    in_transaction("standing_new_rows")
+    cols = dict(fields, agent=agent, created=t0)
+    item = DB.execute(f"INSERT INTO standing({','.join(chr(34) + c + chr(34) for c in cols)}) "
+                      f"VALUES({','.join('?' * len(cols))})", tuple(cols.values())).lastrowid
+    r = DB.execute("SELECT * FROM standing WHERE id=?", (item,)).fetchone()
+    DB.execute("INSERT INTO owner_reports(text,about,created,agent,in_reply_to) VALUES(?,?,?,?,NULL)",
+               (standing_said(r), f"standing {iref(item)} of {agent}", t0, manager_name()))
+    standing_news_rows(r, lambda reader: (
+        f"[hub] New standing item: {standing_line(r, reader, t0)}. It steers your work from now on, inside your "
+        f"access."), agent, by_task, t0)
+    log_row(agent, f"kept {iref(item)}, a {r['kind']} for {'its team' if r['scope'] == 'team' else 'itself'}, from "
+                   f"{r['author']}" + (f" ({item_source(r)})" if item_source(r) else ""))
+    return item
+
+
+def standing_end_rows(r, actor, asked_by, why, t0, by_task=None):
+    """Inside a transaction: item `r` ends. actor is the agent that ended it, or 'owner' for the owner's own end and for
+    a person he blocked or removed; asked_by, who asked: 'owner', 'P-<id>' or an agent (AUTONOMY.md P3: the hub records
+    who asked). Its quiet line and a message to each running session that it steered go with it."""
+    in_transaction("standing_end_rows")
+    DB.execute("UPDATE standing SET ended=?, ended_by=?, ended_why=? WHERE id=? AND ended IS NULL",
+               (t0, asked_by, why, r["id"]))
+    DB.execute("INSERT INTO owner_reports(text,about,created,agent,in_reply_to) VALUES(?,?,?,?,NULL)",
+               (standing_said(r, actor, asked_by, why), f"standing {iref(r['id'])} of {r['agent']}", t0,
+                manager_name()))
+    standing_news_rows(r, lambda reader: (
+        f"[hub] Standing item {iref(r['id'])} ended" + (f" ({why})" if why else "") + f": {clip(r['words'], 200)}. "
+        f"Stop following it."), actor, by_task, t0)
+    log_row(actor, f"ended {iref(r['id'])}, as {asked_by} asked: {why or '-'}")
+
+
+def standing_person_rows(pid, why, t0, kept_agents=None):
+    """Inside the transaction that blocks or removes a person, or takes agents off their list: the items they gave end,
+    on the owner's word (AUTONOMY.md P3: blocking or removing a person ends their items). With kept_agents, only the
+    items of the agents they lost."""
+    in_transaction("standing_person_rows")
+    for r in DB.execute("SELECT * FROM standing WHERE ended IS NULL AND author_kind='person' AND author=? ORDER BY id",
+                        (f"P-{pid}",)).fetchall():
+        if kept_agents is None or r["agent"] not in kept_agents:
+            standing_end_rows(r, "owner", "owner", why, t0)
+
+
+def record_progress(target, value, source):
+    """Inside the caller's transaction: the newest progress of a target. L4 calls it in a check run's decision when the
+    check prints `progress <number>` as its first line (AUTONOMY.md 6.5), and set_target when an agent reports the
+    progress of a target that names no check. source is the number of the wake-up rule whose check measured it, or the
+    name of the agent that reported it; target is an item id, or None for every active target that names that check.
+    A target that names a check takes its progress only from that check. Returns None when it recorded, else why not,
+    in words: it raises nothing for a refused value, so a refused line never costs a check its run, and it wakes
+    nobody (a check wakes its agent with its own lines)."""
+    in_transaction("record_progress")
+    if isinstance(value, bool):
+        return "progress is a number."
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "progress is a number."
+    if not math.isfinite(value):
+        return "progress is a finite number."
+    check = source if isinstance(source, int) and not isinstance(source, bool) else None
+    if target is None:
+        if check is None:
+            return "Without a target, progress comes from a check."
+        rows = read_rows("SELECT * FROM standing WHERE kind='target' AND ended IS NULL AND \"check\"=? ORDER BY id",
+                         (check,))
+        if not rows:
+            return f"No active target names the check of wake-up rule {check}."
+    else:
+        rows = read_rows("SELECT * FROM standing WHERE id=? AND kind='target'", (target,))
+        if not rows:
+            return f"There is no target {iref(target)}."
+    for r in rows:
+        if r["ended"]:
+            return f"{iref(r['id'])} has ended."
+        if r["check"] and r["check"] != check:
+            return (f"{iref(r['id'])} takes its progress only from the check of wake-up rule {r['check']}, which "
+                    f"records it at each run.")
+        if check is not None and r["check"] != check:
+            return f"{iref(r['id'])} does not name the check of wake-up rule {check}."
+    for r in rows:
+        DB.execute("UPDATE standing SET progress=? WHERE id=?", (value, r["id"]))
+    return None
+
+
+def item_words(value, what="words"):
+    words = " ".join(str(value or "").split())
+    if not words or len(words) > STANDING_WORDS_MAX:
+        raise ToolError(f"{what} is 1 to {STANDING_WORDS_MAX} characters: the wish in one sentence.")
+    return words
+
+
+def item_field(value, what):
+    text = " ".join(str(value or "").split())
+    if not text or len(text) > STANDING_FIELD_MAX:
+        raise ToolError(f"{what} is 1 to {STANDING_FIELD_MAX} characters.")
+    return text
+
+
+def item_value(value, what):
+    if isinstance(value, bool):
+        raise ToolError(f"{what} is a number, for example 90.")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ToolError(f"{what} is a number, for example 90.") from None
+    if not math.isfinite(number):
+        raise ToolError(f"{what} is a finite number.")
+    return number
+
+
+def item_scope(agent, value):
+    scope = str(value or "").strip().lower()
+    if scope not in STANDING_SCOPES:
+        raise ToolError("scope is agent (it steers you) or team (it steers you and every agent of your team).")
+    if scope == "team" and not team_below(agent):
+        raise ToolError("Nobody is in your team, so an item for it would steer only you: scope agent.")
+    return scope
+
+
+def target_check(agent, value):
+    """The wake-up rule whose code check measures a target: one of the agent's own, or None."""
+    if value in (None, ""):
+        return None
+    try:
+        rule = wakeups.trigger_ref(value)
+    except wakeups.Refused:
+        raise ToolError("check is the number of one of your own wake-up rules with a code check, for example 7.") \
+            from None
+    row = read_row("SELECT agent, state, check_spec FROM triggers WHERE id=?", (rule,))
+    if not row or row["agent"] != agent or row["state"] == "deleted" or not row["check_spec"]:
+        raise ToolError(f"Wake-up rule {rule} is not one of your own with a code check (see_triggers).")
+    return rule
+
+
+def session_task(agent, a):
+    """The task of the calling session, or None in the fleet manager's standing session."""
+    if role_of(agent) == "manager" or a.get("task_id") in (None, ""):
+        return None
+    return parse_task(a["task_id"])
+
+
+def standing_keep(agent, task, fields):
+    """The new item, or the one of the same kind, scope and words that already stands: keeping a wish twice keeps it
+    once."""
+    for r in read_rows("SELECT * FROM standing WHERE agent=? AND kind=? AND scope=? AND ended IS NULL ORDER BY id",
+                       (agent, fields["kind"], fields["scope"])):
+        if plain_words(r["words"]) == plain_words(fields["words"]):
+            return f"{iref(r['id'])} already says this, and it stands. Nothing changed."
+    t0 = now()
+    with transaction():
+        item = standing_new_rows(agent, fields, task, t0)
+    team = team_below(agent) if fields["scope"] == "team" else []
+    return (f"Kept as {iref(item)}. It steers your work from now on" + (f", and the work of {', '.join(team)}" if team
+                                                                       else "")
+            + ": every new session starts with it, and every other running session gets it as a message. The owner "
+              f"reads one quiet line about it. End it with end_standing(id=\"{iref(item)}\", why=...) when its author, "
+              "a person whose role allows it or the owner asks" + (", or when it is reached" if fields["kind"] ==
+                                                                   "target" else "") + ".")
+
+
+def t_keep_instruction(agent, a):
+    words = item_words(a.get("words"))
+    scope = item_scope(agent, a.get("scope"))
+    task = session_task(agent, a)
+    guard(agent, words)
+    kind, author, conversation, message = standing_source(agent, a.get("source"), words, task)
+    return standing_keep(agent, task, {"scope": scope, "kind": "instruction", "words": words, "author_kind": kind,
+                                       "author": author, "conversation": conversation, "message": message})
+
+
+def t_set_target(agent, a):
+    task = session_task(agent, a)
+    if a.get("id") not in (None, ""):
+        return target_update(agent, parse_item(a["id"]), a)
+    measure, how = item_field(a.get("measure"), "measure"), item_field(a.get("how"), "how")
+    number = item_value(a.get("number"), "number")
+    due = parse_wake(a["due"], "due", within=None) if a.get("due") not in (None, "") else None
+    scope = item_scope(agent, a.get("scope"))
+    check = target_check(agent, a.get("check"))
+    progress = None if a.get("progress") in (None, "") else item_value(a["progress"], "progress")
+    if check and progress is not None:
+        raise ToolError("A target with a check takes its progress only from that check: leave progress out.")
+    sourced = a.get("source") not in (None, "")
+    if sourced and a.get("words") in (None, ""):
+        raise ToolError("A target from a message gives words: its author's own words of it, as written there.")
+    words = item_words(a["words"]) if a.get("words") not in (None, "") else target_words(measure, number, due)
+    guard(agent, words, measure, how)
+    kind, author, conversation, message = standing_source(agent, a.get("source"), words if sourced else None, task)
+    return standing_keep(agent, task, {"scope": scope, "kind": "target", "words": words, "measure": measure,
+                                       "number": number, "due": due, "how": how, "check": check, "progress": progress,
+                                       "author_kind": kind, "author": author, "conversation": conversation,
+                                       "message": message})
+
+
+def target_update(agent, item, a):
+    """set_target with id: new values of one of the agent's own active targets. Its scope, its source and the words
+    that somebody else gave stay as it was kept; a new progress is the agent's own report of it."""
+    r = read_row("SELECT * FROM standing WHERE id=? AND kind='target'", (item,))
+    if not r:
+        raise ToolError(f"There is no target {iref(item)}.")
+    if r["agent"] != agent:
+        raise ToolError(f"{iref(item)} is {r['agent']}'s target, not yours.")
+    if r["ended"]:
+        raise ToolError(f"{iref(item)} ended {ago(r['ended'])} ago. Keep a new one with set_target.")
+    for field in ("scope", "source"):
+        if a.get(field) not in (None, ""):
+            raise ToolError(f"A target keeps the {field} it was kept with: end it with end_standing and keep a new one.")
+    change = {}
+    if a.get("measure") not in (None, ""):
+        change["measure"] = item_field(a["measure"], "measure")
+    if a.get("how") not in (None, ""):
+        change["how"] = item_field(a["how"], "how")
+    if a.get("number") not in (None, ""):
+        change["number"] = item_value(a["number"], "number")
+    if a.get("due") not in (None, ""):
+        change["due"] = parse_wake(a["due"], "due", within=None)
+    if a.get("check") not in (None, ""):
+        change["check"] = target_check(agent, a["check"])
+    own = r["author"] == agent and not r["message"]
+    if a.get("words") not in (None, ""):
+        if not own:
+            raise ToolError(f"The words of {iref(item)} are {standing_who(r['author'], agent)}'s, as given.")
+        change["words"] = item_words(a["words"])
+    elif own and r["words"] == target_words(r["measure"], r["number"], r["due"]) and \
+            {"measure", "number", "due"} & set(change):
+        new = dict(r)
+        new.update(change)
+        change["words"] = target_words(new["measure"], new["number"], new["due"])
+    progress = None if a.get("progress") in (None, "") else item_value(a["progress"], "progress")
+    if progress is not None and change.get("check", r["check"]):
+        raise ToolError(f"{iref(item)} takes its progress only from its check: leave progress out.")
+    if not change and progress is None:
+        raise ToolError("Give what changes: measure, number, due, how, check, words or progress.")
+    guard(agent, *[str(v) for v in change.values()])
+    with transaction():
+        if change:
+            DB.execute(f"UPDATE standing SET {', '.join(chr(34) + c + chr(34) + '=?' for c in change)} WHERE id=?",
+                       (*change.values(), item))
+        if progress is not None:
+            record_progress(item, progress, agent)
+    r = read_row("SELECT * FROM standing WHERE id=?", (item,))
+    return f"{iref(item)} stands as: {r['words']} [{target_detail(r, now())}]."
+
+
+def t_end_standing(agent, a):
+    item = parse_item(a.get("id"))
+    why = " ".join(str(a.get("why") or "").split())
+    if not why or len(why) > STANDING_WHY_MAX:
+        raise ToolError(f"why is 1 to {STANDING_WHY_MAX} characters: why it ends, which the owner reads.")
+    r = read_row("SELECT * FROM standing WHERE id=?", (item,))
+    if not r:
+        raise ToolError(f"There is no standing item {iref(item)}.")
+    if r["agent"] != agent and role_of(agent) != "manager":
+        raise ToolError(f"{iref(item)} is {r['agent']}'s: ask {r['agent']} to end it, or {manager_name()}.")
+    if r["ended"]:
+        return (f"{iref(item)} already ended {ago(r['ended'])} ago, as {standing_who(r['ended_by'], agent)} asked. "
+                f"Nothing changed.")
+    guard(agent, why)
+    task = session_task(agent, a)
+    asked_by = standing_source(agent, a.get("asked_by"), None, task)[1] if a.get("asked_by") not in (None, "") else agent
+    with transaction():
+        standing_end_rows(r, agent, asked_by, why, now(), task)
+    return (f"{iref(item)} ended" + (f", as {standing_who(asked_by, agent)} asked" if asked_by != agent else "")
+            + ". New sessions no longer start with it, every other running session it steered is told, and the owner "
+              "reads one quiet line.")
+
+
+def t_see_standing(agent, a):
+    t0, out = now(), []
+    if role_of(agent) == "manager":
+        rows = read_rows("SELECT * FROM standing WHERE ended IS NULL ORDER BY agent, id")
+        out.append(f"EVERY ACTIVE STANDING ITEM OF THE FLEET ({len(rows)}):")
+        out += [f"  {r['agent']}: {standing_line(r, agent, t0)}" for r in rows] or ["  none"]
+        out.append("You end any of them with end_standing when the owner asks (asked_by=\"M-<n>\"); its agent ends its "
+                   "own.")
+        return "\n".join(out)
+    rows = steering_items(agent)
+    out.append(f"STANDING ITEMS THAT STEER YOU ({len(rows)}):")
+    out += [f"  {standing_line(r, agent, t0)}" for r in rows] or ["  none"]
+    team = team_below(agent)
+    if team:
+        held = read_rows(f"SELECT * FROM standing WHERE ended IS NULL AND agent IN ({','.join('?' * len(team))}) "
+                         f"ORDER BY agent, id", tuple(team))
+        out.append(f"ITEMS THAT THE AGENTS OF YOUR TEAM HOLD ({len(held)}):")
+        out += [f"  {r['agent']}: {standing_line(r, r['agent'], t0)}" for r in held] or ["  none"]
+    out.append("A lasting wish (\"from now on ...\", \"reach ... by ...\") of yours, the owner's, a person's or another "
+               "agent's is kept with keep_instruction or set_target, naming its message as source. End one of yours "
+               "with end_standing when its author, a person whose role allows it or the owner asks, or when a target "
+               "is reached.")
+    return "\n".join(out)
+
+
+def standing_view(r):
+    """One item for the owner's reads (GET /ui/standing)."""
+    view = {k: r[k] for k in ("id", "agent", "scope", "kind", "words", "measure", "number", "due", "how", "check",
+                              "progress", "author_kind", "author", "conversation", "message", "created", "ended",
+                              "ended_by", "ended_why")}
+    view.update(ref=iref(r["id"]), source=item_source(r),
+                author_name=person_name(r["author"]) if r["author_kind"] == "person" else None,
+                steers=[r["agent"]] + (team_below(r["agent"]) if r["scope"] == "team" else []))
+    return view
+
+
 # ---------------------------------------------------------------- reporting up, history and circles
 #
 # An agent had one upward verb, and it cost the task: ask_my_requester sets state='input-required' and tells the
 # session to stop. So an agent that was not blocked but had something worth saying had to block itself to say it, and
 # said nothing. report_up is the verb that costs nothing: it changes no state, it counts as a step (activity), and it
 # goes one level up, to tasks.requester - the lead for a subtask, the manager otherwise. A worker still cannot reach
-# the owner and cannot pass its lead; severity changes how it is delivered and never who gets it.
+# the owner and cannot pass its lead; severity changes how it is delivered and never who gets it. One kind is the
+# exception: a proposal needs the owner, so it goes to the fleet manager's weekly list for him (AUTONOMY.md P3).
 
 REPORT_KINDS = {
     "outside_task": "something this agent found that its own task does not cover",
@@ -13984,6 +14537,9 @@ REPORT_KINDS = {
                          "repository",
     "capacity": "what the work needs and the fleet does not have",
     "risk": "something that can go wrong, and what it would cost",
+    # AUTONOMY.md P3: it goes to the fleet manager's weekly list for the owner, whoever gave the task
+    "proposal": "an improvement that needs the owner -- new money, or a change of how the fleet works -- with its "
+                "evidence, its cost and how to undo it",
 }
 REPORT_SEVERITY = ("note", "soon", "now")
 REPORT_DECISIONS = {
@@ -14080,15 +14636,16 @@ def report_line(r):
 
 
 def open_reports(to_agent=None, kinds=True):
-    """The reports that wait for a decision, oldest first. A lesson_for_others wants no decision, so it is out of the
-    set that the sweep counts; it is still in a list the receiver reads, and decide_report still takes it."""
+    """The reports that wait for a decision, oldest first. A lesson_for_others wants no decision, and a proposal waits
+    for the fleet manager's weekly list, so both are out of the set that the sweep counts; they are still in a list
+    the receiver reads, and decide_report still takes them."""
     where = "decided IS NULL AND collapsed_into IS NULL"
     args = []
     if to_agent:
         where += " AND to_agent=?"
         args.append(to_agent)
     if not kinds:
-        where += " AND kind<>'lesson_for_others'"
+        where += " AND kind NOT IN ('lesson_for_others','proposal')"
     return q(f"SELECT * FROM reports WHERE {where} ORDER BY id", tuple(args))
 
 
@@ -14165,13 +14722,17 @@ def t_report_up(agent, a):
     t = get_task(tid, owner=agent)
     if t["state"] in TERMINAL:
         raise ToolError(f"{tref(tid)} is already {t['state']}. A finished task reports nothing.")
-    to = t["requester"]
+    # A proposal is for the owner, so it goes to the fleet manager's weekly list of them, and waits there to be read.
+    proposal = kind == "proposal"
+    to = manager_name() if proposal else t["requester"]
     command, stored = agent_write(agent, "report_up", a, {"task_id": tref(tid), "kind": kind, "text": text,
                                                           "about": about, "severity": severity})
     if stored:
         return stored["text"]
     t0 = now()
-    delivered, lowered = report_price(agent, severity, about, t0)
+    delivered, lowered = report_price(agent, severity, about, t0) if not proposal else \
+        ("note", None if severity == "note" else f"a proposal waits for {to}'s weekly list for the owner, so it went "
+                                                 f"in as note.")
     head = report_head(to, kind, about, text, t0)
     # filed_under reads with q1, which commits, so it is read here and not inside the transaction below: a read that
     # commits there would commit the half-written report. event_rows says the same of every other emit on this path.
@@ -14192,7 +14753,9 @@ def t_report_up(agent, a):
                                        t0, "{}")).lastrowid
             DB.execute("UPDATE reports SET event_id=? WHERE id=?", (event, rid))
         DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, agent, f"reported {upref(rid)} up to {to}"))
-        answer = (f"{upref(rid)} is with {to}. {tref(tid)} is untouched: go on with it." if not head else
+        answer = (f"{upref(rid)} is on {to}'s list of proposals, which it takes to the owner once a week. "
+                  f"{tref(tid)} is untouched: go on with it." if proposal and not head else
+                  f"{upref(rid)} is with {to}. {tref(tid)} is untouched: go on with it." if not head else
                   f"{upref(rid)} says the same as {upref(head['id'])}, which {to} has not decided yet, so it is one "
                   f"line for {to} and your own answer comes back to you. {tref(tid)} is untouched: go on with it.")
         if lowered:
@@ -14778,6 +15341,8 @@ def manager_resume_text():
     # question texts — and a login registered after any of them was stored was never masked at the write.
     return mask_secrets("Where the fleet stands, as the hub has it (nothing here is only in this session):\n"
                         + "\n".join(resume_lines(t0))
+                        # L3: its standing items (AUTONOMY.md 6.4). L8's structure moves this call.
+                        + standing_start_text(manager_name()).rstrip("\n")
                         + "\nThen call read_messages: its read is the receipt.")
 
 
@@ -14952,7 +15517,8 @@ TOOLS = [
     ("worker", "report_up", t_report_up,
      "Say something upward that your task does not cover, without stopping it: this changes no state and counts as a "
      "step, so use it instead of blocking yourself with ask_my_requester when you are not blocked. It goes to the "
-     "one who gave you the task, never past it and never to the owner. about names what it is about (an open task, "
+     "one who gave you the task, never past it and never to the owner; only a proposal, which needs the owner, goes "
+     "to the fleet manager's weekly list for him. about names what it is about (an open task, "
      "an open case, a goal, a duty or an agent), and severity=\"now\" reaches your requester at once only when the "
      "hub can confirm that what about names is live.",
      S({"task_id": TASK_ID, "request_id": {"type": "string", "description": "A new UUID for each report"},
@@ -15405,6 +15971,54 @@ TOOLS = [
         "responsibility": {"type": "string", "description": "Responsibility id, for example R-1"},
         "action": {"type": "string", "description": "pause, resume, retire or reopen"}, "note": {"type": "string"},
         "task_id": TASK_ID}, ["request_id", "responsibility", "action"])),
+    # Standing items (AUTONOMY.md P3): every session with the agent's tools has them, and tools_for keeps them out of
+    # an owner chat and of a conversation with a person.
+    ("all", "keep_instruction", t_keep_instruction,
+     "Keep a standing instruction: a lasting wish about how you work or what you decide, from now on until it is "
+     "ended (\"assign yearly-plan cancellations to Africa\"). Keep one when the owner, a person whose role allows it "
+     "or another agent asks for it, or when your own work shows you need it. With source, words are that message's "
+     "own words as written there, and the item is its author's; without source it is your own, also when another "
+     "agent asked. It steers your work "
+     "inside your access and never gives access, money or a credential. Every new session of yours starts with it, "
+     "and the owner reads one quiet line about it.",
+     S({"words": {"type": "string", "description": "The instruction in one sentence"},
+        "scope": {"type": "string", "enum": list(STANDING_SCOPES),
+                  "description": "agent: it steers you; team: it steers you and every agent of your team"},
+        "source": {"type": "string", "description": "The message the words came from: M-12 (the owner's) or "
+                                                    "CM-41 (a person's)"},
+        "task_id": TASK_ID}, ["words", "scope"])),
+    ("all", "set_target", t_set_target,
+     "Keep a standing target: what to reach, as a measure, a number, a date and how it is measured, from your own data "
+     "or because the owner, a person whose role allows it or another agent set it. check names one of your wake-up "
+     "rules whose code check measures it: it then records the progress at each run, and the target takes its progress "
+     "only from it. With id, change one of your own targets, or give its progress when it has no check.",
+     S({"measure": {"type": "string", "description": "What is measured, for example: tickets with a first draft "
+                                                     "within 2 hours, in percent"},
+        "number": {"type": "number", "description": "The number to reach"},
+        "due": {"type": "string", "description": "By when: an ISO date, for example 2026-11-30. No date: it stands "
+                                                 "until it is ended"},
+        "how": {"type": "string", "description": "How it is measured: the source of the data"},
+        "check": {"type": "integer", "description": "The wake-up rule whose code check measures it"},
+        "scope": {"type": "string", "enum": list(STANDING_SCOPES),
+                  "description": "agent: it steers you; team: it steers you and every agent of your team"},
+        "source": {"type": "string", "description": "The message it came from: M-12 or CM-41"},
+        "words": {"type": "string", "description": "The target in one sentence: with source, the author's own words "
+                                                   "as written there"},
+        "id": {"type": "string", "description": "One of your targets to change, for example I-8"},
+        "progress": {"type": "number", "description": "Where it stands now, for a target with no check"},
+        "task_id": TASK_ID})),
+    ("all", "end_standing", t_end_standing,
+     "End one of your standing items when its author, a person whose role allows it or the owner asks, or when a "
+     "target is reached. asked_by names the message that asked (M-12 or CM-41); without it, you asked. The "
+     "fleet manager ends any agent's item when the owner asks.",
+     S({"id": {"type": "string", "description": "The item, for example I-7"},
+        "why": {"type": "string", "description": "Why it ends, in one line: the owner reads it"},
+        "asked_by": {"type": "string", "description": "The message that asked for its end: M-12 or CM-41"},
+        "task_id": TASK_ID}, ["id", "why"])),
+    ("all", "see_standing", t_see_standing,
+     "See the standing items that steer you now: your own and your leads' items for their team. A lead also sees the "
+     "items of its team's agents, and the fleet manager every item of the fleet.",
+     S({"task_id": TASK_ID})),
     ("all", "set_reminder", t_set_reminder,
      "Come back to this at a time you name. In a task session it parks that task: nothing nudges it and no session "
      "is started for it until then, and at the time you named the hub puts your note in front of you in this "
@@ -15580,7 +16194,7 @@ def tool_contract(agent, context=None):
 def tools_for(agent, context=None):
     role = agents()[agent].get("role")
     read_only = ("list_my_tasks", "see_team", "see_goals", "see_capacity", "see_triggers", "search_knowledge",
-                 "see_responsibilities", "see_earlier_work", "see_history", "recall", *GOOGLE_READS)
+                 "see_responsibilities", "see_earlier_work", "see_history", "recall", "see_standing", *GOOGLE_READS)
     return [{"name": name, "description": described(agent, name, desc), "inputSchema": schema,
              "annotations": {"readOnlyHint": name in read_only, "destructiveHint": False,
                              "idempotentHint": name in read_only, "openWorldHint": False}}
@@ -15820,6 +16434,12 @@ def overview_text():
                    + f": {r['tool']}: {r['input']}")
     if not rows:
         out.append("  none")
+    out.append("")
+    # AUTONOMY.md P3: report_up's proposals wait here for the weekly list that the fleet manager takes to the owner
+    out.append("PROPOSALS FOR THE OWNER. Decide a weak one yourself with decide_report (noted or wrong); every other one "
+               "goes on your weekly list to him, and only his yes makes it goal.")
+    rows = q("SELECT * FROM reports WHERE kind='proposal' AND decided IS NULL AND collapsed_into IS NULL ORDER BY id")
+    out += [report_line(r) for r in rows] or ["  none"]
     out.append("")
     out.append("NEEDS YOU (owner)")
     rows = q("SELECT * FROM needs ORDER BY id")
@@ -20785,7 +21405,8 @@ AGENT_COLUMNS = (
     ("memories", "dropped_by"), ("memory_folds", "by"), ("tool_commands", "agent"), ("agent_messages", "sender"),
     ("agent_messages", "recipient"), ("person_agents", "agent"), ("conversations", "agent"), ("server_jobs", "agent"),
     ("signin_jobs", "agent"), ("resource_grants", "agent"), ("resource_grants", "by"), ("deposits", "agent"),
-    ("withdrawals", "agent"), ("placements", "agent"))
+    ("withdrawals", "agent"), ("placements", "agent"),
+    ("standing", "agent"), ("standing", "author"), ("standing", "ended_by"))     # 'owner' and 'P-<id>' are no agent
 # The tables with one row for each agent. A row under the new name is what an agent of that name left before it
 # was removed by hand, so it goes first, and the renamed agent's own row takes the name.
 AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent", "machine_updates": "agent"}
@@ -25850,6 +26471,54 @@ class Handler(BaseHTTPRequestHandler):
                       "next": rows[limit]["id"] + 1 if len(rows) > limit else None, "history": history}
         return self.json(200, scrub(result), {"Cache-Control": "no-store"})
 
+    def ui_standing(self, query):
+        """GET /ui/standing: the standing items, newest first (AUTONOMY.md P3); with agent, the ones that steer it: its
+        own and the team items of the agents above it."""
+        if not self.ui_allowed():
+            return
+        generation = kv_get("db_id")
+        if query.get("db") != generation:
+            return self.json(409, {"error": "hub generation changed; refresh state"})
+        agent = query.get("agent") or None
+        try:
+            before, limit = int(query.get("before") or 0), int(query.get("limit") or STANDING_PAGE)
+            if not 0 <= before < 2 ** 53 or not 1 <= limit <= STANDING_PAGE:
+                raise ValueError()
+        except ValueError:
+            return self.json(400, {"error": f"before must be an item id and limit 1 to {STANDING_PAGE}"})
+        with LOCK:
+            holders = [agent] + line_above(agent) if agent else None
+            if agent and agent not in agents() and not q1("SELECT 1 FROM standing WHERE agent=?", (agent,)):
+                return self.json(404, {"error": "no such agent"})
+            rows = q("SELECT * FROM standing WHERE (?=0 OR id<?)"
+                     + (f" AND (agent=? OR (scope='team' AND agent IN ({','.join('?' * len(holders))})))"
+                        if agent else "") + " ORDER BY id DESC LIMIT ?",
+                     (before, before, *((agent, *holders) if agent else ()), limit + 1))
+            result = {"db": generation, "standing": [standing_view(r) for r in rows[:limit]],
+                      "next": rows[limit]["id"] + 1 if len(rows) > limit else None}
+        return self.json(200, scrub(result), {"Cache-Control": "no-store"})
+
+    def ui_standing_end(self, item):
+        """POST /ui/standing/<id>/end: the owner ends one standing item of any agent. The agent's running sessions are
+        told at once, and the quiet line goes into his chat with the fleet manager, as for every ended item."""
+        def read(data):
+            self.only(data, ("why",))
+            why = data.get("why", "")
+            if not isinstance(why, str) or len(why) > STANDING_WHY_MAX:
+                raise ValueError(f"why must be text of at most {STANDING_WHY_MAX} characters")
+            return {"item": item, "why": " ".join(why.split())}
+
+        def act(body):
+            r = q1("SELECT * FROM standing WHERE id=?", (item,))
+            if not r:
+                raise Refusal(404, "no such standing item")
+            if r["ended"]:
+                raise Refusal(409, f"{iref(item)} has already ended")
+            with transaction():
+                standing_end_rows(r, "owner", "owner", body["why"] or None, now())
+            return {"standing": standing_view(q1("SELECT * FROM standing WHERE id=?", (item,)))}
+        return self.ui_command(f"standing/{item}/end", read, act)
+
     def ui_duty_state(self, duty_id):
         def read(data):
             action, note = data.get("action"), data.get("note", "")
@@ -26841,10 +27510,13 @@ class Handler(BaseHTTPRequestHandler):
                         DB.execute(f"UPDATE people SET {field}=? WHERE id=?", (body[field], p["id"]))
                 if "blocked" in body:
                     DB.execute("UPDATE people SET blocked=? WHERE id=?", (t0 if body["blocked"] else None, p["id"]))
+                    if body["blocked"]:         # L3 (AUTONOMY.md P3): blocking a person ends their standing items
+                        standing_person_rows(p["id"], f"{p['name']} is blocked", t0)
                 if "agents" in body:
                     DB.execute("DELETE FROM person_agents WHERE person=?", (p["id"],))
                     for agent in body["agents"]:
                         DB.execute("INSERT INTO person_agents(person,agent,added) VALUES(?,?,?)", (p["id"], agent, t0))
+                    standing_person_rows(p["id"], f"{p['name']} no longer writes to that agent", t0, body["agents"])
             log("owner", f"changed P-{p['id']}: {', '.join(changed) or 'nothing'}")
             return {"person": person_view(q1("SELECT * FROM people WHERE id=?", (p["id"],)), t0), "changed": changed}
         return self.ui_command("people", read, act)
@@ -27211,6 +27883,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_responsibilities(query)
         if len(parts) == 3 and parts[:2] == ["ui", "responsibilities"] and re.fullmatch(r"[1-9][0-9]*", parts[2]):
             return self.ui_responsibility(int(parts[2]), query)
+        if parts == ["ui", "standing"]:            # AUTONOMY.md P3
+            return self.ui_standing(query)
         if parts == ["ui", "triggers"]:
             return self.ui_triggers(query)
         if parts == ["ui", "checks"]:
@@ -27699,6 +28373,9 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["ui", "responsibilities"] and re.fullmatch(r"[1-9][0-9]*", parts[2]) \
                 and parts[3] == "state":
             return self.ui_duty_state(int(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["ui", "standing"] and re.fullmatch(r"[1-9][0-9]*", parts[2]) \
+                and parts[3] == "end":
+            return self.ui_standing_end(int(parts[2]))
         if len(parts) == 4 and parts[:2] == ["helper", "trigger"] and re.fullmatch(r"[1-9][0-9]*", parts[3]):
             return self.helper_trigger(parts[2], int(parts[3]))
         if len(parts) == 4 and parts[:2] == ["ui", "triggers"] and re.fullmatch(r"[1-9][0-9]*", parts[2]) \
@@ -29216,7 +29893,8 @@ def leak_scan():
               "sealed": ("label", "task"), "ui_requests": ("text", "edits"), "owner_reports": ("text", "about"),
               "agent_messages": ("text",), "thread_events": ("data",), "holds": ("note", "detail"),
               "outcomes": ("title", "note"),
-              "ui_controls": ("body", "result"), "chat_out": ("text", "error"), "chat_ignored": ("name", "preview")}
+              "ui_controls": ("body", "result"), "chat_out": ("text", "error"), "chat_ignored": ("name", "preview"),
+              "standing": ("words", "measure", "how", "ended_why")}
     for table, cols in tables.items():
         for row in q(f"SELECT rowid AS rid, {', '.join(cols)} FROM {table}"):
             if secret_hit(*[row[c] for c in cols]):

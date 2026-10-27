@@ -74,7 +74,9 @@ def start_hub(name, addresses, *flags, agents=None, extra=None):
 EVERY_AGENT = ["read_messages", "search_knowledge", "write_knowledge", "see_responsibilities", "open_case",
                "record_step", "close_case", "attach_watch", "see_notes", "write_notes", "remember", "recall",
                "forget", "see_triggers", "save_trigger", "change_trigger", "set_reminder", "message_owner",
-               "message_agent"]
+               "message_agent",
+               # AUTONOMY.md P3: standing instructions and targets, in every session with the agent's tools
+               "keep_instruction", "set_target", "end_standing", "see_standing"]
 MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "answer", "check_result",
                                "decide_permission", "see_team", "see_capacity", "see_goals",
                                "update_goal", "record_spend", "raise_needs_you", "request_secret", "tell_owner",

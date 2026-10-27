@@ -156,6 +156,7 @@ would read as an empty fleet instead of as a mistake.
 | `answer_needs_you` | `/ui/needs/<id>` | Answer a Needs-you item, in words or by choosing an option. A secret request takes neither: the app's secure form answers it. |
 | `control_task` / `steer_task` | `/ui/tasks/<id>/control`, `/steer` | Pause, stop, resume; steer an open task. |
 | `goal_state` / `duty_state` / `trigger_state` | `/ui/goals/<id>/state` and the two beside it | Pause, resume, finish, drop. |
+| `end_standing` | `/ui/standing/<id>/end` | End one standing instruction or target of any agent. `fleet_read(page="standing")` lists them. |
 | `settle_outcome` | `/ui/outcomes/<id>` | Record whether an unknown outcome took effect. |
 | `check_releases` / `take_release` / `automatic_releases` | `/ui/releases/*` | Ask the channel; take the release; turn automatic updates off or on (on by default). |
 | `take_backup` | `/ui/backup`, `/ui/backups/confirm` | A copy of the fleet into a file on this Mac, checked. |
