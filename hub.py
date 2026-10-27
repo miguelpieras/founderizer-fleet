@@ -55,9 +55,9 @@ import mcp
 import push
 import releases
 from lifecycle import (APP_SERVER, APP_SERVER_RUNTIME, DEPLOY_APP_NOTE, GITHUB_TOKEN, MCP_LIMIT, MCP_NAME,
-                       REPO_ACCESS, REPO_NAME, RUNTIMES, RUNTIME_RESULTS, SWITCH_RUNTIMES, TOOL_CATALOG,
-                       app_server_task, mcp_server, mcp_variable, no_sign_in, runtime_fact, runtimes_with,
-                       switch_target, tool_catalog, tool_needs)
+                       REPO_ACCESS, REPO_NAME, REUSE_SETTINGS, RUNTIMES, RUNTIME_RESULTS, SWITCH_RUNTIMES, TOOL_CATALOG,
+                       app_server_task, mcp_server, mcp_variable, no_sign_in, reuse_value, runtime_fact,
+                       runtimes_with, switch_target, tool_catalog, tool_needs)
 
 DESKTOP = Frames()
 
@@ -1838,9 +1838,10 @@ def t_read_messages(agent, a):
                     chased(agent, chase[1], emit(agent, "say", chase[0]))
             return "No unread messages. Wait for the next signal."
         # A task's start event is the text that its session began with, as its first prompt or its appended system
-        # prompt (fleet.session_command), so its first read gave the same thousands of characters a second time.
-        messages = "\n\n".join(f"Message M-{r['id']}:\n" + (START_READ if r["kind"] == "task" else r["text"])
-                               for r in rows)
+        # prompt (fleet.session_command), so its first read gave the same thousands of characters a second time. A
+        # Claude session that began with its stable text instead (opening "read", plan P9.2) reads it here.
+        messages = "\n\n".join(f"Message M-{r['id']}:\n" + (START_READ if r["kind"] == "task" and json.loads(
+            r["extra"] or "{}").get("opening") != "read" else r["text"]) for r in rows)
         if agents()[agent].get("role") == "manager":
             # The first line names the messages: after a switch the helper finds them there in the previous session's
             # conversation file (fleet.read_ids), where no message text can stand in for that line. The guidance is
@@ -2079,7 +2080,7 @@ RULE_FOUR = (" Never contact the owner: if you are blocked, use ask_my_requester
              "time your requester is told.")
 
 
-def start_text(agent, task_id, resume=False, note="", row=None):
+def start_text(agent, task_id, resume=False, note="", row=None, opening=None):
     """The per-task block that a task session opens with (AUTONOMY.md 6.4): one function of each owning lane, in the
     contract's order, and nothing else. A lane that lands later puts its own call in its own place below, never at the
     end, and returns "" when it has nothing to say. Every part reads with read_row or read_rows only: admit_task runs
@@ -2088,9 +2089,10 @@ def start_text(agent, task_id, resume=False, note="", row=None):
     resume: a new attempt of the same task, with `note` (why it starts again) and `row`, the task row as the attempt
     before it left it (attempt_event). Masked on the way out, not only where each part was written: this text carries
     the agent's own notes, its lessons and its holdings, and a login registered after any of them was stored was
-    never masked at the write."""
+    never masked at the write. opening: how a session with its stable text first gets this block (stable_opening),
+    or None for a session that is told to read the rules and its profile here."""
     return mask_secrets(
-        task_start_text(agent, task_id, resume, note, row)            # 1. the task or wake (L8)
+        task_start_text(agent, task_id, resume, note, row, opening)   # 1. the task or wake (L8)
         + holdings_team_text(agent, task_id)                            # 2. holdings and the team directory (L8)
         + standing_start_text(agent)                                    # 3. standing items (L3)
         + notes_start_text(agent) + memory_start_text(agent, task_id)   # 4. matching lessons (L6)
@@ -2123,10 +2125,33 @@ def rules_files(parts):
     return ["RULES.md"] + [f"rules/{part}.md" for part in parts]
 
 
-def task_start_text(agent, task_id, resume=False, note="", row=None):
+def stable_opening(agent, needs):
+    """How a new session of this agent's task gets its per-task block (plan P9.2): "read" for a Claude session, whose
+    first read_messages answer is the block, "prompt" for a Codex session, whose first prompt ends with it, and None
+    for a start as before, which reads the rules and its profile as files. Only on a helper that starts so
+    (helper feature stable_start), and only in a terminal: a screen or app-server task and an ACP runtime start as
+    before. read_row: admit_task runs this inside the transaction that writes the task."""
+    a = agents().get(agent) or {}
+    st = read_row("SELECT data FROM machine_status WHERE agent=?", (agent,))
+    try:
+        features = (json.loads(st["data"]).get("features") or []) if st else []
+    except (TypeError, ValueError):
+        features = []
+    if STABLE_START not in features or runtime_fact(a.get("runtime"), "driver") != "terminal" or \
+            app_server_task(a, needs):
+        return None
+    return runtime_fact(a.get("runtime"), "task_opening")
+
+
+STABLE_START = "stable_start"       # the helper feature (lifecycle.FEATURES)
+
+
+def task_start_text(agent, task_id, resume=False, note="", row=None, opening=None):
     """Part 1 of the per-task block: which task this session is for, how it starts and ends, the part of a split step
-    it is, the team that a lead gives parts to, what came before it, and what came of the agent's own reports."""
-    said = (f'You are agent "{agent}" in Founderizer. Read {", ".join(rules_files(rules_parts(agent)))} and '
+    it is, the team that a lead gives parts to, what came before it, and what came of the agent's own reports. A
+    session whose start held its rules and its profile (opening) is told nothing about reading them."""
+    said = (f'Call read_messages with task_id "{tref(task_id)}" whenever signalled. ' if opening else
+            f'You are agent "{agent}" in Founderizer. Read {", ".join(rules_files(rules_parts(agent)))} and '
             f'profiles/{agent}.md in this folder first, but RULES.md only if your context does not hold it yet: '
             f'Claude Code loads it through CLAUDE.md. Your helper brought this folder up to date just before this '
             f'session; do not pull at the start. Call read_messages with task_id \"{tref(task_id)}\" now and whenever '
@@ -2134,9 +2159,7 @@ def task_start_text(agent, task_id, resume=False, note="", row=None):
     said += (f'You are RESUMING task {tref(task_id)} after your earlier session stopped. '
              f'Call the fleet tool list_my_tasks with task_id "{tref(task_id)}". First check what '
              f'was already done (rule 9: check before repeating), then continue and finish with '
-             f'deliver_result.' if resume else
-             f'Your task is {tref(task_id)}. Call the fleet tool list_my_tasks with task_id '
-             f'"{tref(task_id)}", do the task, report progress as you go, and finish with deliver_result.') + RULE_FOUR
+             f'deliver_result.' if resume else task_itself(task_id)) + RULE_FOUR
     # manager_as_lead: when this task is one part of a split piece of work, which piece and who holds the other
     # parts -- a part that does not know it is a part does the whole piece.
     part = part_start_text(task_id)
@@ -2157,6 +2180,30 @@ def task_start_text(agent, task_id, resume=False, note="", row=None):
         t = read_row("SELECT follows FROM tasks WHERE id=?", (task_id,))
         said += warm_follows(t["follows"] if t else None)
     return said + report_feedback(agent) + "\n"
+
+
+TASK_DETAILS_CHARS = 6000       # the most of a task's details that its start carries; list_my_tasks has the rest
+
+
+def task_itself(task_id):
+    """The task as list_my_tasks gives it, in its own start (plan P9.4): its title, its requester, its done-when line
+    and its details, so that a session needs no call to learn its task. Its first fleet call marks it started
+    (task_started), and deliver_result keeps its last note. A goal's own words and limits are not here: they are read
+    when the worker asks, so a goal that the manager corrects after the task was given out reads as corrected.
+    read_row only: admit_task runs this inside its transaction."""
+    t = read_row("SELECT * FROM tasks WHERE id=?", (task_id,))
+    if not t:
+        return f"Your task is {tref(task_id)}. Call the fleet tool list_my_tasks with task_id \"{tref(task_id)}\"."
+    details = " ".join((t["details"] or "").split())
+    goal = read_row("SELECT id, title FROM goals WHERE id=?", (t["goal_id"],)) if t["goal_id"] else None
+    return (f'Your task is {tref(task_id)}, from {t["requester"]}: "{t["title"]}". Done when: {t["done_when"]}'
+            + (f"\nDetails: {details[:TASK_DETAILS_CHARS]}" + (" ... (list_my_tasks gives the rest)"
+                                                                if len(details) > TASK_DETAILS_CHARS else "")
+               if details else "")
+            + (f'\nIt belongs to {gref(goal["id"])} "{goal["title"]}": list_my_tasks gives that goal\'s words, its '
+               f'plan step and its limits as they stand now, and they hold for this task.' if goal else "")
+            + "\nDo the task and finish with deliver_result. Report progress at each real step of longer work; "
+              "deliver_result keeps your last note too, so a short task needs no other call.")
 
 
 def holdings_team_text(agent, task_id):
@@ -2523,8 +2570,16 @@ def session_alive(agent, task_id):
 
 def attempt_event(t, note=""):
     """emit's row for the start of the next attempt of task row `t` (see event_rows)."""
-    return (t["owner"], "task", t["id"], start_text(t["owner"], t["id"], resume=True, note=note, row=t),
-            {"needs": t["needs"], "resume": True, "attempt": t["attempt"] + 1, "generation": kv_get("db_id")})
+    opening = stable_opening(t["owner"], t["needs"])
+    return (t["owner"], "task", t["id"], start_text(t["owner"], t["id"], resume=True, note=note, row=t, opening=opening),
+            dict({"needs": t["needs"], "resume": True, "attempt": t["attempt"] + 1, "generation": kv_get("db_id")},
+                 **stable_extra(t["owner"], opening)))
+
+
+def stable_extra(agent, opening):
+    """What a start event says to a helper that starts the session with its stable text first (plan P9.2): how the
+    session gets its task, and the parts of the rules it reads. Nothing for a start as before."""
+    return {"opening": opening, "rules": rules_parts(agent)} if opening else {}
 
 
 def attempt_rows(t, reason, event, t0, counted=False):
@@ -4170,6 +4225,7 @@ def deliver_result(agent, a, files_said=None):
                         "cannot be weighed later, and this one carries no case key that could contradict it.")
     tried = a.get("tried")
     tried = None if tried in (None, "") else goal_text_or_error(tried, "tried", MEMORY_TEXT)
+    note = str(a.get("note") or "").strip()             # the last progress note (plan P9.4)
     if a.get("cost_minutes") not in (None, "") and not tried:
         raise ToolError("cost_minutes says what a repeat of a dead end would cost, so it goes with tried.")
     if a.get("recheck") not in (None, "") and not tried:
@@ -4182,7 +4238,7 @@ def deliver_result(agent, a, files_said=None):
         raise ToolError("Say what was done (or, for failed or rejected, the reason).")
     if outcome == "completed" and (not where or not how):
         raise ToolError("A completed result needs where_output_is and how_checked.")
-    guard(agent, what, where, how, learned or "", prevents or "", tried or "", str(a.get("recheck") or ""))
+    guard(agent, what, where, how, learned or "", prevents or "", tried or "", str(a.get("recheck") or ""), note)
     fence(agent, tid)                   # again here: a cancel or a Stop can land while the helper sends the files
     t = get_task(tid, owner=agent)
     if t["state"] in TERMINAL:
@@ -4203,6 +4259,8 @@ def deliver_result(agent, a, files_said=None):
                         f"you deliver, nobody can.")
     if files_said is None:
         return t
+    if note:
+        ins("INSERT INTO notes(task,agent,ts,text) VALUES(?,?,?,?)", (tid, agent, now(), note))
     q("UPDATE tasks SET state=?, outcome=?, what=?, where_=?, how=?, delivered=?, waiting_on=NULL WHERE id=?",
       (outcome, outcome, what, where, how, now(), tid))
     unfile_notices(tid)
@@ -4546,10 +4604,12 @@ def admit_task(requester, f, trigger_id=None, trigger_run=None):
                       f.get("step"), f["owner"], requester, "submitted", f["follows"], t0, t0, f["case_id"],
                       trigger_id, trigger_run, f.get("why"), f.get("responsibility"), f.get("duty_case"))).lastrowid
     DB.execute("INSERT INTO attempts(task,attempt,created,reason) VALUES(?,1,?,'created')", (tid, t0))
+    opening = stable_opening(f["owner"], f["needs"])
     DB.execute("INSERT INTO events(agent,kind,task,text,created,extra) VALUES(?,?,?,?,?,?)",     # emit's row
-               (f["owner"], "task", tid, start_text(f["owner"], tid), t0,
-                json.dumps({"needs": f["needs"], "resume": False, "attempt": 1,
-                            "generation": generation[0] if generation else None})))
+               (f["owner"], "task", tid, start_text(f["owner"], tid, opening=opening), t0,
+                json.dumps(dict({"needs": f["needs"], "resume": False, "attempt": 1,
+                                 "generation": generation[0] if generation else None},
+                                **stable_extra(f["owner"], opening)))))
     waiting_say_rows(f["owner"], tid)
     feedback_rows(f["owner"], t0)
     return tid
@@ -16569,6 +16629,8 @@ TOOLS = [
      "certain to be read before the work starts.",
      S({"task_id": TASK_ID, "outcome": {"type": "string", "enum": ["completed", "failed", "rejected"]},
         "what_was_done": STR, "where_output_is": STR, "how_checked": STR,
+        "note": {"type": "string", "description": "Your last progress note, if you have one: it is kept with the "
+                 "task's notes, so no report_progress is needed just before this call."},
         "learned": {"type": "string", "description": "What this work taught you, if anything. Leave it out when it "
                     "taught you nothing."},
         "prevents": {"type": "string", "description": "With learned: what you expect it to prevent, in one line"},
@@ -16707,23 +16769,17 @@ TOOLS = [
      S({"title": {"type": "string", "description": "One line: what the person wants"}, "details": STR},
        ["title", "details"])),
     ("manager", "create_task", t_create_task,
-     "Give one worker a task. needs is none, browser or screen; the hub refuses a worker that lacks it. "
+     "Give one agent a task. needs is none, browser or screen; the hub refuses an agent that lacks it. "
      "Use follows to point at an earlier task whose result this one builds on or fixes. "
      "Set goal to G-<id> to link the task to an owner goal; the hub refuses a goal that is not active. "
      "WHAT ITS AGENT SEES: title, done_when, details, what the task it follows did, and -- only when goal is a "
-     "G-<id> -- that goal's own words, its plan step and its limits, in the answer of list_my_tasks. It does not "
+     "G-<id> -- that goal's own words, its plan step and its limits, at the start of its session. It does not "
      "see this conversation, so link the goal, and put in details anything else the owner said that limits this "
      "work. "
      "Say in why, in one line, why this agent suits the task. "
-     "WORK TOO MUCH FOR ONE AGENT: write that piece as one step of the goal's plan (update_goal), then give each "
-     "part with goal=G-<id> and step=<n>. Every part is then one piece of work: the hub takes the goal from the "
-     "step, the step will not go done while a part is open, the goal will not close while a part is open, each "
-     "part's session is told which piece it belongs to and who holds the others, and each part's result tells you "
-     "what the step still waits on. Split only when the work really divides into parts a stranger could check on "
-     "their own, and give every part to an agent that SUITS it (see_capacity). Suitability first, availability "
-     "second: never put a part on an unsuitable agent because it is free or has more allowance -- a part with no "
-     "suitable agent waits for its agent instead. Splitting buys time only across different runtime accounts, "
-     "because agents that share one account share one allowance (see_capacity, ACCOUNTS).",
+     "Work too much for one agent is one step of the goal's plan (update_goal), and each part of it a task with "
+     "goal=G-<id> and step=<n>, for an agent that suits that part: rules/manager.md, \"Work that is too much for "
+     "one agent\".",
      S({"owner": STR, "title": STR, "done_when": STR, "details": STR,
         "needs": {"type": "string", "enum": ["none", "browser", "screen"]},
         "goal": {"type": "string", "description": "G-<id> of the goal this task belongs to. Write the goal down "
@@ -17447,6 +17503,44 @@ def unknown_fields(name, sent):
     return []
 
 
+def task_started(t):
+    """The first fleet call of a task's session that the hub carried out marks the task and its attempt started (plan
+    P9.4), as list_my_tasks with its task_id does, so that no call is made for that alone. A session whose first prompt
+    ended with its task (opening "prompt") has read its start event too: its read would give nothing new, so the
+    helper types no signal for it."""
+    for e in q("SELECT id, extra FROM events WHERE agent=? AND task=? AND kind='task' AND read_at IS NULL",
+               (t["owner"], t["id"])):
+        extra = json.loads(e["extra"] or "{}")
+        if extra.get("opening") == "prompt" and extra.get("attempt", 1) == t["attempt"]:
+            q("UPDATE events SET read_at=? WHERE id=? AND read_at IS NULL", (now(), e["id"]))
+    if t["state"] == "submitted":
+        q("UPDATE tasks SET state='working', started=COALESCE(started,?) WHERE id=? AND state='submitted'",
+          (now(), t["id"]))
+    elif not t["started"]:
+        q("UPDATE tasks SET started=? WHERE id=?", (now(), t["id"]))
+    a = q1("SELECT started FROM attempts WHERE task=? AND attempt=?", (t["id"], t["attempt"]))
+    if a and not a["started"]:
+        q("UPDATE attempts SET started=? WHERE task=? AND attempt=?", (now(), t["id"], t["attempt"]))
+
+
+# The fleet calls whose MCP answer carries no unread messages (unread_tail): the read itself, the delivery that closes
+# the task, and the two whose answer is JSON that a caller reads.
+NO_TAIL = ("read_messages", "deliver_result", "message_agent", "message_owner")
+
+
+def unread_tail(agent, tid):
+    """The messages of a task that its session has not read, read now and added to the MCP answer of another fleet
+    call as a block of their own (rpc, plan P9.4), so that the session needs no read_messages for them and its helper
+    types no signal. "" when none. A start event alone is not one of them: its read is the session's own, which its
+    start tells it to make. It reads in the call's own context (CALL.context), as read_messages does."""
+    unread = q1("SELECT 1 FROM events WHERE agent=? AND task=? AND kind='say' AND read_at IS NULL LIMIT 1",
+                (agent, tid))
+    if not unread:
+        return ""
+    said = t_read_messages(agent, {"task_id": tref(tid)})
+    return "" if said.startswith("No unread messages") else "\n\nNEW MESSAGES of this task, read now:\n" + said
+
+
 def stale_instructions(name, extra):
     """What an agent reads when it called a tool with a field the tool does not take.
 
@@ -17522,6 +17616,8 @@ def call_tool(agent, name, args, context=None):
                 # guard refuses a login that is registered at the moment of the write; this catches the ones
                 # registered after it, which is every login the owner added since.
                 text = mask_secrets(text)
+                if tid:
+                    task_started(get_task(tid))         # a refused call leaves no trace, a done one starts the task
                 with area("activity"):
                     ins("INSERT INTO calls(ts,agent,task,attempt,name,args,ok,detail) VALUES(?,?,?,?,?,?,1,?)",
                         (now(), agent, tid, attempt, name,
@@ -21300,6 +21396,12 @@ SETTINGS = {
     "contacts.v2": (False, setting_bool, "Roles are prompts and conversations act (AUTONOMY.md P1, P2): one switch "
                                          "for the fleet. Turning it on gives employees and supervisors the role "
                                          "peer and deputies the role manager, one time."),
+    # plan P9.10: the session reuse rule, which each helper reads from its own team.json (lifecycle.reuse_settings)
+    "session_reuse": (dict(REUSE_SETTINGS), reuse_value,
+                      "Session reuse (on), its growth factor (growth) and its margin in seconds (margin): a standing "
+                      "session is told of a new message only while its cache is warm, its context has grown by at "
+                      "most the growth factor and there is room before compaction; otherwise it starts again with "
+                      "the hub's brief."),
 }
 
 
@@ -31299,6 +31401,19 @@ def rpc(agent, m, headers, context=None, credential=None):
                   (now(), parse_task(context[1]), int(context[2])))
             text, is_error = call_tool(agent, params.get("name"), params.get("arguments") or {}, context)
             result = {"content": [{"type": "text", "text": text}], "isError": is_error}
+            # plan P9.4: a task's unread messages come with the answer of its session's other fleet calls, as a block
+            # of their own, so the tool's answer stays what it is and the session needs no read_messages for them
+            if not is_error and context and re.fullmatch(r"T-[1-9][0-9]{0,17}", str(context[1])) and \
+                    params.get("name") not in NO_TAIL and role_of(agent) in ("worker", "lead"):
+                CALL.context = context              # the read is the session's own, fenced as its call was
+                try:
+                    tail = unread_tail(agent, parse_task(context[1]))
+                except ToolError:
+                    tail = ""                       # the tail never costs the call its answer
+                finally:
+                    CALL.context = None
+                if tail:
+                    result["content"].append({"type": "text", "text": tail.lstrip("\n")})
         elif method == "resources/list":
             result = {"resources": []}
         elif method == "resources/templates/list":

@@ -55,7 +55,9 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "prompt_polls",         # its hooks and runners ask again for a permission prompt until it is decided (C7)
             "job_runs",             # it acks a job before it runs it and lists the jobs it holds in each poll (C7)
             "check_runs",           # it lists the check runs it holds in each poll, and no claim expires (C12)
-            "update_between_turns"]     # its update waits for the turns that run in its task windows (plan P0)
+            "update_between_turns",     # its update waits for the turns that run in its task windows (plan P0)
+            "stable_start",             # a task session opens with its rules and profile, and its task last (P9.2)
+            "session_reuse"]            # a cold, grown or switched standing session starts fresh (P9.10)
 # ---------------------------------------------------------------- the runtimes
 #
 # What the fleet knows about a runtime is here, in one entry for each provider, and nowhere else. hub.py, fleet.py and
@@ -118,6 +120,18 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
 #   screen_counter    a running turn of its terminal session repaints an elapsed counter every second, read live on
 #                     the fleet's machines, so the screen watch takes a running screen that stopped changing for a
 #                     frozen runtime (fleet.Helper.watch_screens, plan C2); False where nobody has read it
+#   cache_seconds     how long the provider keeps a session's prompt cache after its last model call, as far as
+#                     the fleet knows; a session told of a message later than that reads its whole context again at
+#                     the price of writing it (plan P9.10, session_reuse). A session's own records can say less (a
+#                     Claude session on a five-minute cache). None where the fleet knows nothing
+#   compact_tokens    the context at which a session of it compacts its conversation as Fleet starts it; the reuse
+#                     rule leaves room before it. None where the fleet knows nothing
+#   routine           the model and effort of routine work on it, {model, effort}, None for the runtime's own
+#                     default model: what an agent's one changer reaches for first (plan P9.7, P8)
+#   task_opening      how a task session that opens with its stable text first (helper feature stable_start, plan
+#                     P9.2) gets its task: "read", in its first read_messages answer, because the rules and the
+#                     profile are its appended system prompt; "prompt", at the end of its first prompt, because it
+#                     reads RULES.md as its folder's AGENTS.md; None where Fleet starts none so
 #
 # What is NOT here, because it is code and not a fact: how a runtime's records become a transcript (threads.py), how
 # its allowance is read (usage.py), what its own installer is (onboard.py), and how its sign-in window is driven to
@@ -162,6 +176,12 @@ RUNTIMES = {
                               "read-only": "the runtime allows reads only"},
                     "otherwise": "see the Codex settings"},
         "screen_counter": False,
+        # OpenAI keeps a prompt's cache for some minutes of inactivity, and Codex keys it by its own thread
+        # (prompt_cache_key), so a new Codex session reads little of another's
+        "cache_seconds": 300,
+        "compact_tokens": 200000,
+        "routine": {"model": None, "effort": "low"},
+        "task_opening": "prompt",
     },
     "claude": {
         "label": "Claude Code",
@@ -202,6 +222,10 @@ RUNTIMES = {
                     "otherwise": "the session settings allow and deny tools; they are not an OS boundary"},
         # read on 2.1.285, 2.1.308 and 2.1.311 while a foreground `sleep 300` ran, 27 October 2026
         "screen_counter": True,
+        "cache_seconds": 3600,          # an hour; its own records say when it is five minutes (fleet.claude_context)
+        "compact_tokens": 200000,       # fleet.STANDING_COMPACT, the window that Fleet starts its standing sessions with
+        "routine": {"model": "sonnet", "effort": "low"},
+        "task_opening": "read",
     },
     "grok": {
         "label": "Grok",
@@ -229,13 +253,88 @@ RUNTIMES = {
                        "Sign in to Grok yourself on {where} machine."),
         "sandbox": None,
         "screen_counter": False,
+        "cache_seconds": None,
+        "compact_tokens": None,
+        "routine": None,
+        "task_opening": None,
     },
 }
 # Every fact above in one list, so that a new entry cannot quietly leave one out (test_runtime_table).
 RUNTIME_FACTS = ("label", "driver", "acp_command", "can", "full_access", "manager_access", "first_worker", "manager",
                  "owner_chat", "agent_messages", "conversation", "conversation_why", "mcp_servers", "app_server",
                  "switch", "session_settings", "token_in_env", "model_flags", "local_model", "sign_in", "sign_out",
-                 "no_sign_in", "sandbox", "screen_counter")
+                 "no_sign_in", "sandbox", "screen_counter", "cache_seconds", "compact_tokens", "routine",
+                 "task_opening")
+
+
+# The session reuse rule (AUTONOMY.md P9.10) and its setting (section 4), one object in team.json "settings":
+# "session_reuse": {"on", "growth", "margin"} -- on, the growth factor of a context since its start, and the margin in
+# seconds before the provider's cache lifetime ends. hub.SETTINGS checks the owner's value (reuse_value).
+REUSE_SETTINGS = {"on": True, "growth": 2, "margin": 60}
+REUSE_LIMITS = {"growth": (1, 10), "margin": (0, 3600)}
+REUSE_ROOM = 0.8                # the share of the compaction point that a reused session's context may fill
+
+
+def reuse_value(value):
+    """The owner's session_reuse setting, checked and with its defaults: an object of on (true or false), growth
+    (a whole number 1-10) and margin (seconds, 0-3600), any of which may be left out. Raises ValueError."""
+    if not isinstance(value, dict) or set(value) - set(REUSE_SETTINGS):
+        raise ValueError("must be an object of on, growth and margin")
+    out = dict(REUSE_SETTINGS)
+    for key, given in value.items():
+        if key == "on":
+            if not isinstance(given, bool):
+                raise ValueError("on must be true or false")
+        else:
+            low, high = REUSE_LIMITS[key]
+            if isinstance(given, bool) or not isinstance(given, int) or not low <= given <= high:
+                raise ValueError(f"{key} must be a whole number from {low} to {high}")
+        out[key] = given
+    return out
+
+
+def reuse_settings(team):
+    """The reuse rule's setting from a team.json: the owner's own value, else the defaults; a value that its check
+    refuses reads as the defaults, as hub.setting reads it."""
+    stored = (team or {}).get("settings")
+    try:
+        return reuse_value(stored.get("session_reuse", {}) if isinstance(stored, dict) else {})
+    except ValueError:
+        return dict(REUSE_SETTINGS)
+
+
+def session_reuse(runtime, context, started, now_runs, settings=None, at=None):
+    """The session reuse rule (AUTONOMY.md P9.10), for every kind of session and every provider: (True, "") to tell a
+    session of a new message of its own thread, or (False, why) to start it fresh with the hub's short brief.
+
+    A session is reused only when its cache is still warm (its records' cache lifetime, else its runtime's
+    cache_seconds, less the margin), its context has at most grown by the growth factor since its start, there is
+    room before its runtime's compaction point, and it runs on the runtime, model and effort that the agent has now.
+    The same thread is the caller's: a window is one thread (a task, a case, a conversation, the owner chat).
+
+    context: its own records, (tokens now, tokens at its first call, time of its last model call, cache seconds or
+    None), or None for a session that made no call yet, which has no context to read again. started and now_runs:
+    {"runtime", "model", "effort"} that it started with and that the agent has now; started is None when its start
+    cannot be read, and then nothing is compared."""
+    settings = dict(REUSE_SETTINGS, **(settings or {}))
+    if not settings["on"]:
+        return True, ""
+    if started is not None and any(started.get(k) != (now_runs or {}).get(k) for k in ("runtime", "model", "effort")):
+        return False, "it runs another runtime, model or effort than the agent has now"
+    if not context:
+        return True, ""
+    tokens, first, last, cache = context
+    lifetime = cache or runtime_fact(runtime, "cache_seconds")
+    idle = (time.time() if at is None else at) - last
+    if lifetime is not None and idle > lifetime - settings["margin"]:
+        return False, (f"its cache is cold after {idle / 60:.0f} quiet minutes, and a new session costs only its "
+                       f"start")
+    if first and tokens > settings["growth"] * first:
+        return False, f"its context grew from {first // 1000}K to {tokens // 1000}K tokens since its start"
+    room = runtime_fact(runtime, "compact_tokens")
+    if room and tokens > REUSE_ROOM * room:
+        return False, f"its {tokens // 1000}K tokens leave no room before its compaction at {room // 1000}K"
+    return True, ""
 
 
 def runtime_fact(runtime, fact, otherwise=None):

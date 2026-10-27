@@ -63,8 +63,8 @@ import uuid
 from threads import MARKER, THREAD_ID, CodexFiles, Tailer, Translator, complete_rows, manager_transcript, text_of
 from usage import Collector, local_model, timestamp
 from lifecycle import (GITHUB_TOKEN, MCP_PROGRAM, REPO_ACCESS, REPO_NAME, RUNTIMES, TOOL_CATALOG, Lifecycle,
-                       Updating, app_server_task, exe, follow_config_ref, mcp_variable, no_sign_in, runtime_fact,
-                       runtimes_with, tool_catalog, tool_needs)
+                       Updating, app_server_task, exe, follow_config_ref, mcp_variable, no_sign_in, reuse_settings,
+                       runtime_fact, runtimes_with, session_reuse, tool_catalog, tool_needs)
 from desktop import Publisher
 
 KIT = os.path.dirname(os.path.abspath(__file__))
@@ -96,6 +96,16 @@ def load_team():
             return json.load(f)
     except (OSError, ValueError) as e:
         die(f"cannot read {path}: {e}")
+
+
+def checkout_team():
+    """This checkout's team.json as it is now, or {} when it cannot be read: the owner's settings change in it while
+    the helper runs (lifecycle.reuse_settings)."""
+    try:
+        with open(os.path.join(KIT, "team.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
 
 
 def hub_url(team):
@@ -766,14 +776,63 @@ def codex_server(name, catalog=None):
     return "".join("-c " + shlex.quote(o) + " " for o in options + [key + 'default_tools_approval_mode="approve"'])
 
 
+# Plan P9.2 (helper feature stable_start): a task session opens with the text that is the same at every start of
+# the same agent, so that the provider's cache holds it from one session to the next, and with its task last. That
+# text is the fleet's rules (RULES.md, and the parts of rules/ that hub.rules_parts names for this agent) and the
+# agent's profile, all from this checkout, which the helper brought up to date just before the start. Claude reads it
+# as its appended system prompt, from a file, and takes no CLAUDE.md of the folder (--setting-sources user); its task
+# is the first answer of read_messages. Codex reads RULES.md as the folder's AGENTS.md, which the published tree
+# carries as RULES.md itself (publish.COPIED), and the parts, its profile and then its task as its first prompt.
+RULES_PARTS = ("lead", "manager", "conversations", "logins", "github")     # hub.RULES_PARTS, in that order
+STABLE_TASK = ('You are agent "{agent}" in Founderizer, in a session for one task of yours. {where} Your helper '
+               'brought this folder up to date just before this session; do not pull at the start. {rules} are '
+               'in your context, so do not read them again.')
+STABLE_WHERE = {"read": ("The task is the first answer of read_messages.",
+                         "The fleet's rules for you (RULES.md and your parts of rules/) and your profile follow: they"),
+                "prompt": ("The task is at the end of this text.",
+                           "RULES.md is the AGENTS.md of this folder, and your parts of rules/ and your profile follow: "
+                           "they")}
+CODEX_RULES_BYTES = 32 * 1024   # Codex's own default project_doc_max_bytes, which a longer AGENTS.md would be cut at
+
+
+def stable_text(agent, opening, parts):
+    """The stable start of a task session of `agent` that gets its task by `opening` (plan P9.2), or None when this
+    checkout cannot give it: a file is missing, or for a session that reads RULES.md as its folder's AGENTS.md, that
+    AGENTS.md is not RULES.md byte for byte (a checkout of the code repository, whose AGENTS.md is the developers').
+    The same files give the same bytes."""
+    def read(name):
+        with open(os.path.join(KIT, name), encoding="utf-8") as f:
+            return f.read().strip()
+    try:
+        core = read("RULES.md")
+        if opening == "prompt" and read("AGENTS.md") != core:
+            return None
+        texts = ([core] if opening == "read" else []) + \
+            [read(f"rules/{part}.md") for part in RULES_PARTS if part in parts] + [read(f"profiles/{agent}.md")]
+    except OSError:
+        return None
+    where, rules = STABLE_WHERE[opening]
+    return "\n\n".join([STABLE_TASK.format(agent=agent, where=where, rules=rules)] + texts) + "\n"
+
+
+def stable_start(conf, needs, opening, rules):
+    """True when this task session starts with its stable text first (plan P9.2): the hub said how its task reaches
+    it (opening, its runtime's task_opening) and which parts of the rules it reads, and it starts in a terminal of
+    that runtime. Anything else starts as before."""
+    runtime = conf.get("runtime")
+    return isinstance(rules, list) and opening in STABLE_WHERE and runtime_fact(runtime, "task_opening") == opening \
+        and runtime_fact(runtime, "driver") == "terminal" and not app_server_task(conf, needs)
+
+
 def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, generation="", session="", token=None,
-                    resume=False, env=None):
+                    resume=False, env=None, opening=None, rules=None):
     """token: the session credential (owner API 1.12); None starts the session as before, without one. resume: the
     standing session continues its conversation `session` and gets no first prompt: Claude's session (--resume, never
     with a new --session-id) or Codex's thread (codex resume). Everything else is the command of a new start: the same
     settings, MCP configuration and credential. A new Codex session ends its prompt with its session id as a marker,
     by which the helper finds its rollout. env: {NAME: value} of session_env, which the session gets as the
-    credential, from a file that its window reads and removes."""
+    credential, from a file that its window reads and removes. opening and rules: how the hub said this task's
+    session starts (stable_start); with them, `prompt` is the task's own block and comes last."""
     if resume and (task or conf.get("runtime") not in MANAGER_RUNTIMES or not session):
         raise Refused("only the standing Claude or Codex session continues a conversation")
     values = dict(env or {})
@@ -786,7 +845,8 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
     runtime = conf.get("runtime")
     tools = [] if not runtime_fact(runtime, "mcp_servers") or app_server_task(conf, needs) else \
         [t for t in values.get("FLEET_TOOLS", "").split() if t in catalog]
-    if task:
+    stable = stable_text(agent, opening, rules) if task and stable_start(conf, needs, opening, rules) else None
+    if task and stable is None:
         prompt += github_text(values, tools)
     if runtime_fact(runtime, "driver") == "acp":
         # An ACP agent (Grok Build: "grok agent stdio") runs inside acp_runner.py, with the task-bound fleet tools.
@@ -826,6 +886,19 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
     idle = task and conf.get("runtime") == "claude"
     first = (shlex.quote(session) if conf.get("runtime") == "codex" else "") if resume else \
         ("--append-system-prompt " if idle else "") + shlex.quote(prompt)
+    if stable is not None:
+        # The stable text first, then what is this session's own: its repositories' line, and for Codex its task.
+        # Claude's task comes with its first read_messages, so no task text is in its start at all.
+        stable += github_text(values, tools)
+        if opening == "read":
+            first = "--setting-sources user --append-system-prompt-file " + \
+                shlex.quote(session_file(agent, task, "md", stable))
+        else:
+            # A first prompt longer than a tmux command can carry: the window's shell reads it from its file, which
+            # it removes before Codex starts. Codex reads all of RULES.md as this folder's AGENTS.md.
+            path = shlex.quote(session_file(agent, task, "md", stable + "\n" + prompt))
+            limit = max(CODEX_RULES_BYTES, os.path.getsize(os.path.join(KIT, "AGENTS.md")) + 4096)
+            first = f'-c project_doc_max_bytes={limit} "$(cat {path}; rm -f {path})"'
     cmd = conf["start"].format(prompt=" ".join(x for x in (flags, first) if x),
                                chrome="--chrome" if needs == "browser" else "",
                                settings=settings_arg(agent, conf, task, tools))
@@ -925,6 +998,50 @@ def claude_context(path):
     if not first or not calls:
         return None
     return calls[-1][0], first[0], calls[-1][1], next((c[2] for c in reversed(calls) if c[2]), CACHE_SECONDS)
+
+
+def codex_context(path):
+    """(tokens now, tokens at its start, time of its last model call, None) of a Codex rollout, from its first and its
+    last token count (each one's last_token_usage is the context of that call); None when either is not found. Only
+    the head and the tail of the file are read. Codex's records name no cache lifetime, so its runtime's fact holds."""
+    def calls(lines):
+        for line in lines:
+            if b'"token_count"' not in line:
+                continue
+            try:
+                row = json.loads(line)
+                usage = row["payload"]["info"]["last_token_usage"]
+                tokens, at = usage["input_tokens"], timestamp(row.get("timestamp"))
+            except (ValueError, KeyError, TypeError):
+                continue
+            if isinstance(tokens, int) and tokens and at is not None:
+                yield tokens, at
+    try:
+        with open(path, "rb") as stream:
+            head = stream.read(CONTEXT_BYTES)
+            stream.seek(max(0, os.fstat(stream.fileno()).st_size - CONTEXT_BYTES))
+            tail = stream.read(CONTEXT_BYTES)
+    except (OSError, TypeError):
+        return None
+    first, last = next(calls(head.splitlines()), None), list(calls(tail.splitlines()))
+    return (last[-1][0], first[0], last[-1][1], None) if first and last else None
+
+
+def started_runs(start, runtime):
+    """{"runtime", "model", "effort"} that a window started with, read from its start command with the runtime's own
+    model flags (lifecycle.RUNTIMES "model_flags"): what the session reuse rule compares with the agent's now."""
+    try:
+        words = launch_words(start)
+    except ValueError:
+        words = []
+    out = {"runtime": os.path.basename(words[0]) if words else None, "model": None, "effort": None}
+    for key, flag in (runtime_fact(runtime, "model_flags") or {}).items():
+        shape = re.compile(re.escape(flag[1]).replace(re.escape("{}"), "(.+)") + r"\Z")
+        for word, value in zip(words, words[1:]):
+            found = shape.match(value) if word == flag[0] else None
+            if found:
+                out[key] = found.group(1)
+    return out
 
 
 # Claude Code puts RULES.md in the context through CLAUDE.md, so a session that also read it was given its
@@ -2600,10 +2717,10 @@ class Helper:
         if window in STANDING_WINDOWS and self.turn_runs(window, target):
             return                  # a turn runs: it reads its messages at its end, and this tells it after that
         try:
-            if window == "manager" and self.restart_fresh(target):
+            if window in STANDING_WINDOWS and self.restart_fresh(target, window):
                 return              # a new conversation starts instead, and the next poll tells it
-        except Exception as e:      # a check that fails never keeps a message from the manager: it is told as before
-            self.say(f"manager: the check for a cold session failed ({type(e).__name__})")
+        except Exception as e:      # a check that fails never keeps a message from a session: it is told as before
+            self.say(f"{window}: the check for a cold session failed ({type(e).__name__})")
         text = (CONVERSATION_SIGNAL if CONVERSATION_WINDOW.fullmatch(window) else
                 f'New fleet messages. Call read_messages(task_id="{window}") now.'
                 if self.worker and window != "owner-chat" else CHAT_SIGNAL)
@@ -2673,7 +2790,8 @@ class Helper:
         """Start the owner chat window of this generation: for his message (handle), or before any message when the
         hub wants it running (keep_chat). Raises Refused when it may not start now."""
         window, runtime = "owner-chat", self.conf.get("runtime")
-        resume = self.chat_resume(generation)      # first: the conversation it continues, if any
+        # first: the conversation it continues, if any; none after the reuse rule closed the last one (restart_fresh)
+        resume = None if self.__dict__.pop("chat_fresh", False) else self.chat_resume(generation)
         # **Two starts while its starts keep ending, and then a reason** (plan C5: a count, not a minute). A chat
         # whose window ended before its conversation began starts again once, but not at every poll: each start asks
         # the hub for a credential and starts the runtime. A chat with a conversation to continue starts at once, and
@@ -2800,7 +2918,8 @@ class Helper:
                                            attempt=extra.get("attempt", 1))
                 self.start(task, lambda: session_command(self.agent, self.conf, ev["text"], task=task,
                     needs=needs, attempt=extra.get("attempt",1), generation=extra.get("generation",""),
-                    session=session, token=token, env=session_env(self.agent, self.conf, "task")),
+                    session=session, token=token, env=session_env(self.agent, self.conf, "task"),
+                    opening=extra.get("opening"), rules=extra.get("rules")),
                     extra.get("attempt",1), extra.get("generation",""), session, needs=needs)
                 self.say(f"{task}: session started, attempt {extra.get('attempt',1)}")
                 # plan C6: the ack says only "started once"; the event stays pending until the session reads it
@@ -3085,27 +3204,31 @@ class Helper:
         self.manager_due = True
         self.say("manager: its team tools changed, so its session starts again on the same conversation")
 
-    def restart_fresh(self, target):
-        """True when this closed the standing Claude manager session so that it starts again on a new conversation,
-        with the hub's brief, instead of being told of its messages (signal): its watch starts it within ten
-        seconds, and the next poll tells the new session. Between two turns only, and for one of two reasons:
+    def restart_fresh(self, target, window="manager"):
+        """True when this closed a standing session -- the manager's, or an owner chat -- so that it starts again on a
+        new conversation, with the hub's brief or its recap, instead of being told of its messages (signal): its watch
+        starts it within ten seconds, and the next poll tells the new session. Between two turns only, and for one of
+        two reasons:
 
-        - It is cold. Its last model call is older than the provider's cache (CACHE_SECONDS, or what its own records
-          say), and its context has grown FRESH_GROWN past the start of its conversation, so telling it would read
-          all of that again at the price of writing it, where a new session pays only for a start. Nothing is lost
-          that a read cannot give back: the fleet's state is in the hub, and the brief opens with it.
+        - The session reuse rule says so (lifecycle.session_reuse, plan P9.10, helper feature session_reuse): its
+          cache is cold, its context has grown past the growth factor since its start, it has no room before its
+          compaction, or it runs another model or effort than the agent has now. Telling it would read all of its
+          context again at the price of writing it, where a new session pays only for a start. Nothing is lost that
+          a read cannot give back: the fleet's state is in the hub, and the brief opens with it.
         - It started without the compaction window (STANDING_COMPACT), before this helper had it: one time.
 
         A signal that this helper typed less than one cache lifetime ago counts as a model call, so a conversation file
         that is not where it should be never makes a session that is still cached look cold. A start does not: a
         session that continues its conversation makes no call until it is told of a message."""
-        if self.conf.get("role") != "manager" or self.conf.get("runtime") != "claude":
+        runtime = self.conf.get("runtime")
+        if (window == "manager") != (self.conf.get("role") == "manager") or runtime not in MANAGER_RUNTIMES:
             return False
         if self.manager_due or self.manager_left or self.manager_retiring is not None or self.outdated():
             return False                # a start or a switch is already going to replace this session
         # At most one new conversation for each started session until it made a model call (plan C5): a session with
         # no call yet has no context to read (claude_context below), so it is never cold, and no clock spaces them.
-        if self.window_runtime("manager") != "claude":
+        # A window of another runtime is the switch's to replace.
+        if self.window_runtime(window) != runtime:
             return False
         r = tmux("display-message", "-p", "-t", target, "#{@fleet_session}\t#{pane_start_command}")
         screen = tmux("capture-pane", "-p", "-t", target)
@@ -3113,25 +3236,45 @@ class Helper:
                 WORKING.search("\n".join(screen.stdout.rstrip().split("\n")[-15:])):
             return False                # unknown, a question waits on its screen, or a turn runs: not now
         session, _, start = r.stdout.rstrip("\n").partition("\t")
-        if start.strip() and "CLAUDE_CODE_AUTO_COMPACT_WINDOW=" not in start and not self.compact_restarted:
+        if window == "manager" and runtime == "claude" and start.strip() and \
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW=" not in start and not self.compact_restarted:
             self.compact_restarted = True       # one time for this helper, whatever the new start says
             why = f"it started without the {STANDING_COMPACT}-token compaction window"
         else:
-            path = claude_chat_file(session if THREAD_ID.fullmatch(session) else self.manager_session)
-            seen = claude_context(path) if path else None
-            if not seen:
+            seen = self.standing_context(window, runtime, session)
+            if seen:
+                # A signal that this helper typed less than one cache lifetime ago counts as a model call.
+                typed = time.time() - (time.monotonic() - self.typed_at.get(window, float("-inf")))
+                seen = seen[:2] + (max(seen[2], typed),) + seen[3:]
+            reuse, why = session_reuse(runtime, seen, started_runs(start, runtime) if start.strip() else None,
+                                       {"runtime": runtime, "model": self.conf.get("model"),
+                                        "effort": self.conf.get("effort")}, reuse_settings(checkout_team()))
+            if reuse:
                 return False
-            tokens, first, at, cached = seen
-            idle = min(time.time() - at, time.monotonic() - self.typed_at.get("manager", float("-inf")))
-            if idle < cached or tokens - first < FRESH_GROWN:
-                return False
-            why = (f"its {tokens // 1000}K tokens of context are no longer cached after {idle / 60:.0f} quiet "
-                   f"minutes, and a new session costs only its start of about {first // 1000}K")
         with contextlib.suppress(subprocess.CalledProcessError, Refused):
             tmux("kill-window", "-t", target)
-        self.fresh_at, self.manager_due, self.manager_fresh = time.monotonic(), True, True
-        self.say(f"manager: {why}, so its session starts again on a new conversation with the hub's brief")
+        if window == "manager":
+            self.fresh_at, self.manager_due, self.manager_fresh = time.monotonic(), True, True
+            self.say(f"manager: {why}, so its session starts again on a new conversation with the hub's brief")
+        else:
+            self.chat_fresh = True          # its next start begins a new conversation, with the hub's recap
+            self.say(f"{window}: {why}, so it starts again on a new conversation with the hub's recap")
         return True
+
+    def standing_context(self, window, runtime, session):
+        """The context reading of a standing window's conversation from its own records (claude_context,
+        codex_context), or None when they are not found: the manager's by its session or its record, an owner
+        chat's by its record."""
+        if window == "manager":
+            thread = session if THREAD_ID.fullmatch(session or "") else self.manager_session
+        else:
+            record = load_chat_record(self.agent, runtime) if runtime in MANAGER_RUNTIMES else None
+            thread = (record or {}).get("session")
+        if runtime == "claude":
+            path = claude_chat_file(thread)
+            return claude_context(path) if path else None
+        files = codex_threads(thread) if thread and THREAD_ID.fullmatch(str(thread)) else []
+        return codex_context(files[0]) if files else None
 
     def account_changed(self):
         """**A sign-in is an account change, and the app says so only from a reading.** The address on the owner's

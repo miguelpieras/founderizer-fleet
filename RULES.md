@@ -207,6 +207,17 @@ Say in your result which route you used. A long command may run in the backgroun
 
 If your browser tools say that the browser extension is not connected, stop. Do not use another route, and do not repeat your last action. Ask your requester with `ask_my_requester`, and give your attempt number (`$FLEET_ATTEMPT`).
 
+## Working at little cost
+
+- Make the reads that do not need each other in one turn, where your runtime allows it.
+- A duty with many small events handles them together in one session; its own words say how, and an urgent event
+  goes at once.
+- Routine work needs a small model and low effort. Whoever sets your model and effort chooses them by the work.
+- Keep what you write short: results, notes, messages and answers. Output costs five to eight times what input
+  costs.
+- A short question that needs no tools goes as a message to a session that runs (`message_agent`, or the owner
+  chat), not as a new task.
+
 ## Logins
 
 A login never travels as text. For passwords and keys this rule has no exceptions.
