@@ -1713,6 +1713,7 @@ def migrate():
     ]:
         sql_step(statement, problems)
     # Plan P1: the default roles, one time, so a role that the owner deleted does not come back at the next start.
+    # Then, one time too, a role that still holds the first seed's words takes the words of today's defaults.
     try:
         if not kv_get("roles_seeded"):
             t0 = now()
@@ -1721,6 +1722,13 @@ def migrate():
                     DB.execute("INSERT OR IGNORE INTO roles(name,prompt,tools,daily,created,updated) "
                                "VALUES(?,?,?,?,?,?)", (name, prompt, int(tools), daily, t0, t0))
                 DB.execute("INSERT INTO kv(k,v) VALUES('roles_seeded',?)", (str(t0),))
+        if not kv_get("roles_reworded"):
+            t0 = now()
+            with transaction():
+                for name, before in ROLE_DEFAULTS_BEFORE.items():
+                    DB.execute("UPDATE roles SET prompt=?, updated=? WHERE prompt=?",
+                               (ROLE_DEFAULTS[name][0], t0, before))
+                DB.execute("INSERT INTO kv(k,v) VALUES('roles_reworded',?)", (str(t0),))
     except sqlite3.Error as e:
         problems.append(f"the default roles: {e}")
     # Not through sql_step and not in SCHEMA: a machine without FTS5 searches with a scan, and must not have that
@@ -5642,8 +5650,12 @@ def t_see_triggers(agent, a):
     return "\n\n".join(shown) or "No wake-up rules that you may see. Create one with save_trigger."
 
 
-LINES_OFF = ("This fleet does not take checks that print lines yet. Give the check condition and repeat_minutes, and "
-             "have it print one JSON object: {\"value\": a number, \"summary\": text}.")
+LINES_OFF = ("This fleet does not take checks that print lines yet. Give the check a condition, {\"op\": \">\", "
+             "\">=\", \"<\", \"<=\", \"==\" or \"!=\", \"value\": a number}, and have it print one JSON object: "
+             "{\"value\": a number, \"summary\": text}. It wakes the agent once while the value matches the "
+             "condition, and again only after a quiet run.")
+VALUE_OFF = ("Checks print lines in this fleet: leave out condition, and have the check print one line for each item "
+             "that needs the agent now, beginning with the item's own id.")
 
 
 @wake_refused
@@ -5656,8 +5668,10 @@ def t_save_trigger(agent, a):
     rule = trigger_view(t, t0) if t and t["state"] != "deleted" else None
     rules = [dict(r) for r in q("SELECT id, agent, created_by, state FROM triggers WHERE state<>'deleted'")]
     plan = wakeups.plan_save(org, agent, a, rule, rules)
-    if "check" in a and wakeups.is_lines(plan.get("check")) and not setting("checks.lines"):
-        raise ToolError(LINES_OFF)          # the shipped app cannot read such a rule until the owner has 0.1.64
+    if "check" in a and plan.get("check"):
+        lines = setting("checks.lines")     # the app 0.1.63 cannot read a line check; one way to wake once it can
+        if wakeups.is_lines(plan["check"]) != lines:
+            raise ToolError(VALUE_OFF if lines else LINES_OFF)
     if plan["op"] == "create":
         body = dict(trigger_fields(dict(plan["fields"]), create=True), request_id=command[1])
     else:
@@ -8606,16 +8620,30 @@ PERSON_LEAST = "customer"
 # first rows, in the plan's words: what the agent is told about such a person, the switch (True: the conversation
 # runs with the agent's own tools; False: closed, for an outsider) and the messages a day (None: no limit; staff have
 # none). PERSON_LEAST's words here are also what a role that the table does not hold reads as, when the table has no
-# closed row of that name.
+# closed row of that name. Each says whose conversations the person may hear about, because access does not: a
+# session that a person drives finds every conversation of the agent (search_history), customers' included.
 ROLE_DEFAULTS = {
-    "customer": ("An outsider: a customer. Help them with their own business, and with nothing outside it.",
-                 False, 30),
+    "customer": ("An outsider: a customer. Help them with their own business, and with nothing outside it. Tell "
+                 "them about their own conversation only, not about other people's.", False, 30),
     "peer": ("A colleague. Do work for them, share the work and its data with them, and write to them first when "
-             "it helps.", True, None),
+             "it helps. Tell them about their own conversation and the work, not about other people's "
+             "conversations.", True, None),
     "manager": ("A colleague above you. As for a peer, do work for them, share the work and its data with them, and "
                 "write to them first when it helps. They may also ask about your other conversations, decide in "
                 "their domain, give you instructions and targets, and hand their own decisions to you. The owner's "
-                "note on them names their domain.", True, None),
+                "note on them names their domain. Tell them about the conversations of the people in their domain, "
+                "not about other people's.", True, None),
+}
+# The words of the first seed, before the sentence about conversations. A role that still holds them, under any
+# name, takes the new words one time (migrate, kv roles_reworded); a role whose words the owner changed keeps his.
+ROLE_DEFAULTS_BEFORE = {
+    "customer": "An outsider: a customer. Help them with their own business, and with nothing outside it.",
+    "peer": "A colleague. Do work for them, share the work and its data with them, and write to them first when it "
+            "helps.",
+    "manager": "A colleague above you. As for a peer, do work for them, share the work and its data with them, and "
+               "write to them first when it helps. They may also ask about your other conversations, decide in their "
+               "domain, give you instructions and targets, and hand their own decisions to you. The owner's note on "
+               "them names their domain.",
 }
 # Plan P1: the one conversion, when contacts.v2 turns on (contacts_v2_on). Nothing reads a stored role through this:
 # the rows are changed one time, and this goes with PERSON_ROLES when the live fleet has switched.
@@ -16261,7 +16289,9 @@ def item_scope(agent, value):
 
 
 def target_check(agent, value):
-    """The wake-up rule whose code check measures a target: one of the agent's own, or None."""
+    """The wake-up rule whose check measures a target: one of the agent's own, or None. Only a check that prints lines
+    records progress (AUTONOMY.md 6.5: its first line "progress <number>"), so a target takes no other check, and
+    while the fleet takes no such checks (checks.lines) the agent reports a target's progress itself."""
     if value in (None, ""):
         return None
     try:
@@ -16272,6 +16302,11 @@ def target_check(agent, value):
     row = read_row("SELECT agent, state, check_spec FROM triggers WHERE id=?", (rule,))
     if not row or row["agent"] != agent or row["state"] == "deleted" or not row["check_spec"]:
         raise ToolError(f"Wake-up rule {rule} is not one of your own with a code check (see_triggers).")
+    if not wakeups.is_lines(json.loads(row["check_spec"])):
+        raise ToolError(f"Wake-up rule {rule}'s check does not print lines, so it records no progress: a target's "
+                        f"check prints \"progress <number>\" as its first line." +
+                        ("" if setting("checks.lines") else " This fleet does not take such checks yet: leave check "
+                         "out, and give the target's progress yourself with progress."))
     return rule
 
 
@@ -17621,6 +17656,7 @@ def manager_resume_text(parts=True):
                         + "\n".join(resume_lines(t0))
                         + team_start_text(manager_name())               # the team directory (P9.1)
                         + standing_start_text(manager_name()).rstrip("\n")   # its standing items (L3, 6.4)
+                        + manager_checks_text(t0).rstrip("\n")         # its checks and its reports' new ones (L4)
                         + "\nThen call read_messages: its read is the receipt.")
 
 
@@ -18285,15 +18321,16 @@ TOOLS = [
     ("all", "set_target", t_set_target,
      "Keep a standing target: what to reach, as a measure, a number, a date and how it is measured, from your own data "
      "or because the owner, a person whose role allows it or another agent set it. check names one of your wake-up "
-     "rules whose code check measures it: it then records the progress at each run, and the target takes its progress "
-     "only from it. With id, change one of your own targets, or give its progress when it has no check.",
+     "rules whose check prints lines: its first line \"progress <number>\" records the progress at each run, and the "
+     "target takes its progress only from it. With id, change one of your own targets, or give its progress when it "
+     "has no check.",
      S({"measure": {"type": "string", "description": "What is measured, for example: tickets with a first draft "
                                                      "within 2 hours, in percent"},
         "number": {"type": "number", "description": "The number to reach"},
         "due": {"type": "string", "description": "By when: an ISO date, for example 2026-11-30. No date: it stands "
                                                  "until it is ended"},
         "how": {"type": "string", "description": "How it is measured: the source of the data"},
-        "check": {"type": "integer", "description": "The wake-up rule whose code check measures it"},
+        "check": {"type": "integer", "description": "The wake-up rule whose check prints its progress"},
         "scope": {"type": "string", "enum": list(STANDING_SCOPES),
                   "description": "agent: it steers you; team: it steers you and every agent of your team"},
         "source": {"type": "string", "description": "The message it came from: M-12 or CM-41"},
@@ -19327,9 +19364,9 @@ def trigger_view(t, t0):
             "created": t["created"], "updated": t["updated"],
             "request_id": t["request_id"], "failures": t["failures"], "failing_since": failing_since(t),
             "created_by": t["created_by"],
-            # a line check has no armed state: each new line wakes, once (plan P4)
-            "armed": dict(zip(("armed", "reason"), rule_armed(t, t0)[:2]))
-            if t["check_spec"] and not wakeups.is_lines(json.loads(t["check_spec"])) else None}
+            # an agent's check has no armed state: each new line wakes, once (plan P4)
+            "armed": dict(zip(("armed", "reason"), trigger_armed(t, t0)[:2]))
+            if t["check_spec"] and not agent_rule(t) else None}
 
 
 def failing_since(t):
@@ -19446,7 +19483,7 @@ def run_wake(t, due, manual, t0):
         state, reason, admission = "not_started", f"{t['agent']} is no longer in the team, so the hub paused this trigger.", None
         pause = f"{t['agent']} is no longer in the team."
     else:
-        state, reason, admission, pause = wake_decision(t, None, None, manual, t0, due=due)
+        state, reason, admission, pause = wake_decision(t, manual, t0, due)
     later = [] if manual else trigger_slots(json.loads(t["schedule"]), t["anchor"], max(due, t0), 1)
     with transaction():
         run = DB.execute("INSERT INTO trigger_runs(trigger_id,revision,due,manual,state,reason,created,finished) "
@@ -19682,9 +19719,9 @@ def wake_when(t):
 
 
 def wake_last(t):
-    """(last, quiet_after) of an agent's rule for wakeups.wake_armed: what its newest started run started (None, or
-    {"ref", "open", "ended", "ended_at"}), and whether a quiet run came after it. From the stored rows only, so it is
-    the same after a restart. The wake is the target's own task: a lead's task that it is a subtask of carries the
+    """(last, quiet_after) of an agent's rule, for a prompt run (wake_decision): what its newest started run started
+    (None, or {"ref", "open", "ended", "ended_at"}), and whether a quiet run came after it. From the stored rows only,
+    so it is the same after a restart. The wake is the target's own task: a lead's task that it is a subtask of carries the
     results of the lead's whole team (plan P9.11), so it says nothing about this rule."""
     started = q1("SELECT * FROM trigger_runs WHERE trigger_id=? AND state='started' ORDER BY id DESC LIMIT 1", (t["id"],))
     if not started:
@@ -19700,14 +19737,6 @@ def wake_last(t):
     still = child["state"] not in TERMINAL
     return {"ref": tref(child["id"]), "open": still, "ended": None if still else child["state"],
             "ended_at": None if still else child["delivered"] or child["last_activity"] or 0}, quiet
-
-
-def rule_armed(t, t0):
-    """trigger_armed for the owner's rules; the wake-up module's armed state, for every route, for an agent's."""
-    if not agent_rule(t):
-        return trigger_armed(t, t0)
-    last, quiet = wake_last(t)
-    return wakeups.wake_armed(last, quiet, json.loads(t["check_spec"]).get("repeat_minutes"), t0, wake_when(t))
 
 
 def wakes_24h(t, t0):
@@ -19743,11 +19772,11 @@ def wake_admission(t, route, task):
     return {"route": route, "child": child, "parent": parent}
 
 
-def wake_decision(t, r, value, manual, t0, due=None):
-    """(state, reason, admission, pause) of one run of an agent's rule (WAKEUPS-INTERFACE.md, section 5): the rule is
-    checked again with the current team first, and a stale rule starts nothing and is paused by the hub (pause is
-    the reason). A message route decides with wakeups.manager_decision; a task route with the 1.7 and 1.8 task rules,
-    without the reporting-line rule. r is the check run, or None for a prompt run."""
+def wake_decision(t, manual, t0, due):
+    """(state, reason, admission, pause) of one prompt run of an agent's rule (WAKEUPS-INTERFACE.md, section 5): the
+    rule is checked again with the current team first, and a stale rule starts nothing and is paused by the hub (pause
+    is the reason). A message route decides with wakeups.manager_decision; a task route with the 1.7 task rules,
+    without the reporting-line rule. A check run wakes through its lines instead (plan P4: lines_wake)."""
     org = wake_org()
     valid, why = wakeups.still_valid(org, trigger_view(t, t0))
     if not valid:
@@ -19755,53 +19784,31 @@ def wake_decision(t, r, value, manual, t0, due=None):
     route, why = wakeups.wake_route(org, t["agent"])
     if route is None:
         return "not_started", why, None, why
-    spec, task = json.loads(t["check_spec"]) if t["check_spec"] else None, json.loads(t["task"])
-    check = r is not None
-    last, quiet = wake_last(t)
+    task = json.loads(t["task"])
+    last, _ = wake_last(t)
+    if t["responsibility"]:         # owner API 1.13: one key of a duty has at most one open case, on either route
+        why = duty_block(t, due, t0)
+        if why:
+            return "not_started", why, None, None
     if route["kind"] == "message":
-        if t["responsibility"]:         # owner API 1.13: as on the task route, one key has at most one open case
-            why = duty_block(t, due if due is not None else (r["due"] if r else t0), t0)
-            if why:
-                return ("waiting" if check else "not_started"), why, None, None
-        limit = active_limit(route["to"])
-        state, reason = wakeups.manager_decision({
-            "check": check, "matches": check and check_matches(spec["condition"], value),
-            "check_now": bool(check and r["check_now"]), "repeat_minutes": spec["repeat_minutes"] if spec else None,
-            "last": last, "quiet_after": quiet, "limit_until": limit["until"] if limit else None, "t0": t0},
-            wake_when(t))
-        if state == "started":              # after the quiet rule: a check that does not match stays quiet
+        state, reason = wakeups.manager_decision(last)
+        if state == "started":
             try:
                 wake_goal(t, task)
             except ToolError as e:
-                return ("waiting" if check else "not_started"), str(e), None, None
+                return "not_started", str(e), None, None
         return state, reason, ({"route": route} if state == "started" else None), None
-    if check:
-        if not check_matches(spec["condition"], value):
-            return "quiet", None, None, None
-        if r["check_now"]:
-            return "not_started", "Check now never starts a task.", None, None
-        armed, why, final = wakeups.wake_armed(last, quiet, spec["repeat_minutes"], t0, wake_when(t))
-        if not armed:
-            return ("not_started" if final else "waiting"), why, None, None
-    wait = "waiting" if check else "not_started"
     if last and last["open"]:
-        return wait, f"{last['ref']} is still open.", None, None
-    if t["responsibility"]:         # owner API 1.13: one key of a duty has at most one open case
-        why = duty_block(t, due if due is not None else (r["due"] if r else t0), t0)
-        if why:
-            return wait, why, None, None
+        return "not_started", f"{last['ref']} is still open.", None, None
     done = q1("SELECT id FROM tasks WHERE trigger_id=? ORDER BY id DESC LIMIT 1", (t["id"],))
     unknown = q1("SELECT id FROM outcomes WHERE task=? AND state='unknown' ORDER BY id LIMIT 1",
                  (done["id"],)) if done else None
     if unknown:
-        return wait, f"O-{unknown['id']} of {tref(done['id'])} is unknown. Settle it first.", None, None
-    limit = active_limit(t["agent"])
-    if check and limit:
-        return "waiting", f"{t['agent']} is at its usage limit until {clock(limit['until'])}.", None, None
+        return "not_started", f"O-{unknown['id']} of {tref(done['id'])} is unknown. Settle it first.", None, None
     try:
         return "started", None, wake_admission(t, route, task), None
     except ToolError as e:
-        return wait, str(e), None, None
+        return "not_started", str(e), None, None
 
 
 def admit_wake(t, run, admission, line, t0):
@@ -19870,24 +19877,44 @@ def checks_start_text(agent, task_id):
     since = read_row("SELECT MAX(a.created) at FROM attempts a JOIN tasks t ON t.id=a.task WHERE t.owner=? AND "
                      "(a.task<>? OR a.attempt<(SELECT MAX(attempt) FROM attempts WHERE task=?))",
                      (agent, task_id, task_id))["at"]
-    out = []
-    for t in read_rows("SELECT * FROM triggers WHERE agent=? AND state IN ('active','paused') AND check_spec IS NOT "
-                       "NULL ORDER BY id", (agent,)):
-        out.append(check_start_line(t, since, mine=True))
     team = [n for n in agents() if reports_to(n) == agent] if role_of(agent) == "lead" else []
+    return checks_block(agent, since, team, "YOUR TEAM since your last session")
+
+
+def manager_checks_text(t0):
+    """The checks block of the fleet manager's brief (plan P4): its own checks, and the new or changed checks of the
+    agents that report to it with no lead between, since its last brief (kv checks_brief, which this moves to t0). A
+    lead reads its own team's in its sessions' starts. Outside every transaction: the standing session's start asks
+    for the brief."""
+    manager = manager_name()
+    last = kv_get(f"checks_brief:{manager}")
+    try:
+        since = float(last) if last else None
+    except ValueError:
+        since = None
+    team = [n for n in agents() if n != manager and reports_to(n) == manager]
+    text = checks_block(manager, since, team, "THE AGENTS THAT REPORT TO YOU since your last brief")
+    kv_set(f"checks_brief:{manager}", str(t0))
+    return text
+
+
+def checks_block(agent, since, team, whose):
+    """The agent's checks and the new or changed checks of `team` since `since` (check_start_line), "" when neither
+    has a line. Reads only."""
+    out = [check_start_line(t, since, mine=True) for t in read_rows(
+        "SELECT * FROM triggers WHERE agent=? AND state IN ('active','paused') AND check_spec IS NOT NULL ORDER BY id",
+        (agent,))]
     marks = ",".join("?" * len(team))
-    changed = [check_start_line(t, since, mine=False) for t in read_rows(
+    changed = [x for x in (check_start_line(t, since, mine=False) for t in read_rows(
         f"SELECT * FROM triggers WHERE agent IN ({marks}) AND state IN ('active','paused') AND check_spec IS NOT NULL "
-        f"ORDER BY id", tuple(team))] if team else []
-    changed = [x for x in changed if x]
+        f"ORDER BY id", tuple(team))) if x] if team else []
     if not out and not changed:
         return ""
     text = ""
     if out:
         text += "\nYOUR CHECKS (see_triggers shows each in full; fix a noisy or failing one yourself):\n" + "\n".join(out)
     if changed:
-        text += "\nNEW OR CHANGED CHECKS OF YOUR TEAM since your last session (read their code with see_triggers):\n" + \
-            "\n".join(changed)
+        text += f"\nNEW OR CHANGED CHECKS OF {whose} (read their code with see_triggers):\n" + "\n".join(changed)
     if len(text) > CHECKS_START_MAX:
         text = text[:CHECKS_START_MAX].rsplit("\n", 1)[0] + "\n- ... and more: see_triggers lists them all."
     return text + "\n"
@@ -20008,11 +20035,21 @@ def check_body(data):
         if "retry_after" in data:
             body["retry_after"] = whole(data["retry_after"], 1, CHECK_TIMEOUT_MAX, "retry_after")
         if isinstance(data.get("tail"), str) and data["tail"].strip():      # the end of its error output (plan P4)
-            body["tail"] = mask_secrets(TAIL_CONTROL.sub(" ", data["tail"])[-CHECK_TAIL:].strip())
+            body["tail"] = error_tail(data["tail"])
     if secret_hit(*text.values()):
         body = dict({k: body[k] for k in ("token", "elapsed_ms") if k in body}, ok=False, error="blocked",
                     detail="The check output contained a registered login.")
     return body
+
+
+def error_tail(text):
+    """The end of a check's error output, as its failure wake shows it: masked whole first and only then cut, at a
+    line's start, so no login is ever cut in two with one half outside the mask."""
+    masked = mask_secrets(TAIL_CONTROL.sub(" ", text))
+    if len(masked) > CHECK_TAIL:
+        cut = masked[-CHECK_TAIL:]
+        masked = cut.split("\n", 1)[1] if "\n" in cut else ""
+    return masked.strip()
 
 
 def end_open_runs(trigger_id, why, t0):
@@ -20206,11 +20243,13 @@ def check_result(t, r, body, t0, stored=None, held=None):
     The third failed run in a row of an agent's check wakes the agent once, with the end of its error output."""
     spec = json.loads(t["check_spec"]) if t["check_spec"] else None
     lines_form = wakeups.is_lines(spec)
-    if held is not None:
-        body = {"ok": True, "lines": held}
+    if held is not None:        # the lines that the run kept, and for a value check its value and summary
+        body = {"ok": True, "lines": held} if lines_form else {"ok": True, "value": r["value"],
+                                                                 "summary": r["summary"] or ""}
     fields = admission = wake = fail = None
     retry = blocked = None
     printed = progress = new = None
+    lost_ids = ()
     stale = wakeups.still_valid(wake_org(), trigger_view(t, t0)) if agent_rule(t) and t["agent"] in agents() else (True, None)
     if not stale[0]:                        # checked again at each result: a stale claim starts nothing
         failures, error, detail = t["failures"], None, None
@@ -20222,15 +20261,19 @@ def check_result(t, r, body, t0, stored=None, held=None):
         failures, error, detail = t["failures"], None, None
         state, reason, pause = "waiting", f"busy: {body.get('detail') or 'its machine runs four checks now'}.", None
         retry = t0 + CHECK_BUSY_RETRY
-    elif body["ok"] and lines_form:
+    elif body["ok"] and agent_rule(t):     # plan P4: an agent's check wakes in one way, by its lines
         failures, error, detail, pause = 0, None, None, None
-        progress, printed = (None, held) if held is not None else wakeups.progress_of(body["lines"])
+        if held is not None:
+            progress, printed = None, held
+        elif lines_form:
+            progress, printed = wakeups.progress_of(body["lines"])
+        else:                   # a value that matches its condition reads as one line, the same while it holds
+            progress = None
+            printed = [wakeups.value_line(t["id"])] if check_matches(spec["condition"], float(body["value"])) else []
         printed = wakeups.new_lines(printed, ())        # each line once, in its order
-        new = wakeups.new_lines(printed, accepted_lines(t))
+        lost_ids, lost = lost_lines(t)      # told to a wake that ended before its session read them
+        new = wakeups.new_lines(printed, [x for x in accepted_lines(t) if x not in lost])
         state, reason, admission, wake = lines_wake(t, r, new, t0)
-    elif body["ok"] and agent_rule(t):
-        failures, error, detail = 0, None, None
-        state, reason, admission, pause = wake_decision(t, r, float(body["value"]), False, t0)
     elif body["ok"]:
         failures, error, detail = 0, None, None
         state, reason, fields = check_decision(t, r, float(body["value"]), t0)     # reads commit: before the transaction
@@ -20281,10 +20324,11 @@ def check_result(t, r, body, t0, stored=None, held=None):
                                             trigger_id=t["id"], trigger_run=r["id"])
             if rest:            # the lines that the wake text has no room for go into the same wake, as a message
                 joined = join_rows(t, {"task": answer["task"]} if answer["task"] else {"event": event},
-                                   lines_said(t, r, rest, "more"), t0)
+                                   lines_said(t, r, rest, "more"), t0, rest)
                 event = event if answer["task"] else joined[1]
         elif state == "joined":
-            answer["task"], joined = join_rows(t, wake, lines_said(t, r, new, "new"), t0)
+            said = lines_said(t, r, new, "new") if lines_form else value_said(t, r, spec, body)
+            answer["task"], joined = join_rows(t, wake, said, t0, new)
             event = None if answer["task"] else joined
         if fail:
             answer["task"], fail_event = failure_wake_rows(t, fail, t0)
@@ -20301,6 +20345,10 @@ def check_result(t, r, body, t0, stored=None, held=None):
             DB.execute("DELETE FROM trigger_runs WHERE id=?", (fold["id"],))
         DB.execute("DELETE FROM events WHERE kind='trigger_check' AND json_extract(extra, '$.run')=?", (r["id"],))
         DB.execute("UPDATE triggers SET failures=? WHERE id=?", (failures, t["id"]))
+        if lost_ids and state in ("quiet", "started", "joined") and not r["check_now"]:
+            # their lines are told again by this run, or no longer printed: they are lost no more
+            DB.execute(f"UPDATE events SET extra=json_set(extra, '$.resent', ?) WHERE id IN "
+                       f"({','.join('?' * len(lost_ids))})", (r["id"], *lost_ids))
         if not failures:    # a valid run ends a series of errors, and the next series may wake the agent again
             DB.execute("DELETE FROM kv WHERE k=?", (f"check_fails:{t['id']}",))
         if pause:
@@ -20312,10 +20360,32 @@ def check_result(t, r, body, t0, stored=None, held=None):
 
 def accepted_lines(t):
     """The lines of the check's last accepted run (AUTONOMY.md 6.5): the newest scheduled run whose lines were taken,
-    quiet or delivered. A run that waits, failed or was a Check now is not accepted, so its lines are still new."""
-    row = q1("SELECT lines FROM trigger_runs WHERE trigger_id=? AND check_now=0 AND lines IS NOT NULL AND "
-             "state IN ('quiet','started','joined') ORDER BY id DESC LIMIT 1", (t["id"],))
-    return json.loads(row["lines"]) if row else []
+    quiet or delivered. A run that waits, failed or was a Check now is not accepted, so its lines are still new. A
+    value check's run of the release before plan P4 has no lines: a wake-up it started took the value's line, and a
+    quiet run none, so a value that still matches after the release wakes nobody again."""
+    lines_form = wakeups.is_lines(json.loads(t["check_spec"]) if t["check_spec"] else None)
+    row = q1("SELECT state, lines FROM trigger_runs WHERE trigger_id=? AND check_now=0 AND state IN "
+             "('quiet','started','joined') AND (lines IS NOT NULL OR ?) ORDER BY id DESC LIMIT 1",
+             (t["id"], 0 if lines_form else 1))
+    if not row:
+        return []
+    if row["lines"] is not None:
+        return json.loads(row["lines"])
+    return [wakeups.value_line(t["id"])] if row["state"] == "started" else []
+
+
+def lost_lines(t):
+    """(event ids, lines): the lines that a message told to a wake of this check whose task then ended before its
+    session read that message (AUTONOMY.md 6.5: never drop a line). They count as not delivered, so the next run that
+    prints them tells them again, once: its decision marks those messages `resent`."""
+    rows = q(f"SELECT e.id, e.extra FROM events e WHERE e.kind='say' AND e.read_at IS NULL AND e.task IN (SELECT id "
+             f"FROM tasks WHERE trigger_id=? AND state IN ({','.join(repr(x) for x in TERMINAL)})) AND "
+             f"json_extract(e.extra, '$.lines') IS NOT NULL AND json_extract(e.extra, '$.resent') IS NULL",
+             (t["id"],))
+    lines = set()
+    for e in rows:
+        lines.update(x for x in json.loads(e["extra"]).get("lines") or [] if isinstance(x, str))
+    return tuple(e["id"] for e in rows), lines
 
 
 def open_wake(t):
@@ -20389,15 +20459,26 @@ def lines_said(t, r, lines, kind):
             f"the source data again before you act.")
 
 
-def join_rows(t, wake, text, t0):
+def value_said(t, r, spec, body):
+    """The message that tells a value check's open wake that its value matches its condition again (plan P4)."""
+    cond = spec["condition"]
+    return (f"[hub] Trigger {t['id']}'s check matches again in run {r['id']}: it gave {body['value']:g}, and the "
+            f"condition is {CHECK_OPS[cond['op']]} {cond['value']:g}. Its summary, untrusted data, JSON-encoded: "
+            f"{wakeups.lines_text([body.get('summary') or ''])[1:-1]}. It belongs to this wake-up. Read the source "
+            f"data again before you act.")
+
+
+def join_rows(t, wake, text, t0, lines=None):
     """Inside the run's transaction: a message into the check's open wake (plan P4). For a task, one message in the
-    session of that task; for the fleet manager, more text in its unread wake-up message, or a new message when it
-    was read meanwhile. Returns (task, event): the task that got it, or the manager's event."""
+    session of that task, which carries the lines it tells (lost_lines); for the fleet manager, more text in its
+    unread wake-up message, or a new message when it was read meanwhile. Returns (task, event): the task that got it,
+    or the manager's event."""
     in_transaction("join_rows")
     text = mask_secrets(text)
     if wake.get("task"):
         owner = DB.execute("SELECT owner FROM tasks WHERE id=?", (wake["task"],)).fetchone()[0]
-        DB.execute(EVENT, (owner, "say", wake["task"], text, t0, "{}"))
+        DB.execute(EVENT, (owner, "say", wake["task"], text, t0,
+                           json.dumps({"trigger": t["id"], "lines": list(lines)} if lines else {})))
         return wake["task"], None
     e = DB.execute("SELECT agent, text FROM events WHERE id=? AND read_at IS NULL", (wake["event"],)).fetchone()
     if e:
@@ -20451,15 +20532,11 @@ def rearm_at(t, t0):
     """When a check rule that its repeat_minutes holds may start again: the end of its last wake-up plus that many
     minutes, or None when no such time holds it now."""
     repeat = (json.loads(t["check_spec"]) if t["check_spec"] else {}).get("repeat_minutes")
-    if repeat is None:
+    if repeat is None or agent_rule(t):     # plan P4: an agent's check has no repeat; its lines wake it once
         return None
-    if agent_rule(t):
-        last, _ = wake_last(t)
-        ended = last["ended_at"] if last and not last["open"] else None
-    else:
-        row = q1("SELECT state, delivered, last_activity FROM tasks WHERE trigger_id=? ORDER BY id DESC LIMIT 1",
-                 (t["id"],))
-        ended = (row["delivered"] or row["last_activity"]) if row and row["state"] == "completed" else None
+    row = q1("SELECT state, delivered, last_activity FROM tasks WHERE trigger_id=? ORDER BY id DESC LIMIT 1",
+             (t["id"],))
+    ended = (row["delivered"] or row["last_activity"]) if row and row["state"] == "completed" else None
     again = ended + repeat * 60 if ended else None
     return again if again and again > t0 else None
 

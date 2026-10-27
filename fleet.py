@@ -2184,7 +2184,7 @@ CHECK_SOURCE_MAX, CHECK_OUTPUT_MAX = 65536, 4096
 # plan P4: a check that prints lines prints at most this many bytes, unless its event gives the fleet's own limit; and
 # the end of a check's error output, which goes to the hub with a failed run, so its third failure in a row can say why
 CHECK_LINES_MAX = 16384
-CHECK_TAIL_KEEP = 4096
+CHECK_TAIL_KEEP = 8192
 # plan C12: the check's own process ends at its time too, a little after the helper's own end of it, so a check whose
 # helper died does not run on. Its arguments stay as a check reads them: sys.argv[1] is the JSON it is given.
 CHECK_WRAPPER = ("import signal, sys\n"
@@ -2282,7 +2282,7 @@ def run_source(extra, source, result, fail, keys=None):
                                     start_new_session=True)
         except OSError as e:
             return fail("exit", f"the check did not start: {e}")
-        out, err = [], [b""]
+        out, err = [], [b"", False]
 
         def drain():            # all of the error output is read, and only its end is kept
             try:
@@ -2290,7 +2290,8 @@ def run_source(extra, source, result, fail, keys=None):
                     chunk = proc.stderr.read1(65536)
                     if not chunk:
                         return
-                    err[0] = (err[0] + chunk)[-CHECK_TAIL_KEEP:]
+                    kept = err[0] + chunk
+                    err[0], err[1] = kept[-CHECK_TAIL_KEEP:], err[1] or len(kept) > CHECK_TAIL_KEEP
             except (OSError, ValueError):       # closed under it: a process that escaped its group holds the pipe
                 return
 
@@ -2313,7 +2314,9 @@ def run_source(extra, source, result, fail, keys=None):
         proc.stdout.close()
         proc.stderr.close()
         printed = out[0] if out else b""
-    tail = err[0].decode("utf-8", "replace").strip()
+    # a cut end starts at a line's start, so no key in it is cut in two: the hub masks whole keys only (plan P4)
+    kept = err[0].split(b"\n", 1)[1] if err[1] and b"\n" in err[0] else b"" if err[1] else err[0]
+    tail = kept.decode("utf-8", "replace").strip()
     if len(printed) > limit:
         return fail("too_large", f"the check printed more than {limit} bytes" if lines else
                     "the check printed more than 4 KiB", tail)

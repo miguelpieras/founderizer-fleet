@@ -13,11 +13,12 @@ so its tests need no hub:
 - saved check code: an agent writes a check as text; the hub keeps each version by its SHA-256 and never changes it,
   without a repository commit or an owner pin for each change;
 - where saved code runs (plan P4): only on its own agent's machine, as that agent's user and with that agent's read
-  keys, and only where that agent's runtime already runs any command without asking (execution_grant), so a check
-  adds no capability. There is no other runner and no approval of each code version;
-- what a check says (plan P4): the value form prints {"value", "summary"} and wakes the agent when the value matches
-  its condition (owner API 1.8); the line form prints one line for each item that needs the agent now, and the hub
-  wakes the agent only for the lines that the last accepted run did not print (AUTONOMY.md 6.5);
+  keys, only where that agent's runtime already runs any command without asking (execution_grant), and only when
+  that agent saved the code itself, so a check adds no capability. There is no other runner and no approval;
+- what a check says (plan P4): one line for each item that needs the agent now, and the hub wakes the agent only for
+  the lines that the last accepted run did not print (AUTONOMY.md 6.5). The older value form prints {"value",
+  "summary"}; a value that matches its condition reads as one line that begins with the rule's own id (value_line),
+  so it wakes once while the condition holds and again only after a quiet run, through the same delivery;
 - authority is always the current one: a rule is checked again at each send, each claim, each result and each
   prompt run (still_valid), with its author's current authority, so a reporting-line or grant change makes a
   stale rule or claim start nothing. A check result is data: it never changes a rule or an authority;
@@ -38,8 +39,7 @@ ACTIONS = ("pause", "resume", "delete", "check_now")
 RULE_FIELDS = ("agent", "schedule", "task")      # the hub checks them (1.7); no late window and no cap (plan C12)
 SAVE_KEYS = {"request_id", "trigger_id", "base_revision", "check", "task_id"} | set(RULE_FIELDS)
 CHANGE_KEYS = {"request_id", "trigger_id", "base_revision", "action", "task_id"}    # call_tool adds task_id
-CHECK_KEYS = {"code", "args", "timeout_seconds", "condition", "repeat_minutes"}
-VALUE_KEYS = ("condition", "repeat_minutes")      # the value form's own fields (owner API 1.8)
+CHECK_KEYS = {"code", "args", "timeout_seconds", "condition"}
 LINE_FORM = "lines"         # plan P4: the `form` of a check that prints lines
 SAVED = ("code", "sha256", "bytes")       # the fields of a stored saved check that come from its code
 PROGRESS = re.compile(r"progress[ \t]+([-+]?(?:\d+(?:\.\d*)?|\.\d+))")    # AUTONOMY.md 6.5: a target's progress line
@@ -299,15 +299,18 @@ def runner_problem(org, agent):
 
 def code_grant(org, author, target):
     """(allowed, reason): may code that `author` saved run as `target`'s check? It runs on target's own machine, as
-    target's user and with target's read keys (plan P4), so two things must hold now: target's runtime already runs
-    any command without asking (execution_grant), and the author may set target's rules (the one authority
-    function). Nothing else grants it."""
+    target's user and with target's read keys (plan P4), so it must be target's own code -- a check adds no
+    capability only then -- and target's runtime must already run any command without asking (execution_grant).
+    Another agent's code never runs with target's keys, the fleet manager's included: it sets target a wake-up without
+    a check, or asks target to write its check."""
     problem = runner_problem(org, target)
     if problem:
         return False, problem
-    if level(org, author, target) >= SELF:
-        return True, None
-    return False, f"{author} saved this check's code and may no longer set {target}'s rules."
+    if author != target:
+        return False, (f"A check runs only with code that its own agent saved, and {author} saved this one: only "
+                       f"{target} saves the code of {target}'s checks. Set {target} a wake-up without a check, or "
+                       f"ask {target} to write its check.")
+    return True, None
 
 
 def foreign_runner(check, target):
@@ -318,23 +321,28 @@ def foreign_runner(check, target):
 
 def saved_check(value, author, old=None):
     """(stored check, source): an agent's check, with its code kept by SHA-256. A stored version never changes: new
-    code is a new SHA-256 and a new trigger revision. The fields say the form: with condition and repeat_minutes it is
-    the value form (owner API 1.8), without them the line form (plan P4, "form": "lines"). In an edit, a check without
+    code is a new SHA-256 and a new trigger revision. The fields say the form: with condition it is the value form
+    (owner API 1.8), without it the line form (plan P4, "form": "lines"). In an edit, a check without
     "code" keeps the code of `old` (the stored check), so new args need no resend; source is then None. The caller
     becomes code_by, the agent that answers for the code. The hub checks args, timeout_seconds, condition and
     repeat_minutes with its own rules. An agent cannot pin a repository check: path and commit are not agent
     fields."""
     if not isinstance(value, dict):
-        raise Refused("check must be an object: code, and optional args and timeout_seconds (and condition and "
-                      "repeat_minutes for the value form). Use null to remove the check.")
+        raise Refused("check must be an object: code, and optional args and timeout_seconds. Use null to remove the "
+                      "check.")
     extra = sorted(set(value) - CHECK_KEYS)
     if extra:
         if extra[0] == "run_on":
             raise Refused("check has no field run_on: a check runs only on its own agent's machine.")
-        raise Refused(f"check has no field {extra[0]}. Its fields are code, args and timeout_seconds, and condition "
-                      f"and repeat_minutes for the value form.")
+        if extra[0] == "repeat_minutes":
+            raise Refused("check has no field repeat_minutes: a check wakes once for each new line, and a value "
+                          "check once while its condition holds and again only after a quiet run.")
+        raise Refused(f"check has no field {extra[0]}. Its fields are code, args and timeout_seconds (and condition "
+                      f"in the value form).")
     rest = {k: v for k, v in value.items() if k != "code"}
-    if not any(k in value for k in VALUE_KEYS):
+    if "condition" in value:
+        rest["repeat_minutes"] = None       # kept for the app that reads it; plan P4 took its meaning away
+    else:
         rest["form"] = LINE_FORM
     if "code" not in value:
         if not old or old.get("code") != "saved":
@@ -562,52 +570,13 @@ def history_detail(action, old, new):
 
 # ---------------------------------------------------------------- what a wake-up starts
 
-def wake_armed(last, quiet_after, repeat_minutes, t0, when):
-    """(armed, reason, final) of a check rule, as hub.trigger_armed, for any route. last is what the newest started
-    run started: None, or {"ref": "T-41" or "M-812", "open": bool, "ended": a final task state, or "read" for a
-    manager message, "ended_at": epoch or None}. For a parent task route, last is open while either task is open.
-    quiet_after: a quiet run came after that run. final: only a quiet check or Run task now arms the rule again."""
-    if last is None or quiet_after:
-        return True, None, False
-    if repeat_minutes is None:
-        return False, "Waiting for a quiet check.", True
-    if last["open"]:
-        return False, f"{last['ref']} is still {'unread' if last['ref'].startswith('M-') else 'open'}.", False
-    if last["ended"] not in ("completed", "read"):
-        return False, (f"{last['ref']} ended {last['ended']}. Only a quiet check or Run task now starts the next "
-                       f"one."), True
-    again = (last["ended_at"] or 0) + repeat_minutes * 60
-    if t0 < again:
-        return False, f"Again at {when(again)}.", False
-    return True, None, False
-
-
-def manager_decision(facts, when):
-    """(state, reason) of one run whose route is a message to the fleet manager. "started" means that the hub writes
-    that message in the run's transaction. The rules come in the order of the hub's trigger_decision (prompt runs)
-    and check_decision (check runs); the first that applies wins. The hub applies the late rule ("missed") and
-    still_valid before, and reads these facts:
-
-    check: a check run. matches: the check's value matches the condition. check_now: a Check now run.
-    repeat_minutes, last, quiet_after: as for wake_armed. limit_until: the end of the manager's usage limit, or None.
-    t0: now. No count of wake-ups caps a rule (plan C12): its brakes are one open wake-up and repeat_minutes.
-
-    A prompt run gives "started" or "not_started" (never tried again). A check run gives "quiet", "not_started"
-    (final), "waiting" (tried again on fresh data) or "started". Only "started" writes anything that a model reads."""
-    check, last = facts["check"], facts["last"]
-    if check:
-        if not facts["matches"]:
-            return "quiet", None
-        if facts.get("check_now"):
-            return "not_started", "Check now never starts a wake-up."
-        armed, why, final = wake_armed(last, facts["quiet_after"], facts["repeat_minutes"], facts["t0"], when)
-        if not armed:
-            return ("not_started" if final else "waiting"), why
-    wait = "waiting" if check else "not_started"
+def manager_decision(last):
+    """(state, reason) of one prompt run whose route is a message to the fleet manager: "started" writes that message
+    in the run's transaction, unless the rule's last message is still unread. last: what the newest started run
+    started, None or {"ref", "open", "ended", "ended_at"}. A check run of an agent's rule wakes through its lines
+    (AUTONOMY.md 6.5: lines_decision), not here. No count of wake-ups caps a rule (plan C12)."""
     if last and last["open"]:
-        return wait, f"{last['ref']} is still unread."
-    if check and facts.get("limit_until"):
-        return "waiting", f"The manager is at its usage limit until {when(facts['limit_until'])}."
+        return "not_started", f"{last['ref']} is still unread."
     return "started", None
 
 
@@ -635,6 +604,13 @@ def batch_fields(lead):
 
 
 # ---------------------------------------------------------------- the lines of a check (AUTONOMY.md 6.5)
+
+def value_line(trigger_id):
+    """The one line that a value check's result reads as while its value matches its condition (plan P4): it begins
+    with the rule's own id and stays the same while the condition holds, so it wakes once, and again only after a
+    quiet run, through the line delivery. The value and the summary go into the wake's text beside it."""
+    return f"trigger {trigger_id}: its check's value matches its condition"
+
 
 def progress_of(lines):
     """(progress or None, the other lines): a first line "progress <number>" is the progress of a target that names
@@ -738,6 +714,9 @@ def check_text(c, target):
     if is_lines(c):
         return f"{code}; each line that it prints and its last run did not print wakes {target}"
     cond = c["condition"]
+    if c.get("code") == "saved":        # an agent's value check reads as one line (plan P4)
+        return (f"{code}; it wakes {target} once when the value is {OPS[cond['op']]} {cond['value']:g}, and again "
+                f"only after a quiet run")
     repeat = ("once, until a check is quiet again" if c["repeat_minutes"] is None else
               f"again {c['repeat_minutes']} minutes after the last wake-up completed, while the check still matches")
     return f"{code}; it starts the wake-up when the value is {OPS[cond['op']]} {cond['value']:g}; {repeat}"
@@ -836,8 +815,8 @@ TOOL_SPECS = (
      "Create a wake-up rule, or change one (with trigger_id and base_revision; give only the fields that change). A "
      "rule wakes an agent on its schedule: you by default; the manager sets rules for any agent, and its own wake-up "
      "is an inbox message. Without a check, each time starts its task, which costs model tokens. With a check, your "
-     "code runs first, outside every AI session, on the agent's own machine as its user with its read keys, and a "
-     "quiet run costs nothing.\n"
+     "code runs first, outside every AI session, on your own machine as your user with your read keys, and a quiet "
+     "run costs nothing: only an agent itself saves the code of its checks.\n"
      "schedule: {\"kind\":\"every\",\"minutes\":15}, {\"kind\":\"once\",\"at\":\"2026-10-14T09:00\","
      "\"timezone\":\"Europe/Madrid\"}, {\"kind\":\"daily\",\"time\":\"09:00\",\"days\":[\"mon\"] or null,"
      "\"timezone\":...}, or {\"kind\":\"monthly\",\"day\":1,\"time\":\"09:00\",\"timezone\":...}.\n"
@@ -848,10 +827,8 @@ TOOL_SPECS = (
      "with the item's own id. Only lines that its last run did not print wake the agent: as a new task, or as a "
      "message to the check's open wake. Nothing printed wakes nobody. A check that a target names may print "
      "\"progress <number>\" as its first line. When the source cannot be read, end with an error: the third failed "
-     "run in a row wakes the agent with the end of its error output. The value form, for a fleet that does not take "
-     "line checks yet, adds \"condition\": {\"op\": \">\", \">=\", \"<\", \"<=\", \"==\" or \"!=\", \"value\": a "
-     "number} and \"repeat_minutes\": null or minutes, and prints one JSON object {\"value\": a number, "
-     "\"summary\": text}. The program gets one argument, the JSON {\"trigger\", \"run\", \"args\"}, and runs with "
+     "run in a row wakes the agent with the end of its error output. The program gets one argument, the JSON "
+     "{\"trigger\", \"run\", \"args\"}, and runs with "
      "python3 -I in an empty folder. Never put a secret in the code or the args. In a change, a check without code "
      "keeps the saved code, and \"check\": null removes it.",
      obj({"request_id": REQUEST_ID, "trigger_id": TRIGGER_ID, "base_revision": BASE,
