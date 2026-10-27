@@ -1192,17 +1192,51 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
     return env_prefix(agent, "owner-chat", values) + shlex.join(words + args)
 
 
-CONVERSATION_TOOLS = ("read_messages", "reply", "ask_owner", "request_work")    # MCP context conversation (CHAT-APPS 9.4)
+# The Fleet tools that a closed conversation session may call, MCP context conversation (CHAT-APPS 9.4): the hub offers
+# the ones of the person's role. ask_team is a closed session's way out with contacts.v2 (AUTONOMY.md P2).
+CONVERSATION_TOOLS = ("read_messages", "reply", "ask_owner", "request_work", "ask_team")
 CONVERSATION_WINDOW = re.compile(r"C-[1-9][0-9]{0,11}")     # the tmux window of a conversation: C-<id>
 CONVERSATION_IDLE = 1200        # seconds a conversation window stays open after its last signal (CHAT-APPS.md 7.2)
 CONVERSATION_WINDOWS = 2        # conversation windows of one agent at the same time; the others wait in the hub
 CONVERSATION_SIGNAL = "A new message in this conversation. Call read_messages now."
 CHATS = os.path.expanduser("~/fleet-chats")     # the empty working folders of conversation sessions: CHATS/<id>
 CONVERSATION_ID = re.compile(r"[1-9][0-9]{0,11}")
-# The one built-in tool that a conversation session can have besides the Fleet tools: Claude Code 2.1.301 adds it when
-# a remote feature flag is on, and neither --tools, --disallowedTools nor a deny rule takes it away. It reaches no file,
-# command or site. Its second call ends the conversation: the window stays and shows "Claude has ended this chat.".
-CLAUDE_BUILT_IN = "EndConversation"
+# The built-in tools that a closed conversation session can have besides the Fleet tools, none of which reaches a
+# file, a command or a site (test_conversation_lockdown's live proof). EndConversation: Claude Code 2.1.301 adds it
+# when a remote feature flag is on, and neither --tools, --disallowedTools nor a deny rule takes it away; its second
+# call ends the conversation, and the window stays and shows "Claude has ended this chat.". DeferredToolPlaceholder:
+# 2.1.311 offers it with no fields and defer_loading, "Reserved placeholder that keeps deferred tool loading active;
+# never call this tool", beside no tool that could load another one (27 October 2026).
+CLAUDE_BUILT_INS = ("EndConversation", "DeferredToolPlaceholder")
+# AUTONOMY.md P10: where Claude Code's own installer keeps each version that it installed (and removes old ones), and
+# where this helper keeps a link to the version that closed conversations run at, so that neither an update nor that
+# cleanup moves them.
+CLAUDE_VERSIONS = os.path.expanduser("~/.local/share/claude/versions")
+KEPT_RUNTIMES = os.path.join(HOME, "runtimes")
+RUNTIME_VERSION = re.compile(r"\d{1,4}\.\d{1,4}\.\d{1,6}")
+
+
+def closed_program(runtime, version):
+    """The program that a closed conversation runs (AUTONOMY.md P10): the runtime that the hub chose for closed
+    conversations, at exactly the version that passed the lockdown test, whatever this agent's own runtime and its
+    version are. Claude Code's installer keeps a few versions of its own, and the helper keeps a hard link to the
+    pinned one, which costs nothing while the installer's file is there and keeps it when the installer removes it.
+    Refused when this machine has no such version: then no closed conversation of this agent starts here."""
+    if runtime != "claude" or not runtime_fact(runtime, "conversation"):
+        raise Refused(f"closed conversations run on Claude Code here: {runtime} cannot be locked to the conversation tools")
+    if not isinstance(version, str) or not RUNTIME_VERSION.fullmatch(version):
+        raise Refused("the version of closed conversations is not a version")
+    kept, vendor = os.path.join(KEPT_RUNTIMES, f"claude-{version}"), os.path.join(CLAUDE_VERSIONS, version)
+    if not os.path.isfile(kept) and os.path.isfile(vendor):
+        os.makedirs(KEPT_RUNTIMES, mode=0o700, exist_ok=True)
+        with contextlib.suppress(OSError):          # another file system: the installer's own file, while it is there
+            os.link(vendor, kept)
+    for path in (kept, vendor):
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    raise Refused(f"Claude Code {version}, the version that closed conversations run at, is not on this machine: "
+                  f"install it once (the vendor's installer with that version), or set conversations.closed_version "
+                  f"to a version that passed the lockdown test")
 
 
 def conversation_folder(conversation):
@@ -1216,19 +1250,26 @@ def conversation_folder(conversation):
     return folder
 
 
-def conversation_command(agent, conf, generation, conversation, url, token, prompt):
+def conversation_command(agent, conf, generation, conversation, url, token, prompt, runtime=None, version=None):
     """The start of a locked conversation session with another person than the owner (CHAT-APPS.md 7.2): only the Fleet
     tools of url, the conversation's MCP address, with token, its credential of kind conversation. The hub decides
     which of CONVERSATION_TOOLS the person's level gets. prompt: the hub's whole prompt for this person, from a mode-600
     file (a tmux command must stay under 16 KiB). No hook, browser, catalog tool, API key or GitHub token, and no
     user, project or local settings, CLAUDE.md, memory, skill or plugin: test_conversation_lockdown proves the offered
-    tools (the Fleet tools, and CLAUDE_BUILT_IN when its flag is on) and the prompt against stand-ins. The window starts
-    in conversation_folder; Claude Code asks its workspace trust question there unless it trusts CHATS. A runtime
-    whose entry does not carry "conversation" is refused with the reason that entry gives (lifecycle.RUNTIMES): its
-    tools cannot be limited yet."""
-    if not runtime_fact(conf.get("runtime"), "conversation"):
-        raise Refused(runtime_fact(conf.get("runtime"), "conversation_why") or
-                      "conversations are only for Claude agents: the tools of this runtime cannot be limited")
+    tools (the Fleet tools, and CLAUDE_BUILT_INS) and the prompt against stand-ins. The window starts in
+    conversation_folder; Claude Code asks its workspace trust question there unless it trusts CHATS.
+
+    runtime and version (AUTONOMY.md P10, which the hub gives with contacts.v2): the runtime and the version of every
+    closed conversation, whatever this agent's own runtime is (closed_program), with its updater off, and with the
+    agent's own model only when that runtime is the agent's. Without them, the agent's own runtime: one whose entry
+    does not carry "conversation" is refused with the reason that entry gives (lifecycle.RUNTIMES)."""
+    if runtime is None:
+        if not runtime_fact(conf.get("runtime"), "conversation"):
+            raise Refused(runtime_fact(conf.get("runtime"), "conversation_why") or
+                          "conversations are only for Claude agents: the tools of this runtime cannot be limited")
+        program = "claude"
+    else:
+        program = closed_program(runtime, version)
     if not CONVERSATION_ID.fullmatch(str(conversation)):
         raise Refused("a conversation id is a number")
     address = urllib.parse.urlsplit(url or "")
@@ -1241,12 +1282,41 @@ def conversation_command(agent, conf, generation, conversation, url, token, prom
                 "permissions": {"allow": [f"mcp__fleet__{t}" for t in CONVERSATION_TOOLS], "deny": DENY}}
     # --setting-sources "": no user, project or local settings, so no CLAUDE.md, hook or plugin of this machine, and
     # --settings still applies. --safe-mode would also drop the --mcp-config server, so the session had no tools.
-    args = ["claude", "--setting-sources", "", "--permission-mode", "dontAsk", "--tools", "", "--strict-mcp-config",
+    own = runtime is None or runtime == conf.get("runtime")
+    args = [program, "--setting-sources", "", "--permission-mode", "dontAsk", "--tools", "", "--strict-mcp-config",
             "--mcp-config", mcp_config_file(agent, window, url, token), "--settings", json.dumps(settings),
-            "--append-system-prompt-file", session_file(agent, window, "md", prompt)] + shlex.split(model_flags(conf))
+            "--append-system-prompt-file", session_file(agent, window, "md", prompt)] + \
+        (shlex.split(model_flags(conf)) if own else [])
     words = ["env", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}", f"FLEET_AGENT={agent}", "FLEET_TASK=", NO_TIMERS,
              f"CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"]     # a window that stays open: a bounded context
+    if runtime is not None:
+        words.append(CLOSED_NO_UPDATES)         # the pinned version stays the version that runs
     return f"cd {shlex.quote(folder)} && exec " + shlex.join(words + args)
+
+
+CLOSED_NO_UPDATES = "DISABLE_AUTOUPDATER=1"     # Claude Code's own updater, off in a closed session at its pinned version
+
+
+def conversation_work_command(agent, conf, generation, conversation, token, prompt, session, env=None, opening=None,
+                              rules=None):
+    """The start of a conversation with the agent's own tools (AUTONOMY.md P2: a role with tools on): this agent's own
+    runtime, settings, hooks, keys and catalog tools, in this checkout, exactly as a task session starts
+    (session_command), on the conversation's own MCP address, whose route is `conversation` and whose attempt is the
+    conversation: /mcp/<agent>/<generation>/conversation/<id>. Its hooks name that route too, and the hub works them
+    for the conversation's open conversation task. prompt is the hub's one line: its brief comes with the first read.
+    session: the session id by which the helper reads its records (task_windows), which the hub files under that
+    conversation's tasks. opening and rules: its stable text first (plan P9.2), as the hub says for a task session."""
+    if not runtime_fact(conf.get("runtime"), "owner_chat"):
+        raise Refused(f"a conversation with its tools runs in a session of its own, which "
+                      f"{runtime_fact(conf.get('runtime'), 'label', conf.get('runtime'))} has not")
+    if not CONVERSATION_ID.fullmatch(str(conversation)):
+        raise Refused("a conversation id is a number")
+    if not token or not prompt or not session:
+        raise Refused("a conversation session needs its credential, its prompt and its session id")
+    if conf.get("runtime") == "claude":     # a window that stays open across messages: a bounded context, as a closed one
+        env = dict(env or {}, CLAUDE_CODE_AUTO_COMPACT_WINDOW=str(STANDING_COMPACT))
+    return session_command(agent, conf, prompt, task="conversation", needs="none", attempt=int(conversation),
+                           generation=generation, session=session, token=token, env=env, opening=opening, rules=rules)
 
 
 def chat_record_file(agent, runtime="codex", kind="chat"):
@@ -2274,6 +2344,7 @@ class Helper:
         self.conversation_starts = {}   # {C-<id>: (newest message's event, starts for it)} (conversation_may_start)
         self.newest = {}                # {C-<id>: its newest pending event} of this poll (handle_events)
         self.conversations = None       # the ids of this agent's open conversations, from the hub's last poll
+        self.conversation_modes = None  # {id: "tools" or "closed"} of them, with contacts.v2 (AUTONOMY.md P2)
         self.outside, self.outside_lock = 0, threading.Lock()      # checks and login jobs that run now
         self.logins = set()             # the sign-ins that run now, by id (begin_signin)
         self.loop_wake = threading.Event()      # ends the loop's pause, so an owner's request acts at once
@@ -2881,12 +2952,25 @@ class Helper:
                 code, data = http("POST", f"/helper/conversations/{self.agent}/{cid}/start", {})
                 if code != 200:
                     raise Refused(f"the hub did not give the start of {window} ({code}): {data.get('error', '')}")
-                self.start(window, conversation_command(self.agent, self.conf, extra["generation"], cid,
-                                                        data.get("url") or HUB + str(data.get("path") or ""),
-                                                        data.get("token"), data.get("prompt")),
-                           cid, extra["generation"])
+                if data.get("closed") is False:
+                    # AUTONOMY.md P2: a role with tools on runs with this agent's own tools, as a task session does,
+                    # with a session id by which its records reach the hub
+                    session = str(uuid.uuid4())
+                    self.start(window, lambda: conversation_work_command(
+                        self.agent, self.conf, extra["generation"], cid, data.get("token"), data.get("prompt"),
+                        session, env=session_env(self.agent, self.conf, "task"), opening=data.get("opening"),
+                        rules=data.get("rules")), cid, extra["generation"], session, needs="none")
+                else:
+                    self.start(window, conversation_command(self.agent, self.conf, extra["generation"], cid,
+                                                            data.get("url") or HUB + str(data.get("path") or ""),
+                                                            data.get("token"), data.get("prompt"),
+                                                            runtime=data.get("runtime"), version=data.get("version")),
+                               cid, extra["generation"])
+                if data.get("mode"):        # how it started, which Helper.retire_conversations holds to the hub's
+                    tmux("set-option", "-w", "-t", f"{self.session}:={window}", "@fleet_conversation", data["mode"])
                 self.conversation_seen[window] = time.monotonic()
-                self.say(f"{window}: conversation session started; the agent's read and reply are still pending")
+                tools = " with the agent's own tools" if data.get("closed") is False else ""
+                self.say(f"{window}: conversation session started{tools}; the agent's read and reply are still pending")
             else:
                 self.want(window, ev["id"])     # it stays pending until the session reads it (plan C5)
         elif kind == "task":
@@ -2934,6 +3018,8 @@ class Helper:
         elif kind == "say":
             if not self.worker:
                 self.want("manager", ev["id"])
+            elif CONVERSATION_WINDOW.fullmatch(str(ev.get("window") or "")):
+                self.want(ev["window"], ev["id"])       # AUTONOMY.md P2: a conversation task's session reads it
             elif task:
                 self.want(task, ev["id"])
             else:
@@ -3429,14 +3515,18 @@ class Helper:
         """(window, generation, attempt, session id, runtime, needs) for each task session started with a session id.
         A task in the runner (app_server_task) writes its own record file of Codex app-server notifications
         ("codex_app"); the other windows have this agent's runtime (None). The record reader takes its requested
-        settings from needs: the screen runtime's for a screen task, the primary runtime's for every other task."""
+        settings from needs: the screen runtime's for a screen task, the primary runtime's for every other task. A
+        conversation's session with the agent's tools (AUTONOMY.md P2) has a session id too, and its window C-<id>
+        and its conversation as the attempt: the hub files its records under that conversation's tasks. A closed
+        one has none, and keeps its records on this machine."""
         r = tmux("list-windows", "-t", self.session, "-F",
                  "#{window_name}\t#{@fleet_attempt}\t#{@fleet_session}\t#{@fleet_needs}")
         found = []
         for line in r.stdout.splitlines() if r.returncode == 0 else []:
             name, attempt, session, needs = (line.split("\t") + ["", "", ""])[:4]
             generation, _, number = attempt.rpartition(":")
-            if re.fullmatch(r"T-\d+", name) and re.fullmatch(r"[0-9a-f-]{36}", session) and number.isdigit():
+            if (re.fullmatch(r"T-\d+", name) or CONVERSATION_WINDOW.fullmatch(name)) and \
+                    re.fullmatch(r"[0-9a-f-]{36}", session) and number.isdigit():
                 found.append((name, generation, int(number), session,
                               "codex_app" if app_server_task(self.conf, needs) else None, needs))
         return found
@@ -3521,7 +3611,9 @@ class Helper:
         names = self.look_known()
         if names is None:
             return True
-        windows = [w for w in names if re.fullmatch(r"T-\d+", w)]
+        # AUTONOMY.md P2: a conversation's session with the agent's tools runs in this checkout, with its hooks
+        windows = [w for w in names if re.fullmatch(r"T-\d+", w) or
+                   (CONVERSATION_WINDOW.fullmatch(w) and self.conversation_kind(w) == "tools")]
         if not windows:
             return False
         if self.hub_turns is None:
@@ -4074,19 +4166,32 @@ class Helper:
         self.conversation_starts[window] = (newest, count + 1 if newest == last else 1)
         return True
 
+    def conversation_kind(self, window):
+        """How a conversation window started (AUTONOMY.md P2): "tools", "closed", or "" for one from before
+        contacts.v2, from its tmux option @fleet_conversation."""
+        r = tmux("show-options", "-wv", "-t", f"{self.session}:={window}", "@fleet_conversation")
+        return r.stdout.strip() if r.returncode == 0 else ""
+
     def retire_conversations(self):
         """Close a conversation window whose conversation the hub no longer holds open (plan C5: its words, not a
         clock; the person's /new closes one too). Nothing is lost: the next message of that person starts a new
         window, whose prompt carries the hub's recap. A helper whose hub does not say (an older hub) keeps the old
-        rule: a window quiet for CONVERSATION_IDLE seconds closes."""
+        rule: a window quiet for CONVERSATION_IDLE seconds closes. With contacts.v2 (AUTONOMY.md P2) the hub also says
+        how each conversation runs now (conversation_modes), and a window that started another way closes once no
+        turn runs in it, because its tools were fixed at its start."""
         open_windows = [w for w in self.look() if CONVERSATION_WINDOW.fullmatch(w)]
         for window in [w for w in self.conversation_seen if w not in open_windows]:
             self.conversation_seen.pop(window, None)
+        modes = getattr(self, "conversation_modes", None)
         for window in open_windows:
             if self.conversations is not None:
                 if int(window[2:]) in self.conversations:
-                    continue
-                why = "its conversation is not open any more"
+                    if not isinstance(modes, dict) or modes.get(window[2:]) in (None, self.conversation_kind(window)) \
+                            or self.working(f"{self.session}:={window}"):
+                        continue
+                    why = "its conversation runs another way now"
+                else:
+                    why = "its conversation is not open any more"
             else:
                 quiet = time.monotonic() - max(self.conversation_seen.setdefault(window, time.monotonic()),
                                                self.signalled.get(window, 0))
@@ -4566,6 +4671,8 @@ def cmd_run(args):
             h.hub_turns = ({t for t in turns if isinstance(t, str)}, time.monotonic()) if isinstance(turns, list) \
                 else None
             h.conversations = data.get("conversations") if isinstance(data.get("conversations"), list) else None
+            h.conversation_modes = data.get("conversation_modes") \
+                if isinstance(data.get("conversation_modes"), dict) else None
             h.keep_chat(data.get("chat"), data.get("db"))
             h.handle_events(data.get("events", []))
             h.doing("screen watch")

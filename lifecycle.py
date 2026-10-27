@@ -58,7 +58,10 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "check_runs",           # it lists the check runs it holds in each poll, and no claim expires (C12)
             "update_between_turns",     # its update waits for the turns that run in its task windows (plan P0)
             "stable_start",             # a task session opens with its rules and profile, and its task last (P9.2)
-            "session_reuse"]            # a cold, grown or switched standing session starts fresh (P9.10)
+            "session_reuse",            # a cold, grown or switched standing session starts fresh (P9.10)
+            # AUTONOMY.md P2, P10 (lane L2): a conversation with the agent's own tools (conversation_work_command), a
+            # closed one on the chosen runtime at its pinned version, and the records of a conversation's session
+            "conversation_tasks"]
 # ---------------------------------------------------------------- the runtimes
 #
 # What the fleet knows about a runtime is here, in one entry for each provider, and nowhere else. hub.py, fleet.py and
