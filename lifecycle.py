@@ -118,10 +118,6 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
 #                     None when it drives one
 #   sandbox           how its start command says what it may touch, as the owner reads it; None when Fleet cannot
 #                     read it
-#   token_weights     its list prices in dollars per million tokens, {model key: {input, cache_read, cache_write,
-#                     output}}, so that the cost of a session compares across providers (AUTONOMY.md P8, P10). A
-#                     session's model takes the entry whose key is the longest part of its name, else "default".
-#                     The owner's own prices are in team.json runtime_facts (facts_now); None for no prices
 #   screen_counter    a running turn of its terminal session repaints an elapsed counter every second, read live on
 #                     the fleet's machines, so the screen watch takes a running screen that stopped changing for a
 #                     frozen runtime (fleet.Helper.watch_screens, plan C2); False where nobody has read it
@@ -137,6 +133,11 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
 #                     P9.2) gets its task: "read", in its first read_messages answer, because the rules and the
 #                     profile are its appended system prompt; "prompt", at the end of its first prompt, because it
 #                     reads RULES.md as its folder's AGENTS.md; None where Fleet starts none so
+#   token_weights     its list prices in dollars per million tokens, {model key: {input, cache_read, cache_write,
+#                     output}}, so that the cost of a session compares across providers (AUTONOMY.md P8, P10); on a
+#                     subscription account they are weights, not money spent. A session's model takes the entry
+#                     whose key is the longest part of its name, else "default". The owner's own prices are in
+#                     team.json runtime_facts (facts_now); None for no prices
 #
 # What is NOT here, because it is code and not a fact: how a runtime's records become a transcript (threads.py), how
 # its allowance is read (usage.py), what its own installer is (onboard.py), and how its sign-in window is driven to
@@ -180,9 +181,6 @@ RUNTIMES = {
                               "workspace-write": "the runtime limits writes to the workspace",
                               "read-only": "the runtime allows reads only"},
                     "otherwise": "see the Codex settings"},
-        # gpt-6.1-sol's list prices as public price pages gave them on 27 October 2026; OpenAI charges no more for
-        # a cache write than for input
-        "token_weights": {"default": {"input": 2.0, "cache_read": 0.1, "cache_write": 2.0, "output": 10.0}},
         "screen_counter": False,
         # OpenAI keeps a prompt's cache for some minutes of inactivity, and Codex keys it by its own thread
         # (prompt_cache_key), so a new Codex session reads little of another's
@@ -190,6 +188,10 @@ RUNTIMES = {
         "compact_tokens": 200000,
         "routine": {"model": None, "effort": "low"},
         "task_opening": "prompt",
+        # gpt-6.1-sol's list prices as public price pages gave them on 27 October 2026, NOT checked on OpenAI's own
+        # pricing page: the owner sets the right ones with runtime_facts. OpenAI charges no more for a cache write
+        # than for input.
+        "token_weights": {"default": {"input": 2.0, "cache_read": 0.1, "cache_write": 2.0, "output": 10.0}},
     },
     "claude": {
         "label": "Claude Code",
@@ -228,18 +230,18 @@ RUNTIMES = {
         "sandbox": {"name": "Claude", "flag": "--permission-mode", "value": "[A-Za-z]+", "unset": "default",
                     "words": {},
                     "otherwise": "the session settings allow and deny tools; they are not an OS boundary"},
-        # Anthropic's list prices of 6 October 2026. Its sessions write one-hour caches, which cost twice the input.
-        "token_weights": {"default": {"input": 4.0, "cache_read": 0.2, "cache_write": 8.0, "output": 20.0},
-                          "fable": {"input": 10.0, "cache_read": 0.25, "cache_write": 20.0, "output": 50.0},
-                          "opus": {"input": 4.0, "cache_read": 0.2, "cache_write": 8.0, "output": 20.0},
-                          "sonnet": {"input": 2.0, "cache_read": 0.2, "cache_write": 4.0, "output": 10.0},
-                          "haiku": {"input": 0.1, "cache_read": 0.01, "cache_write": 0.2, "output": 0.5}},
         # read on 2.1.285, 2.1.308 and 2.1.311 while a foreground `sleep 300` ran, 27 October 2026
         "screen_counter": True,
         "cache_seconds": 3600,          # an hour; its own records say when it is five minutes (fleet.claude_context)
         "compact_tokens": 200000,       # fleet.STANDING_COMPACT, the window that Fleet starts its standing sessions with
         "routine": {"model": "sonnet", "effort": "low"},
         "task_opening": "read",
+        # Anthropic's list prices of 6 October 2026. Its sessions write one-hour caches, which cost twice the input.
+        "token_weights": {"default": {"input": 4.0, "cache_read": 0.2, "cache_write": 8.0, "output": 20.0},
+                          "fable": {"input": 10.0, "cache_read": 0.25, "cache_write": 20.0, "output": 50.0},
+                          "opus": {"input": 4.0, "cache_read": 0.2, "cache_write": 8.0, "output": 20.0},
+                          "sonnet": {"input": 2.0, "cache_read": 0.2, "cache_write": 4.0, "output": 10.0},
+                          "haiku": {"input": 0.1, "cache_read": 0.01, "cache_write": 0.2, "output": 0.5}},
     },
     "grok": {
         "label": "Grok",
@@ -266,21 +268,20 @@ RUNTIMES = {
         "no_sign_in": ("Fleet drives no Grok sign-in: xAI's terms do not let a third party run it this way. "
                        "Sign in to Grok yourself on {where} machine."),
         "sandbox": None,
-        "token_weights": None,
         "screen_counter": False,
         "cache_seconds": None,
         "compact_tokens": None,
         "routine": None,
         "task_opening": None,
+        "token_weights": None,
     },
 }
 # Every fact above in one list, so that a new entry cannot quietly leave one out (test_runtime_table).
 RUNTIME_FACTS = ("label", "driver", "acp_command", "can", "full_access", "manager_access", "first_worker", "manager",
                  "owner_chat", "agent_messages", "conversation", "conversation_why", "mcp_servers", "app_server",
-                 "token_weights",
                  "switch", "session_settings", "token_in_env", "model_flags", "local_model", "sign_in", "sign_out",
                  "no_sign_in", "sandbox", "screen_counter", "cache_seconds", "compact_tokens", "routine",
-                 "task_opening")
+                 "task_opening", "token_weights")
 
 
 # The session reuse rule (AUTONOMY.md P9.10) and its setting (section 4), one object in team.json "settings":

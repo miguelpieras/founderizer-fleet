@@ -16530,10 +16530,11 @@ def costs_text(view, days, viewer):
     """see_history what="costs": the view as lines a session reads, each number with the period before it."""
     def was(now_v, before_v, show):
         return show(now_v) + (f" ({show(before_v)} before)" if before_v is not None else " (none before)")
-    out = [f"WHAT THE WORK COST, the last {days} days against the {days} before them, in list dollars at the prices "
-           f"of the runtime facts now, so a price change does not read as a change of work. Rework, not acceptance, "
-           f"judges a result: it is clean when no follow-up fixed it, its case key did not come back and no person "
-           f"corrected it."]
+    out = [f"WHAT THE WORK COST, the last {days} days against the {days} before them, at the list prices of the "
+           f"runtime facts now, so a price change does not read as a change of work. On a subscription account a list "
+           f"price is a weight, not money spent: its usage window is the real cost. Rework, not acceptance, judges a "
+           f"result: it is clean when no follow-up fixed it, its case key did not come back and no person corrected "
+           f"it."]
     for a in view["agents"]:
         n, b = a["now"], a["before"]
         if not n["sessions"] and not b["sessions"] and not a["kinds"]:
