@@ -3086,7 +3086,9 @@ class Helper:
             window, expected = f"C-{cid}", f"{extra['generation']}:{cid}"
             if window in self.look():
                 existing = tmux("show-options", "-wv", "-t", f"{self.session}:={window}", "@fleet_attempt").stdout.strip()
-                if existing != expected:
+                # a window that started another way than the hub runs this conversation now gets no new message:
+                # the person's next turn would run with the tools of before, a shell among them (AUTONOMY.md P2)
+                if existing != expected or self.conversation_switched(window):
                     tmux("kill-window", "-t", f"{self.session}:={window}", check=True)
             if window not in self.look():
                 if len([w for w in self.look() if CONVERSATION_WINDOW.fullmatch(w)]) >= CONVERSATION_WINDOWS and \
@@ -4407,26 +4409,33 @@ class Helper:
         r = tmux("show-options", "-wv", "-t", f"{self.session}:={window}", "@fleet_conversation")
         return r.stdout.strip() if r.returncode == 0 else ""
 
+    def conversation_switched(self, window):
+        """True when a conversation window started another way than the hub runs its conversation now (AUTONOMY.md
+        P2): its person's role gained or lost its tools, or contacts.v2 changed. The hub's modes come with the poll
+        that brings the message. Without them (contacts.v2 off, or an older hub) no conversation runs with tools, so a
+        window that started with them is one."""
+        modes, kind = getattr(self, "conversation_modes", None), self.conversation_kind(window)
+        if not isinstance(modes, dict):
+            return kind == "tools"
+        return modes.get(window[2:]) not in (None, kind)
+
     def retire_conversations(self):
         """Close a conversation window whose conversation the hub no longer holds open (plan C5: its words, not a
         clock; the person's /new closes one too). Nothing is lost: the next message of that person starts a new
         window, whose prompt carries the hub's recap. A helper whose hub does not say (an older hub) keeps the old
-        rule: a window quiet for CONVERSATION_IDLE seconds closes. With contacts.v2 (AUTONOMY.md P2) the hub also says
-        how each conversation runs now (conversation_modes), and a window that started another way closes once no
-        turn runs in it, because its tools were fixed at its start."""
+        rule: a window quiet for CONVERSATION_IDLE seconds closes. A window that started another way than the hub runs
+        its conversation now (conversation_switched) closes once no turn runs in it, because its tools were fixed at
+        its start."""
         open_windows = [w for w in self.look() if CONVERSATION_WINDOW.fullmatch(w)]
         for window in [w for w in self.conversation_seen if w not in open_windows]:
             self.conversation_seen.pop(window, None)
-        modes = getattr(self, "conversation_modes", None)
         for window in open_windows:
-            if self.conversations is not None:
+            if self.conversation_switched(window) and not self.working(f"{self.session}:={window}"):
+                why = "its conversation runs another way now"
+            elif self.conversations is not None:
                 if int(window[2:]) in self.conversations:
-                    if not isinstance(modes, dict) or modes.get(window[2:]) in (None, self.conversation_kind(window)) \
-                            or self.working(f"{self.session}:={window}"):
-                        continue
-                    why = "its conversation runs another way now"
-                else:
-                    why = "its conversation is not open any more"
+                    continue
+                why = "its conversation is not open any more"
             else:
                 quiet = time.monotonic() - max(self.conversation_seen.setdefault(window, time.monotonic()),
                                                self.signalled.get(window, 0))

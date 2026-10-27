@@ -591,15 +591,16 @@ def manager_message(trigger_id, fields, line):
 
 
 def batch_fields(lead):
-    """The task fields of a lead's one open task for its team's waiting results (plan P9.11). A wake-up, a case or a
-    duty review of an agent under the lead is a subtask of it, so their results arrive in one session of the lead,
-    which checks them together. The hub starts a new one when the lead has delivered the last."""
+    """The task fields of a lead's one open task for its team's waiting results (plan P9.11). A wake-up, a case, a
+    duty review or the work from a conversation (hub.conversation_line_task) of an agent under the lead is a
+    subtask of it, so their results arrive in one session of the lead, which checks them together. The hub starts
+    a new one when the lead has delivered the last."""
     return {"owner": lead, "title": "Your team's wake-up and case results",
-            "details": ("The wake-ups, duty cases and duty reviews of the agents that you lead are subtasks of this "
-                        "task, and more join it while it is open. Their results, questions and permission prompts "
-                        "arrive in this session. Check each result with check_result: closely where an agent's record "
-                        "is weak, by sample where it is good; you decide. Answer with answer. Deliver this task when "
-                        "no subtask is open."),
+            "details": ("The wake-ups, duty cases and duty reviews of the agents that you lead, and the work that "
+                        "they open from conversations, are subtasks of this task, and more join it while it is "
+                        "open. Their results, questions and permission prompts arrive in this session. Check each "
+                        "result with check_result: closely where an agent's record is weak, by sample where it is "
+                        "good; you decide. Answer with answer. Deliver this task when no subtask is open."),
             "done_when": "Every subtask has ended and you have checked its result.", "needs": "none"}
 
 

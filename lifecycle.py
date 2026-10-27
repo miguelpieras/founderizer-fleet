@@ -101,6 +101,10 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
 #   agent_messages    its agents send and answer agent messages
 #   conversation      its session can be locked down to the conversation tools of another person (C-<id>)
 #   conversation_why  why it cannot be, in the words that person reads; None when it can
+#   closed_versions   the versions of it that passed the lockdown test (test_conversation_lockdown's LiveProof and
+#                     Pinned), oldest first: with contacts.v2 a closed conversation runs at one of them and at no
+#                     other, at the last unless the owner chose another (AUTONOMY.md P10, decision 35). A version
+#                     joins only in a release whose lockdown test passed; () where none did
 #   mcp_servers       its task sessions load the owner's MCP servers and the catalog tools
 #   app_server        the fleet drives it over its own app-server protocol: screen tasks, and the app-server start
 #                     policy of a worker or a lead (screen_runner.py)
@@ -174,6 +178,7 @@ RUNTIMES = {
         # the tools that OpenAI's model catalog gives each model (code mode, apply_patch, sub-agents).
         "conversation_why": ("a Codex agent has no conversations yet: no start option limits its tools to the Fleet "
                              "tools, and its global AGENTS.md always loads"),
+        "closed_versions": (),          # 0.163 still offers its shell and its agent tools (27 October 2026)
         "mcp_servers": True,
         "app_server": True,
         "switch": True,
@@ -224,6 +229,9 @@ RUNTIMES = {
         "agent_messages": True,
         "conversation": True,
         "conversation_why": None,
+        # 2.1.311 on the owner's Mac, 27 October 2026: only the Fleet tools and fleet.CLAUDE_BUILT_INS, and only the
+        # hub's prompt
+        "closed_versions": ("2.1.311",),
         "mcp_servers": True,
         "app_server": False,
         "switch": True,
@@ -277,6 +285,7 @@ RUNTIMES = {
         "agent_messages": False,
         "conversation": False,
         "conversation_why": None,
+        "closed_versions": (),
         "mcp_servers": False,
         "app_server": False,
         "switch": False,
@@ -300,9 +309,9 @@ RUNTIMES = {
 }
 # Every fact above in one list, so that a new entry cannot quietly leave one out (test_runtime_table).
 RUNTIME_FACTS = ("label", "driver", "acp_command", "can", "full_access", "manager_access", "first_worker", "manager",
-                 "owner_chat", "agent_messages", "conversation", "conversation_why", "mcp_servers", "app_server",
-                 "switch", "session_settings", "token_in_env", "model_flags", "local_model", "sign_in", "sign_out",
-                 "no_sign_in", "sandbox", "screen_counter", "cache_seconds", "compact_tokens", "routine",
+                 "owner_chat", "agent_messages", "conversation", "conversation_why", "closed_versions", "mcp_servers",
+                 "app_server", "switch", "session_settings", "token_in_env", "model_flags", "local_model", "sign_in",
+                 "sign_out", "no_sign_in", "sandbox", "screen_counter", "cache_seconds", "compact_tokens", "routine",
                  "task_tools", "task_opening", "token_weights")
 
 
