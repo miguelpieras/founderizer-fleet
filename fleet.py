@@ -705,9 +705,9 @@ def github_text(values, tools):
         text += ("Your GitHub repositories are clones on this machine: " +
                  ", ".join(f"{r} ({access}) in ~/fleet-work/{r}" for r, access in repos) +
                  ". Your helper fetched them just before this session; clone a missing one there with git. In each "
-                 "repository, work on a new branch from the latest origin default branch and push only that branch. "
-                 "For a change, open a pull request (gh pr create) and give its link in your result. Never push to the "
-                 "default branch and never merge. ")
+                 "repository, work on the default branch of origin: git pull --rebase, commit your change, and push "
+                 "it to that branch. Do not make a branch, and do not open a pull request. Give your commit in "
+                 "where_output_is. A task that asks for something else wins. ")
     if any(access == "deploy" for _, access in repos):
         text += ("deploy is write and the repository's own deployment: its .github/workflows files, which a write "
                  "token may not push at all, and its GitHub Actions runs (gh workflow, gh run). ")
