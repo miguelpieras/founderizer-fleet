@@ -2047,7 +2047,7 @@ def start_text(agent, task_id, resume=False):
                  f'{tref(task_id)}. Their results, questions and permission prompts arrive in this session: check each '
                  f'result with check_result, answer with answer, and decide prompts with decide_permission. Deliver '
                  f'{tref(task_id)} only when its subtasks are finished. Standing work of your team is yours to write '
-                 f'as a duty, with set_duty and change_duty: your team and nobody else, and never your own duty. '
+                 f'as a duty, with set_duty and change_duty: your team\'s and your own, and nobody else\'s. '
                  f'{manager_name()} stays the authority over every duty of the fleet, so it reads what you write and '
                  f'it writes a duty outside your team. ')
     if resume:
