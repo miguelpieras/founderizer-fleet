@@ -265,6 +265,8 @@ class Runner:
             self.records.send()
 
     def next_line(self):
+        """The next prompt: the next typed line, and every line already queued behind it, as one prompt (plan C5).
+        Lines that waited while a turn ran each asked for a read, so one turn reads them all."""
         while not self.stopping.is_set():
             try:
                 line = self.lines.get(timeout=0.5)
@@ -272,8 +274,20 @@ class Runner:
                 continue
             if line is None:
                 return None
-            if line.strip():
-                return line.strip()
+            if not line.strip():
+                continue
+            merged = [line.strip()]
+            while True:
+                try:
+                    more = self.lines.get_nowait()
+                except queue.Empty:
+                    break
+                if more is None:
+                    self.lines.put(None)        # the end comes after this prompt
+                    break
+                if more.strip() and more.strip() not in merged:
+                    merged.append(more.strip())
+            return "\n".join(merged)
         return None
 
 

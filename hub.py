@@ -1674,6 +1674,24 @@ def chat_listed(credential):
     q("UPDATE session_credentials SET ready=? WHERE sha256=? AND kind='chat' AND ready IS NULL", (now(), credential))
 
 
+def listed_window(agent, context):
+    """A session listed its tools on its own route (plan C5): count it for its window, which the helper's poll reads
+    (Helper.first_line_due). A count and not a time, so the helper needs no clock of the hub's: a window's first line
+    goes when the count passes the one it saw at its start. Quiet: no screen of the owner's shows it."""
+    window = "manager" if context is None else f"C-{context[2]}" if context[1] == "conversation" else context[1]
+    if not re.fullmatch(r"manager|owner-chat|T-[1-9][0-9]{0,17}|C-[1-9][0-9]{0,11}", str(window)):
+        return
+    with area("quiet"):
+        kv_set(f"listed:{agent}:{window}", int(kv_get(f"listed:{agent}:{window}") or 0) + 1)
+
+
+def listed_windows(agent, alive):
+    """{window: count} of listed_window for the windows that the helper lists now."""
+    names = set(filter(None, (alive or "").split(","))) | {"manager"}
+    return {w: int(kv_get(f"listed:{agent}:{w}") or 0) for w in names
+            if re.fullmatch(r"manager|owner-chat|T-[1-9][0-9]{0,17}|C-[1-9][0-9]{0,11}", w)}
+
+
 def chat_session_ready(agent):
     """True when the agent's newest owner chat credential of this generation has listed its tools. A new start asks
     for a new credential, which revokes the one before (helper_session), so this is the session that runs now."""
@@ -2428,10 +2446,9 @@ def release_hold(task_id, mode, by, via=None, note=""):
 # hours -- a machine rebooted, a runtime updated, a usage-limit episode that ended the session -- is recovered
 # without spending anything, because a task that worked for 60 hours and is then restarted a fourth time is not a
 # task the hub should give up on. What the budget counts is the loss that says the start itself is failing: a
-# session lost within SESSION_YOUNG of starting. Three of those and the hub stops and reports, as before. The
-# rate at which long-lived sessions are lost is not bound here at all: it is a circle the manager is told about
-# (CIRCLE_RESTART_RATE), because stopping a task that is getting work done is the manager's decision and not a
-# counter's.
+# session lost within SESSION_YOUNG of starting. Three of those and the hub stops and reports, as before. These
+# two are the rule for a helper without START_ONCE; one that names it is judged by facts and progress instead
+# (session_lost, plan C6), and its requester gets a quiet note every LOST_NOTE losses.
 SESSION_RESTARTS = 3        # the most new sessions that a task gets for a session that was lost young, or failed
 SESSION_YOUNG = 600         # a session lost within this of its own start died young: that is the crash loop
 RESTART_TABS = ("The browser tabs of the earlier session stay open and are not yours now: do not use them, do not close "
@@ -2495,14 +2512,13 @@ def restart_command(agent, a, tid):
 
 
 def t_restart_task(agent, a):
-    """restart_task: the requester of an open task has the hub start it once more in a new session, for something that
-    the running session cannot get. Two cases. Its browser tools lost their connection (a session has its own
-    connection to the browser). Or it waits at an ask for access that its agent holds now, because the grant reached
-    team.json after the session started and a running session keeps what it started with. It is the owner's Stop and
+    """restart_task: the requester of an open task has the hub start it once more in a new session, whenever it judges
+    that a new session helps (plan C6): a browser that lost its connection, access settled after the start, a frozen
+    screen, automatic restarts that stopped, a start that failed. No count refuses it. It is the owner's Stop and
     Resume with a check in one step: the helper's confirmation, the unknown outcomes, the fenced new attempt and the
     desktop claim are the existing ones. Nothing continues without a confirmed stop. The first half is written
-    together: the stop hold, its control event, the restart and the answer of this request_id are all there, or
-    none of them is."""
+    together: the stop hold, its control event, the restart and the answer of this request_id are all there, or none
+    of them is."""
     tid = parse_task(a.get("task_id"))
     command, replay = restart_command(agent, a, tid)
     if replay:
@@ -2521,22 +2537,16 @@ def t_restart_task(agent, a):
     allowed, why = authority(agent, t["owner"], "task")
     if not allowed:
         raise ToolError(why)
-    asks = access_asks(t)
-    settled = [x for x in asks if x["enough"]]
-    if t["needs"] != "browser" and not settled:
-        raise ToolError(f"restart_task is for the two things a running session cannot get: a browser task whose "
-                        f"browser tools lost their connection, and a task that waits at an ask for access which its "
-                        f"agent holds now. " +
-                        (f"{tref(tid)} waits at Q-{asks[0]['question']} for {ask_phrase(asks[0])} "
-                         f"({asks[0]['resource']}), and {t['owner']} " +
-                         (f"holds it at {asks[0]['held']} only" if asks[0]["held"] else "does not hold it yet") +
-                         f": settle the access first, and restart {tref(tid)} after that." if asks else
-                         f"{tref(tid)} needs {t['needs']} and waits at no ask for access."))
+    unsettled = [x for x in access_asks(t) if not x["enough"]]
+    if unsettled:           # the one thing a new session would lack as the old one did: settle it first
+        raise ToolError(f"{tref(tid)} waits at Q-{unsettled[0]['question']} for {ask_phrase(unsettled[0])} "
+                        f"({unsettled[0]['resource']}), and {t['owner']} " +
+                        (f"holds it at {unsettled[0]['held']} only" if unsettled[0]["held"] else "does not hold it yet") +
+                        f": a new session would lack it too. Settle the access first, and restart {tref(tid)} after "
+                        f"that.")
     if t["attempt"] != expected:
         raise ToolError(f"{tref(tid)} is at attempt {t['attempt']} now, not {expected}: its session already changed. "
                         f"Read its newest messages before you decide again.")
-    if t["state"] == "submitted":
-        raise ToolError(f"{tref(tid)} has not started yet, so it has no session to start again.")
     h = active_hold(tid)
     own = h is not None and h["by"] == agent    # only a restart makes a hold of an open task in its requester's name
     if own and q1("SELECT 1 FROM restart_holds WHERE hold=? AND state='pending'", (h["id"],)):
@@ -2554,9 +2564,10 @@ def t_restart_task(agent, a):
     if lim and limit_route(lim) == "primary":
         raise ToolError(f"{t['owner']} waits for its usage limit to reset at {clock(lim['until'])}. {tref(tid)} "
                         f"continues by itself then, so it is not restarted now.")
-    if t["restarts"] >= SESSION_RESTARTS:
-        raise ToolError(f"{tref(tid)} has used all {SESSION_RESTARTS} of its restarts. Do not try again: cancel it, "
-                        f"or {PASS_UP}.")
+    kv_set(f"lost:{tid}", None)         # the requester acted: the losses since then count again from nothing
+    # A count never refuses it, and it starts the count again. A task whose start failed goes the same way: its helper
+    # confirms that no session runs, and only a confirmed stop starts the next attempt (plan C6).
+    q("UPDATE tasks SET restarts=0 WHERE id=?", (tid,))
     confirmed = own and h["state"] == "stopped"         # a stop that the helper reported late: nothing more to stop
     extra, t0 = control_extra(t, 0, "stop"), now()
     with transaction():
@@ -2665,7 +2676,8 @@ def restart_continue(hold_id):
         for x in asked:
             DB.execute("UPDATE questions SET answer=?, answered=?, waiting=0 WHERE id=?",
                        (RESTART_ANSWER.format(by=r["by"], task=name), t0, x))
-        DB.execute("UPDATE tasks SET restarts=restarts+1 WHERE id=?", (tid,))
+        # The requester acted: its restart counts no loss, and the losses in a row count again from nothing (plan C6).
+        DB.execute("UPDATE tasks SET restarts=0 WHERE id=?", (tid,))
         if asked:
             DB.execute("UPDATE tasks SET state='working', waiting_on=NULL WHERE id=? AND state='input-required'", (tid,))
         DB.execute("UPDATE restart_holds SET state='done' WHERE hold=?", (hold_id,))
@@ -2675,11 +2687,13 @@ def restart_continue(hold_id):
 
 def restart_sweep(t0):
     """The restarts that wait. One whose stop is confirmed continues (also after a hub restart). One whose stop the
-    helper did not report within the hub's silence time is over: the task stays held, and its requester is told."""
+    helper did not report waits for that report with no cut (plan C6): a helper that cannot complete the stop
+    reports it, and an offline helper is told at its offline notice. A helper without START_ONCE keeps the old cut
+    at the hub's silence time."""
     for r in q("SELECT * FROM restart_holds WHERE state='pending' ORDER BY hold"):
         h = q1("SELECT h.*, t.owner, t.title FROM holds h JOIN tasks t ON t.id=h.task WHERE h.id=?", (r["hold"],))
         if h and h["state"] == "requested":
-            if t0 - r["created"] > CFG["silence"]:
+            if START_ONCE not in helper_features(h["owner"]) and t0 - r["created"] > CFG["silence"]:
                 told = (r["by"], "say", filed_under(r["by"], "say", h["task"]),
                         f"[hub] The stop of {tref(h['task'])} ({h['title']}, owner {h['owner']}) for its restart has no "
                         f"report from {h['owner']}'s helper after {span(t0 - r['created'])}. It stays held, but the hub "
@@ -3845,7 +3859,7 @@ def deliver_result(agent, a, files_said=None):
          + went_on_with(tid) + step_stands_text(t["step"]) + left +
          f"-- Check it, then call check_result(task_id=\"{tref(tid)}\", accepted=true or false).", task=tid)
     return f"Delivered. {tref(tid)} is {outcome}." + (" " + files_said if files_said else "") + \
-        f"{said} You are done with it: stop now."
+        f"{said} You are done with it: stop now and end your turn; your session closes when it ends."
 
 
 # set_duty and change_duty are here again by the owner's decision of 20 October 2026 ("manager should also act as a
@@ -13843,9 +13857,7 @@ def t_see_history(agent, a):
 
 CIRCLE_QUESTION_DAYS = 14       # the same question twice inside this is a circle
 CIRCLE_CHAIN = 3                # tasks in one follows chain whose last one ended badly
-CIRCLE_RESTARTS = 3             # restarts on one task
-CIRCLE_RESTART_RATE = 6         # sessions of one open task lost and started again inside CIRCLE_RESTART_WINDOW
-CIRCLE_RESTART_WINDOW = 86400
+CIRCLE_RESTARTS = 2             # counted losses in a row of one task: its automatic restarts stopped (plan C6)
 CIRCLE_REFUSALS = 5             # identical refusals inside one task
 CIRCLE_SHOWN = 10
 CIRCLE_OWNER_WAIT = 86400       # seconds a circle may stand after the manager was told, before the owner is
@@ -13888,25 +13900,13 @@ def circles(t0):
                           f"and ended "
                           f"{t['outcome'] or 'unaccepted'} too: "
                           f"{' <- '.join(tref(x['id']) for x in chain)}. {clip(t['title'], 100)}"))
-    # 3. one task started again and again. `restarts` counts the sessions that died young and the ones its own
-    # requester restarted, so this is the task whose three restarts are spent or nearly spent (SESSION_RESTARTS).
+    # 3. one task whose sessions were lost again and again and left nothing: `restarts` counts the losses in a row
+    # that counted (plan C6), and at CIRCLE_RESTARTS the hub restarts it no more by itself. A task whose sessions
+    # are lost while they work is no circle: its requester gets a quiet note every LOST_NOTE losses (session_lost).
     for t in q(f"SELECT * FROM tasks WHERE restarts>=? AND {OPEN_TASK} ORDER BY id", (CIRCLE_RESTARTS,)):
         found.append((f"restarts:{t['id']}:{t['restarts']}",
-                      f"{tref(t['id'])} ({t['owner']}) has used {t['restarts']} restarts and is still "
-                      f"{t['state']}: {clip(t['title'], 100)}"))
-    # 3b. one task whose sessions keep being lost at a rate that nothing bounds. A session that lived and worked
-    # and was then lost is recovered without spending one of the three (SESSION_YOUNG), which is right for a
-    # reboot and says nothing about a task that loses its session every hour. So the rate is a circle and not a
-    # stop: the hub keeps the task alive, the manager reads how often it is being revived, and the decision to
-    # cancel work that is getting done stays its own. Counted from the attempts, which carry each one's own start.
-    for t in q(f"SELECT * FROM tasks WHERE {OPEN_TASK} ORDER BY id"):
-        n = q1("SELECT COUNT(*) n FROM attempts WHERE task=? AND reason='restart' AND created>?",
-               (t["id"], t0 - CIRCLE_RESTART_WINDOW))["n"]
-        if n >= CIRCLE_RESTART_RATE:
-            found.append((f"lost:{t['id']}:{n // CIRCLE_RESTART_RATE}",
-                          f"{tref(t['id'])} ({t['owner']}) lost its session {n} times in the last "
-                          f"{CIRCLE_RESTART_WINDOW // 3600} hours and was started again each time, and is still "
-                          f"{t['state']}: {clip(t['title'], 100)}"))
+                      f"{tref(t['id'])} ({t['owner']}) lost {t['restarts']} sessions in a row that left nothing and is "
+                      f"still {t['state']}: {clip(t['title'], 100)}"))
     # 4. one session asking for the same refused thing
     for r in q("SELECT task, agent, name, detail, COUNT(*) n FROM calls WHERE ok=0 AND task IS NOT NULL "
                "GROUP BY task, agent, name, SUBSTR(detail,1,?) HAVING n>=? ORDER BY task",
@@ -13992,8 +13992,7 @@ def tasks_stuck(t0):
     `last_activity` nor `nudge_level`, so a session that is replaced and is silent again keeps the silence measure
     and the nudge that opens the gate; and a replacement that never comes up is a young loss, which spends the
     budget and ends at the no-path measure. What is left is a task whose new sessions do work each time, which is
-    not stuck: the churn of it is a circle the manager is told about (CIRCLE_RESTART_RATE), and the owner reads it
-    on the `circles_stuck` rung beside this one when it stands for a day.
+    not stuck: its requester gets a quiet note every LOST_NOTE losses (session_lost, plan C6).
 
     **Deliberate quiet is not stuckness**, and that is the case that must not regress. A held task, a task whose
     agent is at its usage limit and a parked task are left out whole, exactly as the clocks of `tick` leave them
@@ -14431,14 +14430,14 @@ TOOLS = [
      "Cancel a task you requested that is not finished yet.",
      S({"task_id": TASK_ID, "reason": STR}, ["task_id", "reason"])),
     ("manager", "restart_task", t_restart_task,
-     "Start a task that you requested once more in a new session, for the two things a running session cannot get. "
-     "One: its browser tools lost their connection, as its owner reported. Two: it waits at an ask for access that "
-     "its agent holds now, because a running session keeps what it started with. The hub stops the session and waits "
-     "for the helper to confirm the stop. Then the same task starts as a new attempt: its history stays, and its "
-     "owner first checks what its last actions did, so nothing it already did is repeated. Without a confirmed stop "
-     "the task stays held, and you get a message. It restarts no browser, it repairs no browser extension and it "
-     "settles no access: grant the access first. When it is refused or the task fails again, pass it up. A task gets "
-     "at most three new sessions.",
+     "Start a task that you requested once more in a new session, whenever you judge that a new session helps: its "
+     "browser tools lost their connection, it waits at an ask for access that its agent holds now (a running session "
+     "keeps what it started with), its running screen stopped moving, or the hub stopped restarting it after two "
+     "lost sessions that left nothing, or its start failed. The hub stops the session and waits for the helper to "
+     "confirm the stop, also of a session that never came up. Then the same task starts as a new attempt: its history stays, "
+     "and its owner first checks what its last actions did, so nothing it already did is repeated. No count refuses "
+     "it. It is refused while the task waits for a usage limit, a permission decision or access it does not hold "
+     "yet: settle that first. It repairs no browser extension.",
      S({"task_id": TASK_ID, "request_id": {"type": "string", "description": "A new UUID for each restart"},
         "expected_attempt": {"type": "integer", "description": "The attempt the task is at now: the one that failed, "
                                                                 "or the one that waits at the ask for access"},
@@ -17325,6 +17324,10 @@ def liveness(t0):
         busy = presence_of(owner, t0)
         starting = online and busy and busy["task"] == tref(tid)
         hold, lim, park = active_hold(tid), active_limit(owner), parked(tid)
+        # plan C6: a helper that starts each attempt once says so with its ack, so a submitted task whose window it
+        # started and lost is a loss like any other (also for attempt 1), not a start that still waits
+        once = online and START_ONCE in helper_features(owner)
+        launched = once and attempt_started(t)
         # Only a question the task is actually waiting on is a live path. One asked with a default is not: its task
         # works on, so a session that then dies has no path of its own and must be restarted like any other -- and
         # without this filter it would never be, because an open question looked like a reason to wait for ever.
@@ -17338,13 +17341,21 @@ def liveness(t0):
                     f"waiting for {owner}'s usage limit to reset at {clock(lim['until'])}")
         elif park:
             path = f"waiting until {clock(park['due'])}, as {owner} asked (R-{park['id']})"
-        elif t["state"] == "submitted":
+        elif t["state"] == "submitted" and not launched:
             path = ((f"waiting for {owner} to load its new settings" if settings_pending(owner) else
                      "waiting for its session to start") if online else None)
         elif alive or (online and not has_list) or starting:
             path = "live session" if alive else "helper online"
+        elif once and not launched:
+            path = "waiting for its session to start"           # the helper has not started this attempt yet
         elif question:
             path = f"waiting for the answer to Q-{question['id']}"
+        elif release_applying():
+            path = "waiting for the Fleet update to finish"         # plan C6: a known cause restarts nothing
+        elif online and signed_in_now(owner, (agents().get(owner) or {}).get("runtime")) is False:
+            path = f"waiting for {owner} to be signed in"
+        elif once and settings_pending(owner):
+            path = f"waiting for {owner} to load its new settings"
         else:
             path = None
         if path:
@@ -17359,6 +17370,9 @@ def liveness(t0):
                   else f"{owner}'s helper has never checked in")
         q("UPDATE tasks SET live_path=NULL, stalled_since=COALESCE(stalled_since,?), stalled_reason=? WHERE id=? AND "
           "(live_path IS NOT NULL OR stalled_since IS NULL OR stalled_reason IS NOT ?)", (t0, reason, tid, reason))
+        if once:
+            session_lost(t, t0)             # plan C6: its helper's list is the fact, and progress is the count
+            continue
         if t["state"] == "submitted":
             continue        # the never-started nudge reports these
         if online:          # the session vanished: restart it, and only a young death spends one of the three
@@ -17390,6 +17404,66 @@ def liveness(t0):
                  f"It is still {t['state']}. Decide what to do: wait, cancel it and give it to another worker, "
                  f"or raise a Needs-you item.", task=tid)
             log("hub", f"{tref(tid)} has no live path: {reason}")
+
+
+# Plan C6: losses decided by facts. A helper that names START_ONCE acks a task event when it has started its window,
+# starts that attempt no more, sends no window list when tmux does not answer, and reports why a start failed.
+START_ONCE = "start_once"
+LOST_IN_A_ROW = 2               # counted losses in a row after which automatic restarts stop
+LOST_NOTE = 6                   # losses since the requester last acted, after which it gets one quiet note
+
+
+def attempt_started(t):
+    """True when the helper acked the task event of task row `t`'s current attempt: it started that window once."""
+    row = q1("SELECT helper_ack FROM events WHERE agent=? AND kind='task' AND task=? AND "
+             "COALESCE(json_extract(extra, '$.attempt'), 1)=? ORDER BY id DESC LIMIT 1", (t["owner"], t["id"], t["attempt"]))
+    return bool(row and row["helper_ack"])
+
+
+def attempt_progress(t):
+    """True when the current attempt of task row `t` left something that the next one starts from, which is what
+    warm_attempt hands over: a progress note, an outward call, a question, a subtask or a step of a case."""
+    w = attempt_window(t["id"], t["attempt"])
+    if not w:
+        return False
+    since = w[0]
+    return bool(attempt_notes(t["id"], t["attempt"]) or outward_done(t["id"], t["attempt"]) or
+                q1("SELECT 1 FROM questions WHERE task=? AND asked>=? LIMIT 1", (t["id"], since)) or
+                q1("SELECT 1 FROM tasks WHERE parent=? AND created>=? LIMIT 1", (t["id"], since)) or
+                q1("SELECT 1 FROM duty_steps WHERE task=? AND ts>=? LIMIT 1", (t["id"], since)))
+
+
+def session_lost(t, t0):
+    """The helper's window list counts and the current attempt's window, which the helper started, is not in it:
+    its session is lost (plan C6). The loss counts when the attempt never came up (no call on its own route) or left
+    nothing for the next one; a loss with progress starts the count again. The next attempt starts at once, also
+    for attempt 1. After LOST_IN_A_ROW counted losses in a row the hub starts no more and tells the requester once,
+    with what the helper said of the start; restart_task starts it again. Every LOST_NOTE losses since the requester
+    last acted, it gets one quiet note, for the loop that keeps a note and dies at the same step."""
+    tid, owner = t["id"], t["owner"]
+    up = read_row("SELECT started FROM attempts WHERE task=? AND attempt=?", (tid, t["attempt"]))
+    counted = not (up and up["started"]) or not attempt_progress(t)
+    why = kv_get(f"start_failed:{tid}")
+    if counted and t["restarts"] + 1 >= LOST_IN_A_ROW:
+        if t["restarts"] < LOST_IN_A_ROW:
+            q("UPDATE tasks SET restarts=? WHERE id=?", (LOST_IN_A_ROW, tid))
+            emit(t["requester"], "say", f"[hub] {tref(tid)} ({t['title']}) lost its session on {owner} {LOST_IN_A_ROW} "
+                 f"times in a row, and each left nothing to start from" + (f": {why}" if why else "") + ". The hub "
+                 f"starts it no more by itself. Fix the cause, then restart_task starts it again; or cancel it.",
+                 task=tid)
+            log("hub", f"{tref(tid)} on {owner} was lost {LOST_IN_A_ROW} times in a row; no more restarts")
+        return
+    if not counted:
+        q("UPDATE tasks SET restarts=0 WHERE id=?", (tid,))
+    new_attempt(t, "restart", counted=counted)
+    lost = int(kv_get(f"lost:{tid}") or 0) + 1
+    kv_set(f"lost:{tid}", lost)
+    log("hub", f"session for {tref(tid)} on {owner} was lost; attempt {t['attempt'] + 1} starts" +
+               ("" if counted else " (not counted: it left something to start from)"))
+    if lost % LOST_NOTE == 0:
+        emit(t["requester"], "say", f"[hub] {tref(tid)} ({t['title']}) lost its session on {owner} {lost} times since "
+             f"you last acted on it. Each time it was started again; decide whether it should go on.", task=tid,
+             extra=QUIET_SAY)
 
 
 OFFLINE_RETELL = 1800      # seconds: a machine that goes offline again within this time is not reported again
@@ -17634,8 +17708,11 @@ def tick():
             traceback.print_exc()           # a goal or database check must not stop the timers below
         # close sessions of finished tasks
         for t in q("SELECT * FROM tasks WHERE state IN ('completed','failed','rejected','canceled') AND stop_sent=0"):
-            if t0 - (t["delivered"] or t0) > CFG["stop_after"]:
+            # plan C5: a helper that closes the window at the end of its turn (turn_close) gets the stop at once;
+            # an older one still after stop_after, because it closes at the stop
+            if t0 - (t["delivered"] or t0) > CFG["stop_after"] or "turn_close" in helper_features(t["owner"]):
                 q("UPDATE tasks SET stop_sent=1 WHERE id=?", (t["id"],))
+                kv_set(f"listed:{t['owner']}:{tref(t['id'])}", None)      # its window's listings end with it
                 emit(t["owner"], "stop", f"close the session of {tref(t['id'])}", task=t["id"],
                      extra={"generation": kv_get("db_id"), "needs": t["needs"]})
         offline_sweep(t0)
@@ -21901,8 +21978,8 @@ def health_view():
              + " | ".join(line for _, line in wedged[:2])
              + (f" | and {len(wedged) - 2} more." if len(wedged) > 2 else ""),
              f"Open {manager_name().capitalize()} and tell it what to do about them: wait, cancel each and give the "
-             f"work to another worker, or raise a Needs-you item. The hub starts a lost session again three times "
-             f"and then changes nothing by itself, because cancelling work is a decision, not a timer.",
+             f"work to another worker, or raise a Needs-you item. The hub starts a lost session again until two in a "
+             f"row left nothing and then changes nothing by itself, because cancelling work is a decision.",
              agent=manager_name())
     waiting = reports_waiting(t0)
     if waiting:
@@ -26496,6 +26573,9 @@ class Handler(BaseHTTPRequestHandler):
         after = int(query.get("after") or 0)
         wait = max(0, min(int(query.get("wait") or 25), 50))
         touch(agent)
+        if "alive_unknown" in query:        # plan C6: tmux did not answer, so the hub reads no list until the next one
+            with area("quiet"):
+                q("UPDATE agents SET alive_ts=NULL WHERE name=?", (agent,))
         if "alive" in query:
             # The window list counts only when it changes; its time is quiet (live_changes). The manager's banner
             # follows a change of its windows at once, not at the next tick.
@@ -26522,8 +26602,13 @@ class Handler(BaseHTTPRequestHandler):
             deadline, told = now() + wait, None
             while True:
                 rows = q("SELECT * FROM events WHERE agent=? AND "
-                         "((kind IN ('task','say') AND read_at IS NULL) OR "
-                         "(kind='chat') OR (kind NOT IN ('task','say','chat') AND helper_ack IS NULL)) ORDER BY id", (agent,))
+                         "((kind IN ('task','say') AND read_at IS NULL) OR (kind='chat') OR "
+                         "(kind='conversation' AND (read_at IS NULL OR helper_ack IS NULL)) OR "
+                         "(kind NOT IN ('task','say','chat','conversation') AND helper_ack IS NULL)) ORDER BY id",
+                         (agent,))
+                # plan C5: a conversation's event stays until its session read the message, for a helper that
+                # waits for that read (conversation_reads); an older one takes it at its ack, as before
+                reads = "conversation_reads" in helper_features(agent)
                 keep = []
                 worker = agents()[agent].get("role") in ("worker", "lead")       # a lead works like a worker
                 limited = active_limit(agent)          # the manager's own limit holds its signals too
@@ -26543,6 +26628,9 @@ class Handler(BaseHTTPRequestHandler):
                             "SELECT 1 FROM conversations WHERE id=? AND state='open'",
                             (extra.get("conversation"),))):
                         continue        # no window now: the message waits in the hub until this agent can answer
+                    if r["kind"] == "conversation" and (r["read_at"] is not None if reads else
+                                                        r["helper_ack"] is not None):
+                        continue
                     if held and r["kind"] == "say":
                         continue        # held until the manager's new session runs; the read receipt stays open
                     if r["kind"] == "say" and quiet_waits(r["created"], extra, now()):
@@ -26601,8 +26689,15 @@ class Handler(BaseHTTPRequestHandler):
                 told = chat
                 time.sleep(0.5)
             return self.json(200, {"db": kv_get("db_id"), "last": newest, "chat": chat,
+                "listed": listed_windows(agent, query.get("alive")),
+                # plan C5: a conversation window closes when its conversation is not open any more
+                "conversations": [r["id"] for r in q("SELECT id FROM conversations WHERE agent=? AND state='open'",
+                                                     (agent,))] if worker else None,
                 "events": [{"id": r["id"], "kind": r["kind"], "task": tref(r["task"]) if r["task"] else None,
-                            "text": r["text"], "extra": json.loads(r["extra"] or "{}")} for r in rows]})
+                            "text": r["text"], "extra": json.loads(r["extra"] or "{}"),
+                            # plan C6: the helper started this attempt once; only the hub starts it again
+                            **({"started": True} if r["kind"] == "task" and r["helper_ack"] else {})}
+                           for r in rows]})
         if query.get("fresh") == "1":
             # a helper with no memory of this hub: hand it the tasks still waiting to start, and nothing older
             waiting = {r["id"] for r in q("SELECT id FROM tasks WHERE state='submitted'")}
@@ -27100,8 +27195,30 @@ class Handler(BaseHTTPRequestHandler):
         if not self.allowed(agent):
             return
         kind = self.form().get("kind") if self.body() else None
-        if kind not in (None, "shown", "gone"):
-            return self.json(400, {"error": "kind is shown or gone"})
+        if kind not in (None, "shown", "gone", "untaken", "start_failed"):
+            return self.json(400, {"error": "kind is shown, gone, untaken or start_failed"})
+        if kind == "start_failed":
+            # plan C6: why the start of a task's session failed, once for each distinct reason: kept for the loss
+            # that it causes, and told to the requester once
+            why = text_field(self.form().get("reason"), 300, False)
+            try:
+                tid = parse_task(task)
+            except ToolError:
+                return self.json(200, {})
+            t = q1("SELECT * FROM tasks WHERE id=? AND owner=?", (tid, agent))
+            if t and t["state"] not in TERMINAL and why and why != kv_get(f"start_failed:{tid}"):
+                kv_set(f"start_failed:{tid}", why)
+                emit(t["requester"], "say", f"[hub] The session of {tref(tid)} ({t['title']}) cannot start on {agent}: "
+                     f"{why}. Its helper tries again, and the hub tells you if that does not help.", task=tid)
+                log("hub", f"{tref(tid)} cannot start on {agent}: {why}")
+            return self.json(200, {})
+        if kind == "untaken":
+            # plan C5: a line told twice that the session did not take, kept for the turn-end check and the
+            # manager's flag (C9, C10); the hub types nothing itself
+            with area("quiet"):
+                kv_set(f"untaken:{agent}:{task}", now())
+            log("hub", f"{agent}'s {task} did not take its line, told twice")
+            return self.json(200, {})
         if agent == manager_name():
             if kind is None:
                 kv_set("mgr_screen", now())         # the timers turn this into a banner and a notification
@@ -28155,9 +28272,14 @@ def rpc(agent, m, headers, context=None, credential=None):
                 kv_set("tools:" + agent, tool_contract(agent))
             if credential and chat_context(agent, context):
                 chat_listed(credential)
+            listed_window(agent, context)
         elif method == "tools/call":
             with area("quiet"):
                 q("UPDATE agents SET client_seen=? WHERE name=? AND client IS NOT NULL", (now(), agent))
+            if context and re.fullmatch(r"T-[1-9][0-9]{0,17}", str(context[1])) and str(context[2]).isdigit():
+                # plan C6: the attempt came up, at its first call on its own route, with or without a credential
+                q("UPDATE attempts SET started=? WHERE task=? AND attempt=? AND started IS NULL",
+                  (now(), parse_task(context[1]), int(context[2])))
             text, is_error = call_tool(agent, params.get("name"), params.get("arguments") or {}, context)
             result = {"content": [{"type": "text", "text": text}], "isError": is_error}
         elif method == "resources/list":

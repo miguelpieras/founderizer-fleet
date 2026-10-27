@@ -363,12 +363,13 @@ WORKING = re.compile(r"\besc to interrupt\b|^Fleet: the agent is working\b", re.
 # Claude Code's empty input line, between the two rules of its input box (2.1, read on a fleet machine, 26 October
 # 2026): "❯" alone on its line. Text after it is a line the session has not taken yet, and no idle prompt.
 IDLE_PROMPT = re.compile(r"^\s*[\u276f>]\s*$", re.M)
-# The helper's new-message signals (Helper.signal). A message is told once, SIGNAL_GAP seconds after the window's last
-# signal or start at the soonest. Messages that a session was told of and left unread are told again after a pause
-# that doubles from RESIGNAL_FIRST up to RESIGNAL_MAX seconds: every signal is one more model turn over the whole
-# context of that session, and until 22 October 2026 it came every 20 seconds for as long as one message waited.
+# The helper's new-message signals (Helper.signal, plan C5). A Claude session's lines follow its own facts: its first
+# line when its session listed its tools, one untaken line at a time, and one more at its next idle screen. A runtime
+# whose idle screen the helper cannot read yet keeps the old clock: its first line SIGNAL_GAP seconds after its start
+# at the soonest when its tools are not listed, and a line it left unread told again after RESIGNAL_FIRST seconds,
+# doubling up to RESIGNAL_MAX.
 SIGNAL_GAP = 20
-CHAT_RESTART = 60           # seconds between two new owner chats whose windows ended before their conversation began
+IDLE_READINGS = 3           # a session whose tools never list gets its first line after this many idle readings
 RESIGNAL_FIRST = 60
 RESIGNAL_MAX = 900
 # The standing sessions, which read their messages once more at the end of each turn: nothing is typed into them while
@@ -503,6 +504,9 @@ def type_into(session, name, text):
     for keys in (("-l", "--", line), ("Enter",)):
         if keys == ("Enter",):
             time.sleep(0.6)     # let the session take the text in before the Enter
+            r = tmux("capture-pane", "-p", "-t", target)
+            if r.returncode == 0 and shows_question(r.stdout):
+                return "asks"   # a question opened since: an Enter would answer it (plan C5)
         r = tmux("send-keys", "-t", target, *keys)
         if r.returncode != 0:
             return "reading" if r.returncode == 124 else "gone"
@@ -660,26 +664,32 @@ def git_credentials():
     return values
 
 
+GIT_STALLED = 600       # seconds a git transfer may move no data before git ends it (prepare_repos)
+
+
 def prepare_repos(repos, values):
     """Fetch each repository in WORK/<owner>/<name>, or clone a missing one there, with the session's own
     credentials and never a prompt. The working tree stays as the last task left it. {repo: problem} of the failures."""
     problems, env = {}, {**os.environ, **values, "GIT_TERMINAL_PROMPT": "0"}     # values has it too
     for repo in sorted(repos):
         folder = os.path.join(WORK, *repo.split("/"))
+        # plan C6: no wall clock, because a large first clone is healthy work. git's own rule ends only a transfer
+        # that moves less than a byte a second for GIT_STALLED seconds: a dead one.
+        stalled = ["-c", "http.lowSpeedLimit=1", "-c", f"http.lowSpeedTime={GIT_STALLED}"]
         if os.path.isdir(os.path.join(folder, ".git")):
-            args, wait = ["git", "-C", folder, "fetch", "--quiet", "--prune", "origin"], 120
+            args = ["git", *stalled, "-C", folder, "fetch", "--quiet", "--prune", "origin"]
         elif os.path.lexists(folder):
             problems[repo] = f"{folder} is there, but it is not a git clone"
             continue
         else:
             os.makedirs(os.path.dirname(folder), exist_ok=True)
-            args, wait = ["git", "clone", "--quiet", f"https://github.com/{repo}.git", folder], 300
+            args = ["git", *stalled, "clone", "--quiet", f"https://github.com/{repo}.git", folder]
         try:
-            r = subprocess.run(args, env=env, capture_output=True, text=True, timeout=wait, stdin=subprocess.DEVNULL)
+            r = subprocess.run(args, env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
             if r.returncode != 0:
                 problems[repo] = " ".join((r.stderr or r.stdout).split())[-200:] or f"git ended with {r.returncode}"
-        except (OSError, subprocess.TimeoutExpired):
-            problems[repo] = "git did not finish in time"
+        except OSError:
+            problems[repo] = "git could not run"
     return problems
 
 
@@ -845,7 +855,6 @@ STANDING_COMPACT = 200000
 # has grown FRESH_GROWN past the start of its conversation, starts a new conversation instead (Helper.restart_fresh).
 CACHE_SECONDS = 3600
 FRESH_GROWN = 50000             # tokens
-FRESH_SPACING = 600             # seconds between two new conversations at the least, whatever the readings say
 CONTEXT_BYTES = 1 << 20         # read of the head and of the tail of a conversation file, which can be hundreds of MB
 
 
@@ -1096,7 +1105,8 @@ def conversation_command(agent, conf, generation, conversation, url, token, prom
     args = ["claude", "--setting-sources", "", "--permission-mode", "dontAsk", "--tools", "", "--strict-mcp-config",
             "--mcp-config", mcp_config_file(agent, window, url, token), "--settings", json.dumps(settings),
             "--append-system-prompt-file", session_file(agent, window, "md", prompt)] + shlex.split(model_flags(conf))
-    words = ["env", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}", f"FLEET_AGENT={agent}", "FLEET_TASK=", NO_TIMERS]
+    words = ["env", f"FLEET_GENERATION={generation}", f"FLEET_HUB={HUB}", f"FLEET_AGENT={agent}", "FLEET_TASK=", NO_TIMERS,
+             f"CLAUDE_CODE_AUTO_COMPACT_WINDOW={STANDING_COMPACT}"]     # a window that stays open: a bounded context
     return f"cd {shlex.quote(folder)} && exec " + shlex.join(words + args)
 
 
@@ -1585,6 +1595,13 @@ def read_ids(value):
     return [int(i) for i in re.findall(r"\d+", head.group(1))] if head else []
 
 
+def reads_its_screen(runtime):
+    """Whether the helper reads this provider's idle input line and its turn records as facts (plan C5): when a
+    window takes its first line, when it reached an idle point, when an old session retires, when a delivered task's
+    window closes and when an interrupt took. Only Claude Code's are read; another provider keeps its clocks."""
+    return runtime == "claude"
+
+
 def turn_reads(runtime, rows):
     """(ended, ids): whether a turn of the session ended normally in these conversation rows, and the ids of the
     messages that read_messages gave it after the last such end. A Claude turn ends normally with the model's own
@@ -2038,11 +2055,12 @@ class Helper:
         self.agent, self.conf, self.session = agent, conf, f"fleet-{agent}"
         self.worker = conf.get("role") in ("worker", "lead")      # a lead works like a worker, one session per task
         self.signalled = {}       # a throttle only; the hub owns the unread messages
-        self.told = {}            # {window: (tmux window id, the event ids its last signal told of)} (signal)
-        self.retold = {}          # {window: seconds before the same unread messages are told again}
+        self.lines = {}           # {window: its last line: tmux window id, the ids it told, when, retold, reported}
+        self.listed = {}          # {window: how often its sessions listed their tools}, from the hub's last poll
+        self.ready_base = {}      # {window: that count at its start}: its first line waits for a new listing
+        self.idle_at = {}         # {window: the last screen reading that agreed on its idle input line}
         self.wanted = {}          # {window: ids of this poll's events that want a signal} (handle_events)
         self.typed_at = {}        # {window: when its last signal was typed}, a model call of its session (restart_fresh)
-        self.chat_unready = False     # its owner chat started and has not listed its tools yet (keep_chat)
         self.manager_session = None
         self.retiring = None      # (first quiet reading, its marks) of the previous runtime's chat (runtime_switch)
         self.retired_left = {}    # {pid: args} of that chat's processes that did not end when it closed
@@ -2071,6 +2089,9 @@ class Helper:
         self.manager_seen = ()          # the manager_bound that the hub last got from this helper (never at first)
         self.manager_report_failed = None   # when the hub last did not take such a report (report_manager_bound)
         self.conversation_seen = {}     # {C-<id>: when this helper first saw that window} (retire_conversations)
+        self.conversation_starts = {}   # {C-<id>: (newest message's event, starts for it)} (conversation_may_start)
+        self.newest = {}                # {C-<id>: its newest pending event} of this poll (handle_events)
+        self.conversations = None       # the ids of this agent's open conversations, from the hub's last poll
         self.outside, self.outside_lock = 0, threading.Lock()      # checks and login jobs that run now
         self.logins = set()             # the sign-ins that run now, by id (begin_signin)
         self.loop_wake = threading.Event()      # ends the loop's pause, so an owner's request acts at once
@@ -2078,7 +2099,9 @@ class Helper:
         self.screen_attempts = {}       # {task: (attempt, told)} of the runners (app_server_task) that this helper started
         self.start_waits = {}           # {event id: (seconds, monotonic time of the next try)} of failed task events
         self.step = None                # (name, task or None, monotonic start) of the main loop's step now (doing)
+        self.start_reports = {}         # {task: the last start failure told to the hub} (report_start)
         self.screens = {}               # {window: {"last", "class", "told"}} of the screen watch (watch_screens)
+        self.last_class = {}            # {window: the class its screen had when it went}
         if self.worker:
             self.tailer = Tailer(conf.get("runtime", ""), self.task_windows,
                                  lambda batch: http("POST", f"/helper/events/{agent}", batch, timeout=15), kit=KIT,
@@ -2107,7 +2130,7 @@ class Helper:
         this helper started hears that it went."""
         live = [w for w in windows(self.session) if w != "home"]
         for window in [w for w in self.screens if w not in live]:
-            self.screens.pop(window)
+            self.last_class[window] = self.screens.pop(window).get("class")     # for report_start
         for window in live:
             r = tmux("capture-pane", "-p", "-t", f"{self.session}:={window}")
             if r.returncode != 0:
@@ -2116,8 +2139,12 @@ class Helper:
             reading = screen_class(r.stdout)
             agreed, seen["last"] = reading == seen["last"], reading
             if not agreed:
+                seen["idle_run"] = 0
                 continue                # one reading: the next one must agree
             seen["class"] = reading
+            seen["idle_run"] = seen.get("idle_run", 0) + 1 if reading == "idle" else 0
+            if reading == "idle":
+                self.idle_at[window] = time.monotonic()
             if window != "manager" and not re.fullmatch(r"T-\d+", window):
                 continue
             kind = "shown" if reading == "question" else "gone"
@@ -2149,6 +2176,24 @@ class Helper:
 
     def look(self):
         return [w for w in windows(self.session) if w != "home"]
+
+    def look_known(self):
+        """The windows, or None when tmux did not answer: a list that cannot be read is no list (plan C6)."""
+        r = tmux("list-windows", "-t", self.session, "-F", "#{window_name}")
+        return [w for w in r.stdout.split("\n") if w and w != "home"] if r.returncode == 0 else None
+
+    def report_start(self, task, reason):
+        """Why the start of a task's session failed (plan C6), told to the hub once for each distinct reason: the hub
+        keeps it for the loss it causes and tells the requester once. Never a screen's text or an error's: a class."""
+        if not re.fullmatch(r"T-\d+", str(task)) or self.start_reports.get(task) == reason:
+            return
+        try:
+            code, _ = http("POST", f"/helper/dialog/{self.agent}/{task}", {"kind": "start_failed", "reason": reason},
+                           timeout=10)
+        except (urllib.error.URLError, OSError, ValueError):
+            return
+        if code == 200:
+            self.start_reports[task] = reason
 
     def keep_session(self):
         """Make this agent's tmux session again when it is gone. One round of the helper's loop; True when it had to.
@@ -2358,9 +2403,11 @@ class Helper:
                     # then sends the runner's last records as those of a session that ended.
                     self.screen_attempts[name] = (f"{generation}:{attempt}", False)
                     self.tailer.register((name, generation, attempt, session, "codex_app", needs))
-        # The first signal waits the signal throttle: a runtime's first screen can be its own question (Claude Code's
-        # workspace trust), and a line typed before it shows would answer it with its Enter.
+        # The first signal waits until the session can take it (first_line_due): a runtime's first screen can be
+        # its own question (Claude Code's workspace trust), and a line typed before it shows would answer it.
         self.signalled[name] = time.monotonic()
+        self.ready_base[name] = self.listed.get(name, 0)
+        self.lines.pop(name, None)
 
     def sweep_desktop(self):
         """The owner's live view of a browser task, on a Mac whose agent can show its screen: one publisher per
@@ -2386,6 +2433,29 @@ class Helper:
                 publishers[key] = Publisher(self.agent, name, {"attempt": number, "generation": generation}, http)
                 publishers[key].start()
 
+    def first_line_due(self, window):
+        """True when a window that this helper started can take its first line (plan C5): the hub says its session
+        listed its tools on its own route since the start, or its screen showed its empty input line at
+        IDLE_READINGS readings in a row (a session whose Fleet tools never come: its first turn then runs without
+        them, and the turn-end check sees it). A runtime whose idle screen the helper cannot read gets it after
+        SIGNAL_GAP seconds instead. A window started before this helper ran is due at once."""
+        if window not in self.ready_base:
+            return True
+        due = self.listed.get(window, 0) > self.ready_base[window] or \
+            (self.screens.get(window) or {}).get("idle_run", 0) >= IDLE_READINGS or \
+            (not reads_its_screen(self.conf.get("runtime")) and
+             time.monotonic() - self.signalled.get(window, 0) >= SIGNAL_GAP)
+        if due:
+            self.ready_base.pop(window)
+        return due
+
+    def idle_since(self, window, at):
+        """True when the window reached an idle point after `at`: its screen showed its empty input line (the screen
+        watch), or, for a runtime whose idle screen the helper cannot read, RESIGNAL_FIRST seconds passed."""
+        if not reads_its_screen(self.conf.get("runtime")):
+            return time.monotonic() - at >= RESIGNAL_FIRST
+        return self.idle_at.get(window, 0) > at
+
     def want(self, window, event):
         """A pending event of this poll wants a signal into `window`; handle_events gives each window one."""
         self.wanted.setdefault(window, set()).add(event)
@@ -2393,26 +2463,35 @@ class Helper:
     def signal(self, window, ids=()):
         """Tell one session that the hub holds messages for it. ids: the pending events that want the signal.
 
-        Each message is told once. The hub keeps an unread message pending, so until 22 October 2026 every poll
-        typed the same line again, every 20 seconds and also while a turn ran, for as long as one message waited --
-        and each of those lines was one more model turn over the session's whole context, most of them answered with
-        "No unread messages". The manager spent most of a week's allowance on that. Now a message that a session was
-        told of and left unread is told again only after RESIGNAL_FIRST seconds, doubling up to RESIGNAL_MAX, and a
-        standing session is not typed into while a turn runs (STANDING_WINDOWS): it reads once more at the end of the
-        turn, and a message that came during the turn and is still unread then is told as soon as the turn ends. A
-        task session is still told during its turn, once, so that a steer reaches it. A new window (its tmux id)
-        knows nothing of earlier signals. A manager session that a message finds cold and long is not told at all:
-        it starts again on a new conversation, and that one is told (restart_fresh)."""
+        Each line is one more model turn over the session's whole context, so lines follow the session's own facts
+        and never a clock (plan C5). Its first line goes when it can take it (first_line_due). Then one untaken line
+        at a time: while the session has read nothing that its last line told and has not been idle since, no new
+        line goes, also for a new message. A line whose messages are still unread at the session's next idle point
+        is told once more, and one still not taken after that is reported to the hub once (Handler.helper_dialog,
+        kind "untaken"); nothing is typed again because of time. A standing session is not typed into while a turn
+        runs (STANDING_WINDOWS): it reads once more at the end of the turn. A new window (its tmux id) knows nothing
+        of earlier lines. A manager session that a message finds cold and long is not told at all: it starts again
+        on a new conversation, and that one is told (restart_fresh)."""
         target = f"{self.session}:={window}"
-        if time.monotonic() - self.signalled.get(window, 0) < SIGNAL_GAP:
+        if not self.first_line_due(window):
             return
         r = tmux("display-message", "-p", "-t", target, "#{window_id}")
         wid, ids = (r.stdout.strip() if r.returncode == 0 else ""), frozenset(ids)
-        was, told = self.told.get(window, ("", frozenset()))
-        fresh = wid != was or not ids <= told
-        if not fresh and time.monotonic() - self.signalled.get(window, 0) < self.retold.get(window, RESIGNAL_FIRST):
+        line = self.lines.get(window)
+        if line and (line["wid"] != wid or not line["ids"] <= ids):
+            line = None             # a new window, or the session read what the line told: it took it
+        if line and not self.idle_since(window, line["at"]):
+            return                  # its last line is not taken yet, and the session has not been idle since
+        if line and line["retold"]:
+            if not line["reported"]:
+                line["reported"] = True
+                try:
+                    http("POST", f"/helper/dialog/{self.agent}/{window}", {"kind": "untaken"}, timeout=10)
+                except (urllib.error.URLError, OSError, ValueError):
+                    pass
+                self.say(f"{window}: its line was told twice and not taken; the hub knows")
             return
-        if window in STANDING_WINDOWS and self.working(target):
+        if window in STANDING_WINDOWS and self.turn_runs(window, target):
             return                  # a turn runs: it reads its messages at its end, and this tells it after that
         try:
             if window == "manager" and self.restart_fresh(target):
@@ -2426,12 +2505,22 @@ class Helper:
         self.signalled[window] = time.monotonic()
         if got == "typed":
             self.typed_at[window] = time.monotonic()
-            self.told[window] = (wid, ids)
-            self.retold[window] = RESIGNAL_FIRST if fresh else \
-                min(RESIGNAL_MAX, 2 * self.retold.get(window, RESIGNAL_FIRST))
+            self.lines[window] = {"wid": wid, "ids": ids, "at": time.monotonic(), "retold": line is not None,
+                                  "reported": False}
         if got == "asks" and window != "owner-chat" and not CONVERSATION_WINDOW.fullmatch(window):
             http("POST", f"/helper/dialog/{self.agent}/{window}", {})
-        self.say(f"{window}: inbox signal {got}{'' if fresh else ' again'}; only read_messages acknowledges delivery")
+        self.say(f"{window}: inbox signal {got}{' again' if line else ''}; only read_messages acknowledges delivery")
+
+    def turn_runs(self, window, target):
+        """A standing session runs a turn only when its screen shows one and, for the manager, its own records have
+        no turn end after its last prompt: if either says idle, it is idle (plan C5)."""
+        if not self.working(target):
+            return False
+        if window == "manager":
+            feeds = [f for f in self.tailer.feeds.values() if f.name == "manager"]
+            if feeds and not (feeds[-1].translator.turn or feeds[-1].translator.ending):
+                return False
+        return True
 
     def handle_events(self, events):
         """The pending events of one poll. An event that fails stays pending, and the next poll tries it again: some
@@ -2445,6 +2534,12 @@ class Helper:
         pending = {ev["id"] for ev in events}
         self.start_waits = {i: w for i, w in self.start_waits.items() if i in pending}
         self.wanted = {}
+        # the newest pending message of each conversation window: its start guard counts starts for it
+        self.newest = {}
+        for ev in events:
+            cid = str((ev.get("extra") or {}).get("conversation") or "")
+            if ev.get("kind") == "conversation" and CONVERSATION_ID.fullmatch(cid):
+                self.newest[f"C-{cid}"] = max(self.newest.get(f"C-{cid}", 0), ev["id"])
         for ev in events:
             wait, due = self.start_waits.get(ev["id"], (0, 0))
             if time.monotonic() < due:
@@ -2457,11 +2552,11 @@ class Helper:
                 if ev.get("kind") == "task":
                     wait = min(300, wait * 2 or 15)
                     self.start_waits[ev["id"]] = (wait, time.monotonic() + wait)
+                    self.report_start(ev.get("task"), str(e)[:200] if isinstance(e, Refused) else type(e).__name__)
                 self.say(f"event {ev['id']} remains pending: {type(e).__name__}" +
                          (f"; next try in {wait} s" if ev.get("kind") == "task" else ""))
-        for window in [w for w in self.told if w not in self.wanted]:
-            self.told.pop(window)
-            self.retold.pop(window, None)
+        for window in [w for w in self.lines if w not in self.wanted]:
+            self.lines.pop(window)
         for window, ids in self.wanted.items():
             try:
                 self.signal(window, ids)
@@ -2473,14 +2568,14 @@ class Helper:
         hub wants it running (keep_chat). Raises Refused when it may not start now."""
         window, runtime = "owner-chat", self.conf.get("runtime")
         resume = self.chat_resume(generation)      # first: the conversation it continues, if any
-        # **One new chat a minute while its starts keep ending.** A chat whose window ended before its conversation
-        # began starts again, but not at every poll: each start asks the hub for a credential and starts the runtime,
-        # and a window that cannot run would otherwise do both every two seconds. A chat with a conversation to
-        # continue starts at once.
+        # **Two starts while its starts keep ending, and then a reason** (plan C5: a count, not a minute). A chat
+        # whose window ended before its conversation began starts again once, but not at every poll: each start asks
+        # the hub for a credential and starts the runtime. A chat with a conversation to continue starts at once, and
+        # a sign-in (restart_after_login) or a new helper (a settings or runtime change) starts the count again.
         last = self.__dict__.get("chat_started")
-        if resume is None and last and last[0] == generation and time.monotonic() - last[1] < CHAT_RESTART:
-            raise Refused("the owner chat ended before its conversation began; a new one starts a minute after that "
-                          "start")
+        if resume is None and last and last[0] == generation and last[1] >= 2:
+            raise Refused("the owner chat ended twice before its conversation began; it starts again after a sign-in, "
+                          "a settings change or a runtime change")
         token = session_credential(self.agent, "chat", generation)
         marker = None if resume or runtime not in MANAGER_RUNTIMES else str(uuid.uuid4())
         # No conversation to continue here: a first chat, or the first after a runtime switch, because the record is
@@ -2490,8 +2585,7 @@ class Helper:
         self.start(window, chat_command(self.agent, self.conf, generation, token=token, marker=marker, resume=resume,
                                         recap=recap, env=session_env(self.agent, self.conf, "chat")),
                    1, generation)
-        self.chat_started = (generation, time.monotonic())
-        self.chat_unready = True        # its first signal waits until the hub says it has its tools (keep_chat)
+        self.chat_started = (generation, (last[1] + 1) if resume is None and last and last[0] == generation else 1)
         if marker:      # Codex finds its thread by the marker later; Claude starts with the marker as session id
             save_chat_record(self.agent, {"generation": generation, "marker": marker if runtime == "codex" else None,
                                           "session": None if runtime == "codex" else marker,
@@ -2509,9 +2603,6 @@ class Helper:
         if not self.worker or not isinstance(chat, dict):
             return
         window = "owner-chat"
-        if chat.get("ready") and self.chat_unready:
-            self.chat_unready = False
-            self.signalled.pop(window, None)
         if not chat.get("warm") or not generation:
             return
         try:
@@ -2558,8 +2649,11 @@ class Helper:
                 if existing != expected:
                     tmux("kill-window", "-t", f"{self.session}:={window}", check=True)
             if window not in self.look():
-                if len([w for w in self.look() if CONVERSATION_WINDOW.fullmatch(w)]) >= CONVERSATION_WINDOWS:
+                if len([w for w in self.look() if CONVERSATION_WINDOW.fullmatch(w)]) >= CONVERSATION_WINDOWS and \
+                        not self.free_conversation_slot(window):
                     raise Refused(f"{CONVERSATION_WINDOWS} conversation windows are open; {window} waits for one")
+                if not self.conversation_may_start(window, self.newest.get(window, ev["id"])):
+                    return
                 code, data = http("POST", f"/helper/conversations/{self.agent}/{cid}/start", {})
                 if code != 200:
                     raise Refused(f"the hub did not give the start of {window} ({code}): {data.get('error', '')}")
@@ -2570,7 +2664,7 @@ class Helper:
                 self.conversation_seen[window] = time.monotonic()
                 self.say(f"{window}: conversation session started; the agent's read and reply are still pending")
             else:
-                self.signal(window, [ev["id"]])     # now: the hub takes this event as delivered after this call
+                self.want(window, ev["id"])     # it stays pending until the session reads it (plan C5)
         elif kind == "task":
             expected = f"{extra.get('generation','')}:{extra.get('attempt',1)}"
             needs = extra.get("needs") or "none"
@@ -2588,6 +2682,12 @@ class Helper:
                     self.screen_attempts[task] = (expected, True)
                     self.say(f"{task}: the screen runner of attempt {extra.get('attempt',1)} ended; "
                              f"the helper does not start the same attempt again")
+            elif task not in self.look() and ev.get("started"):
+                # plan C6: this attempt was started once and its window is gone. The hub decides every later start
+                # (a new attempt), also after a restart of this helper; this one says what it saw.
+                seen = self.last_class.get(task)
+                self.report_start(task, "its window ended before its session read the task" +
+                                  (f" (its screen showed: {seen})" if seen else ""))
             elif task not in self.look():
                 session = str(uuid.uuid4())     # a new id for every start, so a repeated start never reuses one
                 token = session_credential(self.agent, "task", extra.get("generation", ""), task=task,
@@ -2597,6 +2697,13 @@ class Helper:
                     session=session, token=token, env=session_env(self.agent, self.conf, "task")),
                     extra.get("attempt",1), extra.get("generation",""), session, needs=needs)
                 self.say(f"{task}: session started, attempt {extra.get('attempt',1)}")
+                # plan C6: the ack says only "started once"; the event stays pending until the session reads it
+                try:
+                    code, _ = http("POST", f"/helper/ack/{self.agent}", {"ids": [ev["id"]]})
+                except (urllib.error.URLError, OSError, ValueError) as e:
+                    code = type(e).__name__
+                if code != 200:
+                    self.say(f"{task}: the hub did not take the start's ack ({code}); the next poll tells it again")
             else:
                 self.want(task, ev["id"])
         elif kind == "say":
@@ -2621,6 +2728,8 @@ class Helper:
             # task's processes taken before the window closes (a macOS child whose environment is hidden loses its
             # parent link when its window closes).
             desktop, generation = extra.get("needs") in ("browser", "screen"), str(extra.get("generation") or "")
+            if task in self.look() and self.closing(task):
+                raise Refused(f"{task}: its turn after the delivery runs; the window closes at its end")
             before = self.task_work(task, generation, keep_runtime=False) if desktop and generation else {}
             if task in self.look():
                 tmux("kill-window", "-t", f"{self.session}:={task}", check=True)
@@ -2669,7 +2778,7 @@ class Helper:
             self.mcp_program(extra)
         elif kind == "outputs":
             self.send_outputs(extra)
-        if kind not in ("say", "task", "chat"):
+        if kind not in ("say", "task", "chat", "conversation"):
             code, data = http("POST", f"/helper/ack/{self.agent}", {"ids": [ev["id"]]})
             if code != 200:
                 raise Refused("the hub did not acknowledge helper work")
@@ -2876,8 +2985,8 @@ class Helper:
             return False
         if self.manager_due or self.manager_left or self.manager_retiring is not None or self.outdated():
             return False                # a start or a switch is already going to replace this session
-        if self.fresh_at is not None and time.monotonic() - self.fresh_at < FRESH_SPACING:
-            return False
+        # At most one new conversation for each started session until it made a model call (plan C5): a session with
+        # no call yet has no context to read (claude_context below), so it is never cold, and no clock spaces them.
         if self.window_runtime("manager") != "claude":
             return False
         r = tmux("display-message", "-p", "-t", target, "#{@fleet_session}\t#{pane_start_command}")
@@ -2919,6 +3028,7 @@ class Helper:
         """A session that started before this machine had a credential is sitting at the provider's own sign-in
         screen, and no credential reaches a window that already runs. So the standing manager session is closed
         here and started again, signed in. A worker has no standing session: its next task window is a new one."""
+        self.chat_started = None        # an owner chat whose starts kept ending may start again now (start_chat)
         if self.conf.get("role") != "manager":
             return
         with contextlib.suppress(subprocess.CalledProcessError, Refused):
@@ -3540,7 +3650,9 @@ class Helper:
         if self.manager_retiring is None or self.manager_retiring[1] != mark:
             self.manager_retiring = (time.monotonic(), mark)
             return False
-        if time.monotonic() - self.manager_retiring[0] < RETIRE_QUIET:
+        # as retire_old_chat: a Claude session retires at its own turn end, another runtime after RETIRE_QUIET
+        idle = reads_its_screen(old) and (self.screens.get("manager") or {}).get("class") == "idle"
+        if not idle and time.monotonic() - self.manager_retiring[0] < RETIRE_QUIET:
             return False
         # Also what earlier readings saw: a process that this reading misses (it left the pane) still ends.
         before = {**still_running(self.manager_procs), **self.task_work("manager", "", keep_runtime=False)}
@@ -3641,21 +3753,56 @@ class Helper:
         else:
             self.manager_report_failed = time.monotonic()
 
+    def conversation_may_start(self, window, newest):
+        """The start guard of a conversation window (plan C5). Its event stays pending until the session reads the
+        message, so a window that ends before its read would start again at every poll. For the same newest message
+        it starts twice; then it says why once and starts again only for a newer message. A new helper (a sign-in, a
+        settings change, a runtime change) starts fresh."""
+        last, count = self.conversation_starts.get(window, (None, 0))
+        if newest == last and count >= 2:
+            if count == 2:
+                self.conversation_starts[window] = (newest, 3)
+                self.say(f"{window}: started twice for the same message and ended before its read both times; it "
+                         f"starts again on a newer message of this conversation")
+            return False
+        self.conversation_starts[window] = (newest, count + 1 if newest == last else 1)
+        return True
+
     def retire_conversations(self):
-        """Close a conversation window that was quiet for CONVERSATION_IDLE seconds (CHAT-APPS.md 7.2). Nothing is
-        lost: the next message of that person starts a new window, whose prompt carries the hub's recap. A window
-        that this helper did not start itself counts from the first time it saw it."""
+        """Close a conversation window whose conversation the hub no longer holds open (plan C5: its words, not a
+        clock; the person's /new closes one too). Nothing is lost: the next message of that person starts a new
+        window, whose prompt carries the hub's recap. A helper whose hub does not say (an older hub) keeps the old
+        rule: a window quiet for CONVERSATION_IDLE seconds closes."""
         open_windows = [w for w in self.look() if CONVERSATION_WINDOW.fullmatch(w)]
         for window in [w for w in self.conversation_seen if w not in open_windows]:
             self.conversation_seen.pop(window, None)
         for window in open_windows:
-            quiet = time.monotonic() - max(self.conversation_seen.setdefault(window, time.monotonic()),
-                                           self.signalled.get(window, 0))
-            if quiet > CONVERSATION_IDLE:
-                tmux("kill-window", "-t", f"{self.session}:={window}")
-                self.conversation_seen.pop(window, None)
-                self.say(f"{window}: closed after {CONVERSATION_IDLE // 60} quiet minutes; the next message of this "
-                         f"person starts a new window")
+            if self.conversations is not None:
+                if int(window[2:]) in self.conversations:
+                    continue
+                why = "its conversation is not open any more"
+            else:
+                quiet = time.monotonic() - max(self.conversation_seen.setdefault(window, time.monotonic()),
+                                               self.signalled.get(window, 0))
+                if quiet <= CONVERSATION_IDLE:
+                    continue
+                why = f"{CONVERSATION_IDLE // 60} quiet minutes"
+            tmux("kill-window", "-t", f"{self.session}:={window}")
+            self.conversation_seen.pop(window, None)
+            self.say(f"{window}: closed, {why}; the next message of this person starts a new window")
+
+    def free_conversation_slot(self, wanted):
+        """A conversation that waits for a window takes the slot of the least recently used open one that runs no
+        turn and has nothing unread (plan C5), instead of waiting for a clock to close it. True when one closed."""
+        quiet = [w for w in self.look() if CONVERSATION_WINDOW.fullmatch(w) and w != wanted and w not in self.newest
+                 and (self.screens.get(w) or {}).get("class") == "idle"]
+        if not quiet:
+            return False
+        window = min(quiet, key=lambda w: max(self.conversation_seen.get(w, 0), self.signalled.get(w, 0)))
+        tmux("kill-window", "-t", f"{self.session}:={window}")
+        self.conversation_seen.pop(window, None)
+        self.say(f"{window}: closed for {wanted}, which waited for a window; it was idle with nothing unread")
+        return True
 
     def retire_old_chat(self):
         """After a runtime switch, close the owner chat window that still runs the previous runtime, but only when it
@@ -3694,7 +3841,10 @@ class Helper:
         if self.retiring is None or self.retiring[1] != mark:
             self.retiring = (time.monotonic(), mark)
             return
-        if time.monotonic() - self.retiring[0] < RETIRE_QUIET:
+        # A Claude chat retires at its own turn end: the screen watch agreed on its idle input line and nothing moved
+        # since the last reading (plan C5). A runtime whose idle screen the helper cannot read keeps RETIRE_QUIET.
+        idle = reads_its_screen(old) and (self.screens.get("owner-chat") or {}).get("class") == "idle"
+        if not idle and time.monotonic() - self.retiring[0] < RETIRE_QUIET:
             return
         before = self.task_work("owner-chat", "", keep_runtime=False)
         tmux("kill-window", "-t", target)
@@ -3708,9 +3858,27 @@ class Helper:
                  "switch back" + ("" if not self.retired_left else f"; processes still run: {left}"))
         self.lifecycle.report()         # the hub delivers chats again once no such window or process is left
 
+    def feeds_of(self, window):
+        """The record feeds of one window's sessions, from the record reader."""
+        with self.tailer.lock:
+            return [f for f in self.tailer.feeds.values() if f.name == window]
+
+    def closing(self, task):
+        """True while a delivered task's window should stay open (plan C5): its records say that the turn after the
+        delivery still runs, its screen does not show it idle, and the session called no tool but Fleet's after the
+        delivery. A window whose records the helper does not read closes at once, as before."""
+        feeds = self.feeds_of(task)
+        if not feeds or not reads_its_screen(self.conf.get("runtime")):
+            return False
+        t = feeds[-1].translator
+        if t.after or not (t.turn or t.ending):
+            return False
+        return (self.screens.get(task) or {}).get("class") != "idle"
+
     def interrupt(self, window):
-        """Stop the running turn with Esc, at most three times. Confirmed when the screen shows no running
-        turn and the session's record file has been quiet for 5 seconds."""
+        """Stop the running turn with Esc, at most three times. Confirmed at once for a session with no running turn,
+        and for a Claude session when its records show the turn's end after the Esc (plan C5); for another runtime
+        when the screen shows no running turn and its record file has been quiet for 5 seconds."""
         target = f"{self.session}:={window}"
         if window not in self.look():
             return True, "no session was running"
@@ -3726,6 +3894,13 @@ class Helper:
                     if window not in self.look():
                         return True, "the screen runner interrupted its turn and stopped"
             return False, "the screen runner did not stop after two interrupts"
+        claude = reads_its_screen(self.conf.get("runtime")) and bool(self.feeds_of(window))     # with its records
+        ends = lambda: sum(f.translator.ends for f in self.feeds_of(window))
+        if claude and not self.working(target):
+            self.tailer.flush(window)
+            if not any(f.translator.turn or f.translator.ending for f in self.feeds_of(window)):
+                return True, "no turn was running"
+        before = ends()
         for _ in range(3):
             if self.working(target):
                 tmux("send-keys", "-t", target, "Escape")
@@ -3734,7 +3909,11 @@ class Helper:
                 time.sleep(1)
                 if window not in self.look():
                     return True, "the session ended"
-                if not self.working(target) and self.tailer.quiet(window, 5):
+                if claude:
+                    self.tailer.flush(window)
+                    if ends() > before and not self.working(target):
+                        return True, "interrupted; its records show the turn's end"
+                elif not self.working(target) and self.tailer.quiet(window, 5):
                     return True, "interrupted; the session is idle"
         return False, "the session still shows a running turn after three interrupts"
 
@@ -4036,8 +4215,10 @@ def cmd_run(args):
             h.retire_old_chat()
             h.retire_conversations()
             h.step = None           # the poll is the loop's own check-in
-            alive = urllib.parse.quote(",".join(h.look()))
-            code, data = http("GET", f"/events/{agent}?delivery=1&after=0&wait=8&alive={alive}")
+            names = h.look_known()
+            # plan C6: a list only when tmux answered; an empty one would read as every window lost
+            listed = f"alive={urllib.parse.quote(','.join(names))}" if names is not None else "alive_unknown=1"
+            code, data = http("GET", f"/events/{agent}?delivery=1&after=0&wait=8&{listed}")
             if code == 403 and data.get("auth") == "no_key" and load_agent_key(agent):
                 os.remove(key_file(agent))      # the owner removed this agent's key: legacy again until it enrolls
                 keyed, enrolled_at = False, 0.0
@@ -4045,6 +4226,8 @@ def cmd_run(args):
             if code != 200:
                 raise Refused(f"hub answered {code}")
             h.doing("chat")
+            h.listed = data.get("listed") if isinstance(data.get("listed"), dict) else {}
+            h.conversations = data.get("conversations") if isinstance(data.get("conversations"), list) else None
             h.keep_chat(data.get("chat"), data.get("db"))
             h.handle_events(data.get("events", []))
             h.doing("screen watch")

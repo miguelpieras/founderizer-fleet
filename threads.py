@@ -173,6 +173,9 @@ class Translator:
         self.shells = {}            # Claude: background command or monitor call -> its task id, until its end notice
         self.shell_calls = {}       # Claude: Bash and Monitor calls of this session -> the tool's name
         self.turn = False           # Claude: a turn of the main session runs
+        self.ends = 0               # Claude: the turn ends of the main session so far (Helper.interrupt reads it)
+        self.delivered = False      # Claude: the session called deliver_result
+        self.after = False          # Claude: and called a tool other than Fleet's after it (Helper.closing)
         self.ending = None          # Claude: the message that ended a turn. One message can be two rows (its thinking
                                     # and its text), so the turn end goes out at the next row, or when a read finds
                                     # no new line (idle): one end for each turn, not one for each row.
@@ -217,6 +220,7 @@ class Translator:
     def turn_end(self, how):
         """The one result record of a turn of the main session that ended; how: its stop reason."""
         self.ending, self.turn = None, False
+        self.ends += 1
         return [{"type": "result", "stop_reason": how}]
 
     def remaining(self):
@@ -423,6 +427,9 @@ class Translator:
         self.open.add(call)
         if name in ("Bash", "Monitor"):
             self.shell_calls[call] = name           # a result with a task id makes it a background call
+        if self.prefix is None:                     # the helper closes a delivered task at the end of its turn
+            self.after = self.after or (self.delivered and not name.startswith("mcp__fleet__"))
+            self.delivered = self.delivered or name == "mcp__fleet__deliver_result"
         record = {"type": "tool_call", "tool_call_id": call, "title": clip(f"{label}: {detail}" if detail else label, TITLE),
                   "kind": kind, "status": "in_progress", "server": clip(server, 60) if server else None}
         path = args.get("file_path") or args.get("notebook_path") or (args.get("path") if name in ("Grep", "Glob", "LS") else None)
