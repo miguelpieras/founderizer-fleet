@@ -17980,6 +17980,10 @@ def liveness(t0):
         # started and lost is a loss like any other (also for attempt 1), not a start that still waits
         once = online and START_ONCE in helper_features(owner)
         launched = once and attempt_started(t)
+        if launched and has_list and not alive and row["alive_ts"] <= launched:
+            # Its helper takes a list before each poll and starts the window after it, so the list that came before
+            # the ack never has that window: it says nothing of it, and the next one does (live check, 27 Oct 2026)
+            has_list = False
         # Only a question the task is actually waiting on is a live path. One asked with a default is not: its task
         # works on, so a session that then dies has no path of its own and must be restarted like any other -- and
         # without this filter it would never be, because an open question looked like a reason to wait for ever.
@@ -18072,10 +18076,11 @@ LOST_NOTE = 6                   # losses since the requester last acted, after w
 
 
 def attempt_started(t):
-    """True when the helper acked the task event of task row `t`'s current attempt: it started that window once."""
+    """When the hub took the helper's ack of the task event of task row `t`'s current attempt (it started that window
+    once), or None."""
     row = q1("SELECT helper_ack FROM events WHERE agent=? AND kind='task' AND task=? AND "
              "COALESCE(json_extract(extra, '$.attempt'), 1)=? ORDER BY id DESC LIMIT 1", (t["owner"], t["id"], t["attempt"]))
-    return bool(row and row["helper_ack"])
+    return row["helper_ack"] if row and row["helper_ack"] else None
 
 
 def attempt_progress(t):
