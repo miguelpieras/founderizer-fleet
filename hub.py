@@ -1685,7 +1685,7 @@ def migrate():
         # as refused (hub.check_schema, releases.schema_summary).
         "CREATE INDEX IF NOT EXISTS memory_claim ON memories(agent, responsibility, prevents_key) "
         "WHERE prevents_key IS NOT NULL",
-        # The shelf's own order (MEMORY_SHELF) and the archive sweep, which both run on a lifetime store.
+        # An agent's current lessons, which the start block and the review read (memory_matches, memory_to_review).
         "CREATE INDEX IF NOT EXISTS memory_shelf ON memories(agent, dropped, folded_into, contradicted)",
         # The history's streams of a moment (HISTORY_STREAMS `at`): what was delivered, checked, answered, decided
         # or forgotten since their cursor, read from these and never by a scan of the whole table.
@@ -4241,19 +4241,13 @@ def deliver_result(agent, a, files_said=None):
     tried = a.get("tried")
     tried = None if tried in (None, "") else goal_text_or_error(tried, "tried", MEMORY_TEXT)
     note = str(a.get("note") or "").strip()             # the last progress note (plan P9.4)
-    if a.get("cost_minutes") not in (None, "") and not tried:
-        raise ToolError("cost_minutes says what a repeat of a dead end would cost, so it goes with tried.")
-    if a.get("recheck") not in (None, "") and not tried:
-        raise ToolError("recheck says how to find out cheaply whether a wall still stands, so it goes with tried.")
-    if tried:
-        memory_dead_end_fields(a.get("cost_minutes"), a.get("recheck"))     # before the task is delivered, not after
     if outcome not in ("completed", "failed", "rejected"):
         raise ToolError("outcome must be completed, failed or rejected.")
     if not what:
         raise ToolError("Say what was done (or, for failed or rejected, the reason).")
     if outcome == "completed" and (not where or not how):
         raise ToolError("A completed result needs where_output_is and how_checked.")
-    guard(agent, what, where, how, learned or "", prevents or "", tried or "", str(a.get("recheck") or ""), note)
+    guard(agent, what, where, how, learned or "", prevents or "", tried or "", note)
     fence(agent, tid)                   # again here: a cancel or a Stop can land while the helper sends the files
     t = get_task(tid, owner=agent)
     if t["state"] in TERMINAL:
@@ -4287,7 +4281,8 @@ def deliver_result(agent, a, files_said=None):
     if learned or tried:
         # A task of a duty's case carries that case's key, so the work itself can contradict this lesson later.
         # This is the common path, not close_case: a worker cannot close its own case while its task is open.
-        # A dead end takes no key: it is not a claim about an event coming back, so it ages and is re-tested.
+        # What did not work takes no key: it is not a claim about an event coming back (AUTONOMY.md P7: an ordinary
+        # lesson, which the review lists when nothing confirms it).
         case = case_row(t["duty_case"]) if t["duty_case"] else None
         with transaction():
             if learned:
@@ -4297,17 +4292,14 @@ def deliver_result(agent, a, files_said=None):
                 said += (f" {mref(mid)} keeps what you learned."
                          + (f" It claims to stop {cref(case)}'s key '{case['key']}' coming back, so the hub marks "
                             f"it contradicted if it does." if case else
-                            " Nothing can contradict it, because this was not a duty's case, so it expires unless "
-                            "the work teaches it again."))
+                            " Nothing can contradict it, because this was not a duty's case, so your review lists it "
+                            "when nothing has confirmed it for a while."))
             if tried:
-                dead = memory_from_work(agent, tried, None, about, now(), task=tid, kind="dead_end",
-                                        cost_minutes=a.get("cost_minutes"), recheck=a.get("recheck"))
-                spent = memory_spent(memory_cost(a.get("cost_minutes")))
-                said += (f" {mref(dead)} keeps the dead end"
-                         + (f", {spent} of yours that nobody need spend again" if spent else "") + ".")
+                dead = memory_from_work(agent, MEMORY_TRIED + tried, DEAD_END_PREVENTS, about, now(), task=tid)
+                said += f" {mref(dead)} keeps what did not work, so that nobody need pay for it again."
     elif (hard := work_was_hard(t)):
         said = (f" You recorded nothing learned and {hard}. If something would have saved that, say it in learned "
-                f"when you next deliver; if you found a wall instead, say that in tried, with what it cost.")
+                f"when you next deliver; if you found a wall instead, say that in tried, with how to check it again.")
     duty_after_deliver(t, agent, outcome)       # owner API 1.13: a case whose steps are all recorded closes itself
     left = case_left_open(case_id=t["duty_case"]) if t["duty_case"] else None
     left = case_left_open_text(left) + " " if left else ""
@@ -11854,6 +11846,25 @@ def duty_save(body, by, t0, duty_id=None, command=None):
     return duty_row(new_id)
 
 
+# What a review says about the lessons it lists (AUTONOMY.md P7, lane L6): the agent removes or rewrites them, and the
+# hub removes nothing by itself. Here and not in the memory region, because the review's texts below are built from it.
+MEMORY_REVIEW_WHAT = ("Call recall with stale=true to read them. A CONTRADICTED one claimed to stop a case key that "
+                      "has come back since, so it was wrong, or right and never acted on: write it again so it says "
+                      "which, with remember instead_of=\"M-<id>\", which hands the new lesson the same claim, or "
+                      "remove it with forget and the reason. One that nothing has confirmed for a while is not "
+                      "thereby wrong: if your work still bears it out, write it again the same way, which dates it "
+                      "today; if not, forget it. Where two say the same thing, write one of them again and forget "
+                      "the other.")
+MEMORY_REVIEW_TASK = {
+    "title": "Put your lessons in order",
+    "details": "Lessons of your memory need looking at; they are listed below. " + MEMORY_REVIEW_WHAT + " Then give "
+               "one line in your result: how many you wrote again and how many you removed, without their words — "
+               "your memory is yours.",
+    "done_when": "Every lesson listed below has been written again or removed, or the result says why it was kept "
+                 "as it is."}
+MEMORY_REVIEW_SAY = "[hub] Lessons of yours need looking at:\n{lessons}\n" + MEMORY_REVIEW_WHAT
+
+
 # The review of a holder's duties (plan C13). It starts when they have news, on the wake-up route, and it is no rule
 # of the hub's: a rule with no schedule is one that the owner's app cannot draw.
 DUTY_REVIEW_TASK = {
@@ -11869,36 +11880,22 @@ DUTY_REVIEW_TASK = {
                "something they do not say, or showed that something in them is wrong. Leave them "
                "as they are when nothing changed: a version that says the same thing is noise. "
                + NOTES_RULE +
-               " Then call recall with stale=true: it gives exactly the lessons that need "
-               "looking at, so you read no others. A CONTRADICTED one claimed to stop a case key "
-               "that has come back since, so it was wrong, or right and never acted on — write "
-               "it again with remember instead_of=\"M-<id>\" so it says which, which hands the "
-               "new lesson the same claim and lets the work judge that one too, or drop it with "
-               "forget. A plain remember would lose the claim and leave a lesson nothing can "
-               "check. A keyless one "
-               "that has aged with nothing to bear it out is not thereby right, and not "
-               "thereby wrong either — ageing is the absence of evidence, so judge it on what "
-               "you now know: drop it unless the work has taught it to you again, and when it "
-               "has, say so with remember held=\"M-<id>\" instead of writing it twice. Where "
-               "two or more say the same thing, fold them with remember covers=[\"M-4\", "
-               "\"M-9\"], which keeps every member's words and where each came from instead of "
-               "losing them. A lesson whose key has not come "
-               "back is the best-evidenced kind you hold, and what that evidence says is that "
-               "nothing has refuted it, not that it was right: a key can also stay away because "
-               "the circumstance did. Leave it alone. Join two that say "
-               "the same thing into one. "
+               " Then the lessons of your memory that this review lists below, if it lists any. "
+               + MEMORY_REVIEW_WHAT +
+               " A lesson whose key has not come back is the best-evidenced kind you hold, and what that evidence "
+               "says is that nothing has refuted it, not that it was right. Leave it alone. "
                "Then give one line for each duty in your result: is it in order, and what did "
                "you do; one line saying whether you changed your notes and what taught you; and "
-               "one line on what you dropped, what you kept and what held. "
+               "one line saying how many lessons you wrote again and how many you removed, without their words. "
                "Ask your requester only for what the duty does not cover.",
     "done_when": "Each duty of this agent is in order, or its problem is named in the result, "
                  "each case that waited has its first step, the notes are either rewritten or "
-                 "left as they are on purpose, and every contradicted lesson has been rewritten "
-                 "or dropped, with the reasons in the result."}
+                 "left as they are on purpose, and every lesson listed below has been written again "
+                 "or removed, or the result says why it was kept as it is."}
 DUTY_REVIEW_SAY = ("[hub] Your duties have news since your last review:\n{news}\nPut them in order as their words "
                    "say: build the mechanism of a duty that has no watch, repair a broken watch and work a case that "
-                   "waits. Then read your notes with see_notes and call recall with stale=true, and rewrite or drop "
-                   "what the work since your last review showed you.")
+                   "waits. Then read your notes with see_notes, and rewrite what the work since your last review "
+                   "showed you.")
 
 
 def duty_review_last(agent):
@@ -11944,51 +11941,65 @@ def duty_news(agent, since, seen):
 
 
 def duty_reviews(t0):
-    """Plan C13: a holder's duties are reviewed when they have news, not once a day. A holder with news since its last
-    review started and no review open gets one review, on the wake-up route: a task, or a message for the manager."""
-    for agent in [r["agent"] for r in q("SELECT DISTINCT agent FROM responsibilities WHERE state='active' "
-                                        "ORDER BY agent")]:
+    """Plan C13: a holder's duties are reviewed when they have news, not once a day. AUTONOMY.md P7: so are an agent's
+    lessons, whether or not it holds a duty -- one contradicted, or not confirmed for MEMORY_KEYLESS_DAYS, that its
+    last review did not list. An agent with news and no review open gets one review, on the wake-up route: a task, or
+    a message for the manager."""
+    holders = {r["agent"] for r in q("SELECT DISTINCT agent FROM responsibilities WHERE state='active'")}
+    for agent in sorted(holders | set(memory_reviewers(t0))):
         if agent not in agents():
             continue
         last = duty_review_last(agent)
         if duty_review_open(last):
             continue
         news = duty_news(agent, float(last.get("at") or 0), set(last.get("seen") or []))
-        if not news:
+        lessons = memory_to_review(agent, t0)
+        fresh = [m for m in lessons if memory_review_mark(m) not in set(last.get("lessons") or [])]
+        if not news and not fresh:
             continue
         route, _ = wakeups.wake_route(wake_org(), agent)
         if route is None:
             continue            # nobody could follow its review; the duty sweep still tells the manager of its marks
         with transaction():
-            duty_review_rows(agent, route, news, t0)
-        log("hub", f"duty review of {agent}: " + "; ".join(news))
+            duty_review_rows(agent, route, news, t0, lessons, agent in holders)
+        log("hub", f"review of {agent}: " + "; ".join(news + memory_review_lines(fresh)))
 
 
-def duty_review_rows(agent, route, news, t0):
-    """Inside the caller's transaction: one review of the agent's duties on its wake-up route (wakeups.wake_route), with
-    the news that started it, and the record of it that the next review starts from."""
+def duty_review_rows(agent, route, news, t0, lessons=(), duties=True):
+    """Inside the caller's transaction: one review on the agent's wake-up route (wakeups.wake_route), with the news that
+    started it, and the record of it that the next review starts from. `lessons` are the ones of its memory that the
+    review lists (memory_to_review); an agent that holds no duty gets a review of its lessons alone."""
     in_transaction("duty_review_rows")
     seen = [f"{r['id']}:{r['marker_kind']}" for r in read_rows(
         "SELECT id, marker_kind FROM responsibilities WHERE agent=? AND state='active' AND marker_kind IS NOT NULL",
         (agent,))]
-    record = {"at": t0, "seen": seen}
+    record = {"at": t0, "seen": seen, "lessons": [memory_review_mark(m) for m in lessons]}
+    listed = "\n".join(memory_review_lines(lessons))
+    duties = duties and bool(news)          # news of its lessons alone is a review of its lessons alone
     if route["kind"] == "message":
-        record["event"] = DB.execute(EVENT, (agent, "say", None, DUTY_REVIEW_SAY.format(news="\n".join(news)), t0,
-                                             json.dumps(LATER_SAY))).lastrowid
+        say = "\n".join(([DUTY_REVIEW_SAY.format(news="\n".join(news))] if duties else [])
+                        + ([MEMORY_REVIEW_SAY.format(lessons=listed)] if lessons else []))
+        record["event"] = DB.execute(EVENT, (agent, "say", None, say, t0, json.dumps(LATER_SAY))).lastrowid
     else:
-        task = dict(DUTY_REVIEW_TASK, details=DUTY_REVIEW_TASK["details"] + "\n\nThis review started because your "
-                    "duties have news since your last one:\n" + "\n".join(news))
+        base = DUTY_REVIEW_TASK if duties else MEMORY_REVIEW_TASK
+        task = dict(base, details=base["details"]
+                    + ("\n\nThis review started because your duties have news since your last one:\n"
+                       + "\n".join(news) if news else "")
+                    + ("\n\nThe lessons of yours that this review lists:\n" + listed if lessons else ""))
         common = {"needs": "none", "goal": None, "goal_id": None, "follows": None, "case_id": None, "parent": None}
+        what, news_of = (("duties", "duties have news") if duties else
+                         ("lessons", "lessons need looking at"))
         if route["parent"]:
             common["parent"] = admit_task(manager_name(), dict(
-                common, owner=route["requester"], title=f"Review of {agent}'s duties",
-                details=f"{agent}'s duties have news, so a review of them is a subtask of this task. Its result, its "
+                common, owner=route["requester"], title=f"Review of {agent}'s {what}",
+                details=f"{agent}'s {news_of}, so a review of them is a subtask of this task. Its result, its "
                         f"questions and its permission prompts arrive in this session. Check the result with "
                         f"check_result and answer with answer; then deliver this task.",
                 done_when=f"The review subtask for {agent} has ended and you have checked its result.",
-                why=f"{agent}'s duties have news; its review's result arrives in this task."))
-        record["task"] = admit_task(route["requester"], dict(common, owner=agent, **task,
-                                                             why="Its duties have news since its last review."))
+                why=f"{agent}'s {news_of}; its review's result arrives in this task."))
+        record["task"] = admit_task(route["requester"], dict(
+            common, owner=agent, **task, why="Its duties have news since its last review." if duties else
+            "Lessons of its memory need looking at."))
     DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
                (f"duty_review:{agent}", json.dumps(record)))
 
@@ -12632,7 +12643,7 @@ def t_close_case(agent, a):
     learned = None if learned in (None, "") else goal_text_or_error(learned, "learned", MEMORY_TEXT)
     tried = a.get("tried")
     tried = None if tried in (None, "") else goal_text_or_error(tried, "tried", MEMORY_TEXT)
-    guard(agent, note, learned or "", tried or "", str(a.get("recheck") or ""))
+    guard(agent, note, learned or "", tried or "")
     fields = {"case": c["id"], "outcome": outcome, "note": note, "learned": learned, "tried": tried}
     command, stored = agent_write(agent, "close_case", a, fields)
     if stored:
@@ -12664,14 +12675,11 @@ def t_close_case(agent, a):
             text += (f" {mref(mid)} keeps what you learned, and it claims to stop the key '{c['key']}' coming back. "
                      f"If it comes back, the hub marks this lesson contradicted and your next review reads that.")
         if tried:
-            dead = memory_from_work(agent, tried, None, duty_name(r["text"])[:MEMORY_ABOUT], t0,
-                                    task=t_of_case(c["id"]), kind="dead_end",
-                                    cost_minutes=a.get("cost_minutes"), recheck=a.get("recheck"))
-            spent = memory_spent(memory_cost(a.get("cost_minutes")))
+            dead = memory_from_work(agent, MEMORY_TRIED + tried, DEAD_END_PREVENTS,
+                                    duty_name(r["text"])[:MEMORY_ABOUT], t0, task=t_of_case(c["id"]))
             DB.execute("INSERT INTO duty_history(responsibility,ts,by,kind,detail) VALUES(?,?,?,'learned',?)",
                        (r["id"], t0, agent, f"{mref(dead)} from {cref(c)}, a dead end: {tried}"))
-            text += (f" {mref(dead)} keeps the dead end"
-                     + (f", {spent} that nobody need spend again" if spent else "") + ".")
+            text += f" {mref(dead)} keeps what did not work, so that nobody need pay for it again."
         keep_command(command, {"case": c["id"], "text": text}, t0)
     if outcome == "failed":
         emit(manager_name(), "say", f"[duty {rref(r['id'])}] {agent} closed {cref(c)} as failed: {note}. The watch "
@@ -12793,62 +12801,48 @@ def t_change_duty(agent, a):
 #   a fact with NO repository (an account, a customer, a supplier) goes in knowledge/, with write_knowledge.
 #
 # A memory is one agent's own, and it carries what the agent expects it to prevent. That field is not decoration: a
-# lesson that names what it prevents can be shown to be wrong later, and one that names nothing cannot. A wrong memory
-# compounds, so forget drops one with a reason and keeps it as history, the way a retired duty is kept.
-# **Nothing is ever dropped.** The owner, 19 October 2026: "Dont cap the learnings/memory per agent! compact what's
-# directly available but offer tools to recover everything! we don't want to lose evidence... Agent should have a
-# lifetime memory, like a human!! so it learns and get better at every interaction!"
+# lesson that names what it prevents can be shown to be wrong later, and one that names nothing cannot.
 #
-# So the store is a lifetime and the shelf in front of an agent is short. The two are different things and only the
-# second has a budget: a session opens with a digest of a few lessons and reaches the rest with recall, so the opening
-# costs the same at twenty thousand lessons as at twenty. forget keeps the row and its reason, a fold keeps its
-# members, and there is no DELETE FROM memories anywhere in this file.
-MEMORY_WORKING = 300            # lessons the fleet calls an agent's working set: for ranking and for the review only
+# **Memory is current** (AUTONOMY.md P7; the owner, 27 October 2026: "memory probably needs to be current", "Avoid
+# over engineering memory", and as many lessons at the start as the work needs). It holds the lessons that are true
+# now. One that is contradicted or no longer true is removed with forget: it leaves every start and every search of
+# memory, and the history keeps it (the "forgotten" stream of history_streams), so the lifetime the owner asked for on
+# 19 October is the history's and not this table's. Three verbs: remember, which first answers with the closest
+# lessons the agent already holds so that the agent decides -- the same lesson again, a replacement, or a new one --
+# then recall and forget. In phase 1 a removed lesson keeps its row (dropped, dropped_by, drop_reason, which every
+# release since the first already hides), and there is no DELETE FROM memories anywhere in this file. The columns of
+# earlier rounds (reinforced, folded_into, archived, kind, cost_minutes, recheck) keep their data and are read; nothing
+# writes them any more.
 MEMORY_SHOWN = 12               # memories that one page of recall puts into a session
-MEMORY_START_CHARS = 1400       # the shelf: what a task's start text spends on lessons, in characters and not rows
-MEMORY_START = 6                # and at most this many of them, so one long lesson cannot take the whole shelf
-MEMORY_DIGEST = 200             # of one lesson on the shelf. The whole text is one recall memory="M-x" away.
+# The defaults of the two settings of AUTONOMY.md section 4 (SETTINGS: memory.start_chars, memory.review_days).
+MEMORY_START_CHARS = 8000       # the size bound of the lessons in a start block: every match that fits, no row cap
+MEMORY_KEYLESS_DAYS = 60        # a lesson with no case key that nothing confirmed this long goes to the review
 MEMORY_TAGS_SHOWN = 20          # the busiest tags one answer names, with a count of the rest
 MEMORY_TEXT = 1200              # the lesson itself
 MEMORY_ABOUT = 60               # the tag: a product, a tool, a person, the fleet. The agent chooses its own.
 MEMORY_PREVENTS = 400           # what the agent expects this lesson to prevent
 MEMORY_REASON = 300             # why it was forgotten
 MEMORY_REF = re.compile(r"[Mm]-(\d+)\Z")
-# "A keyless lesson expires and a keyed one earns its life by not coming back" (memory_from_work). This is what
-# makes that true. A lesson written when a case closed carries that case's key, so memory_contradicted can show it
-# wrong; one out of an ordinary task carries none, and nothing will ever contradict it. Most of the fleet's work is
-# ordinary tasks, so most lessons are of the second kind — which is how a store nothing can falsify would quietly
-# become the whole store. So the second kind expires, unless the work met it again and the agent said so.
-MEMORY_KEYLESS_DAYS = 60        # after this a keyless lesson that nothing reinforced is stale: rewrite it or drop it
-# Compaction, which is the owner's "compact what's directly available but offer tools to recover everything". Two
-# halves, and the hub only has the first: it marks a lesson archived, which takes it off the shelf and out of the
-# default answers and nothing else — every word of it stays, and recall every=true and the search still reach it.
-# **Summarising is the agent's alone**, with remember covers=[...], because the hub has no model and must not get
-# one: a summary of words is a judgement about words. A fold keeps its members and their source tasks, and a
-# summary's by_task is never the review task that wrote it, because provenance is the containment mechanism and a
-# compaction that loses it destroys the defence rather than the evidence.
-MEMORY_ARCHIVE_DAYS = 365       # a lesson with no evidence either way, this old, that its own tag has moved past
-MEMORY_COVERS = 25              # members one summary may fold at once
-# A dead end is the other kind of lesson: what did NOT work. A worker spends three hours finding that a Stripe test
-# key cannot refund a live charge; four months later another one spends the same three hours on the same wall, with
-# no `follows` between the tasks, so nothing warm-starts it. `learned` records what worked and nothing recorded what
-# did not, which is the more expensive half.
-#
-# It takes no case key, because it is not a claim about an event coming back, so the automatic verdict never touches
-# it. And it is **not exempt from ageing** (the owner's coordinator, 19 October 2026): a dead end is a dated
-# observation about somebody else's system, not a timeless fact — Stripe adds the capability, the flag arrives, the
-# bug is fixed. "This did not work in April" is not "this does not work", and a fleet that treats the first as the
-# second will one day refuse, confidently and for ever, to try the thing that now works.
-#
-# But the costs are not symmetric: a dead end wrongly kept costs one cheap attempt, and one wrongly dropped costs the
-# hours it was written to save. So an aged dead end does not leave the shelf — it is rendered as a question instead
-# of a fact, with how to test it cheaply (`recheck`). An agent that re-tests it writes what it found with
-# `instead_of`, stating its own `kind`: an ordinary lesson when the wall is gone, a dead end again — with today's
-# date, which restarts the clock honestly — when it still stands. `kind` is never inherited, because inheritance is
-# what carries a stale fact silently.
-MEMORY_KINDS = ("lesson", "dead_end")
+MEMORY_MOST = 200               # the most rows any one read of the store returns, so none of them is unbounded
+MEMORY_TERMS = 24               # the words of a task or a lesson that one search of lessons matches on
+MEMORY_CLOSE = 3                # the closest lessons that remember answers with
+# What `tried` on deliver_result and close_case writes: an ordinary lesson that says what did not work. Its prevents
+# is always this sentence, so the agent writes one field and not two.
+MEMORY_TRIED = "What did not work: "
 DEAD_END_PREVENTS = "paying for this dead end a second time"
-MEMORY_RECHECK = 400            # how to find out cheaply whether a dead end still holds
+TRIED_FIELD = ("What you tried that did NOT work, if anything: the wall, why, and how to check cheaply whether it "
+               "still stands — one call or one command, and what the wrong answer looks like. It is kept as a lesson "
+               "of yours, so that your next session does not pay for it twice. Leave it out when nothing was a dead "
+               "end.")
+# Words too common to say what a task or a lesson is about. Without them a search of a task's words matches nearly
+# every lesson on "with" or "that", and the start block fills to its bound with lessons the work does not need.
+MEMORY_COMMON = frozenset("""
+about above after again against all also among and any are because been before being below between both but can
+cannot could did does doing done down during each few for from further had has have having her here hers him his how
+into its itself just let more most must nor not now off once only other our ours out over own same she should some
+such than that the their them then there these they this those through too under until upon very was were what when
+where which while who whom why will with would yet you your yours
+""".split())
 
 
 # What a task read from outside itself before it wrote a lesson, by the hub's own calls. Google and an attachment
@@ -12891,10 +12885,7 @@ def memory_search_ready():
 
 
 def memory_indexed(mid):
-    """Inside the caller's transaction: one lesson added to the search index, as written.
-
-    As written and never as a digest, so a lesson that was archived or folded years ago is as findable as it was the
-    day it was written — "offer tools to recover everything" (the owner, 19 October 2026)."""
+    """Inside the caller's transaction: one lesson added to the search index, as written."""
     if MEMORY_FTS[0]:
         try:
             DB.execute("INSERT INTO memory_fts(rowid, text, prevents, about) "
@@ -12907,8 +12898,8 @@ def memory_indexed(mid):
 
 
 def memory_found(agent, words, limit):
-    """The lessons of one agent whose text, what they prevent or their tag hold these words, newest first, over the
-    whole lifetime store — archived and folded ones included.
+    """The lessons of one agent that stand and whose text, what they prevent or their tag hold these words, newest
+    first -- archived and folded ones of earlier rounds included, a removed one never (AUTONOMY.md P7: removal hides).
 
     **Every word of the query, not any of them.** FTS5 juxtaposition is AND, which is what a search for
     "lesson 1337" means. OR returns every lesson that holds the commonest word in the query, so the newest twelve
@@ -12918,17 +12909,92 @@ def memory_found(agent, words, limit):
     if memory_search_ready():
         try:
             return read_rows("SELECT m.* FROM memory_fts f JOIN memories m ON m.id=f.rowid "
-                             "WHERE memory_fts MATCH ? AND m.agent=? ORDER BY m.id DESC LIMIT ?",
+                             "WHERE memory_fts MATCH ? AND m.agent=? AND m.dropped IS NULL ORDER BY m.id DESC LIMIT ?",
                              (" ".join(f'"{w}"*' for w in search_words(words)[:8]) or '""', agent, limit))
         except sqlite3.Error:
             pass                # a malformed query or a half-built index: the scan below always answers
-    # The same substring match, done by SQLite with a LIMIT rather than by reading the store into this process. At
-    # twenty thousand lessons the Python version held every row in memory to throw almost all of them away.
-    return read_rows("SELECT * FROM memories WHERE agent=? "
+    # The same substring match, done by SQLite with a LIMIT rather than by reading the store into this process.
+    return read_rows("SELECT * FROM memories WHERE agent=? AND dropped IS NULL "
                      "AND (about || char(10) || text || char(10) || prevents) LIKE ? ESCAPE '\\' "
                      "ORDER BY id DESC LIMIT ?",
                      (agent, "%" + words.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
                       + "%", limit))
+
+
+def memory_terms(*texts, most=MEMORY_TERMS):
+    """The words of these texts that a search of lessons matches on, in their order and once each: runs of letters and
+    digits as FTS5's unicode61 splits them (HISTORY_TOKEN), of three characters or more, none of MEMORY_COMMON. At most
+    `most` of them (None for all), so a long task costs the same search as a short one."""
+    seen = []
+    for text in texts:
+        for word in HISTORY_TOKEN.findall(str(text or "").lower()):
+            if len(word) >= 3 and word not in MEMORY_COMMON and word not in seen:
+                seen.append(word)
+                if most and len(seen) >= most:
+                    return seen
+    return seen
+
+
+def memory_matches(agent, said, limit=MEMORY_MOST):
+    """The current lessons of one agent that match some words, the best first: (the lessons, the ids of those whose
+    tag the words name). The start block's choice (AUTONOMY.md P7: "every lesson that matches its work, by tag and by
+    words"), and remember's candidates.
+
+    By tag: a lesson whose tag is in the words, as words of its own ("web" is not in "website"). By words: an FTS5
+    search for any of the words, ranked by bm25, so a lesson that holds more of them, and the rarer ones, comes first;
+    on a machine without FTS5, by how many of them a lesson holds. The ones the tag names first, and a contradicted one
+    after the others of its kind.
+
+    Reads only, with read_rows, and MEMORY_FTS rather than memory_search_ready, whose probe commits: start_text runs
+    inside admit_task's transaction (test_write_atomic walks every call it makes)."""
+    said = " ".join(str(said or "").lower().split())
+    if not said:
+        return [], set()
+    named = [m for m in read_rows(f"SELECT * FROM memories WHERE agent=? AND {MEMORY_ON_SHELF} "
+                                  "AND instr(?, lower(about)) > 0 ORDER BY id DESC LIMIT ?", (agent, said, limit))
+             if re.search(r"(?<!\w)" + re.escape(" ".join(m["about"].lower().split())) + r"(?!\w)", said)]
+    terms, found = memory_terms(said), []
+    if terms and MEMORY_FTS[0]:
+        try:
+            found = read_rows("SELECT m.* FROM memory_fts f JOIN memories m ON m.id=f.rowid WHERE memory_fts MATCH ? "
+                              "AND m.agent=? AND m.dropped IS NULL AND m.folded_into IS NULL AND m.archived IS NULL "
+                              "ORDER BY f.rank LIMIT ?", (" OR ".join(f'"{t}"' for t in terms), agent, limit))
+        except sqlite3.Error:
+            found = []          # a half-built index: the tag still answers
+    elif terms:
+        some = terms[:12]
+        hits = " + ".join("(instr(lower(about || ' ' || text || ' ' || prevents), ?) > 0)" for _ in some)
+        found = read_rows(f"SELECT * FROM memories WHERE agent=? AND {MEMORY_ON_SHELF} AND ({hits}) > 0 "
+                          f"ORDER BY ({hits}) DESC, id DESC LIMIT ?", (agent, *some, *some, limit))
+    rank = {m["id"]: n for n, m in enumerate(found)}
+    ids, seen, every = {m["id"] for m in named}, set(), []
+    for m in sorted(named, key=lambda m: rank.get(m["id"], len(rank))) + list(found):
+        if m["id"] not in seen:
+            seen.add(m["id"])
+            every.append(m)
+    every.sort(key=lambda m: (m["id"] not in ids, bool(m["contradicted"])))      # stable: the rank inside each
+    return every, ids
+
+
+def memory_overlap(one, other, tags=()):
+    """How much two lessons say the same thing: (the share of the shorter one's words that the other holds too, how
+    many they share). At a half or more they are close. The words are memory_terms, less the words of their tags: two
+    lessons about acme/web both say "acme" and "web", and that makes them related, not close. Two shared words are
+    not enough unless they are all the words the shorter one has -- "the smoke of the deploy needs the pool" and "the
+    deploy check is the smoke" share two, and say different things -- so below that the share is 0."""
+    skip = set(memory_terms(*tags, most=None))
+    a, b = (set(memory_terms(one, most=None)) - skip), (set(memory_terms(other, most=None)) - skip)
+    shared, least = len(a & b), min(len(a), len(b))
+    return (shared / least if shared >= 3 or shared == least == 2 else 0.0), shared
+
+
+def memory_closest(agent, tag, text):
+    """The agent's current lessons that are close to a new one (memory_overlap at a half or more), the closest first,
+    at most MEMORY_CLOSE: what remember answers with before it writes, so that the agent decides."""
+    rows, _ = memory_matches(agent, f"{tag} {text}", limit=50)
+    scored = sorted(((memory_overlap(text, m["text"], (tag, m["about"])), m) for m in rows), key=lambda x: x[0],
+                    reverse=True)
+    return [m for (share, _), m in scored if share >= 0.5][:MEMORY_CLOSE]
 
 
 def untrusted_reads(task_id):
@@ -12957,28 +13023,28 @@ def untrusted_said(m):
             + ("s" if m["read_untrusted"] != 1 else "") + " of outside text")
 
 
+def memory_review_days():
+    """The days after which a lesson that nothing has confirmed goes to the review: the setting memory.review_days
+    (AUTONOMY.md section 4), MEMORY_KEYLESS_DAYS by default. It reads team.json and no table, so start_text may call
+    it inside admit_task's transaction."""
+    return setting("memory.review_days")
+
+
 def memory_stale(m, t0):
-    """A keyless lesson that the work has not borne out within the last MEMORY_KEYLESS_DAYS.
+    """A keyless lesson that nothing has confirmed within the last MEMORY_KEYLESS_DAYS: the review lists it.
 
-    The window is the point. "Reinforced at any time in its life" made one `held` enough to keep a lesson out of
-    every review for ever, and memory_sort_key then put it at the head of the shelf — so a wrong lesson an agent
-    kept acting on was immortal and led the opening of every session. A lesson earns its place again or it comes
-    back to the review. `reinforced_at` is the last time the work bore it out; `created` stands in before the first.
-
-    It is not dropped for being stale, exactly as a contradicted one is not: nothing is ever dropped. The agent's
-    own review reads it and decides."""
+    A lesson written when a case closed carries that case's key, so memory_contradicted can show it wrong; one out of
+    an ordinary task carries none, and nothing will ever contradict it. So the second kind goes to the agent's review
+    when nothing has confirmed it for a while, and the agent writes it again (remember instead_of, which dates it
+    today) or removes it. `reinforced_at` is an earlier round's confirmation, `created` the writing. The hub removes
+    nothing for being stale."""
     last = m["reinforced_at"] or m["created"]
-    return bool(not m["prevents_key"] and t0 - last > MEMORY_KEYLESS_DAYS * 86400)
+    return bool(not m["prevents_key"] and t0 - last > memory_review_days() * 86400)
 
 
 def memory_wall(m, t0):
-    """How one dead end is introduced on the shelf and in a list, or "" for an ordinary lesson.
-
-    Inside its window it is a fact: "DEAD END (3 h)". Past it, it is a question — "nothing has tested this since,
-    check it cheaply before you spend again" — because a dead end is a dated observation about somebody else's
-    system and not a timeless fact, and a fleet that reads the first as the second will one day refuse, confidently
-    and for ever, to try the thing that now works. It is not taken off the shelf, because the costs are not
-    symmetric: one wrongly kept costs a cheap attempt, one wrongly dropped costs the hours it saved."""
+    """How a dead end of an earlier round is introduced in a list and a reading, or "" for every other lesson. Since
+    P7 what did not work is an ordinary lesson (MEMORY_TRIED); the rows that earlier rounds marked keep their words."""
     if m["kind"] != "dead_end":
         return ""
     said = [x for x in (memory_spent(m["cost_minutes"]), f"written {goal_time(m['created']).split(' ')[0]}",
@@ -12987,15 +13053,14 @@ def memory_wall(m, t0):
 
 
 def memory_asks(m, t0):
-    """What a session is told to do about an aged dead end, or "". The second half of the question."""
+    """What a session is told about an aged dead end of an earlier round, or "": check it before you spend again."""
     if m["kind"] != "dead_end" or not memory_stale(m, t0):
         return ""
     return ("Nothing has tested this since it was written, and it is an observation about somebody else's system, "
             "not a fact: check it cheaply before you spend again. "
             + (f"How: {memory_said(m, 'recheck')} " if m["recheck"] else
                "It records no cheap check, so weigh one attempt against what it cost. ")
-            + "If the wall is gone, write that with remember instead_of=\"" + mref(m["id"]) + "\"; if it still "
-              "stands, say so with remember kind=\"dead_end\", which dates it again.")
+            + f"Then write what you found with remember instead_of=\"{mref(m['id'])}\", or forget it.")
 
 
 def memory_evidence(m, t0):
@@ -13012,25 +13077,8 @@ def memory_evidence(m, t0):
     elif memory_stale(m, t0) and m["kind"] != "dead_end":
         # A dead end says it in its own words (memory_wall, memory_asks), so saying it twice here would read as
         # two different facts about one lesson.
-        said.append(f"stale: no key, nothing taught it again, written over {MEMORY_KEYLESS_DAYS} days ago")
+        said.append(f"not confirmed for {memory_review_days()} days: write it again or forget it")
     return "; ".join(said)
-
-
-def memory_sort_key(m, t0, named=False):
-    """The order the start text's small budget wants. `named` is whether the task's own words name this lesson's tag.
-
-    Relevance first, and then **a dead end above everything else that is relevant**: stopping a repeat of a known
-    wall is the cheapest thing this machinery can do, and unlike a lesson it needs no judgement to apply — the
-    session is either about to walk into it or it is not. Its cost breaks the tie, because that is what a repeat
-    would cost. After that: nothing the fleet has counted against, a fresh one before a stale one, the ones the work
-    taught again, the newest.
-
-    A dead end is never demoted for being stale, because an aged one is rendered as a question rather than taken off
-    the shelf (memory_block, memory_start_text): a dead end wrongly kept costs one cheap attempt, and one wrongly
-    dropped costs the hours it was written to save."""
-    dead = m["kind"] == "dead_end"
-    return (not named, not dead, bool(m["contradicted"]), -(m["cost_minutes"] or 0),
-            False if dead else memory_stale(m, t0), -m["reinforced"], -m["id"])
 
 
 def mref(memory_id):
@@ -13073,19 +13121,16 @@ def memory_tag(value):
     return tag
 
 
-# What a session sees by default, and what `every=true` adds back. A folded or archived lesson keeps every word and
-# stays in the search index; only its place on the shelf and in these answers goes.
+# What a session sees by default, and what `every=true` adds back. A folded or archived lesson of an earlier round
+# keeps every word and stays in the search; only its place at the start and in these answers went.
 MEMORY_ON_SHELF = "dropped IS NULL AND folded_into IS NULL AND archived IS NULL"
 MEMORY_STANDING = "dropped IS NULL"
-
-
-MEMORY_MOST = 200               # the most rows any one read of the store returns, so none of them is unbounded
 
 
 def memory_live(agent, tag=None, every=False, limit=None):
     """The agent's lessons that stand, newest first, and never more than MEMORY_MOST of them.
 
-    The limit has a default because a lifetime store must not be loadable by forgetting one: every read here is
+    The limit has a default because a large store must not be loadable by forgetting one: every read here is
     bounded, and the paged reader (memory_page) is what an answer is built from."""
     where, args = (MEMORY_STANDING if every else MEMORY_ON_SHELF), [agent]
     if tag:
@@ -13098,11 +13143,11 @@ def memory_live(agent, tag=None, every=False, limit=None):
 def memory_stale_sql(t0):
     """`memory_stale(m, t0) or m["contradicted"]` as SQL, so the review's one call does not load the store."""
     return ("(contradicted > 0 OR (prevents_key IS NULL AND COALESCE(reinforced_at, created) < ?))",
-            [t0 - MEMORY_KEYLESS_DAYS * 86400])
+            [t0 - memory_review_days() * 86400])
 
 
 def memory_page(agent, where, args, page, order="id DESC"):
-    """One page of a lifetime store: (the rows, how many there are in all, the page, how many pages).
+    """One page of the store: (the rows, how many there are in all, the page, how many pages).
 
     Counted in SQL and read with a LIMIT. Nothing here loads what it does not show, which is the difference between
     a store that works at twenty lessons and one that works at twenty thousand."""
@@ -13115,30 +13160,31 @@ def memory_page(agent, where, args, page, order="id DESC"):
 
 
 def memory_drop(m, by, reason, t0):
-    """Inside a transaction: one memory stops standing and stays as history."""
+    """Inside a transaction: one lesson is removed. It leaves every start and every search of memory, its row stays
+    (phase 1 of AUTONOMY.md P7), and the history's "forgotten" stream records it with the reason."""
     DB.execute("UPDATE memories SET dropped=?, dropped_by=?, drop_reason=? WHERE id=? AND dropped IS NULL",
                (t0, by, reason, m["id"]))
 
 
 def memory_count(agent, where="", args=()):
-    """How many of an agent's lessons, counted in SQL. A lifetime store is never loaded to be counted."""
+    """How many of an agent's lessons, counted in SQL. The store is never loaded to be counted."""
     return read_row(f"SELECT COUNT(*) n FROM memories WHERE agent=? {where}", (agent, *args))["n"]
 
 
 def memory_held_until(m):
-    """When a keyless lesson that the work bore out turns stale again unless it is borne out once more, or None.
+    """When a keyless lesson that an earlier round's `held` bore out turns stale again, or None.
 
     memory_stale's own clock: a hold keeps a keyless lesson out of the review for MEMORY_KEYLESS_DAYS and no longer.
     A lesson with a case key never turns stale, so its hold has no end; one never held has no hold."""
     if not m["reinforced"] or m["prevents_key"]:
         return None
-    return (m["reinforced_at"] or m["created"]) + MEMORY_KEYLESS_DAYS * 86400
+    return (m["reinforced_at"] or m["created"]) + memory_review_days() * 86400
 
 
 def memory_view(agent, t0=None):
     """One agent's lessons that stand, for the owner's route (owner feature agent_memory, GET /ui/memory/<agent>).
 
-    The ones the agent's own recall reads with no argument and with stale=true: not forgotten, not folded into a
+    The ones the agent's own recall reads with no argument and with stale=true: not removed, not folded into a
     summary, not archived (MEMORY_ON_SHELF), newest first and never more than MEMORY_MOST, with how many there are.
     Each carries the hub's own evidence and nothing judged — the counts are the hub's and the decision stays the
     agent's. It writes nothing, not even `recalls`, which counts what the agent's own reading printed. Every text is
@@ -13156,23 +13202,9 @@ def memory_view(agent, t0=None):
                         for m in memory_live(agent)]}
 
 
-def memory_prune(agent, t0, keep=None):
-    """How large an agent's working set has grown past MEMORY_WORKING. **It drops nothing.**
-
-    It used to drop the weakest lessons at a cap of 200. The owner ended that on 19 October 2026 — "Dont cap the
-    learnings/memory per agent ... we don't want to lose evidence" — and he is right about more than storage: the
-    weakest lessons are exactly the evidence a review needs, and a store that sheds them cannot be audited and
-    cannot be shown to have been wrong. What the shelf can hold and what the store keeps are two different
-    questions, and only the first has an answer in characters.
-
-    `keep` is accepted and unused, so the callers that passed the memory they had just written still read."""
-    over = memory_count(agent, "AND dropped IS NULL") - MEMORY_WORKING
-    return over if over > 0 else 0
-
-
 def memory_mark_read(rows, t0):
-    """A recall counts for the memories it showed. A lesson nothing reads is what prune drops first, and what the
-    review of these lessons looks at: how often one was read is the only use the fleet can measure."""
+    """A recall counts for the memories it showed: how often one was read is the only use the fleet can measure, and
+    a full reading says it."""
     if rows:
         q(f"UPDATE memories SET recalls=recalls+1, recalled=? WHERE id IN ({','.join('?' * len(rows))})",
           (t0, *[m["id"] for m in rows]))
@@ -13191,21 +13223,20 @@ def memory_said(m, key="text", limit=None):
 
 
 def memory_line(m, t0=None):
-    """One memory in one line, for a list, with what the fleet knows about it. A forgotten one carries its reason,
-    which is the point of reading it."""
+    """One memory in one line, for a list, with what the fleet knows about it."""
     t0 = t0 if t0 is not None else now()
     wall = memory_wall(m, t0)
-    return (f"  {mref(m['id'])} [{m['about']}] " + (wall + " " if wall else "")
+    return (f"  {mref(m['id'])} [{memory_said(m, 'about')}] " + (wall + " " if wall else "")
             + f"{memory_said(m, limit=160)} ({untrusted_said(m)})"
-            + (f" — {memory_evidence(m, t0)}" if memory_evidence(m, t0) else "")
-            + (f" — forgotten by {m['dropped_by']}: {mask_secrets(m['drop_reason'])}" if m["dropped"] else ""))
+            + (f" — {memory_evidence(m, t0)}" if memory_evidence(m, t0) else ""))
 
 
 def memory_block(m, t0=None, full=False):
     """One memory for an agent's eyes. In full it also says where it came from and how often it was read, which is what
     a review of these lessons needs."""
     t0 = t0 if t0 is not None else now()
-    out = [f"{mref(m['id'])} [{m['about']}] written {goal_time(m['created'])} {untrusted_said(m)}"
+    again = f"write it again with remember instead_of=\"{mref(m['id'])}\""
+    out = [f"{mref(m['id'])} [{memory_said(m, 'about')}] written {goal_time(m['created'])} {untrusted_said(m)}"
            + (f", read {m['recalls']} time{'s' if m['recalls'] != 1 else ''}"
               + (f", last {goal_time(m['recalled'])}" if m["recalled"] else "") if full else "")]
     if memory_wall(m, t0):
@@ -13222,292 +13253,130 @@ def memory_block(m, t0=None, full=False):
                    f"'{m['prevents_key']}' again."
                    + (f" That key HAS come back {m['contradicted']} time"
                       f"{'s' if m['contradicted'] != 1 else ''} since, last {goal_time(m['contradicted_at'])}: this "
-                      f"lesson was wrong, or right and never acted on. Rewrite it or forget it."
+                      f"lesson was wrong, or right and never acted on. {again[0].upper() + again[1:]} so it says "
+                      f"which, or forget it."
                       if m["contradicted"] else " It has not come back since, which is the only evidence any lesson "
                                                "here has."))
-    elif not m["dropped"] and m["kind"] != "dead_end":
-        # A dead end names no key either, and memory_wall and memory_asks have already said so in the words its
-        # own kind needs — including what to do about it, which is narrower than "rewrite it or forget it".
-        out.append("  Nothing can contradict this one: it came out of an ordinary task and names no key, so it "
-                   f"expires unless the work teaches it again. "
-                   + (f"It has, {m['reinforced']} time{'s' if m['reinforced'] != 1 else ''}, last "
-                      f"{goal_time(m['reinforced_at'])}." if m["reinforced"] else
-                      f"It is stale: nothing has, and it is more than {MEMORY_KEYLESS_DAYS} days old. Rewrite it or "
-                      f"forget it." if memory_stale(m, t0) else
-                      f"Nothing has yet; after {MEMORY_KEYLESS_DAYS} days it counts as stale. If your work bears it "
-                      f"out, say so with remember held=\"{mref(m['id'])}\"."))
+    elif m["kind"] != "dead_end":
+        # A dead end of an earlier round names no key either, and memory_wall and memory_asks have already said so
+        # in the words its own kind needs. The review reads what stands in the list, so a lesson an earlier round
+        # folded or archived is told nothing about it.
+        listed = not m["folded_into"] and not m["archived"]
+        out.append("  Nothing can contradict this one: it came out of an ordinary task and names no case key."
+                   + (f" The work bore it out {m['reinforced']} time{'s' if m['reinforced'] != 1 else ''}, last "
+                      f"{goal_time(m['reinforced_at'])}." if m["reinforced"] else "")
+                   + ("" if not listed else
+                      f" Nothing has confirmed it for {memory_review_days()} days, so your review lists it: if your "
+                      f"work still bears it out, {again}; if not, forget it." if memory_stale(m, t0) else
+                      f" After {memory_review_days()} days with nothing to confirm it, your review lists it; to "
+                      f"confirm it, {again}."))
     if m["folded_into"]:
-        out.append(f"  Off the shelf since a summary of yours covered it, {mref(m['folded_into'])}. Every word of it "
-                   f"is here: nothing is ever deleted.")
+        out.append(f"  Off the start since a summary of yours covered it in an earlier round, "
+                   f"{mref(m['folded_into'])}. Every word of it is here.")
     elif m["archived"]:
-        out.append(f"  Archived {goal_time(m['archived'])}: nothing could ever check it, nothing bore it out for a "
-                   f"year, and your own tag moved past it. Every word is here and the search still finds it.")
+        out.append(f"  Archived {goal_time(m['archived'])} in an earlier round: nothing could check it and nothing "
+                   f"bore it out for a year. Every word is here and the search still finds it.")
     members = memory_members(m["id"])
     if members:
-        out.append(f"  It is a summary of yours, covering {len(members)}: "
+        out.append(f"  It is a summary of an earlier round, covering {len(members)}: "
                    + ", ".join(mref(x["id"]) for x in members)
-                   + f". recall covers=\"{mref(m['id'])}\" reads them, each with its own provenance.")
-    if m["dropped"]:
-        out.append(f"  Forgotten {goal_time(m['dropped'])} by {m['dropped_by']}: {mask_secrets(m['drop_reason'])}")
+                   + ". recall memory=\"M-<id>\" reads each, with its own provenance.")
     return out
 
 
 def memory_tags(agent):
     """The busiest tags of an agent's standing lessons with their counts, and how many tags are not named.
 
-    Counted in SQL and capped at MEMORY_TAGS_SHOWN: a lifetime store reaches thousands of tags, and naming every one
-    put a single line of many thousands of tokens into the session — the shape this whole feature exists to avoid."""
+    Counted in SQL and capped at MEMORY_TAGS_SHOWN: a large store reaches thousands of tags, and naming every one put
+    a single line of many thousands of tokens into the session. Masked as every render of a lesson is."""
     rows = read_rows("SELECT about, COUNT(*) n FROM memories WHERE agent=? AND dropped IS NULL "
                      "GROUP BY about COLLATE NOCASE ORDER BY n DESC, about COLLATE NOCASE", (agent,))
-    said = ", ".join(f'"{r["about"]}" ({r["n"]})' for r in rows[:MEMORY_TAGS_SHOWN])
+    said = ", ".join(f'"{mask_secrets(r["about"])}" ({r["n"]})' for r in rows[:MEMORY_TAGS_SHOWN])
     return said + (f", and {len(rows) - MEMORY_TAGS_SHOWN} more tags" if len(rows) > MEMORY_TAGS_SHOWN else "")
 
 
-def memory_reinforce(m, t0, task=None):
-    """Inside the caller's transaction: the work met this lesson again and it held.
-
-    It is the mirror of a contradiction and deliberately the weaker half: a contradiction is the hub's own
-    observation that a case key came back, while this is the agent's word about its own work. So it ranks a lesson
-    (memory_sort_key), keeps a keyless one from going stale, and drives nothing. Its worth is that "nothing has
-    contradicted it" and "the work bore it out four times" look identical without it."""
-    DB.execute("UPDATE memories SET reinforced=reinforced+1, reinforced_at=?, by_task=COALESCE(by_task,?) "
-               "WHERE id=?", (t0, task, m["id"]))
-
-
-def memory_held(agent, a, tid):
-    """remember with `held`: a lesson the agent already holds was borne out again, so it is not written a second
-    time. Two near-identical lessons are worse than one with a count on it: the store grows and the review learns
-    nothing."""
-    m = memory_ref(a["held"])
-    if not memory_read_allowed(agent, m):
-        raise ToolError(f"{mref(m['id'])} is not your memory. Only its own agent writes about it.")
-    if m["dropped"]:
-        raise ToolError(f"{mref(m['id'])} was forgotten {goal_time(m['dropped'])} by {m['dropped_by']}: "
-                        f"{m['drop_reason']}. It stands no more. If it was right after all, write it again with "
-                        f"remember.")
-    command, stored = agent_write(agent, "remember", a, {"held": m["id"]})
-    if stored:
-        return stored["text"]
-    t0 = now()
-    with transaction():
-        memory_reinforce(m, t0, tid)
-        said = (f"{mref(m['id'])} held, {m['reinforced'] + 1} time{'s' if m['reinforced'] else ''} now. "
-                + ("It is no longer stale. " if memory_stale(m, t0) else "")
-                + f"recall puts a lesson the work taught again before one that has only survived, and your review "
-                  f"reads this count. It is your word about your own work, so it decides nothing by itself: a "
-                  f"lesson the fleet contradicts later is still yours to rewrite or to forget.")
-        keep_command(command, {"memory": m["id"], "text": said}, t0)
-    return said
-
-
-def memory_fold(agent, summary, members, t0):
-    """Inside the caller's transaction: the members of a summary, folded.
-
-    A folded lesson keeps every word, its own evidence, its provenance and its place in the search index. Only its
-    place on the shelf and in the default answers goes, and `folded_into` is the thread back: recall covers="M-x"
-    reads the members, and recall memory="M-y" on a member says which summary covers it."""
-    for m in members:
-        DB.execute("UPDATE memories SET folded_into=? WHERE id=?", (summary, m["id"]))
-        DB.execute("INSERT OR IGNORE INTO memory_folds(summary,member,created,by) VALUES(?,?,?,?)",
-                   (summary, m["id"], t0, agent))
-
-
 def memory_members(summary):
+    """The lessons an earlier round's summary covered (remember covers=[...] until AUTONOMY.md P7)."""
     return read_rows("SELECT m.* FROM memory_folds f JOIN memories m ON m.id=f.member WHERE f.summary=? "
                      "ORDER BY m.id", (summary,))
 
 
-def memory_covers(agent, a):
-    """remember with `covers`: the agent's own summary of lessons it already holds, which the review writes.
-
-    The members are checked before anything is written: every one must be this agent's, standing, not already folded
-    and not the summary itself. A summary carries no task of its own — its `by_task` stays empty — because the task
-    that wrote it is the review, and a line saying a lesson came from the review would say nothing about where its
-    content came from. The members keep theirs, and that is where provenance lives."""
-    want = a.get("covers")
-    if not isinstance(want, list) or not 1 <= len(want) <= MEMORY_COVERS:
-        raise ToolError(f"covers takes 1 to {MEMORY_COVERS} memories of yours, as [\"M-1\", \"M-2\"].")
-    members = []
-    for one in want:
-        m = memory_ref(one)
-        if not memory_read_allowed(agent, m):
-            raise ToolError(f"{mref(m['id'])} is not yours.")
-        if m["dropped"]:
-            raise ToolError(f"{mref(m['id'])} is forgotten, so a summary cannot cover it. Leave it out.")
-        if m["folded_into"]:
-            raise ToolError(f"{mref(m['id'])} is already covered by {mref(m['folded_into'])}. Leave it out, or "
-                            f"write a summary that covers that one.")
-        if m["prevents_key"]:
-            raise ToolError(f"{mref(m['id'])} claims to stop {rref(m['responsibility'])}/'{m['prevents_key']}', so "
-                            f"the work can still judge it: folding it would take that claim off the shelf. Leave it "
-                            f"out, and fold the ones nothing can check.")
-        members.append(m)
-    return members
-
-
-def memory_sweep(t0):
-    """The hub's half of compaction, once a tick: a lesson leaves the shelf when nothing can ever check it and
-    nothing has. **It marks and never deletes.**
-
-    All five conditions, because each one on its own is a reason to doubt the archiving and not the lesson: no case
-    key, so the work can never contradict it; never contradicted and never borne out, so there is no evidence either
-    way; MEMORY_ARCHIVE_DAYS old; and superseded on its own tag, meaning the agent has written something newer about
-    the same thing. A lesson that fails any one of them stays, and the agent's own review decides about it instead.
-
-    The hub summarises nothing: a summary of words is a judgement about words, and the hub has no model and must not
-    get one. Archiving is the one compaction it can do by itself, because it throws nothing away — recall every=true
-    lists these, the search finds them as written, and recall memory="M-x" gives any of them whole."""
-    cut = t0 - MEMORY_ARCHIVE_DAYS * 86400
-    rows = read_rows(
-        "SELECT m.id FROM memories m WHERE m.dropped IS NULL AND m.folded_into IS NULL AND m.archived IS NULL "
-        "AND m.prevents_key IS NULL AND m.contradicted = 0 AND m.reinforced = 0 AND m.created < ? "
-        # A dead end ages but does not leave: one wrongly kept costs a cheap attempt, one wrongly dropped costs the
-        # hours it was written to save. It is rendered as a question instead (memory_block, memory_start_text).
-        "AND m.kind <> 'dead_end' "
-        "AND EXISTS (SELECT 1 FROM memories n WHERE n.agent=m.agent AND n.about=m.about COLLATE NOCASE "
-        "            AND n.dropped IS NULL AND n.id > m.id) LIMIT 200", (cut,))
-    if rows:
-        with transaction():
-            DB.execute(f"UPDATE memories SET archived=? WHERE id IN ({','.join('?' * len(rows))})",
-                       (t0, *[r["id"] for r in rows]))
-        log("hub", f"archived {len(rows)} lesson(s) nothing could check and nothing bore out; every word kept")
-    return len(rows)
+def memory_close_text(close):
+    """remember's answer when the agent already holds lessons close to the new one: them, and the three ways on. Nothing
+    is written and no answer is kept for the request_id, so the call that decides can use the same one."""
+    many = len(close) != 1
+    return ("Nothing is written yet: you already hold " + (f"{len(close)} lessons" if many else "a lesson")
+            + " close to this one:\n"
+            + "\n".join(f"- {mref(m['id'])} [{memory_said(m, 'about')}] {memory_said(m, limit=400)} (written "
+                        f"{goal_time(m['created']).split(' ')[0]})" for m in close)
+            + "\nIf this is " + ("one of them" if many else "that lesson") + " again, or replaces it, call remember "
+              "again with instead_of=\"M-<id>\": that one is removed, and this one stands, dated today, with the "
+              "claim it carried. If this is a different lesson, call remember again with new=true.")
 
 
 def t_remember(agent, a):
-    """One lesson the agent keeps for its own next session, one it already holds that the work bore out again, or
-    one written again in place of a lesson that was shown to be wrong."""
-    if a.get("held") not in (None, ""):
-        # held says one lesson you already hold was borne out again, and nothing else. Silently dropping a text or
-        # an instead_of given with it would tell the agent it recorded something it did not.
-        also = [k for k in ("text", "about", "prevents", "instead_of", "covers") if a.get(k) not in (None, "", [])]
-        if also:
-            raise ToolError(f"held says that a lesson you already hold was borne out again, so give it on its own: "
-                            f"leave out {', '.join(also)}. To write a new lesson instead, leave held out; to write "
-                            f"one in place of a lesson that was shown wrong, use instead_of without held.")
-        return memory_held(agent, a, parse_task(a["task_id"]) if a.get("task_id") not in (None, "") else None)
+    """One lesson the agent keeps for its own next session (AUTONOMY.md P7). When it already holds lessons close to the
+    new one, remember writes nothing and answers with them, and the agent decides: the same lesson again or a
+    replacement (instead_of, which removes the old one), or a new lesson (new=true)."""
     instead = memory_ref(a["instead_of"]) if a.get("instead_of") not in (None, "") else None
     if instead and not memory_read_allowed(agent, instead):
         raise ToolError(f"{mref(instead['id'])} is not yours.")
-    # Stated and never inherited from the lesson a rewrite replaces. An agent that re-tests an aged dead end and
-    # finds the wall gone writes an ordinary lesson; one that finds it still standing says kind="dead_end" again,
-    # with today's date, which restarts the clock honestly and records that somebody checked. Inheritance is what
-    # carries a stale fact silently (the owner's coordinator, 19 October 2026).
-    kind = memory_kind_of(a.get("kind"))
-    cost = memory_cost(a.get("cost_minutes"))
-    recheck = goal_text(a["recheck"], "recheck", MEMORY_RECHECK) if str(a.get("recheck") or "").strip() else None
-    covers = memory_covers(agent, a) if a.get("covers") not in (None, "", []) else []
-    if covers and instead:
-        raise ToolError("covers writes a summary of lessons you already hold and instead_of replaces one that was "
-                        "shown wrong. Give one or the other.")
+    new = bool(a.get("new"))
+    if instead and new:
+        raise ToolError("instead_of writes this lesson in place of one you hold, and new=true writes it beside the "
+                        "ones you hold. Give one or the other.")
     try:
         text = goal_text(a.get("text"), "text", MEMORY_TEXT)
-        prevents = (DEAD_END_PREVENTS if kind == "dead_end" and not str(a.get("prevents") or "").strip()
-                    else goal_text(a.get("prevents"), "prevents", MEMORY_PREVENTS, True))
+        prevents = goal_text(a.get("prevents"), "prevents", MEMORY_PREVENTS, True)
     except ValueError as e:
         raise ToolError(f"{e}. Say the lesson in text, and in prevents what you expect it to prevent: a lesson that "
-                        f"names nothing cannot be shown to be wrong later. A dead end needs no prevents: what it "
-                        f"prevents is always paying for it a second time.") from None
+                        f"names nothing cannot be shown to be wrong later.") from None
     tag = memory_tag(a.get("about"))
-    guard(agent, text, prevents, tag, recheck or "")
-    fields = {"about": tag, "text": text, "prevents": prevents, "kind": kind, "cost_minutes": cost,
-              "recheck": recheck,
-              "instead_of": instead["id"] if instead else None,
-              "covers": sorted(m["id"] for m in covers)}
+    guard(agent, text, prevents, tag)
+    fields = {"about": tag, "text": text, "prevents": prevents,
+              "instead_of": instead["id"] if instead else None, "new": new}
     command, stored = agent_write(agent, "remember", a, fields)
     if stored:
         return stored["text"]
-    # After agent_write and not before it, exactly as t_forget does: the first call of a rewrite forgets the lesson
+    # After agent_write and not before it, exactly as t_forget does: the first call of a rewrite removes the lesson
     # it replaced, so a check here would refuse every repeat of that same write. A repeat is the documented way back
-    # from an answer that was lost (RULES.md, "Logins"), and an agent told "already forgotten" would write the
-    # lesson again on its own — keyless, losing the very claim this path exists to carry.
+    # from an answer that was lost, and an agent told "already removed" would write the lesson again on its own --
+    # keyless, losing the very claim this path exists to carry.
     if instead and instead["dropped"]:
-        raise ToolError(f"{mref(instead['id'])} is already forgotten"
+        raise ToolError(f"{mref(instead['id'])} is already removed"
                         + (f" ({instead['drop_reason']})" if instead["drop_reason"] else "")
-                        + ". Write the lesson on its own instead, or use a new request_id.")
+                        + ". Write the lesson without instead_of, or use a new request_id.")
+    close = [] if instead or new else memory_closest(agent, tag, text)
+    if close:
+        return memory_close_text(close)
     tid = parse_task(a["task_id"]) if a.get("task_id") not in (None, "") else None
     t0 = now()
     with transaction():
         # A rewrite inherits the claim of the lesson it replaces. Without this every lesson written after a
         # contradiction is keyless, so the one moment the loop has actually learned something produces a lesson
-        # nothing can ever check — and it then expires as stale. The old one is forgotten, naming its successor,
-        # so a lesson contradicted, rewritten and contradicted again reads as the chain it was.
+        # nothing can ever check. The old one is removed, naming its successor, so a lesson contradicted, rewritten
+        # and contradicted again reads as the chain it was.
         mid = DB.execute("INSERT INTO memories(agent,about,text,prevents,created,by_task,request_id,"
-                         "responsibility,prevents_key,read_untrusted,kind,cost_minutes,recheck) "
-                         "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                         (agent, tag, mask_secrets(text), mask_secrets(prevents), t0,
-                          # a summary carries no task of its own: the task is the review, and the members keep the
-                          # provenance that matters (memory_fold)
-                          None if covers else tid, command[1],
-                          # a dead end claims no event, so it inherits no key even from the lesson it replaces
-                          None if kind == "dead_end" else (instead["responsibility"] if instead else None),
-                          None if kind == "dead_end" else (instead["prevents_key"] if instead else None),
-                          0 if covers else untrusted_reads(tid), kind, cost,
-                          mask_secrets(recheck) if recheck else None)).lastrowid
+                         "responsibility,prevents_key,read_untrusted) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                         (agent, tag, mask_secrets(text), mask_secrets(prevents), t0, tid, command[1],
+                          instead["responsibility"] if instead else None,
+                          instead["prevents_key"] if instead else None, untrusted_reads(tid))).lastrowid
         memory_indexed(mid)
-        if covers:
-            memory_fold(agent, mid, covers, t0)
         if instead:
             memory_drop(instead, agent, f"written again as {mref(mid)}", t0)
-        over = memory_prune(agent, t0, keep=mid)
         claim = (f"It takes over what {mref(instead['id'])} claimed: it stops {rref(instead['responsibility'])} "
                  f"opening a case with the key '{instead['prevents_key']}' again, so the work can show this one "
-                 f"wrong as it showed that one. {mref(instead['id'])} is forgotten, naming this one. "
-                 if instead and instead["prevents_key"] else
-                 f"Nothing can contradict this one, because it names no case key, so after {MEMORY_KEYLESS_DAYS} "
-                 f"days it counts as stale unless the work bears it out and you say so with remember "
-                 f"held=\"{mref(mid)}\". "
-                 + (f"{mref(instead['id'])} is forgotten, naming this one. " if instead else ""))
-        said = (f"{mref(mid)} is yours, about \"{tag}\". Your next session reads it: a few of your memories are in "
-                f"the start text of each task, and recall gives the rest — recall with about=\"{tag}\" for this tag. "
-                + (f"It covers {len(covers)} lesson{'s' if len(covers) != 1 else ''} of yours "
-                   f"({', '.join(mref(m['id']) for m in covers)}), which keep every word and leave the shelf: "
-                   f"recall covers=\"{mref(mid)}\" reads them. " if covers else "")
-                + (f"Your working set is {over} past {MEMORY_WORKING}, which costs you nothing — nothing is ever "
-                   f"dropped — and is what your review folds with remember covers=[...]. " if over else "")
+                 f"wrong as it showed that one. " if instead and instead["prevents_key"] else
+                 f"Nothing can contradict this one, because it names no case key, so after {memory_review_days()} days "
+                 f"with nothing to confirm it your review lists it. ")
+        said = (f"{mref(mid)} is yours, about \"{tag}\". A task whose words name this tag or the lesson's own words "
+                f"starts with it, and recall with about=\"{tag}\" reads this tag. "
+                + (f"{mref(instead['id'])} is removed, naming this one. " if instead else "")
                 + claim
-                + "A lesson that turns out wrong is worse than none: drop it with forget and its reason. A durable "
+                + "A lesson that turns out wrong is worse than none: remove it with forget and its reason. A durable "
                   "fact about a product belongs in that product's repository, and this memory is the pointer to it.")
         keep_command(command, {"memory": mid, "text": said}, t0)
     return said
-
-
-def memory_kind_of(value):
-    """The kind of one lesson, from the call and never inherited. 'lesson' when nothing says otherwise."""
-    kind = str(value or "lesson").strip().lower()
-    if kind not in MEMORY_KINDS:
-        raise ToolError(f"kind is one of {', '.join(MEMORY_KINDS)}. A dead end is what did not work; everything else "
-                        f"is a lesson.")
-    return kind
-
-
-def memory_dead_end_fields(cost_minutes, recheck):
-    """(cost_minutes, recheck) of a dead end, checked, or a ToolError saying which is wrong.
-
-    Its own function so the check can run **before** the work is written. deliver_result updates the task outside the
-    transaction that writes the lesson, so a bad cost_minutes used to refuse the call with the task already
-    delivered: the result stood, the dead end was lost, and rule 2 forbids reopening a finished task to record it."""
-    cost = memory_cost(cost_minutes)
-    try:
-        text = goal_text(recheck, "recheck", MEMORY_RECHECK) if str(recheck or "").strip() else None
-    except ValueError as e:
-        raise ToolError(f"{e}. Say in one or two lines how to find out cheaply whether the wall still stands.") \
-            from None
-    return cost, text
-
-
-def memory_cost(value):
-    """How long the work that found a dead end took, in minutes, or None. The only number that says what a repeat
-    would cost, so it is what breaks a tie on the shelf."""
-    if value in (None, ""):
-        return None
-    try:
-        minutes = int(value)
-    except (TypeError, ValueError):
-        raise ToolError("cost_minutes is a whole number of minutes.") from None
-    if isinstance(value, bool) or not 1 <= minutes <= 60 * 24 * 30:
-        raise ToolError("cost_minutes is a whole number of minutes, from 1 to a month of them.")
-    return minutes
 
 
 def memory_spent(minutes):
@@ -13519,38 +13388,23 @@ def memory_spent(minutes):
     return f"{minutes / 60:.0f} h" if minutes < 60 * 24 else f"{minutes / 1440:.0f} d"
 
 
-def memory_from_work(agent, text, prevents, about, t0, task=None, responsibility=None, prevents_key=None,
-                     kind="lesson", cost_minutes=None, recheck=None):
+def memory_from_work(agent, text, prevents, about, t0, task=None, responsibility=None, prevents_key=None):
     """Inside the caller's transaction: one lesson written by the work that taught it, rather than by an agent that
-    remembered to call remember. close_case and deliver_result write here.
+    remembered to call remember. close_case and deliver_result write here: `learned`, and `tried`, which is an
+    ordinary lesson that says what did not work (MEMORY_TRIED, DEAD_END_PREVENTS).
 
     `responsibility` and `prevents_key` are what make the lesson checkable: a lesson written when a case closed
     claims to prevent that case's key, so when the key comes back duty_new_case can mark it contradicted. A lesson
-    out of an ordinary task has neither, and nothing can ever contradict it — which is why a keyless lesson expires
-    and a keyed one earns its life by not coming back. The two travel together: a key without its duty names no case
-    and a duty without a key claims nothing, so either half alone would have memory_contradicted, memory_stale and
-    every reader of a lesson reading a claim that is not there.
-
-    `kind` is 'lesson' or 'dead_end' (MEMORY_KINDS). A dead end takes **no key**, because it is not a claim about an
-    event coming back, and its `prevents` is the same sentence every time, so it is filled in here rather than asked
-    for: one field of ceremony is one field too many. `cost_minutes` is what a repeat would cost and `recheck` is how
-    to find out cheaply whether the wall still stands."""
+    out of an ordinary task has neither, and nothing can ever contradict it — which is why a keyless lesson goes to
+    the review when nothing confirms it, and a keyed one earns its life by not coming back. The two travel together:
+    a key without its duty names no case and a duty without a key claims nothing."""
     in_transaction("memory_from_work")
-    kind = memory_kind_of(kind)
-    cost_minutes, recheck = memory_dead_end_fields(cost_minutes, recheck)
-    if kind == "dead_end" and (responsibility or prevents_key):
-        raise ToolError("A dead end takes no duty and no case key: it is not a claim about an event coming back, so "
-                        "nothing can contradict it automatically. It ages instead, and an agent re-tests it.")
     if bool(responsibility) != bool(prevents_key):
         raise ToolError("A lesson that claims to stop an event needs both the duty and its key, or neither.")
-    if kind == "dead_end" and not str(prevents or "").strip():
-        prevents = DEAD_END_PREVENTS           # always the same sentence, so the agent writes one field and not two
     mid = DB.execute("INSERT INTO memories(agent,about,text,prevents,created,by_task,request_id,"
-                     "responsibility,prevents_key,read_untrusted,kind,cost_minutes,recheck) "
-                     "VALUES(?,?,?,?,?,?,'',?,?,?,?,?,?)",
+                     "responsibility,prevents_key,read_untrusted) VALUES(?,?,?,?,?,?,'',?,?,?)",
                      (agent, about, mask_secrets(text), mask_secrets(prevents), t0, task, responsibility,
-                      prevents_key, untrusted_reads(task), kind, cost_minutes,
-                      mask_secrets(recheck) if recheck else None)).lastrowid
+                      prevents_key, untrusted_reads(task))).lastrowid
     memory_indexed(mid)
     return mid
 
@@ -13571,6 +13425,37 @@ def memory_contradicted(duty_id, key, t0):
     return marked
 
 
+def memory_to_review(agent, t0):
+    """The lessons an agent's review lists (AUTONOMY.md P7, "review on news"): contradicted, or with no case key and
+    not confirmed for MEMORY_KEYLESS_DAYS. The contradicted first; bounded, and read only."""
+    where, args = memory_stale_sql(t0)
+    return read_rows(f"SELECT * FROM memories WHERE agent=? AND {MEMORY_ON_SHELF} AND {where} "
+                     "ORDER BY contradicted DESC, id LIMIT ?", (agent, *args, MEMORY_MOST))
+
+
+def memory_reviewers(t0):
+    """The agents that hold a lesson their review would list, from one read of the table."""
+    where, args = memory_stale_sql(t0)
+    return [r["agent"] for r in read_rows(f"SELECT DISTINCT agent FROM memories WHERE {MEMORY_ON_SHELF} AND {where}",
+                                          args)]
+
+
+def memory_review_mark(m):
+    """What a review saw of one lesson: its id and why it was listed. A lesson contradicted again is news again; one
+    listed and left as it was is not, so it starts no second review by itself."""
+    return f"{mref(m['id'])}:" + (f"c{m['contradicted']}" if m["contradicted"] else "s")
+
+
+def memory_review_lines(rows):
+    """One line for each lesson a review lists: its id and why, and never its words. A review is a task that its
+    requester reads too, and a lesson is its own agent's alone (memory_read_allowed)."""
+    return [f"{mref(m['id'])}: " + (f"contradicted {m['contradicted']}×, last {goal_time(m['contradicted_at'])}"
+                                    if m["contradicted"] else
+                                    f"nothing has confirmed it since "
+                                    f"{goal_time(m['reinforced_at'] or m['created']).split(' ')[0]}")
+            for m in rows]
+
+
 def memory_summary(rows, total, page, pages, heading, t0, more, full=False):
     """One page of lessons: a digest of each unless `full`, what is not shown, and how to reach the rest."""
     memory_mark_read(rows, t0)
@@ -13588,39 +13473,36 @@ def memory_summary(rows, total, page, pages, heading, t0, more, full=False):
 
 
 def memory_tail(agent, t0, out):
-    """What the default answer ends with: the tags, what needs looking at, what is no longer on the shelf. Each one
-    counted in SQL, because a lifetime store is never loaded to be described."""
+    """What the default answer ends with: the tags, what needs looking at, what an earlier round took off the list.
+    Each one counted in SQL, because the store is never loaded to be described."""
     out.append(f"  Your tags: {memory_tags(agent)}.")
     where, args = memory_stale_sql(t0)
     look = memory_count(agent, f"AND {MEMORY_ON_SHELF} AND {where}", args)
     if look:
         out.append(f"  {look} of yours need{'s' if look == 1 else ''} looking at — contradicted, or with no case key "
-                   f"and nothing to bear it out for {MEMORY_KEYLESS_DAYS} days: recall stale=true.")
+                   f"and nothing to confirm it for {memory_review_days()} days: recall stale=true.")
     folded = memory_count(agent, "AND dropped IS NULL AND (folded_into IS NOT NULL OR archived IS NOT NULL)")
     if folded:
-        out.append(f"  {folded} more are off the shelf, covered by a summary or archived. Every word of them is "
-                   f"kept: recall every=true lists them, search finds them, and nothing is ever deleted.")
-    forgotten = memory_count(agent, "AND dropped IS NOT NULL")
-    if forgotten:
-        out.append(f"  {forgotten} forgotten, not listed here: recall forgotten=true names them with the reason.")
+        out.append(f"  {folded} more, folded or archived in an earlier round, are not listed here: recall every=true "
+                   f"lists them, and the search finds them.")
     return out
 
 
 def t_recall(agent, a):
-    """The agent's own lessons, read back. The store is a lifetime and no shape puts it into a session: each list is
-    one page of MEMORY_SHOWN, counted in SQL, with page= for the next one."""
+    """The agent's own lessons that stand, read back. Each list is one page of MEMORY_SHOWN, counted in SQL, with page=
+    for the next one. A removed lesson is not here: the history keeps it."""
     t0 = now()
     try:
         page = max(1, int(a.get("page") or 1))
     except (TypeError, ValueError):
         raise ToolError("page is a whole number from 1.") from None
     full, every = bool(a.get("full")), bool(a.get("every"))
-    tail = ("A lesson that is wrong now: drop it with forget and say why. One that holds: say in your result or your "
+    tail = ("A lesson that is wrong now: remove it with forget and say why. One that holds: say in your result or your "
             "memory where the durable fact lives, which for a product is its own repository.")
     extra, args = "", []
     if a.get("since") not in (None, ""):
-        # Its own parser and not parse_wake, which refuses anything that is not in the future: every date a
-        # lifetime store is asked about is in the past.
+        # Its own parser and not parse_wake, which refuses anything that is not in the future: every date the store
+        # is asked about is in the past.
         import datetime
         try:
             text = str(a["since"]).strip()
@@ -13629,42 +13511,29 @@ def t_recall(agent, a):
         except (TypeError, ValueError):
             raise ToolError('since is an ISO date or date and time, for example "2026-10-01".') from None
 
-    # One lesson whole, wherever it is: standing, forgotten, folded or archived.
+    # One lesson whole, wherever it stands: on the list, or folded or archived in an earlier round.
     if a.get("memory") not in (None, ""):
         m = memory_ref(a["memory"])
         if not memory_read_allowed(agent, m):
             raise ToolError(f"{mref(m['id'])} is not your memory. A memory is its own agent's, and no other agent "
                             f"reads it.")
+        if m["dropped"]:
+            return (f"{mref(m['id'])} was removed {goal_time(m['dropped'])} by {m['dropped_by']}: "
+                    f"{mask_secrets(m['drop_reason'] or '').rstrip('.')}. A removed lesson is not in your memory any "
+                    f"more; your history keeps it, and read_history with ref=\"{mref(m['id'])}\" opens it.")
         memory_mark_read([m], t0)
         return "\n".join(memory_block(memory_row(m["id"]), t0, full=True) + [tail])
 
-    # What one summary of the agent's own covers.
-    if a.get("covers") not in (None, ""):
-        m = memory_ref(a["covers"])
-        if not memory_read_allowed(agent, m):
-            raise ToolError(f"{mref(m['id'])} is not your memory.")
-        members = memory_members(m["id"])
-        if not members:
-            return (f"{mref(m['id'])} covers nothing: it is a lesson of its own, not a summary. A summary is written "
-                    f"with remember covers=[\"M-1\", \"M-2\"], and what it covers keeps every word.")
-        memory_mark_read(members, t0)
-        out = [f"{mref(m['id'])} covers {len(members)} lesson{'s' if len(members) != 1 else ''} of yours, which keep "
-               f"every word and their own provenance:"]
-        for one in members:
-            out += memory_block(one, t0) if full else [memory_line(one, t0)]
-        return "\n".join(out + [f"The summary itself: {memory_said(m)}", tail])
-
-    # A search over the whole lifetime store, archived and folded and forgotten alike.
+    # A search over every lesson that stands, folded and archived ones of earlier rounds too.
     words = str(a.get("search") or "").strip()
     if words:
         if len(words) < 2:
             raise ToolError("Search for at least two characters.")
         hits = memory_found(agent, words, MEMORY_SHOWN * page)
         if not hits:
-            return (f'No lesson of yours has "{words}" in its tag, its text or what it prevents. The search reaches '
-                    f'every lesson you have ever written — forgotten, folded and archived ones too. What you did and '
-                    f'were told, beyond your lessons, search_history finds: every task, message, conversation and '
-                    f'tool record you took part in.')
+            return (f'No lesson of yours has "{words}" in its tag, its text or what it prevents. What you did and '
+                    f'were told, beyond the lessons that stand, search_history finds: every task, message, '
+                    f'conversation and tool record you took part in, and the lessons you removed.')
         rows = hits[(page - 1) * MEMORY_SHOWN:page * MEMORY_SHOWN]
         if not rows:
             return f'Page {page} of the lessons with "{words}" is past the end: {len(hits)} were found.'
@@ -13672,32 +13541,23 @@ def t_recall(agent, a):
         return "\n".join(memory_summary(rows, len(hits), page, max(1, -(-len(hits) // MEMORY_SHOWN)), heading,
                                          t0, "Use other words.", full) + [tail])
 
-    # What the review reads: the contradicted ones, then the ones nothing can bear out any more.
+    # What the review reads: the contradicted ones, then the ones nothing has confirmed for a while.
     if a.get("stale"):
         where, wargs = memory_stale_sql(t0)
         rows, total, page, pages = memory_page(
             agent, f"{MEMORY_ON_SHELF} AND {where}{extra}", [*wargs, *args], page, "contradicted DESC, id DESC")
         if not total:
             return (f"Nothing of yours needs looking at: no lesson of yours is contradicted, and none is a keyless "
-                    f"one that the work has not borne out for {MEMORY_KEYLESS_DAYS} days.")
+                    f"one that nothing has confirmed for {memory_review_days()} days.")
         return "\n".join(memory_summary(rows, total, page, pages,
                                         f"{total} lesson{'s' if total != 1 else ''} of yours to look at, the "
                                         f"contradicted ones first:", t0, "", full)
-                         + ["A lesson the fleet counted against did not stop the case key it claimed: read that "
-                            "case, then rewrite it with remember instead_of=\"M-<id>\", which carries the claim "
-                            "over, or drop it with forget and the reason. One with no key can never be "
-                            "contradicted: if your work bears it out, say so with remember held=\"M-<id>\"; if it "
-                            "does not, forget it; and when several say the same thing, fold them into one with "
-                            "remember covers=[...]. The hub drops nothing and deletes nothing — counting is "
-                            "mechanical, deciding is yours."])
-    if a.get("forgotten"):
-        rows, total, page, pages = memory_page(agent, f"dropped IS NOT NULL{extra}", args, page)
-        if not total:
-            return "You have forgotten no lesson yet. forget drops one with its reason, and keeps every word of it."
-        return "\n".join(memory_summary(rows, total, page, pages,
-                                        f"{total} lesson{'s' if total != 1 else ''} of yours that no longer "
-                                        f"stand{'s' if total == 1 else ''}, the newest first, each with why:",
-                                        t0, "", full) + [tail])
+                         + ["A CONTRADICTED lesson claimed to stop a case key that has come back since: read that "
+                            "case, then write it again so it says what you know now with remember "
+                            "instead_of=\"M-<id>\", which carries the claim over, or remove it with forget and the "
+                            "reason. One with no key can never be contradicted: if your work still bears it out, "
+                            "write it again the same way, which dates it today; if not, forget it. The hub removes "
+                            "nothing by itself — counting is mechanical, deciding is yours."])
 
     tag = memory_tag(a["about"]) if a.get("about") not in (None, "") else None
     where = (MEMORY_STANDING if every else MEMORY_ON_SHELF) + extra
@@ -13710,8 +13570,8 @@ def t_recall(agent, a):
         if not memory_count(agent, f"AND {MEMORY_STANDING}"):
             return (f'No lesson of yours is about "{tag}", because you have written none yet: remember keeps one '
                     f"lesson, with what you expect it to prevent.")
-        return (f'No lesson of yours is about "{tag}"' + ("" if every else " on your shelf — every=true also looks "
-                                                          "at the folded and archived ones")
+        return (f'No lesson of yours is about "{tag}"' + ("" if every else " in this list — every=true also looks "
+                                                          "at the ones an earlier round folded or archived")
                 + f". Your tags: {memory_tags(agent)}.")
     if not total:
         return ("You have no lessons yet. Nothing you learn in a session survives it unless you write it down: "
@@ -13720,7 +13580,7 @@ def t_recall(agent, a):
                 "write_knowledge; this is for what you yourself know.")
     many = f"{total} lesson{'s' if total != 1 else ''} of yours"
     heading = (f'{many} about "{tag}", the newest first:' if tag else
-               f"{many}{' in all, archived and folded included' if every else ' on your shelf'}, the newest first:")
+               f"{many}{' in all, folded and archived included' if every else ''}, the newest first:")
     out = memory_summary(rows, total, page, pages, heading, t0,
                          'One tag with about="<tag>", words with search="<words>", everything with every=true.', full)
     if not tag:
@@ -13730,84 +13590,31 @@ def t_recall(agent, a):
 
 
 def t_forget(agent, a):
-    """One lesson stops standing, with the reason, and stays as history."""
+    """One lesson is removed, with the reason: it leaves every start and every search of memory, and the history keeps
+    it (AUTONOMY.md P7)."""
     m = memory_ref(a.get("memory"))
     if not memory_read_allowed(agent, m):
-        raise ToolError(f"{mref(m['id'])} is not your memory. Only its own agent forgets it.")
+        raise ToolError(f"{mref(m['id'])} is not your memory. Only its own agent removes it.")
     try:
         reason = goal_text(a.get("reason"), "reason", MEMORY_REASON, True)
     except ValueError as e:
-        raise ToolError(f"{e}. Say why it no longer stands: what it told you to do, and what happened instead. The "
-                        f"memory stays as history, so the reason is what the next reading of it needs.") from None
+        raise ToolError(f"{e}. Say why it no longer stands: what it told you to do, and what happened instead. Your "
+                        f"history keeps the lesson with this reason.") from None
     guard(agent, reason)
     fields = {"memory": m["id"], "reason": reason}
     command, stored = agent_write(agent, "forget", a, fields)
     if stored:
         return stored["text"]
     if m["dropped"]:
-        raise ToolError(f"{mref(m['id'])} was already forgotten {goal_time(m['dropped'])} by {m['dropped_by']}: "
-                        f"{m['drop_reason']}. It stands no more; recall with forgotten=true reads it.")
+        raise ToolError(f"{mref(m['id'])} was already removed {goal_time(m['dropped'])} by {m['dropped_by']}: "
+                        f"{(m['drop_reason'] or '').rstrip('.')}.")
     t0 = now()
     with transaction():
         memory_drop(m, agent, reason, t0)
-        said = (f"{mref(m['id'])} no longer stands. It stays as history: recall with forgotten=true reads it with "
-                f"your reason. If the right lesson is a different one, write it with remember.")
+        said = (f"{mref(m['id'])} is removed: no start and no recall shows it again. Your history keeps it with your "
+                f"reason (search_history). If the right lesson is a different one, write it with remember.")
         keep_command(command, {"memory": m["id"], "text": said}, t0)
     return said
-
-
-# The order of the shelf, which is the evidence and nothing else. Not `recalls`: that counts what retrieval
-# printed, so the store would keep what the selector already likes and the two would feed each other with nothing
-# from outside. A lesson nothing has counted against first; then one with a case key the work could have
-# contradicted and has not, which is the best-evidenced kind there is; then the ones the work bore out most often;
-# then the most recently borne out, and the newest.
-MEMORY_SHELF = ("SELECT * FROM memories WHERE agent=? AND dropped IS NULL AND folded_into IS NULL "
-                "AND archived IS NULL AND kind<>'dead_end' "
-                "ORDER BY contradicted ASC, (prevents_key IS NOT NULL) DESC, reinforced DESC, "
-                "COALESCE(reinforced_at, created) DESC, id DESC LIMIT ?")
-# The other half of the candidates: the walls, costliest first, whatever their age. An aged dead end stays eligible
-# and changes its wording instead of leaving (the coordinator's ruling, 19 October 2026).
-MEMORY_WALLS = ("SELECT * FROM memories WHERE agent=? AND dropped IS NULL AND folded_into IS NULL "
-                "AND archived IS NULL AND kind='dead_end' "
-                "ORDER BY contradicted ASC, cost_minutes DESC, id DESC LIMIT ?")
-
-
-def memories_for_start(agent, task_id):
-    """The lessons a task's start text puts on the shelf: the ones whose tag the task's own words name, then the
-    best-evidenced, and never more than the shelf can hold. Returns (the lessons, how many the task named).
-
-    Three things this must not do, each of which it did:
-
-    It must not load the store. It read every row twice — once to choose and once only to count — inside the write
-    transaction of admit_task, which holds the write lock while a task, its first attempt and its start event are
-    written together. Measured at 3,372 rows that was 7 ms and 2.5 MiB; a lifetime store makes it minutes. The count
-    is SQL now and the choice has a LIMIT behind an index.
-
-    It must not rank by `recalls`. That counts what retrieval printed, so the store keeps what the selector already
-    likes and the two feed each other with nothing from outside. The order is the evidence instead: a lesson nothing
-    has counted against, then one with a key the work could have contradicted and has not, then the one the work
-    bore out most recently.
-
-    And it must not spend its budget in rows. One long lesson could take a whole opening; memory_start_text spends
-    MEMORY_START_CHARS on digests, so the opening costs the same at twenty thousand lessons as at twenty."""
-    said = ""
-    if task_id:
-        t = read_row("SELECT title, details, done_when FROM tasks WHERE id=?", (task_id,))
-        said = " ".join(str(t[k] or "") for k in ("title", "details", "done_when")).lower() if t else ""
-    # Two bounded reads and not one: the best-evidenced lessons, and the costliest dead ends. One read ordered to
-    # put dead ends first would fill the whole window with them at fifty walls and leave no lesson to match; one
-    # ordered the other way would never see a dead end at all. Twice the row budget each, so the tag match has
-    # something to choose from inside both.
-    rows = read_rows(MEMORY_SHELF, (agent, MEMORY_START * 2))
-    walls = read_rows(MEMORY_WALLS, (agent, MEMORY_START * 2))
-    seen, every = set(), []
-    for m in (*walls, *rows):
-        if m["id"] not in seen:
-            seen.add(m["id"])
-            every.append(m)
-    named = {m["id"] for m in every if m["about"].lower() in said}
-    every.sort(key=lambda m: memory_sort_key(m, now(), m["id"] in named))
-    return every, len(named)
 
 
 def notes_start_text(agent):
@@ -13826,39 +13633,59 @@ def notes_start_text(agent):
             "is wrong. see_notes reads the versions before.\n" + text.strip() + "\n")
 
 
-def memory_start_text(agent, task_id):
-    """The shelf: a digest of a few of the agent's own lessons, and how to reach the lifetime store behind them.
+def memory_start_line(m, t0):
+    """One lesson in a start block: whole, masked, with what the fleet counted about it and where it was written."""
+    evidence, wall, asks = memory_evidence(m, t0), memory_wall(m, t0), memory_asks(m, t0)
+    return (f"- {mref(m['id'])} [{memory_said(m, 'about')}] " + (wall + " " if wall else "") + memory_said(m)
+            + (" " + asks if asks else
+               f" To check it again: {memory_said(m, 'recheck')}" if m["kind"] == "dead_end" and m["recheck"] else "")
+            + (f" [{evidence}]" if evidence else "") + f" ({untrusted_said(m)})")
 
-    The owner's sentence has two halves — "compact what's directly available but offer tools to recover everything" —
-    and this is the first. A digest of each lesson, MEMORY_DIGEST characters of it, inside a budget of
-    MEMORY_START_CHARS: eight digests cost less than four whole lessons did, and the whole text of any of them is
-    one recall away. The budget is in characters because a row is not a cost."""
-    rows, named = memories_for_start(agent, task_id)
-    live = memory_count(agent, "AND dropped IS NULL AND folded_into IS NULL")
-    if not rows:
+
+MEMORY_START_FOOT = ("These are your own lessons from your own work, not rules: weigh each against the work in front "
+                     "of you and by where it was written. recall finds the others (about=\"<tag>\", "
+                     "search=\"<words>\"). When you learn something, call remember: it first shows you the close "
+                     "lessons you hold, so that you write it again, replace one or add a new one. Remove a lesson "
+                     "that is wrong with forget.\n")
+
+
+def memory_start_text(agent, task_id):
+    """Slot 4 of the per-task block (AUTONOMY.md 6.4): every current lesson that matches the task, by tag and by words
+    (memory_matches), each whole, inside one bound of characters (the setting memory.start_chars) -- P7's "as many as
+    the work needs" with no row cap, because a row is not a cost -- and how to reach the rest. Reads only: start_text
+    runs inside admit_task's transaction."""
+    total = memory_count(agent, f"AND {MEMORY_ON_SHELF}")
+    if not total:
         return ("\nYou have written no memories yet. What you learn in this session dies with it unless you write it "
                 "down: remember keeps one lesson, its tag and what you expect it to prevent.\n")
-    t0, shown, room = now(), [], MEMORY_START_CHARS
-    for m in rows[:MEMORY_START]:
-        evidence, wall = memory_evidence(m, t0), memory_wall(m, t0)
-        line = (f"- {mref(m['id'])} [{m['about']}] " + (wall + " " if wall else "")
-                + memory_said(m, limit=MEMORY_DIGEST)
-                + (" " + memory_asks(m, t0) if memory_asks(m, t0) else "")
-                + (f" [{evidence}]" if evidence else "") + f" ({untrusted_said(m)})")
-        if shown and len(line) > room:
-            break
-        shown.append(line)
-        room -= len(line)
-    out = [f"\nYour own memory. {live} lesson{'s' if live != 1 else ''} in all, and these {len(shown)}"
-           + (f", the {'one' if named == 1 else min(named, len(shown))} whose tag this task names first" if named
-              else ", the best-evidenced") + ", shortened:"]
+    t = read_row("SELECT title, details, done_when FROM tasks WHERE id=?", (task_id,)) if task_id else None
+    rows, named = memory_matches(agent, " ".join(str(t[k] or "") for k in ("title", "details", "done_when"))
+                                 if t else "")
+    lessons = f"{total} lesson{'s' if total != 1 else ''}"
+    if not rows:
+        return (f"\nYour own memory: {lessons}, and none matches this task's words. Your tags: {memory_tags(agent)}. "
+                + MEMORY_START_FOOT)
+    # The heading and the line of what did not fit are each well under 200 characters, so the block stays inside
+    # its bound whatever matched.
+    t0, shown, more, room = now(), [], [], setting("memory.start_chars") - len(MEMORY_START_FOOT) - 400
+    for m in rows:
+        line = memory_start_line(m, t0)
+        if len(line) < room:
+            shown.append(line)
+            room -= len(line) + 1
+        else:
+            more.append(mref(m["id"]))
+    tagged = named & {int(line[4:].split(" ")[0]) for line in shown}
+    head = (f"These {len(shown)} match this task" + (", the ones whose tag it names first:" if tagged else
+                                                     ", by its words:") if len(shown) > 1 else
+            "This one matches this task, " + ("by its tag:" if tagged else "by its words:") if shown else "")
+    out = [f"\nYour own memory: {lessons}." + (" " + head if head else "")]
     out += shown
-    out.append("These are your own lessons from your own work, not rules: weigh them against what is in front of "
-               "you, and weigh each one by where it was written. recall gives any of them whole "
-               "(recall memory=\"M-<id>\"), searches every lesson you have ever written, and with stale=true gives "
-               "the ones that need looking at. remember keeps a new lesson, remember held=\"M-<id>\" says one of "
-               "these was borne out again, and forget drops one that turned out wrong, with its reason. Nothing you "
-               "have written is ever deleted.\n")
+    if more:
+        out.append(f"{len(more)} {'more ' if shown else ''}match{'es' if len(more) == 1 else ''} this task and did "
+                   f"not fit: " + ", ".join(more[:20]) + (" and others" if len(more) > 20 else "")
+                   + '. recall memory="M-<id>" gives one whole.')
+    out.append(MEMORY_START_FOOT)
     return "\n".join(out)
 
 
@@ -17085,11 +16912,8 @@ TOOLS = [
      "taught you something worth "
      "having in your next sessions, say it in learned, with what you expect it to prevent: this is the only moment "
      "an ordinary task offers, and nothing will ask again. And if you hit a wall — a thing that cannot be done the "
-     "way you tried, an approach that wasted hours — say that in tried, with what it cost. A dead end is the "
-     "cheapest knowledge the fleet can hold: what worked you would probably find again, and what does not work "
-     "costs the same hours every time somebody walks into it. A dead end whose tag your next task names "
-     "leads everything else that task carries, costliest first, so it is the one thing you can write that is "
-     "certain to be read before the work starts.",
+     "way you tried, an approach that wasted hours — say that in tried: what does not work costs the same hours "
+     "every time somebody walks into it.",
      S({"task_id": TASK_ID, "outcome": {"type": "string", "enum": ["completed", "failed", "rejected"]},
         "what_was_done": STR, "where_output_is": STR, "how_checked": STR,
         "note": {"type": "string", "description": "Your last progress note, if you have one: it is kept with the "
@@ -17097,16 +16921,7 @@ TOOLS = [
         "learned": {"type": "string", "description": "What this work taught you, if anything. Leave it out when it "
                     "taught you nothing."},
         "prevents": {"type": "string", "description": "With learned: what you expect it to prevent, in one line"},
-        "tried": {"type": "string", "description": "What you tried that did NOT work, if anything: "
-                  "the wall you hit and why, so that your next session does not pay for it twice. Leave it out "
-                  "when nothing was a dead end."},
-        "cost_minutes": {"type": "integer", "description": "With tried: roughly what it cost you, in minutes. "
-                         "The costliest dead ends lead the shelf, so this decides whose wall your next session "
-                         "is warned about first."},
-        "recheck": {"type": "string", "description": "With tried: how to find out cheaply whether the wall still "
-                    "stands — one call or one command, and what the wrong answer looks like. A dead end is "
-                    "dated, so after a while it is shown again as a question with these words under it; a dead "
-                    "end that has none tells the session to weigh one attempt against the cost instead."},
+        "tried": {"type": "string", "description": TRIED_FIELD},
         },
        ["task_id", "outcome", "what_was_done"])),
     ("worker", "sign_in", t_sign_in,
@@ -17477,8 +17292,8 @@ TOOLS = [
      "End one case of a duty: handled, no_action (nothing had to be done) or failed (nobody could handle it, with "
      "the reason). No task of the case may be open. This is the moment you know what the event taught you, so say "
      "it in learned when there is something: it is kept for your own next sessions, and because it names this "
-     "case's key, the work itself can later show it was wrong. A wall you hit on the way goes in tried, with what "
-     "it cost: that one takes no key, because it is not a claim about this event coming back.",
+     "case's key, the work itself can later show it was wrong. A wall you hit on the way goes in tried: that one "
+     "takes no key, because it is not a claim about this event coming back.",
      S({"request_id": {"type": "string", "description": "A new UUID for each write"},
         "case": {"type": "string", "description": "Case id, for example R-1/C-3"},
         "outcome": {"type": "string", "description": "handled, no_action or failed"},
@@ -17486,16 +17301,7 @@ TOOLS = [
         "learned": {"type": "string", "description": "What this event taught you, if anything, for your own next "
                     "sessions. It is kept as a memory that claims to stop this key coming back, so the hub marks "
                     "it contradicted if it does. Leave it out when the case taught you nothing."},
-        "tried": {"type": "string", "description": "What you tried that did NOT work, if anything: "
-                  "the wall you hit and why, so that your next session does not pay for it twice. Leave it out "
-                  "when nothing was a dead end."},
-        "cost_minutes": {"type": "integer", "description": "With tried: roughly what it cost you, in minutes. "
-                         "The costliest dead ends lead the shelf, so this decides whose wall your next session "
-                         "is warned about first."},
-        "recheck": {"type": "string", "description": "With tried: how to find out cheaply whether the wall still "
-                    "stands — one call or one command, and what the wrong answer looks like. A dead end is "
-                    "dated, so after a while it is shown again as a question with these words under it; a dead "
-                    "end that has none tells the session to weigh one attempt against the cost instead."},
+        "tried": {"type": "string", "description": TRIED_FIELD},
         "task_id": TASK_ID},
        ["request_id", "case", "outcome", "note"])),
     ("all", "see_notes", t_see_notes,
@@ -17522,81 +17328,50 @@ TOOLS = [
         "trigger": {"type": "integer", "description": "The number of your wake-up rule (see_triggers)"},
         "detach": {"type": "boolean", "description": "True to take the rule off the duty"}, "task_id": TASK_ID},
        ["request_id", "responsibility", "trigger"])),
-    # An agent's own memory (owner direction, 19 October 2026): what it learned, kept for its own next session.
+    # An agent's own memory (AUTONOMY.md P7): what it learned, kept current for its own next sessions.
     ("all", "remember", t_remember,
-     "Keep one lesson that your next session needs: which approach failed and why, how the owner wants something "
-     "reported, which tool lies, who to ask, what you got wrong last time. It is yours — no other agent reads it, "
-     "and the owner reads it in the app. about is a short tag of your own choosing (a product, a tool, a person, "
-     "the fleet), and prevents says what you expect this lesson to prevent, which is what makes it possible to "
-     "show later that it was wrong. " +
-     NOTES_RULE + " A durable fact about a product belongs in that product's own repository, where you have write "
-     "access: keep the pointer here, not the copy. A fact with no repository (an account, a customer, a supplier) "
-     "goes in a knowledge file with write_knowledge. Never a password or a key. When a lesson you already hold was "
-     "borne out again by this work, do not write it a second time: give held=\"M-<id>\" and nothing else. Two "
-     "near-identical lessons are worse than one with a count on it, and it is the only thing that tells a lesson "
-     "nothing has contradicted apart from one the work keeps proving right. When a lesson was CONTRADICTED "
-     "and you write a better one, give instead_of=\"M-<id>\": the new lesson takes over what the old one "
-     "claimed, so the work can judge it too, and the old one is forgotten naming the new one. Without that the "
-     "better lesson names no event and nothing can ever check it. Nothing you write here is ever deleted and there "
-     "is no cap: your memory is a lifetime. What is short is the shelf your next session opens with, so when several "
-     "of your lessons say one thing, write the one and give covers=[...] with the others — they keep every word, "
-     "they stay in the search, and they leave the shelf.",
+     "Keep one lesson that your next sessions need: which approach failed and why, how the owner wants something "
+     "reported, which tool lies, who to ask. It is yours — no other agent reads it — and the owner reads it in the "
+     "app. about is your own short tag (a product, a tool, a person, the fleet); prevents says what the lesson "
+     "should prevent, so that it can be shown wrong later. " + NOTES_RULE + " A fact about a product belongs in its "
+     "repository, and a fact with no repository in a knowledge file: keep the pointer here. Never a password or a "
+     "key. When you already hold lessons close to this one, remember writes nothing and answers with them: if it is "
+     "one of them again, or replaces it, call it again with instead_of=\"M-<id>\" (that one is removed, and this one "
+     "stands, dated today, with its claim); if it is a different lesson, with new=true.",
      S({"request_id": {"type": "string", "description": "A new UUID for each write"},
         "text": {"type": "string", "description": f"The lesson, at most {MEMORY_TEXT} characters"},
         "about": {"type": "string", "description": "Your own short tag: a product, a tool, a person, the fleet"},
         "prevents": {"type": "string", "description": "What you expect this lesson to prevent, in one line"},
-        "held": {"type": "string", "description": "A lesson of yours the work bore out again, for example M-1. Give "
-                                                  "it alone: with text, about, prevents, instead_of or covers it "
-                                                  "is refused, because those are a different write."},
-        "kind": {"type": "string", "description": "lesson (the default) or dead_end, which is what did NOT work. "
-                                                  "A rewrite says its own: an ordinary lesson when you re-tested "
-                                                  "a dead end and the wall is gone, dead_end again when you "
-                                                  "checked and it still stands."},
-        "cost_minutes": {"type": "integer", "description": "For a dead end: how many minutes the work that found it "
-                                                           "took. It is what a repeat would cost, so it decides "
-                                                           "which dead end your next session is warned about."},
-        "recheck": {"type": "string", "description": "For a dead end: how to find out cheaply whether it still "
-                                                     "holds — one call or one command, and what the wrong answer "
-                                                     "looks like. Without it, 'check before you spend again' is "
-                                                     "a wish."},
-        "covers": {"type": "array", "items": {"type": "string"},
-                   "description": f"1 to {MEMORY_COVERS} lessons of yours that this one says in fewer words, for "
-                                  f"example [\"M-4\", \"M-9\"]. They keep every word and leave your shelf."},
-        "instead_of": {"type": "string", "description": "A lesson of yours this one is written in place of, for "
-                       "example M-1: it is forgotten, and this one takes over what it claimed to prevent, so the "
-                       "work can judge the new one. Use it whenever you rewrite a contradicted lesson."},
+        "instead_of": {"type": "string", "description": "A lesson of yours that this one is again or replaces, for "
+                       "example M-1: it is removed, and this one takes over what it claimed to prevent"},
+        "new": {"type": "boolean", "description": "True to write it beside the close lessons that remember showed "
+                                                  "you"},
         "task_id": TASK_ID},
        ["request_id"])),
     ("all", "recall", t_recall,
-     "Your own lessons, read back. Your memory is a lifetime and nothing in it is ever deleted, so every list here "
-     f"is one page of {MEMORY_SHOWN}, shortened, with page= for the next one and how many there are in all. The "
-     "shelf your task opened with is the few best-evidenced ones; this reaches all the rest. Six shapes, and the "
-     "first one that you give wins: memory=\"M-1\" gives that one whole, wherever it is — standing, forgotten, "
-     "folded or archived — with where it was written and what the fleet has counted about it; covers=\"M-1\" reads "
-     "the lessons one summary of yours covers; search=\"<words>\" looks through every lesson you have ever written, "
-     "archived and forgotten alike; stale=true gives the ones that need looking at, contradicted first; "
-     "forgotten=true names the ones that no longer stand, each with why; about=\"<tag>\" gives one tag. With none "
-     "of them you get your shelf, your busiest tags, and how many need looking at, are off the shelf, or are "
-     "forgotten. full=true gives a page whole instead of shortened, every=true also lists the folded and archived "
-     "ones, and since=\"2026-10-01\" limits a list to what you wrote after that.",
+     f"Your own lessons that stand, read back: one page of {MEMORY_SHOWN} at a time, shortened, with page= for the "
+     "next one. The first shape that you give wins: memory=\"M-1\" gives that one whole, with where it was written "
+     "and what the fleet has counted about it; search=\"<words>\" looks through every lesson that stands; "
+     "stale=true gives the ones your review lists, contradicted first; about=\"<tag>\" gives one tag. With none of "
+     "them: the newest, your busiest tags and how many need looking at. full=true gives a page whole, every=true "
+     "also lists the lessons an earlier round folded or archived, and since=\"2026-10-01\" limits a list to what you "
+     "wrote after that. A lesson you removed is not here: search_history finds it.",
      S({"memory": {"type": "string", "description": "One lesson whole, for example M-1"},
-        "covers": {"type": "string", "description": "A summary of yours: the lessons it covers, for example M-7"},
         "about": {"type": "string", "description": "One of your tags, as you wrote it"},
-        "search": {"type": "string", "description": "Words to look for in every lesson you have written"},
-        "stale": {"type": "boolean", "description": "True for the ones to look at: contradicted, or keyless and old"},
-        "forgotten": {"type": "boolean", "description": "True to look back at the ones you dropped"},
+        "search": {"type": "string", "description": "Words to look for in every lesson that stands"},
+        "stale": {"type": "boolean", "description": "True for the ones your review lists: contradicted, or not "
+                                                    "confirmed for a while"},
         "page": {"type": "integer", "description": f"Which page of {MEMORY_SHOWN}, from 1. Default 1."},
         "full": {"type": "boolean", "description": "True for this page whole instead of shortened"},
         "every": {"type": "boolean", "description": "True to list the folded and archived ones as well"},
         "since": {"type": "string", "description": "Only what you wrote after this date, for example 2026-10-01"},
         "task_id": TASK_ID})),
     ("all", "forget", t_forget,
-     "Drop one of your lessons, with the reason. A wrong memory compounds: when what it told you to do did not hold, "
-     "forget it and say what happened instead. It stops standing and keeps every word, the way a retired duty does, "
-     "so the reason is what a later reading of it gets. Nothing is deleted: recall forgotten=true reads it again, "
-     "and the search still finds it.",
+     "Remove one of your lessons that is wrong or no longer true, with the reason: what it told you to do, and what "
+     "happened instead. A wrong lesson compounds. It leaves your memory — no start and no recall shows it again — and "
+     "your history keeps it with the reason (search_history).",
      S({"request_id": {"type": "string", "description": "A new UUID for each write"},
-        "memory": {"type": "string", "description": "The memory to drop, for example M-1"},
+        "memory": {"type": "string", "description": "The lesson to remove, for example M-1"},
         "reason": {"type": "string", "description": "Why it no longer stands, in one line"}, "task_id": TASK_ID},
        ["request_id", "memory", "reason"])),
     # History search (AUTONOMY.md P6): everything an agent took part in, kept for ever and found by topic and date.
@@ -20751,7 +20526,6 @@ def tick():
         try:
             goal_sweep(t0)
             duty_sweep(t0)              # owner API 1.13: the duties that are not in order
-            memory_sweep(t0)            # a lifetime memory: what leaves the shelf, keeping every word
             circle_sweep(t0)            # what looks like running in circles
             allowance_sweep(t0)         # the manager's own allowance, while it can still act on it
             integrity_check(t0)
@@ -21883,6 +21657,12 @@ SETTINGS = {
     "contacts.v2": (False, setting_bool, "Roles are prompts and conversations act (AUTONOMY.md P1, P2): one switch "
                                          "for the fleet. Turning it on gives employees and supervisors the role "
                                          "peer and deputies the role manager, one time."),
+    "memory.start_chars": (MEMORY_START_CHARS, setting_int(1000, 100000),
+                           "The size bound, in characters, of the lessons that a task's start block carries: every "
+                           "lesson that matches the task and fits (AUTONOMY.md P7)."),
+    "memory.review_days": (MEMORY_KEYLESS_DAYS, setting_int(1, 3650),
+                           "The days after which a lesson that nothing has confirmed goes to its agent's review "
+                           "(AUTONOMY.md P7)."),
     # plan P9.10: the session reuse rule, which each helper reads from its own team.json (lifecycle.reuse_settings)
     "session_reuse": (dict(REUSE_SETTINGS), reuse_value,
                       "Session reuse (on), its growth factor (growth) and its margin in seconds (margin): a standing "
