@@ -143,6 +143,8 @@ would read as an empty fleet instead of as a mistake.
 | `machine_access` | `/ui/team/access` | How the fleet reaches a machine: its SSH user, port, Screen Sharing. |
 | `save_knowledge` | `/ui/knowledge` | The owner's own knowledge files: text, a page the hub fetches, a kept file, a delete. |
 | `save_person` / `person_handle` | `/ui/people`, `/ui/people/<id>/handles` | The people who may write to an agent, and their chat handles. |
+| `save_role` | `/ui/roles` | The roles those people hold: a name, a prompt in the owner's words, tools on or off, a daily limit for a closed role. A held role is not deleted. |
+| `save_settings` | `/ui/settings` | The fleet's settings in `team.json`, such as `contacts.v2`; null gives a setting its default. |
 | `person_code` / `remove_owner_handle` | `/ui/people/codes`, `/ui/people/handles` | Link the owner's own chat account; remove one of his handles. |
 | `control_conversation` | `/ui/conversations/<id>` | Pause one conversation with a person, or let it run again. |
 | `save_chat_account` | `/ui/team/chat-apps` | One chat app account. The account, never its bot token. |

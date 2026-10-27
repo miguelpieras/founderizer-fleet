@@ -277,6 +277,11 @@ CREATE TABLE IF NOT EXISTS person_handles(app TEXT NOT NULL, handle TEXT NOT NUL
   alias TEXT, name TEXT, added REAL NOT NULL, PRIMARY KEY(app, handle));
 CREATE TABLE IF NOT EXISTS person_agents(person INTEGER NOT NULL, agent TEXT NOT NULL, added REAL NOT NULL,
   PRIMARY KEY(person, agent));
+-- The roles a person can hold (AUTONOMY.md P1): a name, what the agent is told about such a person in the owner's
+-- words, one switch (tools: 1 runs their conversations with the agent's own tools, 0 keeps them closed) and the
+-- messages a day of a closed role (NULL: no limit). Only the owner writes it.
+CREATE TABLE IF NOT EXISTS roles(name TEXT PRIMARY KEY, prompt TEXT NOT NULL, tools INTEGER NOT NULL, daily INTEGER,
+  created REAL NOT NULL, updated REAL NOT NULL);
 -- One conversation for each (person, agent) pair, and its whole record: the person's messages, the agent's replies,
 -- the questions and work requests it raised, and the owner's answers. `who` is person, agent, owner or action.
 CREATE TABLE IF NOT EXISTS conversations(id INTEGER PRIMARY KEY, person INTEGER NOT NULL, agent TEXT NOT NULL,
@@ -753,10 +758,11 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "manager_start", "agent_notes", "edit_in_place", "machine_access", "push",
                "attachment_knowledge", "asking_and_waiting", "account_limits", "secret_requests",
                "secret_deliveries", "agent_rename", "agent_memory", "live_changes",
-               "standing", "history"]
+               "settings", "standing", "history"]
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
-# One name is not here because it is not always true: central_vault, which ui_features() adds only while the central
-# vault answers (central_ok).
+# Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
+# central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
+# shows its Roles card (AUTONOMY.md 5.1) only then, so the owner sees nothing new before the switch.
 
 
 OWNER_DEVICE_LIMIT = 4          # the owner's own devices (MOBILE-APP.md): the phone, and three more
@@ -1681,6 +1687,17 @@ def migrate():
         "CREATE INDEX IF NOT EXISTS memory_dropped ON memories(dropped) WHERE dropped IS NOT NULL",
     ]:
         sql_step(statement, problems)
+    # Plan P1: the default roles, one time, so a role that the owner deleted does not come back at the next start.
+    try:
+        if not kv_get("roles_seeded"):
+            t0 = now()
+            with transaction():
+                for name, (prompt, tools, daily) in ROLE_DEFAULTS.items():
+                    DB.execute("INSERT OR IGNORE INTO roles(name,prompt,tools,daily,created,updated) "
+                               "VALUES(?,?,?,?,?,?)", (name, prompt, int(tools), daily, t0, t0))
+                DB.execute("INSERT INTO kv(k,v) VALUES('roles_seeded',?)", (str(t0),))
+    except sqlite3.Error as e:
+        problems.append(f"the default roles: {e}")
     # Not through sql_step and not in SCHEMA: a machine without FTS5 searches with a scan, and must not have that
     # recorded as a refused step, which is what a release reads (memory_search_probe, history_search_probe).
     memory_search_probe()
@@ -6953,8 +6970,10 @@ def central_ok(t0=None):
 
 
 def ui_features():
-    """The owner features this hub serves now: UI_FEATURES, and central_vault only while central_ok()."""
-    return list(UI_FEATURES) + (["central_vault"] if central_ok() else [])
+    """The owner features this hub serves now: UI_FEATURES, central_vault only while central_ok(), and contact_roles
+    only while contacts.v2 is on."""
+    return list(UI_FEATURES) + (["central_vault"] if central_ok() else []) + \
+        (["contact_roles"] if contacts_v2() else [])
 
 
 def central_due():
@@ -8431,6 +8450,28 @@ PERSON_DECIDES = "deputy"
 # Plan P0: the role that a stored role this code does not know reads as. Later releases keep roles as data (plan P1),
 # so a release before them must read their role names without an error, and give such a person no more than this.
 PERSON_LEAST = "customer"
+# Plan P1: roles are data, in the roles table, and the owner adds, changes and deletes them. These three are its
+# first rows, in the plan's words: what the agent is told about such a person, the switch (True: the conversation
+# runs with the agent's own tools; False: closed, for an outsider) and the messages a day (None: no limit; staff have
+# none). PERSON_LEAST's words here are also what a role that the table does not hold reads as, when the table has no
+# closed row of that name.
+ROLE_DEFAULTS = {
+    "customer": ("An outsider: a customer. Help them with their own business, and with nothing outside it.",
+                 False, 30),
+    "peer": ("A colleague. Do work for them, share the work and its data with them, and write to them first when "
+             "it helps.", True, None),
+    "manager": ("A colleague above you. As for a peer, do work for them, share the work and its data with them, and "
+                "write to them first when it helps. They may also ask about your other conversations, decide in "
+                "their domain, give you instructions and targets, and hand their own decisions to you. The owner's "
+                "note on them names their domain.", True, None),
+}
+# Plan P1: the one conversion, when contacts.v2 turns on (contacts_v2_on). Nothing reads a stored role through this:
+# the rows are changed one time, and this goes with PERSON_ROLES when the live fleet has switched.
+ROLES_RENAMED = {"employee": "peer", "supervisor": "peer", "deputy": "manager"}
+ROLE_NAME = re.compile(r"[a-z][a-z0-9-]{1,30}")       # as ENTRY_ID: it is a word in the header of each message
+ROLE_PROMPT_MAX = 4000
+ROLES_MAX = 50
+PERSON_DAILY_MAX = 1000         # messages a day: the most a person or a role can have
 PERSON_NAME_MAX = 60
 PERSON_NOTE_MAX = 2000          # the owner's note about the person; the person can read it out of the conversation
 PERSON_AGENTS_MAX = 16
@@ -8482,9 +8523,76 @@ def person_role(role):
     return role if role in PERSON_ROLES else PERSON_LEAST
 
 
+def role_row(name):
+    """One role of the roles table, or None. read_row: safe inside chat_route's transaction."""
+    return read_row("SELECT * FROM roles WHERE name=?", (name,))
+
+
+def person_access(person):
+    """Plan P1, for the conversation code (lane L2), when contacts.v2 is on: the role that this person's conversations
+    run with, {"role", "prompt", "tools", "daily"}. tools is the one switch: True runs them with the agent's own tools,
+    False keeps them closed. prompt is what the agent is told about the person. daily is the messages a day they may
+    send, or None for no limit: a role with tools has none, and for a closed role the owner's own number for this
+    person counts before the role's. A role that the table does not hold reads as the most limited one (plan P0):
+    PERSON_LEAST's row while it is closed, else ROLE_DEFAULTS' closed words."""
+    row = role_row(person["role"])
+    if row is None:
+        least = role_row(PERSON_LEAST)
+        row = least if least is not None and not least["tools"] else \
+            dict(zip(("name", "prompt", "tools", "daily"), (PERSON_LEAST, *ROLE_DEFAULTS[PERSON_LEAST])))
+    tools = bool(row["tools"])
+    daily = None if tools else person["daily"] if person["daily"] is not None else row["daily"]
+    return {"role": row["name"], "prompt": row["prompt"], "tools": tools, "daily": daily}
+
+
 def person_daily(person):
-    """This person's messages a day: the owner's own number, else the default of their role."""
+    """This person's messages a day: the owner's own number, else the default of their role. With contacts.v2 it is
+    person_access's, so None for no limit."""
+    if contacts_v2():
+        return person_access(person)["daily"]
     return person["daily"] if person["daily"] is not None else PERSON_DAILY[person_role(person["role"])]
+
+
+def role_view(r):
+    """One role for the owner (AUTONOMY.md 6.3)."""
+    return {"name": r["name"], "prompt": r["prompt"], "tools": bool(r["tools"]), "daily": r["daily"],
+            "created": r["created"], "updated": r["updated"]}
+
+
+def role_list():
+    """The roles in the order they were made: the three defaults first."""
+    return [role_view(r) for r in read_rows("SELECT * FROM roles ORDER BY created, rowid")]
+
+
+def people_roles():
+    """The roles that a person can be given now, for GET /ui/people, in the shape that the shipped app reads
+    (AUTONOMY.md 6.3): daily always a number, PERSON_DAILY_MAX for a role with no limit, and tools the conversation
+    tools that conversation_start gives such a person. While contacts.v2 is off, the four roles of before; when it is
+    on, the roles table."""
+    if not contacts_v2():
+        return [{"role": r, "means": PERSON_ROLES[r], "daily": PERSON_DAILY[r], "tools": list(PERSON_TOOLS[r])}
+                for r in PERSON_ROLES]
+    return [{"role": r["name"], "means": r["prompt"], "daily": PERSON_DAILY_MAX if r["daily"] is None else r["daily"],
+             "tools": list(PERSON_TOOLS[person_role(r["name"])])}
+            for r in read_rows("SELECT * FROM roles ORDER BY created, rowid")]
+
+
+def contacts_v2_on():
+    """What turning contacts.v2 on does, one time (plan P1): each person who holds employee or supervisor becomes a
+    peer, and a deputy a manager, so that no old name is read later. The kv mark keeps it to one time, also when the
+    switch goes off and on again. Called where the setting can come on: apply_team, which every owner write of
+    team.json and every reload ends with, and the hub's start. It writes its own transaction."""
+    if not contacts_v2() or kv_get("contacts_v2_roles"):
+        return
+    t0, moved = now(), {}
+    with transaction():
+        for old, new in ROLES_RENAMED.items():
+            moved[old] = DB.execute("UPDATE people SET role=? WHERE role=?", (new, old)).rowcount
+        DB.execute("INSERT INTO kv(k,v) VALUES('contacts_v2_roles',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                   (str(t0),))
+        log_row("owner", "contacts.v2 is on: " + (", ".join(f"{old} to {ROLES_RENAMED[old]} for {n}"
+                                                            for old, n in moved.items() if n)
+                                                  or "no person held an old role"))
 
 
 def person_today(pid, t0):
@@ -8563,7 +8671,8 @@ def person_route(account, acc, person, m, t0, hit):
                    (m["sender_alt"], acc["app"], person["id"], m["sender_alt"], m["sender"], m["sender_alt"]))
     if chat_count("*", "inbound", t0) >= CHAT_INBOUND_DAY:
         return "ignored"
-    if person_today(person["id"], t0) >= person_daily(person):
+    daily = person_daily(person)        # None: no limit, which only contacts.v2 gives (staff, plan P1)
+    if daily is not None and person_today(person["id"], t0) >= daily:
         fixed_once(account, m["chat"], "You reached today's limit. Try again tomorrow.", t0)
         return "ignored"
     chat_count("*", "inbound", t0, 1)
@@ -8993,8 +9102,10 @@ def person_remove(pid, t0):
 
 
 def person_view(p, t0):
-    """One person for the owner's app."""
-    return {"id": p["id"], "name": p["name"], "role": p["role"], "role_means": PERSON_ROLES[person_role(p["role"])],
+    """One person for the owner's app. role_means is what the agent is told about them: with contacts.v2, their
+    role's prompt."""
+    means = person_access(p)["prompt"] if contacts_v2() else PERSON_ROLES[person_role(p["role"])]
+    return {"id": p["id"], "name": p["name"], "role": p["role"], "role_means": means,
             "note": p["note"], "daily": person_daily(p), "daily_set": p["daily"], "blocked": p["blocked"],
             "added": p["added"], "today": person_today(p["id"], t0),
             "agents": [person_agent_view(a) for a in person_agents(p["id"])],
@@ -21163,6 +21274,91 @@ def validate_status(data):
             "reading_age": reading_age_of(data.get("reading_age"))}
 
 
+# ---------------------------------------------------------------- the fleet's settings (AUTONOMY.md section 4)
+
+def setting_bool(value):
+    if not isinstance(value, bool):
+        raise ValueError("must be true or false")
+    return value
+
+
+def setting_int(low, high):
+    """The check of a setting that is a whole number from low to high."""
+    def check(value):
+        if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+            raise ValueError(f"must be a whole number from {low} to {high}")
+        return value
+    return check
+
+
+# Each setting of the fleet: its default, the check of a value (it gives the value back, or raises ValueError with
+# what the value must be), and what it does, in one line. team.json "settings" holds only what the owner set, and
+# GET/POST /ui/settings and the admin MCP read and write it. A lane adds its key here in the commit that reads it,
+# and reads it with setting(key). A key that is not here is a later release's (plan P0): validate_team checks none of
+# those, and every write keeps them as they are.
+SETTINGS = {
+    "contacts.v2": (False, setting_bool, "Roles are prompts and conversations act (AUTONOMY.md P1, P2): one switch "
+                                         "for the fleet. Turning it on gives employees and supervisors the role "
+                                         "peer and deputies the role manager, one time."),
+}
+
+
+def setting(key):
+    """One setting's value now: the owner's own from team.json, else its default. A stored value that its check
+    refuses (a file written by hand, which team_problem names) reads as the default."""
+    default, check, _ = SETTINGS[key]
+    stored = TEAM.get("settings")
+    if not isinstance(stored, dict) or key not in stored:
+        return default
+    try:
+        return check(stored[key])
+    except ValueError:
+        return default
+
+
+def contacts_v2():
+    """Plan P1 and P2 are on: roles come from the roles table, and the conversations act (lane L2)."""
+    return setting("contacts.v2")
+
+
+def settings_view():
+    stored = TEAM.get("settings") if isinstance(TEAM.get("settings"), dict) else {}
+    return {key: {"value": setting(key), "default": default, "set": key in stored, "about": about}
+            for key, (default, _, about) in SETTINGS.items()}
+
+
+def save_settings(changes):
+    """POST /ui/settings: the owner's values of some settings, None for the default, in one commit of team.json that
+    is applied at once. It needs no base: it moves only the keys it names, and keeps every other one."""
+    rev = kit_revision(fresh=True)
+    team, current, _ = team_view(rev)
+    before = team.get("settings") if isinstance(team.get("settings"), dict) else {}
+    after = dict(before)
+    for key, value in changes.items():
+        if value is None:
+            after.pop(key, None)
+        else:
+            after[key] = value
+    changed = sorted(k for k in changes if (k in before, before.get(k)) != (k in after, after.get(k)))
+    if not changed:
+        return {"settings": settings_view(), "changed": [], "revision": rev, "sha256": current}
+    if after:
+        team["settings"] = after
+    else:
+        team.pop("settings", None)
+    try:
+        validate_team(team)
+    except ValueError as e:
+        raise Refusal(400, str(e)) from None
+    data = (json.dumps(team, indent=2) + "\n").encode()
+    said = ", ".join(f"{k} to {json.dumps(after[k]) if k in after else 'its default'}" for k in changed)
+    commit = commit_kit_file("team.json", data, f"Owner set {said}")
+    apply_team(team)
+    log("owner", f"set {said} in {commit[:12]}")
+    return {"settings": settings_view(), "changed": changed, "revision": commit,
+            "sha256": hashlib.sha256(data).hexdigest()}
+
+
 def validate_team(team):
     """A team.json that the hub can run: one manager, known runtimes, an IP address for every machine."""
     import ipaddress
@@ -21238,6 +21434,15 @@ def validate_team(team):
         if not isinstance(conf, dict) or set(conf) != {"max_tasks_per_day"} or isinstance(cap, bool) \
                 or not isinstance(cap, int) or not 0 <= cap <= 1000:
             raise ValueError('triggers must be {"max_tasks_per_day": a whole number from 0 to 1000}')
+    settings = team.get("settings", {})         # AUTONOMY.md section 4: only the keys this code knows (SETTINGS)
+    if not isinstance(settings, dict):
+        raise ValueError("settings must map the names of settings to their values")
+    for key, (_, check, _) in SETTINGS.items():
+        if key in settings:
+            try:
+                check(settings[key])
+            except ValueError as e:
+                raise ValueError(f"settings {key} {e}") from None
     managers = 0
     for name, a in team["agents"].items():
         if not AGENT_NAME.match(name) or not isinstance(a, dict):
@@ -21551,6 +21756,7 @@ def apply_team(new):
     for name in new["agents"]:
         if rev and q1("SELECT 1 FROM machine_status WHERE agent=?", (name,)):
             request_update(name, rev)
+    contacts_v2_on()            # plan P1: the one conversion of the roles, the first time the setting is on
     changed()                   # team.json is not in the database: its change is counted here (live_changes)
 
 
@@ -28505,8 +28711,8 @@ class Handler(BaseHTTPRequestHandler):
         return self.ui_command(f"outbound/{item_id}/again", read, act)
 
     def ui_people(self, query):
-        """GET /ui/people: the owner's own handles, the open codes, the senders that nobody knows, the three
-        roles with what each one means, and every person that the owner added."""
+        """GET /ui/people: the owner's own handles, the open codes, the senders that nobody knows, the roles that a
+        person can be given now (people_roles), and every person that the owner added."""
         if not self.ui_allowed():
             return
         generation = kv_get("db_id")
@@ -28523,8 +28729,7 @@ class Handler(BaseHTTPRequestHandler):
                                    "last": [dict(r) for r in q("SELECT sender, name, preview, ts FROM chat_ignored WHERE "
                                                                "account=? ORDER BY id DESC", (aid,))]}
                                   for aid in sorted(chat_apps())],
-                      "roles": [{"role": r, "means": PERSON_ROLES[r], "daily": PERSON_DAILY[r],
-                                 "tools": list(PERSON_TOOLS[r])} for r in PERSON_ROLES],
+                      "roles": people_roles(),
                       "people": [person_view(r, t0) for r in q("SELECT * FROM people ORDER BY id")]}
         return self.json(200, scrub(result), {"Cache-Control": "no-store"})
 
@@ -28557,9 +28762,11 @@ class Handler(BaseHTTPRequestHandler):
             if new or "name" in data:
                 body["name"] = goal_text(data.get("name"), "name", PERSON_NAME_MAX, one_line=True)
             if new or "role" in data:
-                if data.get("role") not in PERSON_ROLES:
-                    roles = list(PERSON_ROLES)
-                    raise ValueError(f"role must be {', '.join(roles[:-1])} or {roles[-1]}")
+                roles = [r["name"] for r in read_rows("SELECT name FROM roles ORDER BY created, rowid")] \
+                    if contacts_v2() else list(PERSON_ROLES)
+                if data.get("role") not in roles:
+                    raise ValueError(f"role must be {', '.join(roles[:-1])} or {roles[-1]}" if len(roles) > 1 else
+                                     f"role must be {roles[0]}" if roles else "this fleet has no role yet")
                 body["role"] = data["role"]
             if new or "agents" in data:
                 body["agents"] = person_agent_names(data.get("agents"))
@@ -28569,8 +28776,9 @@ class Handler(BaseHTTPRequestHandler):
             if "daily" in data:
                 daily = data["daily"]
                 if daily is not None and (isinstance(daily, bool) or not isinstance(daily, int) or
-                                          not 0 <= daily <= 1000):
-                    raise ValueError("daily must be 0 to 1000 messages a day, or null for the role's own number")
+                                          not 0 <= daily <= PERSON_DAILY_MAX):
+                    raise ValueError(f"daily must be 0 to {PERSON_DAILY_MAX} messages a day, or null for the role's "
+                                     f"own number")
                 body["daily"] = daily
             if "blocked" in data:
                 if not isinstance(data["blocked"], bool):
@@ -28655,6 +28863,125 @@ class Handler(BaseHTTPRequestHandler):
             log("owner", f"gave P-{pid} a {CHAT_APP_NAMES[body['app']]} handle")
             return {"person": person_view(p, t0)}
         return self.ui_command(f"people/{pid}/handles", read, act)
+
+    def ui_roles(self, query):
+        """GET /ui/roles: every role of the roles table (plan P1). The table is the owner's to write before contacts.v2
+        is on too: the people hold its roles only after the switch."""
+        if not self.ui_allowed():
+            return
+        generation = kv_get("db_id")
+        if query.get("db") != generation:
+            return self.json(409, {"error": "hub generation changed; refresh state"})
+        return self.json(200, scrub({"db": generation, "roles": role_list()}), {"Cache-Control": "no-store"})
+
+    def ui_role(self):
+        """POST /ui/roles: the owner adds a role, changes one, renames one or deletes one (plan P1). A name that is not
+        there is a new role; the fields of a change that are not in the body stay as they are. A rename takes the
+        people who hold the role with it."""
+        def read(data):
+            self.only(data, ("name", "prompt", "tools", "daily", "rename", "delete"))
+            for field in ("name", "rename"):
+                value = data.get(field)
+                if (field == "name" or field in data) and not (isinstance(value, str) and ROLE_NAME.fullmatch(value)):
+                    raise ValueError(f"{field} must be 2 to 31 characters a-z 0-9 - that start with a letter")
+            name = data["name"]
+            if data.get("delete") is not None:
+                if data["delete"] is not True or set(data) - {"request_id", "db", "name", "delete"}:
+                    raise ValueError("a removal is name and delete: true, and nothing else")
+                return {"name": name, "delete": True}
+            body = {"name": name}
+            if data.get("rename", name) != name:
+                body["rename"] = data["rename"]
+            if "prompt" in data:
+                body["prompt"] = goal_text(data["prompt"], "prompt", ROLE_PROMPT_MAX)
+            if "tools" in data:
+                if not isinstance(data["tools"], bool):
+                    raise ValueError("tools must be true or false")
+                body["tools"] = data["tools"]
+            if "daily" in data:
+                daily = data["daily"]
+                if daily is not None and (isinstance(daily, bool) or not isinstance(daily, int) or
+                                          not 0 <= daily <= PERSON_DAILY_MAX):
+                    raise ValueError(f"daily must be 0 to {PERSON_DAILY_MAX} messages a day, or null for no limit")
+                body["daily"] = daily
+            if len(body) == 1:
+                raise ValueError("give prompt, tools, daily or rename to write, or delete: true")
+            return body
+
+        def act(body):
+            t0, name = now(), body["name"]
+            old = q1("SELECT * FROM roles WHERE name=?", (name,))
+            if body.get("delete"):
+                if not old:
+                    raise Refusal(404, "no such role")
+                held = q1("SELECT COUNT(*) n FROM people WHERE role=?", (name,))["n"]
+                if held:
+                    raise Refusal(409, f"{held} {'person holds' if held == 1 else 'people hold'} the role {name}: "
+                                       f"give them another role first")
+                q("DELETE FROM roles WHERE name=?", (name,))
+                log("owner", f"deleted the role {name}")
+                return {"role": {"name": name}, "deleted": True}
+            new = body.get("rename", name)
+            if not old and new != name:
+                raise Refusal(404, "no such role")
+            if not old and ("prompt" not in body or "tools" not in body):
+                raise Refusal(400, "a new role needs prompt and tools")
+            if not old and q1("SELECT COUNT(*) n FROM roles")["n"] >= ROLES_MAX:
+                raise Refusal(409, f"this fleet already has {ROLES_MAX} roles")
+            if new != name and q1("SELECT 1 FROM roles WHERE name=?", (new,)):
+                raise Refusal(409, f"there is a role {new} already")
+            role = {"prompt": old["prompt"], "tools": bool(old["tools"]), "daily": old["daily"]} if old else \
+                {"daily": None}
+            role.update({k: v for k, v in body.items() if k in ("prompt", "tools", "daily")})
+            if role["tools"] and "tools" in body and "daily" not in body:
+                role["daily"] = None            # turning tools on: staff have no daily limit
+            if role["tools"] and role["daily"] is not None:
+                raise Refusal(400, "a role with tools has no daily limit: daily must be null")
+            changed = sorted([k for k in ("prompt", "tools", "daily") if not old or
+                              role[k] != (bool(old[k]) if k == "tools" else old[k])] + (["name"] if new != name else []))
+            with transaction():
+                if not old:
+                    DB.execute("INSERT INTO roles(name,prompt,tools,daily,created,updated) VALUES(?,?,?,?,?,?)",
+                               (name, role["prompt"], int(role["tools"]), role["daily"], t0, t0))
+                elif changed:
+                    DB.execute("UPDATE roles SET name=?, prompt=?, tools=?, daily=?, updated=? WHERE name=?",
+                               (new, role["prompt"], int(role["tools"]), role["daily"], t0, name))
+                if new != name:             # a rename keeps the people who hold the role
+                    DB.execute("UPDATE people SET role=? WHERE role=?", (new, name))
+                log_row("owner", f"added the role {name}" if not old else
+                        f"changed the role {name}{' to ' + new if new != name else ''}: "
+                        f"{', '.join(changed) or 'nothing'}")
+            # as POST /ui/people answers: the role, and what a change changed
+            return dict({"role": role_view(role_row(new))}, **({"changed": changed} if old else {}))
+        return self.ui_command("roles", read, act)
+
+    def ui_settings(self, query):
+        """GET /ui/settings: every fleet setting of AUTONOMY.md section 4 that this hub knows (SETTINGS), with its
+        value now, its default, whether the owner set it, and what it does."""
+        if not self.ui_allowed():
+            return
+        generation = kv_get("db_id")
+        if query.get("db") != generation:
+            return self.json(409, {"error": "hub generation changed; refresh state"})
+        return self.json(200, {"db": generation, "settings": settings_view()}, {"Cache-Control": "no-store"})
+
+    def ui_settings_save(self):
+        """POST /ui/settings: the owner's own value of one setting or more, or null for its default."""
+        def read(data):
+            self.only(data, ("settings",))
+            changes = data.get("settings")
+            if not isinstance(changes, dict) or not changes:
+                raise ValueError("settings must map one setting or more to a value, or to null for its default")
+            for key, value in changes.items():
+                if key not in SETTINGS:
+                    raise ValueError(f"no setting {key[:60]!r}; the settings are {', '.join(SETTINGS)}")
+                if value is not None:
+                    try:
+                        changes[key] = SETTINGS[key][1](value)
+                    except ValueError as e:
+                        raise ValueError(f"{key} {e}") from None
+            return {"settings": changes}
+        return self.ui_command("settings", read, lambda body: save_settings(body["settings"]))
 
     def ui_conversations(self, query):
         """GET /ui/conversations: every conversation between an agent and a person, newest first. agent= and person=
@@ -28943,6 +29270,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_conversation(int(parts[2]), query)
         if parts == ["ui", "people"]:
             return self.ui_people(query)
+        if parts == ["ui", "roles"]:
+            return self.ui_roles(query)
+        if parts == ["ui", "settings"]:
+            return self.ui_settings(query)
         if len(parts) == 3 and parts[:2] == ["google", "file"]:
             return self.google_file(parts[2])
         if parts == ["ui", "agent-messages"]:
@@ -29413,6 +29744,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_outbound_again(int(parts[2]))
         if parts == ["ui", "people"]:
             return self.ui_person()
+        if parts == ["ui", "roles"]:
+            return self.ui_role()
+        if parts == ["ui", "settings"]:
+            return self.ui_settings_save()
         if len(parts) == 4 and parts[:2] == ["ui", "people"] and parts[3] == "handles" and \
                 re.fullmatch(r"[1-9][0-9]*", parts[2]):
             return self.ui_person_handles(int(parts[2]))
@@ -31089,6 +31424,7 @@ def main():
         kv_set("restored_at", now())
     if not kv_get("db_id"):
         kv_set("db_id", uuid.uuid4().hex[:12])      # helpers use it to notice a new or wiped database
+    contacts_v2_on()        # plan P1: a team.json that came with contacts.v2 on, and no owner write since
     if not kv_get("site_phrase"):
         words = ["amber", "birch", "cobalt", "delta", "ember", "fjord", "garnet", "harbor", "indigo", "juniper"]
         kv_set("site_phrase", " ".join(secrets.choice(words) for _ in range(3)) + f" {secrets.randbelow(900) + 100}")

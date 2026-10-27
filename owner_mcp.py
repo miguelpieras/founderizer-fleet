@@ -103,7 +103,6 @@ FROM_THE_HUB = {
     "lifecycle.SWITCH_RUNTIMES": ("codex", "claude"),
     "lifecycle.MCP_AUTH": ("none", "oauth", "key"),
     "lifecycle.REPO_ACCESS": ("read", "write", "deploy"),
-    "hub.PERSON_ROLES": ("customer", "employee", "supervisor", "deputy"),
     "hub.HISTORY_KINDS": ("conversation", "owner_chat", "message", "task", "result", "note", "question", "report",
                           "case", "step", "duty", "memory", "standing", "tool"),
 }
@@ -316,6 +315,8 @@ PAGES = {
     "profiles": ("/ui/profiles", "every agent's profile at the hub revision"),
     "knowledge": ("/ui/knowledge", "one owner knowledge file with its text (give path)"),
     "people": ("/ui/people", "the people the owner added, their roles and handles, and the unknown senders"),
+    "roles": ("/ui/roles", "the roles a person can hold: each one's prompt, its tools switch and its daily limit"),
+    "settings": ("/ui/settings", "the fleet's settings: each one's value, its default, and what it does"),
     "conversations": ("/ui/conversations", "every conversation between an agent and a person, newest first"),
     "conversation": ("/ui/conversations/{id}", "one whole conversation, oldest first after `after`"),
     "agent_messages": ("/ui/agent-messages", "the messages one agent sent or got (give agent)"),
@@ -1064,15 +1065,34 @@ def tools():
              plain("/ui/knowledge", ("title", "text", "source", "url", "attachment", "path", "delete"),
                    "this knowledge file")),
         tool("save_person", "The people who may write to an agent from Discord or WhatsApp: add one, change one, or "
-                            "remove one with delete true and its id. role is what they are to the fleet; agents are "
-                            "the agents they may reach; daily is their own message limit, or null for the role's "
-                            "own. This route is the only writer of the people tables, so nothing a person says can "
-                            "widen their own access.",
+                            "remove one with delete true and its id. role is one of the roles that "
+                            "fleet_read(page=\"people\") lists; agents are the agents they may reach; daily is their "
+                            "own message limit, or null for the role's own. This route is the only writer of the "
+                            "people tables, so nothing a person says can widen their own access.",
              {"id": S["int"], "name": S["text"], "role": S["text"], "agents": {"type": "array", "items": S["text"]},
               "note": {"type": ["string", "null"]}, "daily": {"type": ["integer", "null"]}, "blocked": S["bool"],
               "handles": {"type": "array", "items": {"type": "object"}}, "delete": S["bool"], **rid}, (),
              plain("/ui/people", ("id", "name", "role", "agents", "note", "daily", "blocked", "handles", "delete"),
                    "this person")),
+        tool("save_role", "One role of the people who may write to an agent: add one, change one, rename one with "
+                          "rename (its people keep it), or delete one with delete true. A name that is not there yet "
+                          "is a new role, which needs prompt and tools; a change writes only the fields it gives. To "
+                          "copy a role, add a new one with its fields. prompt is what the agent is told about "
+                          "such a person, in the owner's own words: what it does for them, what it shares with whom, "
+                          "whether they may give it instructions or targets, and what they decide. tools true runs "
+                          "their conversations with the agent's own tools; false keeps them closed, for outsiders. "
+                          "daily is the messages a day of a closed role, or null for no limit; a role with tools has "
+                          "none. A role that a person holds cannot be deleted. People hold these roles once the "
+                          "setting contacts.v2 is on.",
+             {"name": S["text"], "prompt": S["text"], "tools": S["bool"], "daily": {"type": ["integer", "null"]},
+              "rename": S["text"], "delete": S["bool"], **rid}, ("name",),
+             plain("/ui/roles", ("name", "prompt", "tools", "daily", "rename", "delete"), "this role")),
+        tool("save_settings", "The fleet's settings, in team.json: settings maps the name of each one to change to "
+                              "its new value, or to null for its default. fleet_read(page=\"settings\") gives every "
+                              "setting with its value, its default and what it does. One commit of team.json, "
+                              "applied at once.",
+             {"settings": {"type": "object"}, **rid}, ("settings",),
+             plain("/ui/settings", ("settings",), "these settings")),
         tool("person_handle", "One chat handle of one person: add it, or remove it with delete true. A handle "
                               "belongs to one person only, and never to the owner.",
              {"person": S["int"], "app": S["text"], "handle": S["text"], "name": S["text"], "delete": S["bool"],
