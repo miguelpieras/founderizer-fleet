@@ -722,9 +722,24 @@ def approval_ref(approval):
     return prompt if isinstance(prompt, str) else f"P-{prompt}"
 
 
+def check_known(check):
+    """True when this release reads a stored check (plan P0): it has no `form`, which a later release sets on a check
+    of its own form, and it has the condition and the repeat rule that the hub decides a value with. A check of any
+    other form reads as quiet: the hub opens no run of it and starts nothing from it."""
+    if not isinstance(check, dict) or "form" in check or "repeat_minutes" not in check:
+        return False
+    cond = check.get("condition")
+    if not isinstance(cond, dict) or cond.get("op") not in OPS:
+        return False
+    value = cond.get("value")
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and abs(value) < float("inf")
+
+
 def check_text(c, target):
     if not c:
         return "none: the task starts at each time"
+    if not check_known(c):
+        return "a check of a newer form, which this release does not run: it reads as quiet"
     a = c.get("approval")
     approved = f", approved by {a.get('approver')} in {approval_ref(a)}" if isinstance(a, dict) else ""
     code = (f"saved code {c['sha256'][:12]} ({c['bytes']} bytes, by {c['code_by']}, runs on "
