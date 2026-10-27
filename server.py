@@ -388,10 +388,36 @@ class Service:
     # ---- the reading
     def reading(self):
         life = self.life
-        runtimes = {n: life.runtime(n) for n in lifecycle.SWITCH_RUNTIMES}
         return {"revision": self.loaded, "os": life.os_info(), "security": life.security(),
-                "runtimes": {n: {"version": r["version"], "signed_in": r["signed_in"]} for n, r in runtimes.items()},
+                "runtimes": self.runtimes(),
                 "access": dict(life.access(), user=pwd.getpwuid(os.getuid()).pw_name), "features": [JOB_HEARTBEAT]}
+
+    def runtimes(self):
+        """Codex and Claude Code as this server's agent reads them: as its own OS user, in its own home and on its own
+        PATH (agent_life), so this reading says what that agent's own helper says.
+
+        On Linux this service's user is not that user: each agent has a user of its own, and its runtime and its
+        credential are in a home of mode 700. Read as this service, one of the owner's servers said that neither
+        runtime was there and another an older Claude Code that nobody had signed in to, while the helper of each
+        agent read Claude Code signed in (27 October 2026). A Mac's agents share this service's user, and so does an
+        agent from before the move, so there and on a server with no agent yet the reading is this service's own."""
+        here, life = self.agents_here(), self.life
+        if here:
+            agent, entry = here[0]
+            life = self.agent_life(self.agent_user(agent, entry.get("user")))
+        runtimes = {n: life.runtime(n) for n in lifecycle.SWITCH_RUNTIMES}
+        return {n: {"version": r["version"], "signed_in": r["signed_in"]} for n, r in runtimes.items()}
+
+    def agents_here(self):
+        """[(agent, its team.json entry)] of this server, in team order, from the team.json of this service's own
+        checkout: it stands on the fleet's configuration ref, where the hub writes it (update), and the join's
+        agent-users step reads the same file. The hub gives a server one agent for now (hub.add_server_agent)."""
+        try:
+            with open(os.path.join(self.kit, "team.json"), encoding="utf-8") as f:
+                agents = json.load(f).get("agents") or {}
+            return [(name, a) for name, a in agents.items() if isinstance(a, dict) and a.get("machine") == self.name]
+        except (OSError, ValueError, AttributeError):
+            return []
 
     def report(self):
         status, answer = self.hub.call("POST", f"/server/{self.name}/status", self.reading())
