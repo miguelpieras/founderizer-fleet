@@ -945,6 +945,14 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
             # task session not the machine's own MCP servers, only Fleet's and its catalog tools (owner feature
             # integrations). --chrome adds its browser server to this configuration.
             cmd = cmd.replace("claude ", "claude --strict-mcp-config --mcp-config " + shlex.quote(config) + " ", 1)
+    # AUTONOMY.md decision 36 (helper feature task_tools): a task session's built-in tools are its runtime's allow
+    # list, so that a new version of the runtime adds no tool by itself. Only a terminal task session: the owner
+    # chat, the manager, a conversation window and a runner keep their own; and a start that names its tools keeps
+    # them.
+    allowed = runtime_fact(runtime, "task_tools")
+    if allowed and task and task != "conversation" and runtime_fact(runtime, "driver") == "terminal" and \
+            not app_server_task(conf, needs) and "--tools" not in shlex.split(conf.get("start") or ""):
+        cmd = cmd.replace("claude ", "claude --tools " + shlex.quote(allowed) + " ", 1)
     if session and conf.get("runtime") == "claude":
         cmd = cmd.replace("claude ", f"claude {'--resume' if resume else '--session-id'} {session} ", 1)
     if resume and conf.get("runtime") == "codex":
@@ -2898,6 +2906,8 @@ class Helper:
                 return              # a new conversation starts instead, and the next poll tells it
             if re.fullmatch(r"T-\d+", window) and self.fresh_task(target, window):
                 return              # a new attempt starts instead, and its session reads the message
+            if CONVERSATION_WINDOW.fullmatch(window) and self.fresh_conversation(target, window):
+                return              # a new window starts at the next poll, and its session reads the message
         except Exception as e:      # a check that fails never keeps a message from a session: it is told as before
             self.say(f"{window}: the check for a cold session failed ({type(e).__name__})")
         text = (CONVERSATION_SIGNAL if CONVERSATION_WINDOW.fullmatch(window) else
@@ -3460,25 +3470,23 @@ class Helper:
             self.say(f"{window}: {why}, so it starts again on a new conversation with the hub's recap")
         return True
 
-    def fresh_task(self, target, window):
-        """True when the hub started this task window's task fresh (plan P9.10, helper feature fresh_tasks): the
-        session reuse rule found its session cold, grown past its start or on another runtime, model or effort, and
-        the hub made a new attempt with its short brief, whose start replaces this window at the next poll. Between
-        two turns of a terminal session only; anything unknown, and a refusal of the hub, tells the session as
-        before."""
+    def window_reuse(self, target, window):
+        """The session reuse rule (plan P9.10) for a task window or a tools-on conversation window of this agent's
+        runtime, from the session's own records: (reuse, why, attempt), or None when the window is no terminal session
+        of that runtime, a question or a turn is on its screen, or it cannot be read."""
         runtime = self.conf.get("runtime")
         if runtime_fact(runtime, "driver") != "terminal" or self.window_runtime(window) != runtime:
-            return False
+            return None
         r = tmux("display-message", "-p", "-t", target,
                  "#{@fleet_session}\t#{@fleet_attempt}\t#{@fleet_needs}\t#{pane_start_command}")
         screen = tmux("capture-pane", "-p", "-t", target)
         if r.returncode != 0 or screen.returncode != 0 or shows_question(screen.stdout) or \
                 WORKING.search("\n".join(screen.stdout.rstrip().split("\n")[-15:])):
-            return False
+            return None
         session, attempt, needs, start = (r.stdout.rstrip("\n").split("\t", 3) + ["", "", "", ""])[:4]
         attempt = attempt.rpartition(":")[2]
         if not THREAD_ID.fullmatch(session) or not attempt.isdigit() or app_server_task(self.conf, needs or "none"):
-            return False
+            return None
         if runtime == "claude":
             path = claude_chat_file(session)
             seen = claude_context(path) if path else None
@@ -3493,10 +3501,20 @@ class Helper:
                                    {"runtime": runtime, "model": self.conf.get("model"),
                                     "effort": self.conf.get("effort")}, reuse_settings(team),
                                    facts=facts_now(team, runtime))
-        if reuse:
+        return reuse, why, int(attempt)
+
+    def fresh_task(self, target, window):
+        """True when the hub started this task window's task fresh (plan P9.10, helper feature fresh_tasks): the
+        session reuse rule found its session cold, grown past its start or on another runtime, model or effort, and
+        the hub made a new attempt with its short brief, whose start replaces this window at the next poll. Between
+        two turns of a terminal session only; anything unknown, and a refusal of the hub, tells the session as
+        before."""
+        decided = self.window_reuse(target, window)
+        if decided is None or decided[0]:
             return False
+        _, why, attempt = decided
         try:
-            code, data = http("POST", f"/helper/fresh/{self.agent}/{window}", {"attempt": int(attempt), "why": why},
+            code, data = http("POST", f"/helper/fresh/{self.agent}/{window}", {"attempt": attempt, "why": why},
                               timeout=15)
         except (urllib.error.URLError, OSError, ValueError):
             return False
@@ -3504,6 +3522,24 @@ class Helper:
             self.say(f"{window}: {why}, but it is told as before: {data.get('error') or code}")
             return False
         self.say(f"{window}: {why}, so the hub starts attempt {data.get('attempt')} fresh with its brief")
+        return True
+
+    def fresh_conversation(self, target, window):
+        """True when this closed a tools-on conversation window (AUTONOMY.md P2) instead of telling it of a person's
+        new message (plan P9.10, helper feature fresh_conversations): the session reuse rule found its session cold,
+        grown past its start or on another runtime, model or effort. The message stays unread, so the next poll
+        starts a new window, whose first read is the hub's brief with its recap (conversation_brief). A closed
+        conversation keeps its own rule (retire_conversations)."""
+        if self.conversation_kind(window) != "tools":
+            return False
+        decided = self.window_reuse(target, window)
+        if decided is None or decided[0]:
+            return False
+        with contextlib.suppress(subprocess.CalledProcessError, Refused):
+            tmux("kill-window", "-t", target)
+        self.conversation_seen.pop(window, None)
+        self.say(f"{window}: {decided[1]}, so it closes, and the person's message starts it fresh with the hub's "
+                 f"brief")
         return True
 
     def standing_context(self, window, runtime, session):
