@@ -570,6 +570,11 @@ def settings_arg(agent, conf, task, tools=()):
         settings = {"skipDangerousModePermissionPrompt": True, "permissions": {"allow": [], "deny": list(UNSEEN_TOOLS)}}
     else:
         deny = DENY + [f"Edit(/{KIT}/{name})" for name in PROTECTED]
+        if task and task != "conversation":
+            # AUTONOMY.md decision 36 (helper feature task_denied): a task session, a duty's case and a wake included,
+            # has every built-in tool but the ones that the owner took away. The owner chat, the manager and a
+            # conversation window keep their own.
+            deny += runtime_fact(conf.get("runtime"), "task_denied") or []
         settings = {"permissions": {"allow": conf.get("allow", ["mcp__fleet__*"]) + [f"mcp__{t}__*" for t in tools],
                                     "deny": deny}}
     settings["prefersReducedMotion"] = False        # the screen watch reads its counters (MOTION)
@@ -945,14 +950,6 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
             # task session not the machine's own MCP servers, only Fleet's and its catalog tools (owner feature
             # integrations). --chrome adds its browser server to this configuration.
             cmd = cmd.replace("claude ", "claude --strict-mcp-config --mcp-config " + shlex.quote(config) + " ", 1)
-    # AUTONOMY.md decision 36 (helper feature task_tools): a task session's built-in tools are its runtime's allow
-    # list, so that a new version of the runtime adds no tool by itself. Only a terminal task session: the owner
-    # chat, the manager, a conversation window and a runner keep their own; and a start that names its tools keeps
-    # them.
-    allowed = runtime_fact(runtime, "task_tools")
-    if allowed and task and task != "conversation" and runtime_fact(runtime, "driver") == "terminal" and \
-            not app_server_task(conf, needs) and "--tools" not in shlex.split(conf.get("start") or ""):
-        cmd = cmd.replace("claude ", "claude --tools " + shlex.quote(allowed) + " ", 1)
     if session and conf.get("runtime") == "claude":
         cmd = cmd.replace("claude ", f"claude {'--resume' if resume else '--session-id'} {session} ", 1)
     if resume and conf.get("runtime") == "codex":

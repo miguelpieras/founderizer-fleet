@@ -62,7 +62,7 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "fresh_tasks",              # a cold, grown or switched task window asks for a fresh attempt (P9.10)
             "stable_standing",          # the manager and an owner chat start with their rules and profile first
             "fresh_conversations",      # a cold, grown or switched tools-on conversation window closes (P9.10)
-            "task_tools",               # a task session gets only its runtime's task_tools (AUTONOMY.md decision 36)
+            "task_denied",              # a task session denies its runtime's task_denied (AUTONOMY.md decision 36)
             # AUTONOMY.md P2, P10 (lane L2): a conversation with the agent's own tools (conversation_work_command), a
             # closed one on the chosen runtime at its pinned version, and the records of a conversation's session
             "conversation_tasks",
@@ -141,10 +141,9 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
 #                     rule leaves room before it. None where the fleet knows nothing
 #   routine           the model and effort of routine work on it, {model, effort}, None for the runtime's own
 #                     default model: what an agent's one changer reaches for first (plan P9.7, P8)
-#   task_tools        the built-in tools that a task session of it gets, as its own --tools list (AUTONOMY.md
-#                     decision 36, helper feature task_tools): every tool that its task sessions had before, less the
-#                     ones that the owner took away; an allow list, so that a new version of the runtime adds no tool by
-#                     itself; None where Fleet passes none
+#   task_denied       the built-in tools that the owner took away from its task sessions, which their settings deny
+#                     (AUTONOMY.md decision 36, helper feature task_denied): every other tool stays, also a tool that a
+#                     later version adds or renames; None where it has none of them
 #   task_opening      how a task session that opens with its stable text first (helper feature stable_start, plan
 #                     P9.2) gets its task: "read", in its first read_messages answer, because the rules and the
 #                     profile are its appended system prompt; "prompt", at the end of its first prompt, because it
@@ -204,7 +203,7 @@ RUNTIMES = {
         "cache_seconds": 300,
         "compact_tokens": 200000,
         "routine": {"model": None, "effort": "low"},
-        "task_tools": None,             # Codex has none of the tools that the owner took away
+        "task_denied": None,            # Codex has none of the tools that the owner took away
         "task_opening": "prompt",
         # gpt-6.1-sol's list prices as public price pages gave them on 27 October 2026, NOT checked on OpenAI's own
         # pricing page: the owner sets the right ones with runtime_facts. OpenAI charges no more for a cache write
@@ -257,13 +256,10 @@ RUNTIMES = {
         "compact_tokens": 200000,       # fleet.STANDING_COMPACT, the window that Fleet starts its standing sessions with
         "routine": {"model": "sonnet", "effort": "low"},
         # The owner, 27 October 2026: "Yes, remove Artifact, Workflow, AskUserQuestion, ReportFindings, Skill and
-        # ListAgents from agent task sessions." So every other built-in tool that a task session had before, on
-        # Claude Code 2.1.301, 2.1.304, 2.1.308, 2.1.311 and 2.1.312 (recorded against stand-ins on 27 October 2026;
-        # most of them deferred, which ToolSearch loads; the Fleet tools are MCP tools). Claude Code offers
-        # ArtifactComments and ArtifactData only together with Artifact, so on all five they go with it.
-        "task_tools": "Bash,Read,Edit,Write,Agent,ToolSearch,WebFetch,WebSearch,NotebookEdit,Monitor,TaskStop,"
-                      "EnterPlanMode,ExitPlanMode,EnterWorktree,ExitWorktree,SendMessage,ArtifactComments,"
-                      "ArtifactData,DesignSync",
+        # ListAgents from agent task sessions." These six and nothing else: on Claude Code 2.1.301, 2.1.304, 2.1.308,
+        # 2.1.311 and 2.1.312 (recorded against stand-ins), Claude Code then offers ArtifactComments and ArtifactData
+        # no more either, as it offers them only together with Artifact.
+        "task_denied": ["Artifact", "Workflow", "AskUserQuestion", "ReportFindings", "Skill", "ListAgents"],
         "task_opening": "read",
         # Anthropic's list prices of 6 October 2026. Its sessions write one-hour caches, which cost twice the input.
         "token_weights": {"default": {"input": 4.0, "cache_read": 0.2, "cache_write": 8.0, "output": 20.0},
@@ -302,7 +298,7 @@ RUNTIMES = {
         "cache_seconds": None,
         "compact_tokens": None,
         "routine": None,
-        "task_tools": None,
+        "task_denied": None,
         "task_opening": None,
         "token_weights": None,
     },
@@ -312,7 +308,7 @@ RUNTIME_FACTS = ("label", "driver", "acp_command", "can", "full_access", "manage
                  "owner_chat", "agent_messages", "conversation", "conversation_why", "closed_versions", "mcp_servers",
                  "app_server", "switch", "session_settings", "token_in_env", "model_flags", "local_model", "sign_in",
                  "sign_out", "no_sign_in", "sandbox", "screen_counter", "cache_seconds", "compact_tokens", "routine",
-                 "task_tools", "task_opening", "token_weights")
+                 "task_denied", "task_opening", "token_weights")
 
 
 # The session reuse rule (AUTONOMY.md P9.10) and its setting (section 4), one object in team.json "settings":
