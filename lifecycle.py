@@ -54,6 +54,7 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "start_once",           # it starts each attempt once and says why a start failed (plan C6)
             "prompt_polls",         # its hooks and runners ask again for a permission prompt until it is decided (C7)
             "job_runs",             # it acks a job before it runs it and lists the jobs it holds in each poll (C7)
+            "session_kinds",        # its usage report gives each session's four kinds of tokens (plan P8)
             "check_runs",           # it lists the check runs it holds in each poll, and no claim expires (C12)
             "update_between_turns",     # its update waits for the turns that run in its task windows (plan P0)
             "stable_start",             # a task session opens with its rules and profile, and its task last (P9.2)
@@ -117,6 +118,10 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
 #                     None when it drives one
 #   sandbox           how its start command says what it may touch, as the owner reads it; None when Fleet cannot
 #                     read it
+#   token_weights     its list prices in dollars per million tokens, {model key: {input, cache_read, cache_write,
+#                     output}}, so that the cost of a session compares across providers (AUTONOMY.md P8, P10). A
+#                     session's model takes the entry whose key is the longest part of its name, else "default".
+#                     The owner's own prices are in team.json runtime_facts (facts_now); None for no prices
 #   screen_counter    a running turn of its terminal session repaints an elapsed counter every second, read live on
 #                     the fleet's machines, so the screen watch takes a running screen that stopped changing for a
 #                     frozen runtime (fleet.Helper.watch_screens, plan C2); False where nobody has read it
@@ -175,6 +180,9 @@ RUNTIMES = {
                               "workspace-write": "the runtime limits writes to the workspace",
                               "read-only": "the runtime allows reads only"},
                     "otherwise": "see the Codex settings"},
+        # gpt-6.1-sol's list prices as public price pages gave them on 27 October 2026; OpenAI charges no more for
+        # a cache write than for input
+        "token_weights": {"default": {"input": 2.0, "cache_read": 0.1, "cache_write": 2.0, "output": 10.0}},
         "screen_counter": False,
         # OpenAI keeps a prompt's cache for some minutes of inactivity, and Codex keys it by its own thread
         # (prompt_cache_key), so a new Codex session reads little of another's
@@ -220,6 +228,12 @@ RUNTIMES = {
         "sandbox": {"name": "Claude", "flag": "--permission-mode", "value": "[A-Za-z]+", "unset": "default",
                     "words": {},
                     "otherwise": "the session settings allow and deny tools; they are not an OS boundary"},
+        # Anthropic's list prices of 6 October 2026. Its sessions write one-hour caches, which cost twice the input.
+        "token_weights": {"default": {"input": 4.0, "cache_read": 0.2, "cache_write": 8.0, "output": 20.0},
+                          "fable": {"input": 10.0, "cache_read": 0.25, "cache_write": 20.0, "output": 50.0},
+                          "opus": {"input": 4.0, "cache_read": 0.2, "cache_write": 8.0, "output": 20.0},
+                          "sonnet": {"input": 2.0, "cache_read": 0.2, "cache_write": 4.0, "output": 10.0},
+                          "haiku": {"input": 0.1, "cache_read": 0.01, "cache_write": 0.2, "output": 0.5}},
         # read on 2.1.285, 2.1.308 and 2.1.311 while a foreground `sleep 300` ran, 27 October 2026
         "screen_counter": True,
         "cache_seconds": 3600,          # an hour; its own records say when it is five minutes (fleet.claude_context)
@@ -252,6 +266,7 @@ RUNTIMES = {
         "no_sign_in": ("Fleet drives no Grok sign-in: xAI's terms do not let a third party run it this way. "
                        "Sign in to Grok yourself on {where} machine."),
         "sandbox": None,
+        "token_weights": None,
         "screen_counter": False,
         "cache_seconds": None,
         "compact_tokens": None,
@@ -262,6 +277,7 @@ RUNTIMES = {
 # Every fact above in one list, so that a new entry cannot quietly leave one out (test_runtime_table).
 RUNTIME_FACTS = ("label", "driver", "acp_command", "can", "full_access", "manager_access", "first_worker", "manager",
                  "owner_chat", "agent_messages", "conversation", "conversation_why", "mcp_servers", "app_server",
+                 "token_weights",
                  "switch", "session_settings", "token_in_env", "model_flags", "local_model", "sign_in", "sign_out",
                  "no_sign_in", "sandbox", "screen_counter", "cache_seconds", "compact_tokens", "routine",
                  "task_opening")
@@ -342,6 +358,70 @@ def runtime_fact(runtime, fact, otherwise=None):
     no runtime of this fleet, so that a check reads as the question it asks: such a name has no owner chat and holds
     no conversation."""
     return (RUNTIMES.get(runtime) or {}).get(fact, otherwise)
+
+
+# ---------------------------------------------------------------- the facts the owner changes (AUTONOMY.md P10)
+#
+# A provider that changes its prices, its cache lifetime or its compaction point changes data, not code: the owner's
+# own value of one of these is in team.json "runtime_facts", {runtime: {fact: value}}, written through GET/POST
+# /ui/settings and the admin MCP, and read with facts_now. Each fact here has the check of a value (it gives the value
+# back, or raises ValueError with what the value must be). A fact or a runtime that is not here is a later release's
+# (plan P0): the hub checks none of those, and every write keeps them as they are.
+TOKEN_KINDS = ("input", "cache_read", "cache_write", "output")
+MODEL_KEY = re.compile(r"[A-Za-z0-9._:/\[\]-]{1,120}")
+
+
+def whole_or_none(low, high):
+    def check(value):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high):
+            raise ValueError(f"must be a whole number from {low} to {high}, or null for none")
+        return value
+    return check
+
+
+def weights_check(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict) or not value or len(value) > 50:
+        raise ValueError('must map at most 50 model names, or "default", to their prices')
+    for key, price in value.items():
+        if not isinstance(key, str) or not (key == "default" or MODEL_KEY.fullmatch(key)):
+            raise ValueError(f"names no model: {str(key)[:60]!r}")
+        if not isinstance(price, dict) or set(price) != set(TOKEN_KINDS) or any(
+                isinstance(p, bool) or not isinstance(p, (int, float)) or not 0 <= p <= 10000 for p in price.values()):
+            raise ValueError(f"{key} must give input, cache_read, cache_write and output in dollars per million "
+                             f"tokens, each from 0 to 10000")
+    return value
+
+
+EDITABLE_FACTS = {"cache_seconds": whole_or_none(0, 86400), "compact_tokens": whole_or_none(1000, 100000000),
+                  "token_weights": weights_check}
+
+
+def facts_now(team, runtime):
+    """The facts of one runtime that the owner can change, as they are now: his own value from team.json
+    "runtime_facts" where it is one that its check takes, else the table's."""
+    stored = (team or {}).get("runtime_facts")
+    stored = stored.get(runtime) if isinstance(stored, dict) else None
+    out = {}
+    for fact, check in EDITABLE_FACTS.items():
+        out[fact] = runtime_fact(runtime, fact)
+        if isinstance(stored, dict) and fact in stored:
+            try:
+                out[fact] = check(stored[fact])
+            except ValueError:
+                pass            # a file written by hand that the check refuses reads as the table's
+    return out
+
+
+def token_price(weights, model):
+    """One model's prices from a runtime's token_weights: the entry whose key is the longest part of the model's
+    name, case aside, else "default"; None for a runtime with no prices."""
+    if not weights:
+        return None
+    name = str(model or "").lower()
+    named = [k for k in weights if k != "default" and k.lower() in name]
+    return weights[max(named, key=len)] if named else weights.get("default")
 
 
 def runtimes_with(fact):

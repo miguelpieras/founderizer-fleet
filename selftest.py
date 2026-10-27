@@ -83,12 +83,16 @@ MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "an
                                "decide_permission", "see_team", "see_capacity", "see_goals",
                                "update_goal", "record_spend", "raise_needs_you", "request_secret", "tell_owner",
                                "grant_access",
-                               "set_duty", "change_duty", "see_history", "decide_report"]
+                               "set_duty", "change_duty", "see_history", "decide_report",
+                               # AUTONOMY.md P8: the one changer of the agents with no lead
+                               "set_agent_model"]
 WORKER_TOOLS = EVERY_AGENT + ["list_my_tasks", "report_progress", "read_attachment", "ask_my_requester",
                               "deliver_result", "sign_in", "hand_over", "resolve_outcome", "see_earlier_work",
                               "report_up",
                               # plan C17 (the owner, 26 October 2026): a worker writes its own duties
-                              "set_duty", "change_duty"]
+                              "set_duty", "change_duty",
+                              # AUTONOMY.md P8: its own costs, and a lead its team's
+                              "see_history"]
 # A lead: its own task's worker tools, and the eleven team tools of RULES.md -- the first nine limited to that
 # task's subtasks, the two duty writes to its own team. No check ever listed a lead's tools, because the hub these
 # checks start has no lead -- which is how LEAD_TEAM_TOOLS came to hold nine where RULES.md named eight, for weeks.
@@ -96,7 +100,9 @@ WORKER_TOOLS = EVERY_AGENT + ["list_my_tasks", "report_progress", "read_attachme
 LEAD_TOOLS = WORKER_TOOLS + ["create_task", "cancel_task", "restart_task", "answer", "check_result",
                              "decide_permission", "see_team", "see_capacity", "decide_report",
                              # the owner, 20 October 2026: a lead writes the duties of its own team
-                             "set_duty", "change_duty"]
+                             "set_duty", "change_duty",
+                             # AUTONOMY.md P8: a lead is the one changer of its team's models
+                             "set_agent_model"]
 
 
 def tool_set(got, want):

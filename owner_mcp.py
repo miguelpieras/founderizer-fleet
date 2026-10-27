@@ -366,6 +366,14 @@ def history(args):
 HISTORY_WORDS = ("agent", "query", "from", "to", "person", "task", "kind", "ref", "limit")
 
 
+def costs(args):
+    """GET /ui/costs: what the work of every agent cost (AUTONOMY.md P8). The words are the route's own."""
+    return get("/ui/costs", "the costs", **{k: args.get(k) for k in COSTS_WORDS}).data
+
+
+COSTS_WORDS = ("from", "to", "agent", "minimum")
+
+
 def overview(_args):
     """What is my fleet doing: the one read that answers it, from the routes the app's own screens read."""
     state = get("/ui/state", "a read of the fleet").data
@@ -872,6 +880,14 @@ def tools():
                                "With ref, one record in full, as a search gave it.",
              {"agent": S["text"], "query": S["text"], "from": S["text"], "to": S["text"], "person": S["text"],
               "task": S["text"], "kind": S["text"], "ref": S["text"], "limit": S["int"]}, (), history),
+        tool("see_costs", "What the work of every agent cost from to to (dates or dates and times in the fleet's "
+                          "time zone; the last 30 days by default), against the period of the same length before "
+                          "it: list dollars at the runtime facts' prices, the four kinds of tokens, calls and cache "
+                          "share, for each kind of work the results without rework and the cost of each, each "
+                          "check's quiet runs against its wakes, each account's windows with each agent's points "
+                          "of the main one and what is left, and the model changes. agent narrows it to one agent; "
+                          "minimum is the results a kind needs in each period to be compared (3).",
+             {"from": S["text"], "to": S["text"], "agent": S["text"], "minimum": S["int"]}, (), costs),
         tool("which_hub", "Which hub this server reads, and on what authority.", {}, (), which_hub),
         tool("use_hub", "Point this server at a hub that runs already. It proves the address by reading the owner "
                         "API from this Mac, and stores nothing but the address.",
@@ -1088,11 +1104,15 @@ def tools():
               "rename": S["text"], "delete": S["bool"], **rid}, ("name",),
              plain("/ui/roles", ("name", "prompt", "tools", "daily", "rename", "delete"), "this role")),
         tool("save_settings", "The fleet's settings, in team.json: settings maps the name of each one to change to "
-                              "its new value, or to null for its default. fleet_read(page=\"settings\") gives every "
-                              "setting with its value, its default and what it does. One commit of team.json, "
-                              "applied at once.",
-             {"settings": {"type": "object"}, **rid}, ("settings",),
-             plain("/ui/settings", ("settings",), "these settings")),
+                              "its new value, or to null for its default. runtime_facts maps a runtime to the facts "
+                              "of it to change -- cache_seconds, compact_tokens and token_weights, its list prices "
+                              "in dollars per million tokens as {model: {input, cache_read, cache_write, output}} "
+                              "with \"default\" for any other model -- or to null for the table's value, for when a "
+                              "provider changes its prices or its cache. fleet_read(page=\"settings\") gives every "
+                              "setting and fact with its value and its default. One commit of team.json, applied "
+                              "at once.",
+             {"settings": {"type": "object"}, "runtime_facts": {"type": "object"}, **rid}, (),
+             plain("/ui/settings", ("settings", "runtime_facts"), "these settings")),
         tool("person_handle", "One chat handle of one person: add it, or remove it with delete true. A handle "
                               "belongs to one person only, and never to the owner.",
              {"person": S["int"], "app": S["text"], "handle": S["text"], "name": S["text"], "delete": S["bool"],

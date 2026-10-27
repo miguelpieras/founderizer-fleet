@@ -48,6 +48,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from usage import IDENTITY_CHANGED, IDENTITY_ERRORS, SIGN_IN_REQUIRED, local_model, validate_usage
+from lifecycle import EDITABLE_FACTS, TOKEN_KINDS, facts_now, token_price     # AUTONOMY.md P8, P10: lane L7
 import wakeups
 from desktop import Frames
 import google
@@ -184,6 +185,8 @@ CREATE TABLE IF NOT EXISTS machine_checks(id INTEGER PRIMARY KEY, agent TEXT NOT
   state TEXT NOT NULL, completed REAL, detail TEXT);
 CREATE TABLE IF NOT EXISTS session_tokens(agent TEXT NOT NULL, session_id TEXT NOT NULL, total INTEGER NOT NULL,
   last_activity REAL, reported REAL NOT NULL, PRIMARY KEY(agent, session_id));
+CREATE TABLE IF NOT EXISTS model_changes(id INTEGER PRIMARY KEY, agent TEXT NOT NULL, by TEXT NOT NULL, "from" TEXT,
+  "to" TEXT, why TEXT, at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS steers(id INTEGER PRIMARY KEY, task INTEGER NOT NULL, attempt INTEGER NOT NULL,
   text TEXT NOT NULL, event_id INTEGER NOT NULL, request_id TEXT NOT NULL, client TEXT NOT NULL, created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS triggers(id INTEGER PRIMARY KEY, agent TEXT NOT NULL, state TEXT NOT NULL, paused_by TEXT,
@@ -758,7 +761,7 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "manager_start", "agent_notes", "edit_in_place", "machine_access", "push",
                "attachment_knowledge", "asking_and_waiting", "account_limits", "secret_requests",
                "secret_deliveries", "agent_rename", "agent_memory", "live_changes",
-               "settings", "standing", "history"]
+               "settings", "standing", "history", "costs"]
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -1616,6 +1619,12 @@ def migrate():
         "machine_checks": {"verify": "TEXT", "revision": "TEXT"},
         "server_jobs": {"was": "TEXT"},             # owner feature agent_rename: the name a rename job moves from
         "session_credentials": {"ready": "REAL"},   # owner feature chat_warm: when its owner chat listed its tools
+        # AUTONOMY.md P8: each session's four kinds of tokens apart, its model calls, the share of its first call that
+        # came from the cache (helper feature session_kinds); and what the hub adds: its runtime, kind and task kind,
+        # account, and its percentage points of that account's main usage window
+        "session_tokens": {"input": "INTEGER", "cache_read": "INTEGER", "cache_write": "INTEGER", "output": "INTEGER",
+                           "calls": "INTEGER", "kind": "TEXT", "task_kind": "TEXT", "model": "TEXT", "runtime": "TEXT",
+                           "account": "TEXT", "first_cache_share": "REAL", "window_share": "REAL"},
         "trigger_runs": {"check_now": "INTEGER NOT NULL DEFAULT 0", "attempts": "INTEGER NOT NULL DEFAULT 0",
                          "retry_at": "REAL", "closes": "REAL", "token": "TEXT", "sent": "REAL", "expires": "REAL",
                          "value": "REAL", "summary": "TEXT", "error": "TEXT", "detail": "TEXT", "finished": "REAL",
@@ -1685,6 +1694,12 @@ def migrate():
         "CREATE INDEX IF NOT EXISTS question_answered ON questions(answered) WHERE answered IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS report_decided ON reports(decided) WHERE decided IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS memory_dropped ON memories(dropped) WHERE dropped IS NOT NULL",
+        # AUTONOMY.md P8: the task whose thread records name a session (session_kinds), and the sessions of one
+        # account's usage window (window_shares), each read on every usage report
+        "CREATE INDEX IF NOT EXISTS thread_session_of ON thread_events(json_extract(data, '$.session_id')) "
+        "WHERE type='session'",
+        "CREATE INDEX IF NOT EXISTS session_tokens_account ON session_tokens(account, last_activity) "
+        "WHERE account IS NOT NULL",
     ]:
         sql_step(statement, problems)
     # Plan P1: the default roles, one time, so a role that the owner deleted does not come back at the next start.
@@ -4313,7 +4328,8 @@ def deliver_result(agent, a, files_said=None):
 # do something, and what they reach is the team the lead already gives tasks to. decide_report is here because a
 # subtask's report reaches its lead, and a report that nobody can decide is the loop that tool is there to end.
 LEAD_TEAM_TOOLS = ("create_task", "cancel_task", "restart_task", "answer", "check_result", "decide_permission",
-                   "see_team", "see_capacity", "decide_report", "set_duty", "change_duty")
+                   "see_team", "see_capacity", "decide_report", "set_duty", "change_duty",
+                   "set_agent_model")       # AUTONOMY.md P8: a lead is its team's one changer
 # A worker writes its own duties in its task sessions (plan C17), and duty_write_allowed keeps them its own.
 WORKER_OWN_TOOLS = ("set_duty", "change_duty")
 # The one tool that only the owner chat of a worker or a lead has: it opens the work the owner asks for there.
@@ -4940,6 +4956,9 @@ def t_see_team(agent, a):
 
 
 USAGE_STALE = 900       # seconds: an account reading older than this is stale (helpers read limits every 300 seconds)
+# A usage report: 500 sessions with their four kinds (usage.SESSION_KINDS), for the runtime and for the one before a
+# switch, are about 230 KiB.
+USAGE_REPORT_MAX = 512 * 1024
 
 
 def kept_reading(key, prior):
@@ -9399,17 +9418,136 @@ def live_next_step(g):
     return {"text": g["next_step"], "task": g["next_task"], "step": g["next_step_id"], "set_at": g["next_set"]}
 
 
-def record_session_tokens(agent, rows):
-    """Per-session totals from a helper's usage report, in one transaction. The hub sums them per goal."""
+KIND_AGAIN = 3600       # seconds: a standing session that spent this recently is matched to a task again
+
+
+def record_session_tokens(agent, rows, runtime=None, reading=None):
+    """Per-session totals from a helper's usage report, in one transaction. The hub sums them per goal.
+
+    AUTONOMY.md P8: a row of a helper with session_kinds also carries the session's four kinds of tokens, its model
+    calls, its model and the share of its first call that came from the cache, and an older row leaves them as they
+    are. The hub adds the session's runtime (the report's), its account (the report's reading, while the session
+    spends), its kind and task kind (session_kind), and its points of that account's main usage window. A task's
+    thread records can arrive after a usage report, so a standing session that spent within KIND_AGAIN is matched
+    again."""
     if not rows:
         return
     t0 = now()
+    account = reading_account(reading)
     with area("activity"), LOCK:
-        DB.executemany("INSERT INTO session_tokens(agent,session_id,total,last_activity,reported) VALUES(?,?,?,?,?) "
-                       "ON CONFLICT(agent,session_id) DO UPDATE SET total=excluded.total, "
-                       "last_activity=excluded.last_activity, reported=excluded.reported",
-                       [(agent, r["session_id"], r["total"], r["last_activity"], t0) for r in rows])
+        ids = [r["session_id"] for r in rows]
+        known = {r["session_id"]: r for at in range(0, len(ids), 500) for r in read_rows(
+            f"SELECT session_id, total, kind FROM session_tokens WHERE agent=? AND session_id IN "
+            f"({','.join('?' * len(ids[at:at + 500]))})", (agent, *ids[at:at + 500]))}
+        values = []
+        for r in rows:
+            old = known.get(r["session_id"])
+            kind = task_kind = None
+            if not old or old["kind"] is None or old["kind"] == "standing" and (
+                    old["total"] != r["total"] or (r["last_activity"] or 0) > t0 - KIND_AGAIN):
+                kind, task_kind = session_kind(agent, r["session_id"])
+            values.append((agent, r["session_id"], r["total"], r["last_activity"], t0,
+                           *(r.get(k) for k in ("input", "cache_read", "cache_write", "output", "calls", "model",
+                                                "first_cache_share")), runtime, account, kind, task_kind))
+        DB.executemany(
+            "INSERT INTO session_tokens(agent,session_id,total,last_activity,reported,input,cache_read,cache_write,"
+            "output,calls,model,first_cache_share,runtime,account,kind,task_kind) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(agent,session_id) DO UPDATE SET total=excluded.total, "
+            "last_activity=excluded.last_activity, reported=excluded.reported, "
+            "input=COALESCE(excluded.input,input), cache_read=COALESCE(excluded.cache_read,cache_read), "
+            "cache_write=COALESCE(excluded.cache_write,cache_write), output=COALESCE(excluded.output,output), "
+            "calls=COALESCE(excluded.calls,calls), model=COALESCE(excluded.model,model), "
+            "first_cache_share=COALESCE(excluded.first_cache_share,first_cache_share), "
+            "runtime=COALESCE(runtime,excluded.runtime), "
+            # the account it spent from: the reading of the report in which it last spent
+            "account=CASE WHEN excluded.total<>total OR account IS NULL THEN COALESCE(excluded.account,account) "
+            "ELSE account END, "
+            "task_kind=CASE WHEN excluded.kind IS NULL THEN task_kind ELSE excluded.task_kind END, "
+            "kind=COALESCE(excluded.kind,kind)", values)
+        if account:
+            window_shares(agent, account, reading, t0)
         commit()
+
+
+def session_kind(agent, session_id):
+    """(kind, task kind) of one session of an agent (AUTONOMY.md P8): the newest task whose thread records name the
+    session, else a standing session -- its own standing session, an owner chat, a conversation window -- which has
+    no task kind."""
+    t = read_row("SELECT t.* FROM thread_events te JOIN tasks t ON t.id=te.task WHERE te.type='session' AND "
+                 "json_extract(te.data, '$.session_id')=? AND t.owner=? ORDER BY t.id DESC LIMIT 1",
+                 (session_id, agent))
+    return task_kind_of(t) if t else ("standing", None)
+
+
+def task_kind_of(t):
+    """(kind, task kind) of one task, which the costs compare one period with the last by: a duty case by its duty,
+    a wake by its check, a conversation task (lane L2's source_conversation), else a task by its goal or none."""
+    if t["responsibility"] or t["duty_case"]:
+        case = None if t["responsibility"] else read_row("SELECT responsibility FROM duty_cases WHERE id=?",
+                                                         (t["duty_case"],))
+        duty = t["responsibility"] or (case["responsibility"] if case else None)
+        return "case", rref(duty) if duty else None
+    if t["trigger_id"]:
+        return "wake", f"trigger {t['trigger_id']}"
+    if "source_conversation" in t.keys() and t["source_conversation"]:
+        return "conversation", "conversation"
+    return "task", gref(t["goal_id"]) if t["goal_id"] else "task"
+
+
+def reading_account(reading):
+    """The account that a usage reading names as its runtime's own, or None: no reading, or one whose identity is not
+    the runtime's now (signed out, or another account since)."""
+    if not reading or not reading.get("account_key") or reading.get("error") in IDENTITY_ERRORS:
+        return None
+    return reading["account_key"]
+
+
+def main_window(reading, t0):
+    """The window of an account reading that the window shares count in: the longest window that is the whole
+    account's allowance (not one model's share of it) and has not reset since, the most used of equal ones. None for
+    a reading that is stale or not a clean read, and for one without such a window."""
+    if not reading or reading.get("error") or t0 - (reading.get("collected_at") or 0) > USAGE_STALE:
+        return None
+    windows = [w for w in reading.get("windows") or [] if w.get("window_minutes") and w.get("resets_at")
+               and w["resets_at"] > t0]
+    whole = [w for w in windows if not SHARE_OF_ONE_MODEL.fullmatch(w.get("label") or "")]
+    return max(whole or windows, key=lambda w: (w["window_minutes"], w["used_percent"]), default=None)
+
+
+def window_shares(agent, account, reading, t0):
+    """Each session of `agent` on `account` in that account's main window gets its percentage points of the window
+    (AUTONOMY.md decision 33): the window's used percent, split over the fleet's sessions in it by their list-dollar
+    cost. So the shares of one window add up to its used percent, and the account's use outside the fleet is spread
+    over them in proportion. Inside record_session_tokens' write."""
+    w = main_window(reading, t0)
+    if not w:
+        return
+    rows = read_rows("SELECT agent, session_id, runtime, model, input, cache_read, cache_write, output FROM "
+                     "session_tokens WHERE account=? AND last_activity>=?",
+                     (account, w["resets_at"] - w["window_minutes"] * 60))
+    book = price_book()
+    costs = {(r["agent"], r["session_id"]): session_cost(r, book) for r in rows}
+    spent = sum(c for c in costs.values() if c)
+    if spent:
+        DB.executemany("UPDATE session_tokens SET window_share=? WHERE agent=? AND session_id=?",
+                       [(round(c * w["used_percent"] / spent, 4), a, s) for (a, s), c in costs.items()
+                        if a == agent and c is not None])
+
+
+def price_book():
+    """{runtime: its token_weights now}: the table's prices, or the owner's own in team.json runtime_facts."""
+    return {name: facts_now(TEAM, name)["token_weights"] for name in RUNTIMES}
+
+
+def session_cost(r, book):
+    """List dollars of one session's tokens at the prices of its runtime and model now (AUTONOMY.md P8, P10), so one
+    period compares with another at the same prices. None for a session whose four kinds are not known, or whose
+    runtime has no prices."""
+    if r["input"] is None:
+        return None
+    price = token_price(book.get(r["runtime"]), r["model"])
+    return sum(r[k] * price[k] for k in TOKEN_KINDS) / 1e6 if price else None
 
 
 def goal_tokens(goal_id):
@@ -16034,7 +16172,7 @@ def t_decide_report(agent, a):
 HISTORY_WINDOW = 30             # days, by default
 HISTORY_WINDOW_MAX = 365
 HISTORY_ROWS = 12               # rows of one group in one mode
-HISTORY_MODES = ("agents", "duties", "questions", "refusals", "accounts")
+HISTORY_MODES = ("agents", "duties", "questions", "refusals", "accounts", "costs")
 HISTORY_DETAIL = 60             # characters of a refusal that make it the same refusal
 
 
@@ -16214,18 +16352,342 @@ def history_accounts(a, days, start, before):
     return out
 
 
+# ---------------------------------------------------------------- costs: what the work cost (AUTONOMY.md P8, L7)
+#
+# Judged by rework and not by acceptance, because an AI lead may accept weak work: a result is clean when no follow-up
+# task fixed it, its case key did not come back, and no person of the agent's conversations corrected it. Each
+# period against the one before it, per task kind, with a minimum count, so that two tasks are not read as a trend.
+# Both periods are priced at the runtime facts' list prices of now, so a change of price does not read as a change
+# of work. On a subscription the account's usage window is the real cost, so each agent's points of its window are
+# here as well, with what is left of each window before it resets.
+
+COSTS_MINIMUM = 3       # results of one task kind in each period before the two periods are compared
+
+
+def costs_scope(agent):
+    """The agents whose costs `agent` sees: its own; a lead its team's as well; the fleet manager every agent's."""
+    role = role_of(agent)
+    if role == "manager":
+        return list(agents())
+    return [agent] + (team_below(agent) if role == "lead" else [])
+
+
+def costs_sums(rows, book):
+    """What some sessions spent: their four kinds of tokens, model calls, list dollars, the share of their input that
+    came from the cache, the mean share of their first call that did, and their points of their accounts' windows.
+    A session from before helper feature session_kinds counts as a session and nothing more."""
+    known = [r for r in rows if r["input"] is not None]
+    out = {"sessions": len(rows), "measured": len(known), **{k: sum(r[k] or 0 for r in known)
+                                                            for k in (*TOKEN_KINDS, "calls")}}
+    costs = [c for c in (session_cost(r, book) for r in known) if c is not None]
+    read = out["input"] + out["cache_read"] + out["cache_write"]
+    firsts = [r["first_cache_share"] for r in known if r["first_cache_share"] is not None]
+    shares = [r["window_share"] for r in rows if r["window_share"] is not None]
+    return dict(out, cost=round(sum(costs), 4) if costs else None,
+                cache_share=round(out["cache_read"] / read, 4) if read else None,
+                first_cache_share=round(sum(firsts) / len(firsts), 4) if firsts else None,
+                window_share=round(sum(shares), 2) if shares else None)
+
+
+def costs_results(agent, since, until):
+    """The results that `agent` delivered in [since, until), each with its kind and its rework: the follow-up tasks
+    that fixed it, a later case of its duty's key that came back, and the corrections by staff, which are the
+    follow-ups that a conversation opened (lane L2's tasks.source_conversation, when there is one)."""
+    talk = "source_conversation" in {c["name"] for c in read_rows("PRAGMA table_info(tasks)")}
+    out = []
+    for t in read_rows("SELECT * FROM tasks WHERE owner=? AND state='completed' AND delivered>=? AND delivered<?",
+                       (agent, since, until)):
+        fixes = read_rows("SELECT * FROM tasks WHERE follows=?", (t["id"],))
+        staff = [f for f in fixes if talk and f["source_conversation"]]
+        case = read_row("SELECT responsibility, key FROM duty_cases WHERE id=?", (t["duty_case"],)) \
+            if t["duty_case"] else None
+        back = bool(case and read_row("SELECT 1 FROM duty_cases WHERE responsibility=? AND key=? AND id>? AND "
+                                      "repeated=1 LIMIT 1", (case["responsibility"], case["key"], t["duty_case"])))
+        out.append({"task": t["id"], "kind": task_kind_of(t), "follow_ups": len(fixes) - len(staff),
+                    "repeats": int(back), "corrections": len(staff)})
+    return out
+
+
+def costs_kinds(agent, since, until, book):
+    """{(kind, task kind): what that kind of work of `agent` cost in [since, until), its results and their rework,
+    its cost for each clean result, and its fleet calls for each task}."""
+    groups = {}
+
+    def group(key):
+        return groups.setdefault(key, {"rows": [], "results": 0, "clean": 0, "follow_ups": 0, "repeats": 0,
+                                       "corrections": 0, "tasks": 0, "fleet_calls": 0})
+    for r in read_rows("SELECT * FROM session_tokens WHERE agent=? AND last_activity>=? AND last_activity<?",
+                       (agent, since, until)):
+        group((r["kind"] or "standing", r["task_kind"]))["rows"].append(r)
+    for res in costs_results(agent, since, until):
+        g = group(res["kind"])
+        g["results"] += 1
+        g["clean"] += not (res["follow_ups"] or res["repeats"] or res["corrections"])
+        for k in ("follow_ups", "repeats", "corrections"):
+            g[k] += res[k]
+    for r in read_rows("SELECT t.*, c.n AS fleet_calls FROM (SELECT task, COUNT(*) n FROM calls WHERE agent=? AND "
+                       "task IS NOT NULL AND ts>=? AND ts<? GROUP BY task) c JOIN tasks t ON t.id=c.task",
+                       (agent, since, until)):
+        g = group(task_kind_of(r))
+        g["tasks"] += 1
+        g["fleet_calls"] += r["fleet_calls"]
+    out = {}
+    for key, g in groups.items():
+        sums = costs_sums(g.pop("rows"), book)
+        out[key] = dict(sums, **g, cost_per_clean=round(sums["cost"] / g["clean"], 4)
+                        if g["clean"] and sums["cost"] is not None else None,
+                        fleet_calls_per_task=round(g["fleet_calls"] / g["tasks"], 2) if g["tasks"] else None)
+    return out
+
+
+def costs_view(names, start, end, minimum=COSTS_MINIMUM):
+    """What the work of these agents cost in [start, end), each number with the period of the same length before it
+    (AUTONOMY.md P8): for each agent and each kind of its work, for each check, and for each account they spend
+    from. GET /ui/costs answers it, and see_history what="costs" says it."""
+    t0, before, book = now(), start - (end - start), price_book()
+    out = {"from": start, "to": end, "before": before, "minimum": minimum, "unit": "list dollars",
+           "prices": book, "agents": [], "checks": [], "accounts": [], "model_changes": []}
+    for name in names:
+        rows = read_rows("SELECT * FROM session_tokens WHERE agent=? AND last_activity>=? AND last_activity<?",
+                         (name, before, end))
+        new, old = costs_kinds(name, start, end, book), costs_kinds(name, before, start, book)
+        kinds = [{"kind": key[0], "task_kind": key[1], "now": new.get(key), "before": old.get(key),
+                  "compared": bool(new.get(key) and old.get(key) and new[key]["results"] >= minimum
+                                   and old[key]["results"] >= minimum)}
+                 for key in sorted(set(new) | set(old), key=lambda k: (k[0], str(k[1])))]
+        out["agents"].append({"agent": name, "runtime": (agents().get(name) or {}).get("runtime"),
+                              "helper_kinds": "session_kinds" in helper_features(name),
+                              "now": costs_sums([r for r in rows if r["last_activity"] >= start], book),
+                              "before": costs_sums([r for r in rows if r["last_activity"] < start], book),
+                              "kinds": kinds})
+    marks = ",".join("?" * len(names))
+    quiet = "runs" in {c["name"] for c in read_rows("PRAGMA table_info(trigger_runs)")}       # lane L4's count
+    for t in read_rows(f"SELECT id, agent FROM triggers WHERE agent IN ({marks}) ORDER BY id", tuple(names)):
+        check = {"trigger": t["id"], "agent": t["agent"]}
+        for when, (since, until) in (("now", (start, end)), ("before", (before, start))):
+            runs = read_rows("SELECT state, task, event_id" + (", runs" if quiet else "") + " FROM trigger_runs "
+                             "WHERE trigger_id=? AND finished>=? AND finished<?", (t["id"], since, until))
+            spent = costs_sums(read_rows("SELECT * FROM session_tokens WHERE agent=? AND kind='wake' AND "
+                                         "task_kind=? AND last_activity>=? AND last_activity<?",
+                                         (t["agent"], f"trigger {t['id']}", since, until)), book)
+            check[when] = {"wakes": len([r for r in runs if r["task"] or r["event_id"]]),
+                           "quiet": sum((r["runs"] or 1) if quiet else 1 for r in runs if r["state"] == "quiet"),
+                           "failed": len([r for r in runs if r["state"] == "error"]), "cost": spent["cost"]}
+        out["checks"].append(check)
+    for key, g in sorted(account_groups(t0).items()):
+        mine = [n for n in g["agents"] if n in names]
+        if not mine:
+            continue
+        reading, main = g["reading"] or {}, main_window(g["reading"], t0)
+        since = main["resets_at"] - main["window_minutes"] * 60 if main else None
+        shares = {n: round(read_row("SELECT COALESCE(SUM(window_share),0) s FROM session_tokens WHERE agent=? AND "
+                                    "account=? AND last_activity>=?", (n, key, since))["s"], 2) for n in mine} \
+            if main else {}
+        out["accounts"].append({"account": key, "runtime": g["runtime"], "agents": mine, "state": g["state"]["state"],
+                                "read_at": reading.get("collected_at"), "shares": shares,
+                                "windows": [{"label": w["label"], "used_percent": w["used_percent"],
+                                             "left_percent": round(max(0.0, 100 - w["used_percent"]), 2),
+                                             "resets_at": w["resets_at"], "window_minutes": w["window_minutes"],
+                                             "main": w is main} for w in reading.get("windows") or []]})
+    out["model_changes"] = [{"agent": r["agent"], "by": r["by"], "from": json.loads(r["from"] or "null"),
+                             "to": json.loads(r["to"] or "null"), "why": r["why"], "at": r["at"]}
+                            for r in read_rows(f'SELECT id, agent, by, "from", "to", why, at FROM model_changes WHERE '
+                                               f'agent IN ({marks}) AND at>=? AND at<? ORDER BY id',
+                                               (*names, before, end))]
+    return out
+
+
+def costs_money(value):
+    return "not measured" if value is None else f"${value:,.2f}" if value >= 0.1 else f"${value:.3f}"
+
+
+def costs_size(n):
+    return f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1e3:.0f}K" if n >= 1e3 else str(n)
+
+
+def costs_kind_name(kind, task_kind):
+    """A kind of work as a line names it."""
+    if kind == "standing":
+        return "standing sessions"
+    if kind == "case":
+        return f"cases of {task_kind or 'a duty that is gone'}"
+    if kind == "wake":
+        return f"wakes of {str(task_kind).replace('trigger', 'check')}"
+    if kind == "conversation":
+        return "conversation tasks"
+    return f"tasks of goal {task_kind}" if str(task_kind).startswith("G-") else "other tasks"
+
+
+def costs_count(n, word):
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def costs_share(value):
+    return "none measured" if value is None else f"{value * 100:.0f}%"
+
+
+def costs_text(view, days, viewer):
+    """see_history what="costs": the view as lines a session reads, each number with the period before it."""
+    def was(now_v, before_v, show):
+        return show(now_v) + (f" ({show(before_v)} before)" if before_v is not None else " (none before)")
+    out = [f"WHAT THE WORK COST, the last {days} days against the {days} before them, in list dollars at the prices "
+           f"of the runtime facts now, so a price change does not read as a change of work. Rework, not acceptance, "
+           f"judges a result: it is clean when no follow-up fixed it, its case key did not come back and no person "
+           f"corrected it."]
+    for a in view["agents"]:
+        n, b = a["now"], a["before"]
+        if not n["sessions"] and not b["sessions"] and not a["kinds"]:
+            continue
+        out.append(f"  {a['agent']} ({a['runtime']}): {was(n['cost'], b['cost'], costs_money)} in "
+                   f"{costs_count(n['sessions'], 'session')} ({b['sessions']} before); input "
+                   f"{costs_size(n['input'])}, cache reads {costs_size(n['cache_read'])}, cache writes "
+                   f"{costs_size(n['cache_write'])}, output "
+                   f"{costs_size(n['output'])}; cache share {was(n['cache_share'], b['cache_share'], costs_share)}; "
+                   f"first call from the cache {was(n['first_cache_share'], b['first_cache_share'], costs_share)}"
+                   + (f"; {n['calls'] / n['measured']:.1f} model calls a session" if n["measured"] else "")
+                   + (f"; {n['window_share']:g} points of its account's window" if n["window_share"] is not None
+                      else "")
+                   + ("" if a["helper_kinds"] else "; its helper reports totals only until it takes this release"))
+        largest = sorted(a["kinds"], key=lambda k: (-((k["now"] or {}).get("cost") or 0),
+                                                     -((k["before"] or {}).get("cost") or 0)))
+        for k in largest[:HISTORY_ROWS]:
+            kn, kb = k["now"] or {}, k["before"] or {}
+            name = costs_kind_name(k["kind"], k["task_kind"])
+            line = (f"    {name}: {was(kn.get('cost'), kb.get('cost'), costs_money)} in "
+                    f"{costs_count(kn.get('sessions', 0), 'session')}")
+            if kn.get("results") or kb.get("results"):
+                line += (f"; {costs_count(kn.get('results', 0), 'result')}, {kn.get('clean', 0)} without rework "
+                         f"({kb.get('clean', 0)} of {kb.get('results', 0)} before)")
+                rework = [costs_count(kn[x], w) + after for x, w, after in (
+                    ("follow_ups", "follow-up", ""), ("repeats", "key", " back"),
+                    ("corrections", "correction", " by staff")) if kn.get(x)]
+                line += f"; rework: {', '.join(rework)}" if rework else ""
+                line += (f"; {was(kn.get('cost_per_clean'), kb.get('cost_per_clean'), costs_money)} a clean result"
+                         if k["compared"] else
+                         f"; fewer than {view['minimum']} results in a period, so not compared")
+            if kn.get("fleet_calls_per_task") is not None:
+                line += f"; {kn['fleet_calls_per_task']:g} fleet calls a task"
+            if kn.get("cache_share") is not None:
+                line += f"; cache share {costs_share(kn['cache_share'])}"
+            out.append(line)
+        if len(largest) > HISTORY_ROWS:
+            out.append(f"    and {len(largest) - HISTORY_ROWS} more kinds of work, each of which cost less")
+    for c in view["checks"]:
+        n, b = c["now"], c["before"]
+        if any(n[k] or b[k] for k in ("wakes", "quiet", "failed")):
+            out.append(f"  check {c['trigger']} of {c['agent']}: {n['wakes']} wakes ({b['wakes']} before), "
+                       f"{n['quiet']} quiet runs ({b['quiet']}), {n['failed']} failed ({b['failed']}); its wakes "
+                       f"cost {was(n['cost'], b['cost'], costs_money)}")
+    for acc in view["accounts"]:
+        windows = "; ".join(f"{w['label']} {w['used_percent']:g}% used, {w['left_percent']:g}% left"
+                            + (f", resets {until_clock(w['resets_at'])}" if w["resets_at"] else "")
+                            for w in acc["windows"]) or "no window read"
+        main = next((w for w in acc["windows"] if w["main"]), None)
+        out.append(f"  the {acc['runtime']} account of {', '.join(acc['agents'])}: {windows}"
+                   + (f". Points of its {main['label']} window: "
+                      + ", ".join(f"{n} {p:g}" for n, p in acc["shares"].items())
+                      + ", with its use outside the fleet spread over them" if main else ""))
+    for m in view["model_changes"]:
+        out.append(f"  {history_time(m['at'])} {m['by']} set {m['agent']} to {costs_model(m['to'])} (it was "
+                   f"{costs_model(m['from'])}): {m['why']}")
+    if len(out) == 1:
+        out.append("  No session was measured in either period.")
+    if role_of(viewer) in ("manager", "lead"):
+        out.append("  Change one thing at a time and read the next period: set_agent_model changes the model or effort "
+                   "of an agent you give work to, inside its own account.")
+    return out
+
+
+def costs_model(m):
+    return f"{(m or {}).get('model') or 'its default model'}, {(m or {}).get('effort') or 'its default effort'}"
+
+
+MODEL_WHY_MAX = 300     # characters of the reason for one model change
+
+
+def t_set_agent_model(agent, a):
+    """AUTONOMY.md P8: an agent's one changer -- its lead, or the fleet manager for an agent with no lead -- sets its
+    model and effort inside the account it has, while the setting model_changes is on: only what its runtime offers
+    on its machine now (offered), written as the owner's settings write them, and recorded in model_changes."""
+    target = str(a.get("agent") or "").strip()
+    if target not in agents():
+        raise ToolError(f"There is no agent {target} in the team.")
+    if reports_to(target) != agent:
+        raise ToolError(f"{target}'s model is the owner's to change." if not reports_to(target) else
+                        f"{target} reports to {reports_to(target)}, which is the one that changes its model and "
+                        f"effort.")
+    if not setting("model_changes"):
+        raise ToolError("The owner turned model changes off (the setting model_changes). The model stays as it is.")
+    new = {k: None if str(a.get(k) or "").strip().lower() in ("", "default") else str(a[k]).strip()
+           for k in ("model", "effort")}
+    if new["model"] is not None and not MODEL_NAME.fullmatch(new["model"]) or \
+            new["effort"] is not None and not EFFORT_NAME.fullmatch(new["effort"]):
+        raise ToolError("model is a model name its runtime offers, and effort 1 to 20 letters a-z, or \"default\".")
+    why = " ".join(str(a.get("why") or "").split())
+    if not why or len(why) > MODEL_WHY_MAX:
+        raise ToolError(f"why is one line of at most {MODEL_WHY_MAX} characters: what this change should improve, "
+                        f"which the next period's costs then show.")
+    guard(agent, why)
+    old = {k: agents()[target].get(k) for k in ("model", "effort")}
+    if new == old:
+        return f"{target} already runs {costs_model(new)}. Nothing changed."
+    try:
+        if new["model"] or new["effort"]:
+            offered(target, new["model"], new["effort"])
+
+        def change(team):
+            entry = team["agents"].get(target)
+            if entry is None:
+                return False
+            for k, v in new.items():
+                if v is None:
+                    entry.pop(k, None)          # absent is the runtime's own default
+                else:
+                    entry[k] = v
+            return True
+        result = save_integration(None, change, f"{agent} set {target} to {costs_model(new)}", by=agent)
+    except Refusal as e:
+        raise ToolError(f"{e} A model or an effort that its runtime does not offer on its own account is the "
+                        f"owner's to bring in.") from None
+    if not result["changed"]:
+        return f"{target} is no longer in team.json. Nothing changed."
+    told = request_update(target, result["revision"]) == "requested"
+    with transaction():
+        DB.execute('INSERT INTO model_changes(agent,by,"from","to",why,at) VALUES(?,?,?,?,?,?)',
+                   (target, agent, json.dumps(old), json.dumps(new), why, now()))
+    return (f"{target} runs {costs_model(new)} from its next session (it was {costs_model(old)}). Revision "
+            f"{result['revision'][:12]}." + (f" Its helper loads it first, and no new session of {target} starts "
+                                              f"until it has." if told else "")
+            + " Read its costs with see_history after the next period, and keep the change or undo it.")
+
+
+def history_costs(a, days, start, before):
+    """see_history what="costs": the agents of a["scope"]."""
+    return costs_text(costs_view(a["scope"], start, now()), days, a["viewer"])
+
+
 def t_see_history(agent, a):
-    """One reader with modes, so the manager asks for the measure it needs and carries nothing else in its session."""
-    what = str(a.get("what") or "agents").strip().lower()
-    if what not in HISTORY_MODES:
-        raise ToolError("what must be one of " + ", ".join(HISTORY_MODES) + ".")
+    """One reader with modes, so the manager asks for the measure it needs and carries nothing else in its session.
+    A worker or a lead reads one mode, its costs: its own, and a lead its team's as well (AUTONOMY.md P8)."""
+    manager = role_of(agent) == "manager"
+    modes = HISTORY_MODES if manager else ("costs",)
+    what = str(a.get("what") or modes[0]).strip().lower()
+    if what not in modes:
+        raise ToolError("what must be one of " + ", ".join(modes) + ".")
     who = str(a.get("agent") or "").strip()
     if who and who not in agents():
         raise ToolError(f"There is no agent {who} in the team.")
-    a = dict(a, agent=who or None)
+    scope = costs_scope(agent)
+    if who and who not in scope:
+        raise ToolError(f"You read the costs of {', '.join(scope)}, and {who} is not one of them.")
+    a = dict(a, agent=who or None, scope=[who] if who else scope, viewer=agent)
     days, start, before = history_window(a)
     lines = {"agents": history_agents, "duties": history_duties, "questions": history_questions,
-             "refusals": history_refusals, "accounts": history_accounts}[what](a, days, start, before)
+             "refusals": history_refusals, "accounts": history_accounts,
+             "costs": history_costs}[what](a, days, start, before)
+    if not manager:
+        return "\n".join(lines + ['see_history with window=<days>'
+                                  + (', agent="<name>" of your team.' if len(scope) > 1 else ".")])
     return "\n".join(lines + [f'see_history with what="{"|".join(x for x in HISTORY_MODES if x != what)}", '
                               f'window=<days>, agent="<name>" or duty="R-<id>".'])
 
@@ -16842,11 +17304,32 @@ TOOLS = [
      "episodes and tokens. duties: cases and repeats. questions: grouped by asker and by the words asked, so the "
      "same question asked twice shows as the answer that lives nowhere. refusals: the refused calls grouped by "
      "agent, tool and reason, which is the cheapest self-diagnosis the fleet has. accounts: the usage limits. "
-     "Nothing here scores or ranks an agent.",
+     "costs: what each agent's work cost in list dollars for each kind of work, with its results without rework, its "
+     "cache share and calls, each check's quiet runs against its wakes, and each account's window: who used how much "
+     "of it and what is left before it resets. Nothing here scores or ranks an agent.",
      S({"what": {"type": "string", "enum": list(HISTORY_MODES), "description": "Which measure. Default agents."},
         "window": {"type": "integer", "description": f"Days. Default {HISTORY_WINDOW}, at most {HISTORY_WINDOW_MAX}."},
         "agent": {"type": "string", "description": "One agent only"},
         "duty": {"type": "string", "description": "One duty only, for example R-2 (with what=\"duties\")"}})),
+    # AUTONOMY.md P8, decision 34: a worker and a lead read their own costs, and a lead its team's as well
+    ("worker", "see_history", t_see_history,
+     "What your work cost, against the period of the same length before it: list dollars, the four kinds of tokens, "
+     "the cache share and calls, the results without rework for each kind of work, your checks' quiet runs against "
+     "their wakes, and your share of your account's usage window with what is left of it. A lead reads its team's "
+     "as well.",
+     S({"what": {"type": "string", "enum": ["costs"], "description": "costs, the default"},
+        "window": {"type": "integer", "description": f"Days. Default {HISTORY_WINDOW}, at most {HISTORY_WINDOW_MAX}."},
+        "agent": {"type": "string", "description": "One agent of your team only"}})),
+    ("manager", "set_agent_model", t_set_agent_model,
+     "Change the model and the effort of an agent you give work to (a lead's own team; the fleet manager's agents "
+     "with no lead), inside its own runtime and account: only a model and an effort that its runtime offers on its "
+     "machine now. Its next sessions start with them. Change one thing at a time, say why, and keep or undo it by "
+     "the next period's costs. \"default\" is the runtime's own. A new account, provider or money is the owner's.",
+     S({"agent": {"type": "string", "description": "The agent whose model and effort change"},
+        "model": {"type": "string", "description": "A model its runtime offers, or \"default\""},
+        "effort": {"type": "string", "description": "An effort of that model, or \"default\""},
+        "why": {"type": "string", "description": "What the change should improve, in one line"}},
+       ["agent", "model", "effort", "why"])),
     ("manager", "decide_report", t_decide_report,
      "Decide one report that an agent sent you with report_up. Every report must be decided, the wrong one included: "
      "task (it becomes work, and you name the task you made), duty, goal, noted, or wrong. A proposal becomes a goal "
@@ -17493,11 +17976,12 @@ def gate(task_id, name, args):
 ANSWERED_FIELDS = {("see_notes", "agent")}
 
 
-def unknown_fields(name, sent):
+def unknown_fields(name, sent, role=None):
     """The fields of this call that the tool does not take, or none. `sent` is what the caller wrote: the fence
-    adds a task_id of its own to tools whose schema has no such field, and that one is not the caller's."""
-    for _r, tname, _fn, _desc, schema in TOOLS:
-        if tname == name:
+    adds a task_id of its own to tools whose schema has no such field, and that one is not the caller's. A tool with
+    an entry for each role (see_history) is read in the caller's role's entry."""
+    for r, tname, _fn, _desc, schema in TOOLS:
+        if tname == name and (role is None or role_offers(role, r, tname)):
             return sorted(set(sent) - set(schema.get("properties") or {})
                           - {f for n, f in ANSWERED_FIELDS if n == name})
     return []
@@ -17587,7 +18071,7 @@ def call_tool(agent, name, args, context=None):
             sent.pop("task_id", None)
         # After the fence and the gate, so a held task still reads STOP first, and before anything is done: a call
         # with a field the tool does not take is refused whole, never half-applied with the field dropped.
-        extra = unknown_fields(name, sent)
+        extra = unknown_fields(name, sent, role)
         if extra:
             raise ToolError(stale_instructions(name, extra))
         for r, tname, fn, desc, schema in TOOLS:
@@ -21393,6 +21877,8 @@ def setting_int(low, high):
 # and reads it with setting(key). A key that is not here is a later release's (plan P0): validate_team checks none of
 # those, and every write keeps them as they are.
 SETTINGS = {
+    "model_changes": (True, setting_bool, "An agent's lead, or the fleet manager for an agent with no lead, changes "
+                                          "its model and effort inside the account it has (AUTONOMY.md P8)."),
     "contacts.v2": (False, setting_bool, "Roles are prompts and conversations act (AUTONOMY.md P1, P2): one switch "
                                          "for the fleet. Turning it on gives employees and supervisors the role "
                                          "peer and deputies the role manager, one time."),
@@ -21429,9 +21915,44 @@ def settings_view():
             for key, (default, _, about) in SETTINGS.items()}
 
 
-def save_settings(changes):
-    """POST /ui/settings: the owner's values of some settings, None for the default, in one commit of team.json that
-    is applied at once. It needs no base: it moves only the keys it names, and keeps every other one."""
+def runtime_facts_view():
+    """GET /ui/settings "runtime_facts" (AUTONOMY.md P10, section 4): each fact of each runtime that the owner can
+    change (lifecycle.EDITABLE_FACTS), with its value now, the table's default, and whether he set it."""
+    stored = TEAM.get("runtime_facts") if isinstance(TEAM.get("runtime_facts"), dict) else {}
+    out = {}
+    for name in RUNTIMES:
+        own = stored.get(name) if isinstance(stored.get(name), dict) else {}
+        now_ = facts_now(TEAM, name)
+        out[name] = {fact: {"value": now_[fact], "default": runtime_fact(name, fact), "set": fact in own}
+                     for fact in EDITABLE_FACTS}
+    return out
+
+
+def runtime_facts_changes(facts):
+    """POST /ui/settings "runtime_facts": {runtime: {fact: value, or None for the table's}}, each value checked by
+    its fact's own check. Returns it with the checked values, or raises ValueError with the one that is wrong."""
+    if not isinstance(facts, dict) or not facts:
+        raise ValueError("runtime_facts must map a runtime to the facts it changes")
+    for name, changes in facts.items():
+        if name not in RUNTIMES:
+            raise ValueError(f"no runtime {str(name)[:40]!r}; the runtimes are {', '.join(RUNTIMES)}")
+        if not isinstance(changes, dict) or not changes:
+            raise ValueError(f"runtime_facts {name} must map one fact or more to a value, or to null for the table's")
+        for fact, value in changes.items():
+            if fact not in EDITABLE_FACTS:
+                raise ValueError(f"no fact {str(fact)[:40]!r} the owner sets; they are {', '.join(EDITABLE_FACTS)}")
+            if value is not None:
+                try:
+                    changes[fact] = EDITABLE_FACTS[fact](value)
+                except ValueError as e:
+                    raise ValueError(f"runtime_facts {name} {fact} {e}") from None
+    return facts
+
+
+def save_settings(changes, facts=None):
+    """POST /ui/settings: the owner's values of some settings, None for the default, and of some runtime facts, None
+    for the table's, in one commit of team.json that is applied at once. It needs no base: it moves only the keys it
+    names, and keeps every other one."""
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
     before = team.get("settings") if isinstance(team.get("settings"), dict) else {}
@@ -21442,23 +21963,42 @@ def save_settings(changes):
         else:
             after[key] = value
     changed = sorted(k for k in changes if (k in before, before.get(k)) != (k in after, after.get(k)))
+    stored = team.get("runtime_facts") if isinstance(team.get("runtime_facts"), dict) else {}
+    held = {name: dict(own) for name, own in stored.items() if isinstance(own, dict)}
+    for name, facts_of in (facts or {}).items():
+        own = held.setdefault(name, {})
+        for fact, value in facts_of.items():
+            if (fact in own, own.get(fact)) != (value is not None, value):
+                changed.append(f"{name}.{fact}")
+            if value is None:
+                own.pop(fact, None)
+            else:
+                own[fact] = value
     if not changed:
-        return {"settings": settings_view(), "changed": [], "revision": rev, "sha256": current}
+        return {"settings": settings_view(), "runtime_facts": runtime_facts_view(), "changed": [], "revision": rev,
+                "sha256": current}
     if after:
         team["settings"] = after
     else:
         team.pop("settings", None)
+    kept = {name: own for name, own in held.items() if own} | \
+        {name: own for name, own in stored.items() if not isinstance(own, dict)}     # a later release's shape
+    if kept:
+        team["runtime_facts"] = kept
+    else:
+        team.pop("runtime_facts", None)
     try:
         validate_team(team)
     except ValueError as e:
         raise Refusal(400, str(e)) from None
     data = (json.dumps(team, indent=2) + "\n").encode()
-    said = ", ".join(f"{k} to {json.dumps(after[k]) if k in after else 'its default'}" for k in changed)
+    said = ", ".join(f"{k} to {json.dumps(after[k]) if k in after else 'its default'}" if k in changes else
+                     f"the runtime fact {k}" for k in changed)
     commit = commit_kit_file("team.json", data, f"Owner set {said}")
     apply_team(team)
     log("owner", f"set {said} in {commit[:12]}")
-    return {"settings": settings_view(), "changed": changed, "revision": commit,
-            "sha256": hashlib.sha256(data).hexdigest()}
+    return {"settings": settings_view(), "runtime_facts": runtime_facts_view(), "changed": changed,
+            "revision": commit, "sha256": hashlib.sha256(data).hexdigest()}
 
 
 def validate_team(team):
@@ -21545,6 +22085,18 @@ def validate_team(team):
                 check(settings[key])
             except ValueError as e:
                 raise ValueError(f"settings {key} {e}") from None
+    facts = team.get("runtime_facts", {})       # AUTONOMY.md P10: only the runtimes and facts this code knows
+    if not isinstance(facts, dict):
+        raise ValueError("runtime_facts must map runtimes to the facts the owner set for them")
+    for name in RUNTIMES:
+        if name in facts and not isinstance(facts[name], dict):
+            raise ValueError(f"runtime_facts {name} must map facts to their values")
+        for fact, check in EDITABLE_FACTS.items():
+            if fact in facts.get(name, {}):
+                try:
+                    check(facts[name][fact])
+                except ValueError as e:
+                    raise ValueError(f"runtime_facts {name} {fact} {e}") from None
     managers = 0
     for name, a in team["agents"].items():
         if not AGENT_NAME.match(name) or not isinstance(a, dict):
@@ -22792,7 +23344,8 @@ AGENT_COLUMNS = (
     ("standing", "agent"), ("standing", "author"), ("standing", "ended_by"),     # 'owner' and 'P-<id>' are no agent
     # history search (AUTONOMY.md P6): whose history a row is, and the other party, which can be an agent. Its index
     # holds the agent's key and not its name (history_key), so a rename leaves the index as it is.
-    ("history", "agent"), ("history", "person"))
+    ("history", "agent"), ("history", "person"),
+    ("model_changes", "agent"), ("model_changes", "by"))       # AUTONOMY.md P8: whose model, and its one changer
 # The tables with one row for each agent. A row under the new name is what an agent of that name left before it
 # was removed by hand, so it goes first, and the renamed agent's own row takes the name.
 AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent", "machine_updates": "agent"}
@@ -27840,6 +28393,34 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(400, {"error": str(e)})
         return self.json(200, scrub(dict(result, db=generation)), {"Cache-Control": "no-store"})
 
+    def ui_costs(self, query):
+        """GET /ui/costs (owner feature costs, AUTONOMY.md P8): what the work of every agent cost from `from` to `to`
+        (the last HISTORY_WINDOW days by default), each number with the period of the same length before it; agent=
+        narrows it to one agent and minimum= is the results a kind of work needs in each period to be compared."""
+        if not self.ui_allowed():
+            return
+        generation = kv_get("db_id")
+        if query.get("db") != generation:
+            return self.json(409, {"error": "hub generation changed; refresh state"})
+        try:
+            end = history_when(query["to"], "to", end=True) if query.get("to") else now()
+            start = history_when(query["from"], "from") if query.get("from") else end - HISTORY_WINDOW * 86400
+            if not 0 < end - start <= HISTORY_WINDOW_MAX * 86400:
+                raise ToolError(f"from comes before to, at most {HISTORY_WINDOW_MAX} days before it.")
+            who = query.get("agent")
+            if who and who not in agents():
+                raise ToolError(f"There is no agent {who} in the team.")
+            minimum = int(query.get("minimum") or COSTS_MINIMUM)
+            if not 1 <= minimum <= 1000:
+                raise ToolError("minimum is a whole number from 1 to 1000.")
+        except ValueError:
+            return self.json(400, {"error": "minimum is a whole number from 1 to 1000."})
+        except ToolError as e:
+            return self.json(400, {"error": str(e)})
+        with LOCK:
+            result = costs_view([who] if who else list(agents()), start, end, minimum)
+        return self.json(200, scrub(dict(result, db=generation)), {"Cache-Control": "no-store"})
+
     def ui_responsibilities(self, query):
         """Every duty with its watches, its counters, its open cases and its marker (owner API 1.13)."""
         if not self.ui_allowed():
@@ -29065,14 +29646,15 @@ class Handler(BaseHTTPRequestHandler):
         generation = kv_get("db_id")
         if query.get("db") != generation:
             return self.json(409, {"error": "hub generation changed; refresh state"})
-        return self.json(200, {"db": generation, "settings": settings_view()}, {"Cache-Control": "no-store"})
+        return self.json(200, {"db": generation, "settings": settings_view(), "runtime_facts": runtime_facts_view()},
+                         {"Cache-Control": "no-store"})
 
     def ui_settings_save(self):
         """POST /ui/settings: the owner's own value of one setting or more, or null for its default."""
         def read(data):
-            self.only(data, ("settings",))
-            changes = data.get("settings")
-            if not isinstance(changes, dict) or not changes:
+            self.only(data, ("settings", "runtime_facts"))
+            changes = data.get("settings", {})
+            if not isinstance(changes, dict) or not changes and "runtime_facts" not in data:
                 raise ValueError("settings must map one setting or more to a value, or to null for its default")
             for key, value in changes.items():
                 if key not in SETTINGS:
@@ -29082,8 +29664,9 @@ class Handler(BaseHTTPRequestHandler):
                         changes[key] = SETTINGS[key][1](value)
                     except ValueError as e:
                         raise ValueError(f"{key} {e}") from None
-            return {"settings": changes}
-        return self.ui_command("settings", read, lambda body: save_settings(body["settings"]))
+            facts = runtime_facts_changes(data["runtime_facts"]) if "runtime_facts" in data else {}
+            return {"settings": changes, "runtime_facts": facts}
+        return self.ui_command("settings", read, lambda body: save_settings(body["settings"], body["runtime_facts"]))
 
     def ui_conversations(self, query):
         """GET /ui/conversations: every conversation between an agent and a person, newest first. agent= and person=
@@ -29416,6 +29999,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_memory(parts[2], query)
         if parts == ["ui", "history"]:              # AUTONOMY.md P6
             return self.ui_history(query)
+        if parts == ["ui", "costs"]:                # AUTONOMY.md P8
+            return self.ui_costs(query)
         if parts == ["ui", "responsibilities"]:
             return self.ui_responsibilities(query)
         if len(parts) == 3 and parts[:2] == ["ui", "responsibilities"] and re.fullmatch(r"[1-9][0-9]*", parts[2]):
@@ -29756,7 +30341,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(404, {"error": "unknown agent"})
             if not self.allowed(agent):
                 return
-            if len(self.body()) > 32768:
+            if len(self.body()) > USAGE_REPORT_MAX:
                 return self.json(413, {"error": "usage report is too large"})
             try:
                 data = validate_usage(self.form(), agents()[agent]["runtime"])
@@ -29765,7 +30350,8 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, TypeError, KeyError):
                 return self.json(400, {"error": "invalid usage report"})
             with LOCK:
-                record_session_tokens(agent, (data.get("tokens") or {}).pop("by_session", None) or [])
+                record_session_tokens(agent, (data.get("tokens") or {}).pop("by_session", None) or [],
+                                      agents()[agent]["runtime"], data.get("limits"))
                 for screen in [data.get("screen") or {}]:
                     (screen.get("tokens") or {}).pop("by_session", None)
                 # owner feature runtime_switch: the helper's new reading of the runtime before the switch, for its own
@@ -29774,7 +30360,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not prev or prev["runtime"] not in (agents()[agent].get("runtime_policies") or {}):
                     prev = None
                 if prev and prev["tokens"]:
-                    record_session_tokens(agent, prev["tokens"].pop("by_session", None) or [])
+                    record_session_tokens(agent, prev["tokens"].pop("by_session", None) or [], prev["runtime"])
                 old = q1("SELECT data FROM agent_usage WHERE name=?", (agent,))
                 old = json.loads(old["data"]) if old else {}
                 for key in ("tokens", "limits"):
@@ -29805,7 +30391,8 @@ class Handler(BaseHTTPRequestHandler):
                     q("INSERT INTO agent_usage(name,data) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET data=excluded.data",
                       (agent, json.dumps(data)))
                 limit_reading(agent, data.get("limits"), now())
-            return self.json(200, {"ok": True})
+            # helper feature session_kinds: this hub takes each session's four kinds (usage.Collector.send)
+            return self.json(200, {"ok": True, "session_kinds": True})
         if parts == ["ui", "messages"]:
             return self.ui_submit()
         if parts == ["ui", "attachments"]:

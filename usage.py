@@ -25,6 +25,12 @@ MAX_LINE = 4 * 1024 * 1024
 TOKEN_KEYS = ("input", "output", "cache_read", "cache_write")
 BY_SESSION = 500                    # per-session totals in one report: the newest sessions
 SESSION_ID = re.compile(r"[A-Za-z0-9._:-]{1,80}")
+SESSION_FIELDS = ("session_id", "total", "last_activity")
+# Helper feature session_kinds (AUTONOMY.md P8): each session's four kinds of tokens apart, its model calls, the model
+# of its newest call and the share of its first call that came from the cache. They go only to a hub whose last
+# answer said that it takes them, so that the release before it never refuses a report (Collector.send).
+SESSION_KINDS = ("input", "cache_read", "cache_write", "output", "calls", "model", "first_cache_share")
+MODEL = re.compile(r"[A-Za-z0-9._:/\[\]-]{1,120}")      # threads.Translator.model_record takes the same names
 SCOPE = "Retained Fleet workspace sessions"
 SOURCES = {"claude": "Claude Code transcripts", "codex": "Codex session records"}
 LIMIT_SOURCES = {"claude": "Claude Code /usage cache", "codex": "Codex account/rateLimits/read"}
@@ -94,6 +100,10 @@ def transcript_tokens(runtime, kit, home=None):
     deadline, size, messages, sessions = time.monotonic() + 10, 0, {}, set()
     owner, recent = {}, {}            # message key -> session; session -> newest record time
     since, last = None, None
+    # session_kinds: Codex key -> its distinct cumulative totals, one for each call; session -> (order, the values of
+    # its own first call); session -> the model of its newest call, in its file's own order. A subagent's calls count
+    # for its root session, but the first call and the model are the session's own.
+    totals_seen, first, models = {}, {}, {}
     for count, path in enumerate(paths):
         if count >= 5000 or time.monotonic() > deadline:
             raise ValueError("scan limit")
@@ -137,8 +147,13 @@ def transcript_tokens(runtime, kit, home=None):
                         continue
                     values = [number(usage.get(k, 0), True) for k in
                               ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")]
+                    own, model, order = not row.get("isSidechain"), message.get("model"), 0     # its first row
                 else:
                     payload = row.get("payload") or {}
+                    if kind == "turn_context" and sid and sid == root:      # the model of the calls that follow
+                        if isinstance(payload.get("model"), str) and MODEL.fullmatch(payload["model"]):
+                            models[root] = payload["model"]
+                        continue
                     if kind != "event_msg" or payload.get("type") != "token_count" or not sid:
                         continue
                     usage = (payload.get("info") or {}).get("total_token_usage")
@@ -147,12 +162,21 @@ def transcript_tokens(runtime, kit, home=None):
                     raw, out, read, write = [number(usage.get(k, 0), True) for k in
                                             ("input_tokens", "output_tokens", "cached_input_tokens", "cache_write_input_tokens")]
                     values, key = [number(raw - read - write, True), out, read, write], sid
+                    if raw + out:
+                        totals_seen.setdefault(key, set()).add((raw, out))     # each call raises the running total
+                    # The running total after a session's first call is that call's own: the smallest one with input.
+                    own, model, order = sid == root and raw > 0, None, raw
                 # Claude can emit several blocks for one API message. Codex
                 # records cumulative totals repeatedly. Neither is additive.
                 previous = messages.get(key, [0, 0, 0, 0])
                 messages[key] = [max(a, b) for a, b in zip(previous, values)]
                 sessions.add(sid)
                 owner[key] = root                       # per-session totals roll subagents up to their root
+                if own:
+                    if root not in first or order < first[root][0]:
+                        first[root] = (order, values)
+                    if isinstance(model, str) and MODEL.fullmatch(model):
+                        models[root] = model
                 ts = timestamp(row.get("timestamp"))
                 if ts is not None:
                     since = min(since, ts) if since is not None else ts
@@ -161,13 +185,26 @@ def transcript_tokens(runtime, kit, home=None):
     if not messages:
         return None
     totals = dict(zip(TOKEN_KEYS, map(sum, zip(*messages.values()))))
-    per = {}
+    per, calls = {}, {}
     for key, values in messages.items():
-        per[owner[key]] = per.get(owner[key], 0) + sum(values)
+        per[owner[key]] = [a + b for a, b in zip(per.get(owner[key], (0, 0, 0, 0)), values)]
+        calls[owner[key]] = calls.get(owner[key], 0) + (len(totals_seen.get(key, ())) if runtime == "codex"
+                                                        else int(sum(values) > 0))
     newest = sorted(per, key=lambda sid: recent.get(sid) or 0, reverse=True)[:BY_SESSION]
     return dict(totals, total=sum(totals.values()), sessions=len(sessions), since=since,
                 last_activity=last, collected_at=time.time(), source=SOURCES[runtime], scope=SCOPE, error=None,
-                by_session=[{"session_id": sid, "total": per[sid], "last_activity": recent.get(sid)} for sid in newest])
+                by_session=[dict({"session_id": sid, "total": sum(per[sid]), "last_activity": recent.get(sid)},
+                                 **dict(zip(TOKEN_KEYS, per[sid])), calls=calls[sid],
+                                 model=models.get(sid),
+                                 first_cache_share=cache_share(first[sid][1]) if sid in first else None)
+                            for sid in newest])
+
+
+def cache_share(values):
+    """The share of one call's input that it read from the cache, from its four kinds in TOKEN_KEYS order: cache
+    reads against everything it read (input, cache reads, cache writes). None for a call that read nothing."""
+    read = values[0] + values[2] + values[3]
+    return round(values[2] / read, 4) if read else None
 
 
 def run_json(args, cwd, timeout=25, ok=(0,)):
@@ -430,12 +467,20 @@ def validate_usage(data, runtime, screen=False):
             if not isinstance(rows, list) or len(rows) > BY_SESSION:
                 raise ValueError("invalid sessions")
             for row in rows:
-                if not isinstance(row, dict) or set(row) != {"session_id", "total", "last_activity"} or \
-                        not isinstance(row["session_id"], str) or not SESSION_ID.fullmatch(row["session_id"]):
+                if not isinstance(row, dict) or set(row) not in ({*SESSION_FIELDS}, {*SESSION_FIELDS, *SESSION_KINDS}) \
+                        or not isinstance(row["session_id"], str) or not SESSION_ID.fullmatch(row["session_id"]):
                     raise ValueError("invalid session")
                 number(row["total"], True)
                 if row["last_activity"] is not None:
                     number(row["last_activity"])
+                if "calls" in row:              # helper feature session_kinds
+                    for key in (*TOKEN_KEYS, "calls"):
+                        number(row[key], True)
+                    model, share = row["model"], row["first_cache_share"]
+                    if row["total"] != sum(row[key] for key in TOKEN_KEYS) or \
+                            not (model is None or isinstance(model, str) and MODEL.fullmatch(model)) or \
+                            not (share is None or number(share) <= 1):
+                        raise ValueError("invalid session")
         if value["error"] is not None and value["error"] not in ERRORS:
             raise ValueError("invalid error")
         if value["collected_at"] is not None and number(value["collected_at"]) > time.time() + 60:
@@ -524,6 +569,18 @@ def local_model(conf):
     return bool(flag) and bool(re.search(rf"(?:^|\s){re.escape(flag)}(?:\s|$)", str(conf.get("start") or "")))
 
 
+def plain_sessions(data):
+    """A report without each session's four kinds: its shape before helper feature session_kinds."""
+    def plain(tokens):
+        if not tokens or "by_session" not in tokens:
+            return tokens
+        return dict(tokens, by_session=[{k: row[k] for k in SESSION_FIELDS} for row in tokens["by_session"]])
+    out = dict(data, tokens=plain(data.get("tokens")))
+    if out.get("previous"):
+        out["previous"] = dict(out["previous"], tokens=plain(out["previous"].get("tokens")))
+    return out
+
+
 class Collector:
     def __init__(self, kit, agent, runtime, publish, home=None, screen_command=None, local=False, previous=None):
         self.kit, self.agent, self.runtime, self.publish = kit, agent, runtime, publish
@@ -537,6 +594,7 @@ class Collector:
         self.path = self.home / ".fleet" / ("usage-" + agent + ".json")
         self.data, self.last_poll = {"tokens": None, "limits": None}, 0
         self.wake = threading.Event()   # account_again: scan now, not at the end of this wait
+        self.kinds = False              # the hub's last answer took each session's four kinds (send)
         try:
             cache = read_json(self.path)
             if cache["runtime"] != runtime:     # another runtime's numbers and poll time never stand for this one
@@ -569,7 +627,7 @@ class Collector:
                 if self.data["screen"]["tokens"]:
                     self.data["screen"]["tokens"]["error"] = "Token records could not be read."
         if self.runtime not in SOURCES:         # Grok documents no usage: unknown, never another runtime's numbers
-            self.publish(self.data)
+            self.send(self.data)
             return
         if self.previous and time.time() - self.previous_poll >= POLL_SECONDS:
             self.previous_poll = time.time()
@@ -613,7 +671,18 @@ class Collector:
         # Numbers, labels, the account key and the account email only. A failed write cannot change task handling.
         with open(self.path, "w", opener=lambda path, flags: os.open(path, flags, 0o600)) as stream:
             json.dump({"runtime": self.runtime, "data": self.data, "last_poll": self.last_poll}, stream)
-        self.publish(self.data)
+        self.send(self.data)
+
+    def send(self, data):
+        """Publish one report. Each session's four kinds go only to a hub whose last answer said that it takes them
+        (helper feature session_kinds); a hub that refuses them, a release from before them, gets the same report
+        without them at once."""
+        answer = self.publish(data if self.kinds else plain_sessions(data))
+        if self.kinds and isinstance(answer, tuple) and answer[0] in (400, 413):
+            self.kinds = False
+            answer = self.publish(plain_sessions(data))
+        if isinstance(answer, tuple) and answer[0] == 200:
+            self.kinds = isinstance(answer[1], dict) and answer[1].get("session_kinds") is True
 
     def run(self):
         while True:
