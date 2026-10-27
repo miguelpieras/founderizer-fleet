@@ -23233,6 +23233,9 @@ def store_entitlement(token):
 
 # ---- what the fleet knows about releases
 
+UPDATE_BETWEEN_TURNS = "update_between_turns"     # the helper feature: its update waits for running turns (plan P0)
+
+
 def running_turns(owner=None, t0=None):
     """The open tasks whose session runs a turn now, by id (plan P0): what an update and a runtime switch wait for.
 
@@ -27485,6 +27488,10 @@ class Handler(BaseHTTPRequestHandler):
                 time.sleep(0.5)
             return self.json(200, {"db": kv_get("db_id"), "last": newest, "chat": chat,
                 "listed": listed_windows(agent, query.get("alive")),
+                # plan P0: the task windows of this helper whose turn runs now, by the rule that a release waits for:
+                # a helper with UPDATE_BETWEEN_TURNS takes its own update when none does (fleet.Helper.update_busy)
+                "turns": [tref(i) for i in running_turns(owner=agent)]
+                if UPDATE_BETWEEN_TURNS in helper_features(agent) else None,
                 # plan C5: a conversation window closes when its conversation is not open any more
                 "conversations": [r["id"] for r in q("SELECT id FROM conversations WHERE agent=? AND state='open'",
                                                      (agent,))] if worker else None,

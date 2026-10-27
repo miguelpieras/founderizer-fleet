@@ -54,7 +54,8 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             "start_once",           # it starts each attempt once and says why a start failed (plan C6)
             "prompt_polls",         # its hooks and runners ask again for a permission prompt until it is decided (C7)
             "job_runs",             # it acks a job before it runs it and lists the jobs it holds in each poll (C7)
-            "check_runs"]           # it lists the check runs it holds in each poll, and no claim expires (C12)
+            "check_runs",           # it lists the check runs it holds in each poll, and no claim expires (C12)
+            "update_between_turns"]     # its update waits for the turns that run in its task windows (plan P0)
 # ---------------------------------------------------------------- the runtimes
 #
 # What the fleet knows about a runtime is here, in one entry for each provider, and nowhere else. hub.py, fleet.py and
@@ -1156,7 +1157,7 @@ class Lifecycle:
             if self.state == "updating":
                 return
             self.pending = desired
-            self.state, self.detail = "waiting_idle", "Waits until no task session is open."
+            self.state, self.detail = "waiting_idle", "Waits until no turn runs in a task session."
 
     def check(self, extra):
         """The owner's "check this machine": collect and report now. The same checks as every report, no change."""

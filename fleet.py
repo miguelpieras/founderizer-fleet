@@ -2122,6 +2122,9 @@ class Helper:
         self.idle_at = {}         # {window: the last screen reading that agreed on its idle input line}
         self.wanted = {}          # {window: ids of this poll's events that want a signal} (handle_events)
         self.typed_at = {}        # {window: when its last signal was typed}, a model call of its session (restart_fresh)
+        # plan P0 (feature update_between_turns): (the task windows whose turn runs, by the hub's reading at the latest
+        # poll, when that answer came), or None while there is none: an older hub, or a poll that failed
+        self.hub_turns = None
         self.manager_session = None
         self.manager_turn = {}    # {"session", "running"}: the manager's own turn, as its records go by (report_limit)
         self.retiring = None      # (first quiet reading, its marks) of the previous runtime's chat (runtime_switch)
@@ -3362,6 +3365,32 @@ class Helper:
         r = tmux("capture-pane", "-p", "-t", target)
         return r.returncode == 0 and bool(WORKING.search("\n".join(r.stdout.rstrip().split("\n")[-15:])))
 
+    def update_busy(self):
+        """True while this helper's Fleet update waits (Lifecycle busy): a check or a login job that runs in it, the
+        previous runtime's manager session that closes, or a task window whose turn runs. Plan P0: a session between
+        turns survives the helper's restart and the update of its checkout, and the new helper types its next line,
+        so a task window keeps the update waiting only while a turn runs in it: by the hub's reading at the latest
+        poll (running_turns, the rule that a release waits for), a line typed into it since that reading, or its own
+        screen. A window in the runner, which runs Fleet's own code, waits as before, and so does every task window
+        while the hub gives no reading (an older hub, or a poll that failed) or tmux gives no list."""
+        if self.outside > 0 or self.manager_lock is not None:
+            return True
+        names = self.look_known()
+        if names is None:
+            return True
+        windows = [w for w in names if re.fullmatch(r"T-\d+", w)]
+        if not windows:
+            return False
+        if self.hub_turns is None:
+            return True
+        turns, at = self.hub_turns
+        for window in windows:
+            target = f"{self.session}:={window}"
+            if window in turns or self.typed_at.get(window, float("-inf")) >= at or self.runner(target) or \
+                    self.working(target):
+                return True
+        return False
+
     def runtimes_busy(self):
         """True while a session of this OS user may be using a runtime, so that an update of the runtimes waits
         (Lifecycle.update_runtimes): a task window, a turn that runs in a standing or conversation window, or a
@@ -4348,8 +4377,7 @@ def cmd_run(args):
     h.collector = collector         # a sign-in on this machine makes it read the account again (account_changed)
     threading.Thread(target=collector.run, name="usage-collector", daemon=True).start()
     h.lifecycle = Lifecycle(KIT, agent, conf, h.post_status,
-                            busy=lambda: any(re.fullmatch(r"T-\d+", w) for w in h.look()) or h.outside > 0 or
-                            h.manager_lock is not None,     # no restart while a previous runtime's manager closes
+                            busy=h.update_busy,     # plan P0: running turns, not open task windows
                             vault=lambda: vault_status(agent), probe=lambda job: probe_logins(agent, job),
                             legacy=h.legacy_windows, switch=h.switch_state,
                             runtimes_busy=h.runtimes_busy, say=h.say,       # it updates this user's runtimes
@@ -4391,6 +4419,9 @@ def cmd_run(args):
                 raise Refused(f"hub answered {code}")
             h.doing("chat")
             h.listed = data.get("listed") if isinstance(data.get("listed"), dict) else {}
+            turns = data.get("turns")       # plan P0: the hub sends it to a helper with update_between_turns
+            h.hub_turns = ({t for t in turns if isinstance(t, str)}, time.monotonic()) if isinstance(turns, list) \
+                else None
             h.conversations = data.get("conversations") if isinstance(data.get("conversations"), list) else None
             h.keep_chat(data.get("chat"), data.get("db"))
             h.handle_events(data.get("events", []))
@@ -4401,6 +4432,7 @@ def cmd_run(args):
             h.loop_wake.clear()
         except (urllib.error.URLError, OSError, Refused) as e:
             h.step = None
+            h.hub_turns = None              # no reading of the turns: the update waits for every task window
             print(f"hub unavailable ({type(e).__name__}); retry in 5 seconds", flush=True)
             time.sleep(5)
 
