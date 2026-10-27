@@ -13573,6 +13573,11 @@ def memory_start_text(agent, task_id):
 # the hub's start a thread of its own takes the older records in (history_indexer), a few milliseconds at a time. So
 # no writer has to remember to index, a release that is rolled back and forward again leaves no gap, and a search
 # finds every record that was written before it. A lane whose records have no stream here calls history_note.
+#
+# And no answer gives a record that is gone or different. A write that removes or changes an indexed record tells the
+# history in that same write (person_remove, owner_message_replace); under that, every search and read holds each row
+# it finds against its record as it reads now (history_heal), so a lane that changes a record and does not say so
+# never has the old words answered.
 HISTORY_KINDS = ("conversation", "owner_chat", "message", "task", "result", "note", "question", "report", "case",
                  "step", "duty", "memory", "standing", "tool")
 HISTORY_SHOWN = 15              # records in one answer of search_history
@@ -13816,8 +13821,7 @@ def history_duty(h):
     kind = "case" if h["kind"] in ("case_opened", "case_closed") else "step" if h["kind"] == "step" else "duty"
     case = HISTORY_CASE.match(h["detail"] or "")
     text = f"{rref(h['responsibility'])} {HISTORY_DUTY_WORDS.get(h['kind'], h['kind'])} by {h['by']}: " \
-           f"{h['detail'] or ''}" + (f"\nThe duty: {h['r_text']}" if h["kind"] in ("created", "edited") and
-                                     h["r_text"] else "")
+           f"{h['detail'] or ''}"
     return [history_rec(a, kind, case.group(0) if case and kind != "duty" else rref(h["responsibility"]), text,
                         h["ts"]) for a in history_who(h["r_agent"], h["by"])]
 
@@ -13961,7 +13965,7 @@ def history_streams():
         HistoryStream("report", "reports", "SELECT r.*, r.id AS _id FROM reports r", "r.id", history_report),
         HistoryStream("decision", "reports", "SELECT r.*, r.id AS _id, r.decided AS _at FROM reports r", "r.id",
                       history_decision, at="r.decided"),
-        HistoryStream("duty", "duty_history", "SELECT h.*, h.id AS _id, r.agent AS r_agent, r.text AS r_text "
+        HistoryStream("duty", "duty_history", "SELECT h.*, h.id AS _id, r.agent AS r_agent "
                       "FROM duty_history h LEFT JOIN responsibilities r ON r.id=h.responsibility", "h.id",
                       history_duty),
         HistoryStream("memory", "memories", "SELECT m.*, m.id AS _id FROM memories m", "m.id", history_memory),
@@ -14101,11 +14105,7 @@ def history_forget_person(person_id):
     all. The owner removed the person, and person_remove deletes their messages, so the index forgets them too."""
     in_transaction("history_forget_person")
     for h in DB.execute("SELECT id, agent, text FROM history WHERE person=?", (f"P-{person_id}",)).fetchall():
-        key = history_key(h["agent"])
-        if HISTORY_FTS[0] and key and h["text"] is not None:
-            DB.execute("INSERT INTO history_fts(history_fts,rowid,text,agent) VALUES('delete',?,?,?)",
-                       (h["id"], h["text"], key))
-        DB.execute("DELETE FROM history WHERE id=?", (h["id"],))
+        history_drop_row(h)
 
 
 def history_rewrite(src, src_id, ref):
@@ -14120,14 +14120,58 @@ def history_rewrite(src, src_id, ref):
     if not old:
         return
     for h in old:
-        key = history_key(h["agent"])
-        if HISTORY_FTS[0] and key and h["text"] is not None:
-            DB.execute("INSERT INTO history_fts(history_fts,rowid,text,agent) VALUES('delete',?,?,?)",
-                       (h["id"], h["text"], key))
-        DB.execute("DELETE FROM history WHERE id=?", (h["id"],))
+        history_drop_row(h)
     row = DB.execute(f"{s.select} WHERE {s.key}=?", (src_id,)).fetchone()
     if row:
         history_insert(src, src_id, s.build(row), {})
+
+
+def history_drop_row(h):
+    """Inside the caller's write: one history row out of the history and out of the index. Only words that the row
+    keeps can leave the contentless index exactly; a tool record keeps none, and its words stay behind with no row to
+    join them, so no search can reach them."""
+    key = history_key(h["agent"])
+    if HISTORY_FTS[0] and key and h["text"] is not None:
+        DB.execute("INSERT INTO history_fts(history_fts,rowid,text,agent) VALUES('delete',?,?,?)",
+                   (h["id"], h["text"], key))
+    DB.execute("DELETE FROM history WHERE id=?", (h["id"],))
+
+
+def history_heal(h):
+    """One row that a search or a read found, held against its record as it reads now, so that no answer gives a
+    record that is gone or different. A record that is gone takes the row out of the history and of the index; one
+    whose words changed (a target's new words, a renamed agent or person) is indexed again as it reads now. This is
+    the floor under the writes that tell the history themselves (person_remove, owner_message_replace): a lane that
+    changes a record and does not tell the history never has the old words answered. An event of a moment (`at`)
+    stays as it happened, a tool record is read from its record anyway, and a record of history_note has no row to
+    read. True when it changed the history."""
+    s = HISTORY_BY_NAME.get(h["src"])
+    if not s or h["src_id"] is None:
+        return False
+    row = read_row(f"{s.select} WHERE {s.key}=?", (h["src_id"],))
+    if row and (s.at or h["text"] is None):
+        return False
+    try:
+        recs = [r for r in (s.build(row) if row else []) if r["agent"] == h["agent"]][:1]
+    except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+        return False
+    if recs and mask_secrets(recs[0]["text"])[:HISTORY_TEXT] == h["text"]:
+        return False
+    with area("quiet"), transaction():
+        history_drop_row(h)
+        if recs:
+            history_insert(h["src"], h["src_id"], recs, {})
+    return True
+
+
+def history_healed(read):
+    """The rows of `read()`, with every row it gives held against its record (history_heal), and read again when one
+    changed: at most three times, so a burst of changed records costs a few reads and never a loop."""
+    for _ in range(3):
+        rows = read()
+        if not [history_heal(h) for h in rows].count(True):
+            break
+    return rows
 
 
 def history_rewrite_message(request_id):
@@ -14352,7 +14396,7 @@ def history_found(agent, a, owner_chats, limit):
                         f"conversation, an agent's name, or owner.")
     task = parse_task(a["task"]) if a.get("task") not in (None, "") else None
     kinds = history_kinds(a.get("kind"))
-    rows = history_query(agent, phrases, since, until, people, task, kinds, owner_chats, limit)
+    rows = history_healed(lambda: history_query(agent, phrases, since, until, people, task, kinds, owner_chats, limit))
     said = [x for x in (f"from {a['from']}" if since is not None else "", f"to {a['to']}" if until is not None else "",
                         f"with {a['person']}" if people else "", f"in {tref(task)}" if task else "",
                         f"of kind {', '.join(kinds)}" if kinds else "") if x]
@@ -14403,9 +14447,10 @@ def history_records(agent, ref, owner_chats=True):
         row = read_row(f"{s.select} WHERE {s.key}=?" + (f" AND {s.where}" if s.where else ""), (int(number),))
         return [dict(r, ref=ref, owner_chat=0) for r in (s.build(row) if row else [])
                 if agent is None or r["agent"] == agent]
-    rows = read_rows("SELECT * FROM history WHERE ref=? AND kind<>'tool'" + (" AND agent=?" if agent else "") +
-                     ("" if owner_chats else " AND owner_chat=0") + " ORDER BY at, id LIMIT ?",
-                     (ref, *([agent] if agent else []), HISTORY_READ))
+    rows = history_healed(lambda: read_rows(
+        "SELECT * FROM history WHERE ref=? AND kind<>'tool'" + (" AND agent=?" if agent else "") +
+        ("" if owner_chats else " AND owner_chat=0") + " ORDER BY at, id LIMIT ?",
+        (ref, *([agent] if agent else []), HISTORY_READ)))
     return [dict(r, text=history_words(r)) for r in rows]
 
 
@@ -15437,6 +15482,7 @@ def target_update(agent, item, a):
         if change:
             DB.execute(f"UPDATE standing SET {', '.join(chr(34) + c + chr(34) + '=?' for c in change)} WHERE id=?",
                        (*change.values(), item))
+            history_rewrite("standing", item, iref(item))      # the history holds the target as it reads now (L5)
         if progress is not None:
             record_progress(item, progress, agent)
     r = read_row("SELECT * FROM standing WHERE id=?", (item,))
