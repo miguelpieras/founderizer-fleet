@@ -16086,7 +16086,7 @@ def standing_start_text(agent):
 
 def standing_said(r, actor=None, asked_by=None, why=None):
     """The owner's one quiet line about a new item, or with `actor` about an ended one (AUTONOMY.md section 5, element
-    2): "Africa gave hgr-manager I-7: decide refunds up to one month's fee. Say 'end I-7' to stop it." actor is the
+    2): "Maria gave support-lead I-7: decide refunds up to one month's fee. Say 'end I-7' to stop it." actor is the
     agent that ended it, or 'owner' for his own end and for a person he blocked or removed."""
     ref, holder = iref(r["id"]), r["agent"] + ("'s team" if r["scope"] == "team" else "")
     if actor is None:
@@ -18243,7 +18243,7 @@ TOOLS = [
     # an owner chat and of a conversation with a person.
     ("all", "keep_instruction", t_keep_instruction,
      "Keep a standing instruction: a lasting wish about how you work or what you decide, from now on until it is "
-     "ended (\"assign yearly-plan cancellations to Africa\"). Keep one when the owner, a person whose role allows it "
+     "ended (\"send every refund request to the billing manager\"). Keep one when the owner, a person whose role allows it "
      "or another agent asks for it, or when your own work shows you need it. With source, words are that message's "
      "own words as written there, and the item is its author's; without source it is your own, also when another "
      "agent asked. It steers your work "
