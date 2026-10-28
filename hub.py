@@ -13357,7 +13357,8 @@ def duty_text(r, t0, every_case=False):
         if w["state"] in ("done", "deleted"):
             continue
         out.append(f"  Watch {w['trigger']} ({w['kind']}) [{w['state']}"
-                   + (f" by {w['paused_by']}: {w['paused_reason']}" if w["paused_by"] else "") + "]"
+                   + (f" by {w['paused_by']}" + (f": {w['paused_reason']}" if w["paused_reason"] else "")
+                      if w["paused_by"] else "") + "]"
                    + (f", next {goal_time(w['next_due'])}" if w["next_due"] else "")
                    + (f", check {w['check']['path'] or 'saved code ' + (w['check']['sha256'] or '')[:12]}"
                       + (f" {check_condition_words(w['check']['condition'])}"
@@ -13691,6 +13692,9 @@ def t_attach_watch(agent, a):
         if rule["watch"] in DUTY_WATCHES + (DUTY_REVIEW,):
             raise ToolError(f"Rule {rule_id} is a {rule['watch']} watch that the hub keeps; make your own rule with "
                             f"save_trigger and attach that one.")
+        if r["state"] == "retired":     # a watch attached a second after the manager retired R-2 (28 October 2026)
+            raise ToolError(f"{rref(r['id'])} is retired, and a retired duty takes no new watch. If it is needed "
+                            f"again, ask your requester to reopen it, then attach the rule.")
     t0 = now()
     with transaction():
         DB.execute("UPDATE triggers SET responsibility=?, watch=? WHERE id=?",
