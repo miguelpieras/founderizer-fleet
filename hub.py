@@ -117,7 +117,7 @@ CREATE TABLE IF NOT EXISTS rules(id INTEGER PRIMARY KEY, agent TEXT, tool TEXT, 
 CREATE TABLE IF NOT EXISTS needs(id INTEGER PRIMARY KEY, title TEXT, why TEXT, todo TEXT, raised REAL,
   by TEXT, answer TEXT, answered REAL);
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, agent TEXT, kind TEXT, task INTEGER, text TEXT,
-  created REAL, extra TEXT, read_at REAL, helper_ack REAL);
+  created REAL, extra TEXT, read_at REAL, helper_ack REAL, handed REAL);
 -- "Come back to this at this time", for any agent. agent is who set it and who the hub brings it back to;
 -- task is the work it brings back, and while it waits that task is parked: no nudge and no new session.
 CREATE TABLE IF NOT EXISTS reminders(id INTEGER PRIMARY KEY, due REAL, note TEXT, done INTEGER DEFAULT 0,
@@ -1575,7 +1575,8 @@ def migrate():
         "attempts": {"turn": "TEXT"},
         # plan C8: the sender's task waits for the answer, and why that wait ended
         "agent_messages": {"waits": "INTEGER", "wait_end": "TEXT"},
-        "events": {"read_at": "REAL", "helper_ack": "REAL"},
+        "events": {"read_at": "REAL", "helper_ack": "REAL",
+                   "handed": "REAL"},           # plan P0: the first poll answer that carried a conversation's signal
         # AUTONOMY.md P2 (lane L2): the task that a message of the conversation belongs to, and, on an agent's
         # message_contact with waits, the task that waits for the person's next message
         "conversation_messages": {"task": "INTEGER", "waits": "INTEGER"},
@@ -27143,13 +27144,14 @@ def running_turns(owner=None, t0=None):
 
 
 def conversation_signalled(t):
-    """Whether the session of conversation task row `t` (AUTONOMY.md P2) can have begun a turn on it: its helper took
-    the signal of one of its messages, or the session read one (the task is no longer submitted). Its window C-<id>
-    outlives each task, so an open window says nothing about this one, and while every signal of it waits in the hub
-    (a usage limit, settings that wait, an update run) nothing runs it, for days at a weekly limit."""
+    """Whether the session of conversation task row `t` (AUTONOMY.md P2) can have begun a turn on it: a poll answer
+    handed the signal of one of its messages to its helper (events.handed), an older helper acknowledged one, or the
+    session read one (the task is no longer submitted). Its window C-<id> outlives each task, so an open window says
+    nothing about this one, and while the hub holds every signal of it (a usage limit, settings that wait, an update
+    run) nothing runs it, for days at a weekly limit."""
     return t["state"] != "submitted" or bool(q1(
         "SELECT 1 FROM conversation_messages m JOIN events e ON e.id=m.event WHERE m.task=? AND "
-        "(e.helper_ack IS NOT NULL OR e.read_at IS NOT NULL) LIMIT 1", (t["id"],)))
+        "(e.handed IS NOT NULL OR e.helper_ack IS NOT NULL OR e.read_at IS NOT NULL) LIMIT 1", (t["id"],)))
 
 
 def checks_running(runner=None, online=True):
@@ -31607,6 +31609,13 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 told = chat
                 time.sleep(0.5)
+            # plan P0: this answer hands out these conversation signals, so a turn of their task may begin now
+            # (conversation_signalled). The helper sends no ack of one: it types it, or starts the window, at once.
+            handed = [r["id"] for r in rows if r["kind"] == "conversation" and r["handed"] is None]
+            if handed:
+                with area("quiet"):
+                    q(f"UPDATE events SET handed=? WHERE handed IS NULL AND id IN ({','.join('?' * len(handed))})",
+                      (now(), *handed))
             return self.json(200, {"db": kv_get("db_id"), "last": newest, "chat": chat,
                 "listed": listed_windows(agent, query.get("alive")),
                 # plan P0: the task windows of this helper whose turn runs now, by the rule that a release waits for:
