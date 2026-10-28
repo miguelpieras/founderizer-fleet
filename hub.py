@@ -16355,11 +16355,12 @@ def standing_said(r, actor=None, asked_by=None, why=None):
             head = f"{r['agent']} set {'its team' if r['scope'] == 'team' else 'itself'} {ref}"
         else:
             head = f"{'You' if r['author'] == 'owner' else standing_who(r['author'])} gave {holder} {ref}"
-        return head + (", a target" if r["kind"] == "target" else "") + f": {r['words']}. Say 'end {ref}' to stop it."
+        return head + (", a target" if r["kind"] == "target" else "") + \
+            f": {r['words'].rstrip('.')}. Say 'end {ref}' to stop it."
     said = (f"You ended {ref}" if actor == "owner" else f"{actor} ended {ref}") + f" ({clip(r['words'], 120)})"
     if asked_by not in (None, actor):
         said += f", as {'you' if asked_by == 'owner' else standing_who(asked_by)} asked"
-    return said + (f": {why}" if why else "") + "."
+    return said + (f": {why.rstrip('.')}" if why else "") + "."
 
 
 def standing_new_say(r, reader, t0):
