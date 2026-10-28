@@ -9654,7 +9654,7 @@ def closed_versions(runtime):
 
 
 CLOSED_RUNTIMES = tuple(name for name in runtimes_with("conversation") if closed_versions(name))
-CLOSED_TESTED = closed_versions(CLOSED_RUNTIMES[0])[-1]    # the newest that passed: closed_version's default
+CLOSED_TESTED = closed_versions(CLOSED_RUNTIMES[0])[0]     # the first that passed: closed_version's default
 
 
 def closed_runtime_check(value):

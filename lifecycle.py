@@ -102,8 +102,8 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
 #   conversation      its session can be locked down to the conversation tools of another person (C-<id>)
 #   conversation_why  why it cannot be, in the words that person reads; None when it can
 #   closed_versions   the versions of it that passed the lockdown test (test_conversation_lockdown's LiveProof and
-#                     Pinned), oldest first: with contacts.v2 a closed conversation runs at one of them and at no
-#                     other, at the last unless the owner chose another (AUTONOMY.md P10, decision 35). A version
+#                     Pinned), the default first: with contacts.v2 a closed conversation runs at one of them and at
+#                     no other, at the first unless the owner chose another (AUTONOMY.md P10, decision 35). A version
 #                     joins only in a release whose lockdown test passed; () where none did
 #   mcp_servers       its task sessions load the owner's MCP servers and the catalog tools
 #   app_server        the fleet drives it over its own app-server protocol: screen tasks, and the app-server start
@@ -228,9 +228,9 @@ RUNTIMES = {
         "agent_messages": True,
         "conversation": True,
         "conversation_why": None,
-        # 2.1.311 on the owner's Mac, 27 October 2026: only the Fleet tools and fleet.CLAUDE_BUILT_INS, and only the
-        # hub's prompt
-        "closed_versions": ("2.1.311",),
+        # On the owner's Mac, 27 and 28 October 2026, each with its updater off: only the Fleet tools and
+        # fleet.CLAUDE_BUILT_INS, and only the hub's prompt. 2.1.308 first, because three of the four machines run it
+        "closed_versions": ("2.1.308", "2.1.311", "2.1.312"),
         "mcp_servers": True,
         "app_server": False,
         "switch": True,

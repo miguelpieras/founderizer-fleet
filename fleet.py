@@ -1279,8 +1279,8 @@ CONVERSATION_ID = re.compile(r"[1-9][0-9]{0,11}")
 # file, a command or a site (test_conversation_lockdown's live proof). EndConversation: Claude Code 2.1.301 adds it
 # when a remote feature flag is on, and neither --tools, --disallowedTools nor a deny rule takes it away; its second
 # call ends the conversation, and the window stays and shows "Claude has ended this chat.". DeferredToolPlaceholder:
-# 2.1.311 offers it with no fields and defer_loading, "Reserved placeholder that keeps deferred tool loading active;
-# never call this tool", beside no tool that could load another one (27 October 2026).
+# 2.1.308, 2.1.311 and 2.1.312 offer it with no fields and defer_loading, "Reserved placeholder that keeps deferred
+# tool loading active; never call this tool", beside no tool that could load another one (27 and 28 October 2026).
 CLAUDE_BUILT_INS = ("EndConversation", "DeferredToolPlaceholder")
 # AUTONOMY.md P10: where Claude Code's own installer keeps each version that it installed (and removes old ones), and
 # where this helper keeps a link to the version that closed conversations run at, so that neither an update nor that
