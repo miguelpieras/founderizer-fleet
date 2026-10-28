@@ -13099,6 +13099,15 @@ def duty_case_view(c):
             "tasks": [{"id": t["id"], "state": t["state"]} for t in duty_case_tasks(c["id"])]}
 
 
+def check_condition_words(condition):
+    """A value check's condition in words ("less than 1"), or None for a line check, which has none (plan P4), and for
+    a form this release does not know. With checks.lines on, every new check has the line form, and a duty that one
+    watched crashed see_responsibilities (28 October 2026)."""
+    if isinstance(condition, dict) and condition.get("op") in CHECK_OPS and finite(condition.get("value")):
+        return f"{CHECK_OPS[condition['op']]} {condition['value']:g}"
+    return None
+
+
 def duty_watch_view(t, t0):
     last = q1("SELECT * FROM trigger_runs WHERE trigger_id=? ORDER BY id DESC LIMIT 1", (t["id"],))
     check = json.loads(t["check_spec"]) if t["check_spec"] else None
@@ -13347,8 +13356,10 @@ def duty_text(r, t0, every_case=False):
         out.append(f"  Watch {w['trigger']} ({w['kind']}) [{w['state']}"
                    + (f" by {w['paused_by']}: {w['paused_reason']}" if w["paused_by"] else "") + "]"
                    + (f", next {goal_time(w['next_due'])}" if w["next_due"] else "")
-                   + (f", check {w['check']['path']} {CHECK_OPS[w['check']['condition']['op']]} "
-                      f"{w['check']['condition']['value']}" if w["check"] else ""))
+                   + (f", check {w['check']['path'] or 'saved code ' + (w['check']['sha256'] or '')[:12]}"
+                      + (f" {check_condition_words(w['check']['condition'])}"
+                         if check_condition_words(w["check"]["condition"])
+                         else ": each new line that it prints wakes the agent") if w["check"] else ""))
     out.append(f"  Cases: {v['open_cases']} open, {v['cases_30d']} in 30 days, {v['repeats_30d']} of them a repeat"
                + (f"; the 30 days before that, {v['repeats_prev_30d']} of {v['cases_prev_30d']}."
                   if v["cases_prev_30d"] else "."))
