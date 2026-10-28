@@ -1156,17 +1156,27 @@ def screen_settings(conf):
 
 def run_settings(conf, models=None):
     """{"model", "effort"} that a new session of the agent starts with: its own, else the one default of its runtime's
-    own model list (models, a Lifecycle.read_models reading) and that entry's default effort when it chose no effort,
-    as a screen task gets them (screen_runner.default_model). Without them the runtime takes its own configuration's,
-    which can name a model that the account offers no more: a Mac's Codex config named one that its ChatGPT sign-in
-    did not offer, and every turn of a Codex agent there failed with model_not_found (28 October 2026). A reading of
-    another runtime, a failed one and a list without exactly one default give nothing; Claude's list marks none."""
+    own model list (models, a Lifecycle.read_models reading), and with no effort of its own that model's default
+    effort in the list, as a screen task gets them (screen_runner.default_model). Without them the runtime takes its
+    own configuration's, which can name a model or an effort that the account offers no more: a Mac's Codex config
+    named a model that its ChatGPT sign-in did not offer, and every turn of a Codex agent there failed with
+    model_not_found (28 October 2026). A reading of another runtime, a failed one and a list without exactly one
+    default give no model; Claude's list marks no default and no default effort."""
     model, effort = conf.get("model") or None, conf.get("effort") or None
-    if model is None and isinstance(models, dict) and models.get("ok") and models.get("runtime") == conf.get("runtime"):
-        defaults = [o for o in models.get("options") or [] if isinstance(o, dict) and o.get("default") is True]
-        if len(defaults) == 1 and isinstance(defaults[0].get("model"), str):
-            model, effort = defaults[0]["model"], effort or defaults[0].get("default_effort") or None
+    if isinstance(models, dict) and models.get("ok") and models.get("runtime") == conf.get("runtime"):
+        options = [o for o in models.get("options") or [] if isinstance(o, dict) and isinstance(o.get("model"), str)]
+        if model is None:
+            defaults = [o for o in options if o.get("default") is True]
+            entry = defaults[0] if len(defaults) == 1 else None
+            model = entry["model"] if entry else None
+        else:
+            entry = next((o for o in options if o["model"] == model), None)
+        if entry and effort is None:
+            effort = entry.get("default_effort") or None
     return {"model": model, "effort": effort}
+
+
+MODELS_RETRY = 300      # seconds between the helper's own reads of a model list while it has no good one (runs)
 
 
 def model_flags(conf):
@@ -2591,7 +2601,8 @@ class Helper:
         self.conversation_seen = {}     # {C-<id>: when this helper first saw that window} (retire_conversations)
         self.conversation_starts = {}   # {C-<id>: (newest message's event, starts for it)} (conversation_may_start)
         self.newest = {}                # {C-<id>: its newest pending event} of this poll (handle_events)
-        self.conversations = None       # the ids of this agent's open conversations, from the hub's last poll
+        self.conversations = False      # the ids of this agent's open conversations, from the hub's last poll;
+                                        # False before the first, None from a hub that does not say
         self.conversation_modes = False     # {id: "tools" or "closed"}, with contacts.v2 (P2); False before the poll
         self.outside, self.outside_lock = 0, threading.Lock()      # checks and login jobs that run now
         self.logins = set()             # the sign-ins that run now, by id (begin_signin)
@@ -3270,7 +3281,7 @@ class Helper:
                     # with a session id by which its records reach the hub
                     session = str(uuid.uuid4())
                     self.start(window, lambda: conversation_work_command(
-                        self.agent, self.conf, extra["generation"], cid, data.get("token"), data.get("prompt"),
+                        self.agent, self.run_conf(), extra["generation"], cid, data.get("token"), data.get("prompt"),
                         session, env=session_env(self.agent, self.conf, "task"), opening=data.get("opening"),
                         rules=data.get("rules")), cid, extra["generation"], session, needs="none")
                 else:
@@ -3318,7 +3329,11 @@ class Helper:
                 session = str(uuid.uuid4())     # a new id for every start, so a repeated start never reuses one
                 token = session_credential(self.agent, "task", extra.get("generation", ""), task=task,
                                            attempt=extra.get("attempt", 1))
-                self.start(task, lambda: session_command(self.agent, self.run_conf(), ev["text"], task=task,
+                # an app-server task's runner reads the account's list itself at its start (screen_runner
+                # default_model), which is fresher than this helper's reading of up to six hours
+                runner = app_server_task(self.conf, needs)
+                self.start(task, lambda: session_command(self.agent, self.conf if runner else self.run_conf(),
+                    ev["text"], task=task,
                     needs=needs, attempt=extra.get("attempt",1), generation=extra.get("generation",""),
                     session=session, token=token, env=session_env(self.agent, self.conf, "task"),
                     opening=extra.get("opening"), rules=extra.get("rules")),
@@ -3669,10 +3684,15 @@ class Helper:
 
     def runs(self):
         """{"model", "effort"} of this agent's new sessions (run_settings), by the latest good reading of its runtime's
-        model list: the first one is read at once, and a reading that failed keeps the one before, so that a slow
-        model/list moves no session back to the runtime's own configuration."""
+        model list: a reading that failed keeps the one before, so that a slow model/list moves no session back to the
+        runtime's own configuration. Until a first good one this helper reads the list itself, at most each
+        MODELS_RETRY seconds: the lifecycle keeps a failed reading for hours."""
         life = getattr(self, "lifecycle", None)
-        models = (life.models or life.read_models()) if life else None
+        models = life.models if life else None
+        if life and not (models or {}).get("ok") and getattr(self, "model_list", None) is None and \
+                time.monotonic() - getattr(self, "models_tried", float("-inf")) >= MODELS_RETRY:
+            self.models_tried = time.monotonic()
+            models = life.read_models(force=models is not None)
         if isinstance(models, dict) and models.get("ok"):
             self.model_list = models
         return run_settings(self.conf, getattr(self, "model_list", None))
@@ -4612,7 +4632,10 @@ class Helper:
         window, whose prompt carries the hub's recap. A helper whose hub does not say (an older hub) keeps the old
         rule: a window quiet for CONVERSATION_IDLE seconds closes. A window that started another way than the hub runs
         its conversation now (conversation_switched) closes once no turn runs in it, because its tools were fixed at
-        its start."""
+        its start. A new helper closes nothing before its first poll: a hub that is down for a while after a release
+        is not an older hub."""
+        if self.conversations is False:
+            return
         open_windows = [w for w in self.look() if CONVERSATION_WINDOW.fullmatch(w)]
         for window in [w for w in self.conversation_seen if w not in open_windows]:
             self.conversation_seen.pop(window, None)
@@ -6032,7 +6055,7 @@ def ready_runtime_config(home=None, kit=None):
         projects[folder] = dict(m, hasTrustDialogAccepted=True)
     kept["projects"] = projects
     try:
-        tmp = path + ".fleet-new"
+        tmp = f"{path}.fleet-new-{os.getpid()}"     # two helpers of one user start at once: one name each
         with open(tmp, "w") as f:
             json.dump(kept, f)
         os.chmod(tmp, 0o600)
@@ -6049,7 +6072,10 @@ def ready_codex_trust(runtime, codex_home=None, kit=None):
     2026). The answer is one block of Codex's own config.toml, in the form Codex writes it, so the helper of a Codex
     agent appends that block for the checkout and touches nothing else; another runtime's helper writes nothing there.
     A block for the checkout that is there already, whatever it says, is the owner's answer and stays; a file that
-    Codex cannot read stays too. True when it wrote one."""
+    Codex cannot read stays too, and so does one that the block would make unreadable (a `projects` inline table):
+    the file holds the owner's own Codex settings. A Python before 3.11 reads no TOML, so there it appends only to a
+    file with no `projects` in it. The installer's worker_install.trust_codex_checkout is the same rule for a new
+    Codex checkout. True when it wrote one."""
     if runtime != "codex":
         return False
     root = codex_home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
@@ -6059,23 +6085,28 @@ def ready_codex_trust(runtime, codex_home=None, kit=None):
             text = f.read()
     except FileNotFoundError:
         text = ""
-    except OSError:
+    except (OSError, ValueError):   # unreadable, or not UTF-8 (UnicodeDecodeError), which Codex cannot read either
         return False
+    block = ("\n" if text and not text.endswith("\n") else "") + \
+        f'\n[projects.{json.dumps(folder, ensure_ascii=False)}]\ntrust_level = "trusted"\n'
     try:
         import tomllib
-        projects = tomllib.loads(text).get("projects")
-        if folder in (projects if isinstance(projects, dict) else {}):
+    except ImportError:
+        if "projects" in text:
             return False
-    except ImportError:             # a Python before 3.11: the folder named anywhere in the file is the owner's
-        if folder in text:
+    else:
+        try:
+            projects = tomllib.loads(text).get("projects")
+            if folder in (projects if isinstance(projects, dict) else {}):
+                return False
+            if tomllib.loads(text + block)["projects"][folder]["trust_level"] != "trusted":
+                return False
+        except (ValueError, KeyError, TypeError):   # tomllib.TOMLDecodeError, before or after the block
             return False
-    except ValueError:              # tomllib.TOMLDecodeError: a block appended to it would not make it readable
-        return False
     try:
         os.makedirs(root, mode=0o700, exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
-            f.write(("\n" if text and not text.endswith("\n") else "") +
-                    f'\n[projects.{json.dumps(folder)}]\ntrust_level = "trusted"\n')
+            f.write(block)
     except OSError:
         return False
     return True
