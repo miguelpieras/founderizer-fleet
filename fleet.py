@@ -4951,8 +4951,8 @@ def cmd_service(args):
         print(f"Installed {path}. Activate in the desktop session: launchctl bootstrap gui/{os.getuid()} {shlex.quote(path)}")
         return
     name = args.name
-    if name not in ("hub", "git") and name not in TEAM["agents"]:
-        die("Linux services require hub, git or a configured agent name")
+    if name not in ("hub", "git", "channels") and name not in TEAM["agents"]:
+        die("Linux services require hub, git, channels or a configured agent name")
     linger = subprocess.run(["loginctl", "show-user", str(os.getuid()), "-p", "Linger", "--value"], capture_output=True, text=True)
     if linger.stdout.strip() != "yes":
         die("enable linger first: loginctl enable-linger --no-ask-password " + os.environ.get("USER", "claude"))
@@ -4962,6 +4962,8 @@ def cmd_service(args):
         host = TEAM["addresses"][TEAM["hub"]["machine"]]
         argv = [shutil.which("git"), "daemon", "--reuseaddr", f"--listen={host}", "--forbid-override=receive-pack",
                 "--base-path=" + os.path.expanduser("~"), os.path.expanduser("~/fleet-pilot.git")]
+    elif name == "channels":    # the chat apps bridge (CHAT-APPS.md): it reads the hub from team.json beside it
+        argv = [sys.executable, os.path.join(KIT, "channels.py"), "run"]
     else:
         argv = [sys.executable, os.path.join(KIT, "fleet.py"), "run", name]
     def unit_quote(x):
@@ -4975,6 +4977,7 @@ def cmd_service(args):
             "[Service]\nType=simple\nWorkingDirectory=" + KIT.replace("%", "%%").replace(" ", r"\x20") + "\n"
             "Environment=" + unit_quote("PATH=" + path_env) + "\nExecStart=" + " ".join(map(unit_quote, argv)) + "\n"
             "Restart=always\nRestartSec=5\nKillMode=process\nTimeoutStopSec=15\n"
+            + ("UMask=0077\n" if name == "channels" else "") +   # its journal holds the text of messages
             "[Install]\nWantedBy=default.target\n")
     folder = os.path.expanduser("~/.config/systemd/user")
     os.makedirs(folder, exist_ok=True)

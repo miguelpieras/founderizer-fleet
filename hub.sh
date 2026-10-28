@@ -336,14 +336,15 @@ that Mac sends the code back; its address becomes addresses.owner"
 }
 
 services() {
-    heading "the services fleet-hub and fleet-git"
+    heading "the services fleet-hub, fleet-git and fleet-channels"
     if [ "$check" = yes ]; then
         plan "run: python3 $kit/fleet.py service hub and git"
-        plan "run: systemctl --user enable --now fleet-hub fleet-git, as $HUB_USER"
+        plan "run: python3 $kit/fleet.py service channels, the chat apps bridge"
+        plan "run: systemctl --user enable --now fleet-hub fleet-git fleet-channels, as $HUB_USER"
         plan "leave each agent to its own user, in the next step: no agent's session runs as $HUB_USER"
         return 0
     fi
-    for name in hub git; do
+    for name in hub git channels; do
         as_user python3 "$kit/fleet.py" service "$name" >/dev/null \
             || stop "Could not write the fleet-$name service. Run it by hand to see why: \
 runuser -u $HUB_USER -- python3 $kit/fleet.py service $name"
@@ -359,7 +360,7 @@ runuser -u $HUB_USER -- python3 $kit/fleet.py service $name"
     done
     as_user systemctl --user is-active -q fleet-hub || stop "fleet-hub is not running. Look at: \
 runuser -u $HUB_USER -- systemctl --user status fleet-hub"
-    say "  fleet-hub and fleet-git are enabled and running"
+    say "  fleet-hub, fleet-git and fleet-channels are enabled and running"
 }
 
 agents() {      # each agent of this machine under its own OS user: its checkout, its runtime and its service, so
