@@ -28375,13 +28375,16 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def join_script(self):
-        """GET /join: the join script, with this hub's address in it. It holds no code and no secret."""
+        """GET /join: the join script, with this hub's address in it, and the fleet's id and release channel, from
+        which a Mac takes its signed vault (the id is no secret: every Mac's vault updater keeps it in a file anyone
+        reads). It holds no code and no secret. kv_get and not fleet_id(): this GET writes nothing."""
         ip, port = hub_address()
         data = git_blob(kit_revision(), "join.sh")
         if data is None:
             return self.send(404, "This hub has no join script.\n", "text/plain; charset=utf-8")
         text = data.decode().replace("__FLEET_HUB__", f"http://{ip}:{port}").replace(
-            "__FLEET_REPO__", f"git://{ip}/fleet-pilot.git")
+            "__FLEET_REPO__", f"git://{ip}/fleet-pilot.git").replace(
+            "__FLEET_ID__", kv_get("fleet_id") or "").replace("__FLEET_CHANNEL__", release_channel().rstrip("/"))
         return self.send(200, text, "text/plain; charset=utf-8", {"Cache-Control": "no-store"})
 
     def join(self):

@@ -201,7 +201,12 @@ machine run as the vault's own user, so only the helper's signature keeps the st
 shut, and the ciphertext alone opens nothing. The handover key is a separate key, so
 rotating one does not orphan the other's values.
 
-Install it from the app repository (`miguelpieras/agents`), with the signed build:
+**A Mac's join line installs it** (since 28 October 2026, `join.sh` `mac_vault`): it takes the
+signed vault of the release channel's newest Mac build, checks it against our Developer ID,
+and runs the `install.py` that the vault carries as root, named after the Mac, with the
+fleet's own store. macOS asks for the Mac user's password once, at that step. A Mac that
+joined before then, or one whose step failed, gets it from the join line run again, or by
+hand from the app repository (`miguelpieras/agents`), with the signed build:
 
 ```sh
 sudo python3 app/Vault/install.py --app "<build>/Fleet Vault.app" --user <mac user> --agent <agent> --hub http://100.80.1.2:8765 --store --fleet <fleet id>

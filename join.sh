@@ -5,7 +5,7 @@
 #   A VPS (Ubuntu 22.04 or 24.04, or Debian 12), as root: base packages, the user fleet, then the join, security
 #   updates and the firewall. The line has joined the private network (Tailscale) before this script.
 #   A Mac (macOS 14 or later, with Tailscale and Homebrew), as the user that will run the agents: tmux and Python
-#   with Homebrew, then the join.
+#   with Homebrew, then the join, then this Mac's vault, the one step that asks for that user's password.
 #
 # The join itself is server.py in a new checkout of the Founderizer repository: the server key, POST /join with the code, and
 # the server service. The code goes to server.py on standard input, never in a command argument or a URL. The script
@@ -22,6 +22,8 @@ set -eu
 
 HUB="__FLEET_HUB__"
 REPO="__FLEET_REPO__"
+FLEET="__FLEET_ID__"            # the fleet's id at its release channel, where a Mac takes its signed vault
+CHANNEL="__FLEET_CHANNEL__"
 WORKER=fleet
 PACKAGES="git tmux python3 curl ca-certificates ufw unattended-upgrades sudo"
 ready=yes       # what the last step, verify, answered about this machine
@@ -141,6 +143,75 @@ vault_broker() { # $1: the checkout. This machine's vault broker: its own user k
         || stop "The vault of this machine could not be set up. Nothing of the owner's was read or changed."
 }
 
+# The Mac vault as the app's own Vault/install.py and Vault/update.zsh check it: signed by our Developer ID team, with
+# the vault's identifier. Nothing of a downloaded build runs as root before it has passed this check.
+VAULT_REQUIREMENT='anchor apple generic and certificate leaf[subject.OU] = "6EBZ756H9Q" and identifier "local.agent-fleet.vault"'
+VAULT_CONFIG="/Library/Application Support/Fleet Vault/config.json"
+VAULT_APP="build/Founderizer.app/Contents/Library/Fleet Vault.app"     # in an unpacked Mac build
+# The root half of mac_vault, run once with sudo. The vault is copied into a folder of root's own and checked there, and
+# only then is the install.py that it carries run, from that copy: nothing that this user can change runs as root.
+# $1 the vault, $2 the Mac user, $3 this Mac's name, $4 the hub, $5 the fleet's id, $6 the channel, $7 the requirement.
+# shellcheck disable=SC2016
+VAULT_ROOT_STEP='set -eu
+stage=$(mktemp -d /tmp/fleet-vault-root.XXXXXX)
+trap "rm -rf \"$stage\"" EXIT
+ditto "$1" "$stage/Fleet Vault.app"
+chown -R root:wheel "$stage"
+codesign --verify --deep --strict -R "=$7" "$stage/Fleet Vault.app"
+installer="$stage/Fleet Vault.app/Contents/Resources/install.py"
+[ -f "$installer" ] || { echo "the vault of the release channel carries no installer yet" >&2; exit 1; }
+/usr/bin/python3 "$installer" --app "$stage/Fleet Vault.app" --user "$2" --agent "$3" --hub "$4" --store \
+    --fleet "$5" --channel "$6" >/dev/null'
+
+mac_vault() {   # This Mac's vault, which every agent of it reaches (the owner, 28 October 2026: "it is essential that
+                # they all have access to secrets"): the signed Fleet Vault that the release channel's newest Mac build
+                # carries, put in place by the install.py inside it. It opens the fleet's own store, so it needs no
+                # account and no token of the owner's, and it is named after this Mac, because each request of an
+                # agent names that agent and carries its key. It is the one step of a Mac's join that needs root, so
+                # macOS asks for this user's password here and nowhere else. A Mac whose vault is there keeps it.
+    if [ -e "$VAULT_CONFIG" ]; then
+        say "this Mac's vault: installed already"
+        return 0
+    fi
+    name=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("name") or "")' \
+        "$HOME/.fleet/server.json" </dev/null 2>/dev/null || true)
+    if [ -z "$name" ] || [ -z "$FLEET" ]; then
+        ready=no
+        say "this Mac's vault was not installed: the hub gave no name or no release channel. Run the line again."
+        return 0
+    fi
+    work=$(mktemp -d "${TMPDIR:-/tmp}/fleet-vault.XXXXXX")
+    if ! vault_build "$work"; then
+        ready=no
+        say "this Mac's vault was not installed: $CHANNEL gave no signed vault. Run the line again."
+    else
+        say "this Mac's vault: macOS asks once for the password of $(id -un), because only root installs it"
+        if sudo /bin/sh -c "$VAULT_ROOT_STEP" sh "$work/$VAULT_APP" "$(id -un)" "$name" "$HUB" "$FLEET" "$CHANNEL" \
+                "$VAULT_REQUIREMENT" </dev/null; then
+            say "this Mac's vault: installed, with the fleet's own store; it updates itself every hour"
+        else
+            ready=no
+            say "this Mac's vault was not installed: the lines above say why. Run the line again."
+        fi
+    fi
+    rm -rf "$work"
+}
+
+vault_build() { # $1: an empty folder. The release channel's newest Mac build, as the vault's own updater takes it: this
+                # fleet's manifest, then the zip that it names on the channel's own host, by its SHA-256, unpacked.
+    curl -fsS --proto '=https' --max-time 60 -H "Founderizer-Fleet: $FLEET" -o "$1/manifest.json" \
+        "$CHANNEL/releases/app" </dev/null || return 1
+    url=$(plutil -extract url raw -o - "$1/manifest.json" 2>/dev/null || true)
+    digest=$(plutil -extract sha256 raw -o - "$1/manifest.json" 2>/dev/null || true)
+    case "$url" in "$CHANNEL"/*) ;; *) return 1 ;; esac
+    case "$url" in *..*) return 1 ;; esac
+    printf '%s' "$digest" | grep -Eq '^[0-9a-f]{64}$' || return 1
+    curl -fsS --proto '=https' --max-time 900 -o "$1/build.zip" "$url" </dev/null || return 1
+    [ "$(shasum -a 256 "$1/build.zip" | cut -d' ' -f1)" = "$digest" ] || return 1
+    ditto -x -k "$1/build.zip" "$1/build" </dev/null || return 1
+    [ -d "$1/$VAULT_APP" ]
+}
+
 verify_step() { # $1: the checkout; $2: how to run a command as the user of the service. The last step: the one health
                 # check of the whole product (PRODUCT.md 4.1), in its readable form.
     say "verify: is this machine of the fleet healthy? (selftest.py takes about a minute)"
@@ -207,6 +278,7 @@ mac() {
     # No OS user for each agent on a Mac, and no root helper: a Mac agent's service is a LaunchAgent of a desktop
     # session, so a second user would have to be logged in at the screen. A Mac keeps one user for its agents
     # (PRODUCT.md P2), and its agents share that user's runtime credential.
+    mac_vault
     verify_step "$HOME/fleet-server" as_self
     say "done. Add an agent to this Mac in Founderizer: Agents, Add agent. Its agents run while this user is logged in."
 }
