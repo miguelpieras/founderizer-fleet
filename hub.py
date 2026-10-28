@@ -14716,6 +14716,7 @@ HISTORY_KINDS = ("conversation", "owner_chat", "message", "task", "result", "not
 HISTORY_SHOWN = 15              # records in one answer of search_history
 HISTORY_READ = 40               # records of one ref in one answer of read_history
 HISTORY_TEXT = 20000            # characters of one record's words that the index takes
+HISTORY_RUN = 2000              # and how far past them the run of characters that the cut falls in is kept whole
 HISTORY_FULL = 8000             # characters of one record that read_history gives
 HISTORY_SNIPPET = 200           # characters of the line that a search shows of each record
 HISTORY_PHRASES = 12            # words or "phrases" of one search
@@ -15118,12 +15119,18 @@ HISTORY_BY_NAME = {s.name: s for s in HISTORY_STREAMS}
 
 def history_masked(text):
     """A record's words as the history keeps them: the first HISTORY_TEXT characters, with every registered login
-    masked. Only that part is read for logins, with the run of characters that the cut falls in whole, because a
-    login holds no whitespace (SECRET_RUN): so no login is cut in two, and masking a row costs what the part kept
-    costs, however long the record. A step masks its rows inside the hub's lock."""
-    text = str(text or "")
-    run = SECRET_RUN.match(text, HISTORY_TEXT)
-    return mask_secrets(text[:run.end() if run else HISTORY_TEXT])[:HISTORY_TEXT]
+    masked. A login holds no whitespace (SECRET_RUN), so no login may be cut in two: the run of characters that the
+    cut falls in is kept whole when it ends within HISTORY_RUN characters of the cut, and is left out from where it
+    starts when it goes on further. So masking reads at most HISTORY_TEXT + HISTORY_RUN characters, however long the
+    record and its logins, and a step masks its rows inside the hub's lock."""
+    text, end = str(text or ""), HISTORY_TEXT
+    run = SECRET_RUN.match(text, end, end + HISTORY_RUN + 1)
+    if run and run.end() <= end + HISTORY_RUN:
+        end = run.end()
+    elif run:
+        start = SECRET_RUN.match(text[end - 1::-1])            # the run read backwards from the cut
+        end -= start.end() if start else 0
+    return mask_secrets(text[:end])[:HISTORY_TEXT]
 
 
 def history_insert(src, src_id, recs, keys, keep=False):
