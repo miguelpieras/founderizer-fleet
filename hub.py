@@ -8979,7 +8979,9 @@ def conversation_read(agent):
     says = q("SELECT * FROM events WHERE agent=? AND task=? AND kind='say' AND read_at IS NULL ORDER BY id",
              (agent, t["id"])) if t else []
     brief = works and kv_get(f"conversation_brief:{conv['id']}")
-    if not rows and not says and not brief:
+    # lane L3: what changed in its standing items since its last read; a brief's per-task block carries them all
+    news = standing_pull(agent, conv["id"], (t is not None) if brief else None) if works else []
+    if not rows and not says and not brief and not news:
         return "No unread messages. Wait for the next signal."
     t0 = now()
     for r in rows:
@@ -9000,7 +9002,7 @@ def conversation_read(agent):
                     chat_queue("read", conv["account"], t0, chat=conv["chat"], sender=conv["sender"],
                                ids=json.dumps(ids))
     text = "\n\n".join([f"Message {cm_ref(r['id'])}:\n{conversation_header(conv, person, r)}\n{r['text']}"
-                        for r in rows] + [e["text"] for e in says] +
+                        for r in rows] + [e["text"] for e in says] + news +
                        ([f"These are {tref(t['id'])}, the open conversation task: your task tools work for it, and "
                          f"your reply ends it."] if t else []))
     if brief:
@@ -9503,6 +9505,7 @@ def person_remove(pid, t0):
             DB.execute("DELETE FROM needs WHERE conversation=? AND answer IS NULL", (cid,))
             DB.execute("UPDATE session_credentials SET revoked=? WHERE kind='conversation' AND task=? AND "
                        "revoked IS NULL", (t0, cid))
+            DB.execute("DELETE FROM kv WHERE k=?", (f"standing_told:{cid}",))      # L3: what its window was told
         DB.execute("DELETE FROM conversations WHERE person=?", (pid,))
         history_forget_person(pid)          # AUTONOMY.md P6: and their words leave the history's index with them
         DB.execute("DELETE FROM person_handles WHERE person=?", (pid,))
@@ -16159,9 +16162,9 @@ STANDING_SCOPES = ("agent", "team")
 STANDING_WORDS_MAX = 600        # characters of an item's words
 STANDING_FIELD_MAX = 300        # characters of a target's measure and of how it is measured
 STANDING_WHY_MAX = 500          # characters of why an item ended
-STANDING_CHARS = 1500           # the most that the items add to a session's opening text
-STANDING_LINE = 360             # characters of one item there
+STANDING_CHARS = 8000           # the most that the items add to a session's opening text, as for its lessons
 STANDING_PAGE = 200             # items of one owner read
+TARGET_FIELDS = ("words", "measure", "number", "due", "how", "check")       # what a target says, beside its progress
 ITEM_REF = re.compile(r"(?i)^\s*I-?([1-9][0-9]{0,17})\s*$")
 SOURCE_REF = re.compile(r"(?i)^\s*(M|CM)-?([1-9][0-9]{0,17})\s*$")
 SOURCE_PREFIX = {"owner": "M", "person": "CM"}         # author_kind: the message its words are part of
@@ -16213,9 +16216,10 @@ def standing_source(agent, source, words=None):
     """(author_kind, author, conversation, message) of what `agent` keeps or ends on the word of `source`, or a
     ToolError (AUTONOMY.md 6.2). No source: the agent itself. M-<n>: the owner's own words, a message of his or a
     steer, that went to this agent or to an agent above it in its line, which passes his words on; never in a session
-    that a person's message drives (contact_session), which must not learn what the owner said. CM-<n>: a person's message in this
-    agent's own conversation, while contacts.v2 is on. Words, when given, must be part of that message: a line inside
-    a customer's email cannot pass for another person's wish."""
+    that a person's message drives (contact_session), which must not learn what the owner said. CM-<n>: a person's
+    message in this agent's own conversation, while contacts.v2 is on, from a person whose role has its tools on: a
+    customer's role gives no item. Words, when given, must be part of that message: a line inside a customer's email
+    cannot pass for another person's wish."""
     if source in (None, ""):
         return "agent", agent, None, None
     m = SOURCE_REF.match(str(source))
@@ -16241,6 +16245,9 @@ def standing_source(agent, source, words=None):
         if not said or said["agent"] != agent or said["who"] != "person" or not person or \
                 person["blocked"] is not None or not person_may(person["id"], agent):
             raise ToolError(f"CM-{n} is no message of a person's in your own conversation.")
+        if not person_access(person)["tools"]:
+            raise ToolError(f"CM-{n} is from {person['name']}, whose role ({person['role']}) has its tools off: a "
+                            f"person in a closed role gives no standing item, changes none and ends none.")
         found = ("person", f"P-{person['id']}", said["conversation"], n, said["text"])
     if words is not None:
         quoted = plain_words(words).strip(" .,;:!?\"'()")
@@ -16296,13 +16303,13 @@ def target_detail(r, t0):
 
 
 def standing_line(r, reader, t0):
-    """One active item in one line, for an agent that it steers."""
+    """One active item in one line, for an agent that it steers. Always whole: an item cut short can lose the
+    condition it was given with. Only the owner's lists cut its words, beside his line that carries them whole."""
     scope = "" if r["scope"] != "team" else " for your team" if r["agent"] == reader else f" for {r['agent']}'s team"
     source = item_source(r)
-    line = (f"{iref(r['id'])} {r['kind']}{scope}, from {standing_who(r['author'], reader)}"
+    return (f"{iref(r['id'])} {r['kind']}{scope}, from {standing_who(r['author'], reader)}"
             + (f" ({source})" if source else "") + f", {ago(r['created'])} ago: {r['words']}"
             + (f" [{target_detail(r, t0)}]" if r["kind"] == "target" else ""))
-    return clip(line, STANDING_LINE)
 
 
 def steering_items(agent):
@@ -16316,20 +16323,22 @@ def steering_items(agent):
 
 
 def standing_start_text(agent):
-    """L3's part of the per-task block (AUTONOMY.md 6.4): the active items that steer `agent`, for every new session of
-    it. Until L8's structure is on main, start_text and manager_resume_text call it at their end."""
+    """L3's part of the per-task block (AUTONOMY.md 6.4): the active items that steer `agent`, each one whole, for
+    every new session of it (start_text, manager_resume_text). The nearest come first and the first always comes; one
+    that does not fit is named, for see_standing."""
     rows = steering_items(agent)
     if not rows:
         return ""
-    t0, kept, left = now(), [], 0
+    t0, kept, left = now(), [], []
     for r in rows:
         line = standing_line(r, agent, t0)
-        if sum(len(x) + 3 for x in kept) + len(line) <= STANDING_CHARS:
+        if not kept or sum(len(x) + 3 for x in kept) + len(line) <= STANDING_CHARS:
             kept.append(line)
         else:
-            left += 1
+            left.append(iref(r["id"]))
     return ("\nSTANDING ITEMS, lasting wishes that steer your work from now on, inside your access and never beyond it: "
-            + " | ".join(kept) + (f" | and {left} more: see_standing" if left else "")
+            + " | ".join(kept) + (f" | and {', '.join(left)}, which do not fit here: read them with see_standing"
+                                  if left else "")
             + ". End one of yours with end_standing when its author, a person whose role allows it or the owner asks, "
               "or when a target is reached.\n")
 
@@ -16351,18 +16360,40 @@ def standing_said(r, actor=None, asked_by=None, why=None):
     return said + (f": {why}" if why else "") + "."
 
 
+def standing_new_say(r, reader, t0):
+    """What a running session that item `r` steers reads about it when it is new."""
+    return (f"[hub] New standing item: {standing_line(r, reader, t0)}. It steers your work from now on, inside your "
+            f"access.")
+
+
+def standing_change_say(r, reader, t0):
+    """... when what target `r` says changed (target_update)."""
+    return f"[hub] Standing item changed: {standing_line(r, reader, t0)}. Follow it as it reads now."
+
+
+def standing_end_say(r, why, ended=True):
+    """... when it ended, or, not ended, when it no longer steers this reader: its reporting line changed."""
+    if not ended:
+        return f"[hub] Standing item {iref(r['id'])} no longer steers you: {r['words']}. Stop following it."
+    return f"[hub] Standing item {iref(r['id'])} ended" + (f" ({why})" if why else "") + f": {r['words']}. " \
+           f"Stop following it."
+
+
 def standing_news_rows(r, said, by_agent, by_task, t0):
-    """Inside the transaction that keeps or ends item `r`: one message to each running session that it steers, at once.
-    A worker's or a lead's session reads only its own task's messages, so each open task of each agent it reaches gets
-    its own, and the fleet manager's standing session gets one. The session that made the change knows it already.
-    said(reader) is the message for one reader."""
+    """Inside the transaction that keeps, changes or ends item `r`: one message to each running session that it steers,
+    at once. A worker's or a lead's session reads only its own task's messages, so each open task of each agent it
+    reaches gets its own, and the fleet manager's standing session gets one. A conversation window with the agent's
+    tools takes its news at its next read instead (standing_pull): its conversation task ends at the reply, often
+    before the window reads again. The session that made the change knows it already. said(reader) is the message
+    for one reader."""
     in_transaction("standing_news_rows")
     for name in [r["agent"]] + (team_below(r["agent"]) if r["scope"] == "team" else []):
         if role_of(name) == "manager":
             if name != by_agent:
                 DB.execute(EVENT, (name, "say", None, said(name), t0, "{}"))
             continue
-        for t in DB.execute(f"SELECT id FROM tasks WHERE owner=? AND {OPEN_TASK}", (name,)).fetchall():
+        for t in DB.execute(f"SELECT id FROM tasks WHERE owner=? AND {OPEN_TASK} AND source_message IS NULL",
+                            (name,)).fetchall():
             if t["id"] != by_task:
                 DB.execute(EVENT, (name, "say", t["id"], said(name), t0, "{}"))
 
@@ -16377,9 +16408,7 @@ def standing_new_rows(agent, fields, by_task, t0):
     r = DB.execute("SELECT * FROM standing WHERE id=?", (item,)).fetchone()
     DB.execute("INSERT INTO owner_reports(text,about,created,agent,in_reply_to) VALUES(?,?,?,?,NULL)",
                (standing_said(r), f"standing {iref(item)} of {agent}", t0, manager_name()))
-    standing_news_rows(r, lambda reader: (
-        f"[hub] New standing item: {standing_line(r, reader, t0)}. It steers your work from now on, inside your "
-        f"access."), agent, by_task, t0)
+    standing_news_rows(r, lambda reader: standing_new_say(r, reader, t0), agent, by_task, t0)
     log_row(agent, f"kept {iref(item)}, a {r['kind']} for {'its team' if r['scope'] == 'team' else 'itself'}, from "
                    f"{r['author']}" + (f" ({item_source(r)})" if item_source(r) else ""))
     return item
@@ -16395,9 +16424,7 @@ def standing_end_rows(r, actor, asked_by, why, t0, by_task=None):
     DB.execute("INSERT INTO owner_reports(text,about,created,agent,in_reply_to) VALUES(?,?,?,?,NULL)",
                (standing_said(r, actor, asked_by, why), f"standing {iref(r['id'])} of {r['agent']}", t0,
                 manager_name()))
-    standing_news_rows(r, lambda reader: (
-        f"[hub] Standing item {iref(r['id'])} ended" + (f" ({why})" if why else "") + f": {clip(r['words'], 200)}. "
-        f"Stop following it."), actor, by_task, t0)
+    standing_news_rows(r, lambda reader: standing_end_say(r, why), actor, by_task, t0)
     log_row(actor, f"ended {iref(r['id'])}, as {asked_by} asked: {why or '-'}")
 
 
@@ -16410,6 +16437,63 @@ def standing_person_rows(pid, why, t0, kept_agents=None):
                         (f"P-{pid}",)).fetchall():
         if kept_agents is None or r["agent"] not in kept_agents:
             standing_end_rows(r, "owner", "owner", why, t0)
+
+
+def standing_digest(r):
+    """What a reader follows of item `r`, in short: a change of it is news, a new progress is not."""
+    return hashlib.sha256(json.dumps([r[k] for k in TARGET_FIELDS]).encode()).hexdigest()[:16]
+
+
+def standing_told(cid):
+    """{item id: standing_digest} of the items that conversation window C-<cid> was told of, or None before its
+    count started."""
+    try:
+        told = json.loads(kv_get(f"standing_told:{cid}") or "null")
+    except ValueError:
+        return None
+    return told if isinstance(told, dict) else None
+
+
+def standing_pull(agent, cid, opening=None):
+    """L3's part of read_messages in a conversation window with the agent's tools (lane L2's conversation_read): what
+    changed in the items that steer `agent` since this window last read, one message each, as a task session gets
+    them (standing_news_rows). The window acts only on what it reads, so its next read is in time, and the news needs
+    no signal and no turn of its own. opening: True when this read is the window's brief, whose per-task block
+    carries the active items; False for a brief with no block, which gets each of them here; None for a later read.
+    A window from before this count starts it with no news."""
+    t0, active = now(), {r["id"]: r for r in steering_items(agent)}
+    seen = {str(i): standing_digest(r) for i, r in active.items()}
+    told = standing_told(cid) if opening is None else seen if opening else {}
+    news = []
+    if told is not None:
+        for i, r in active.items():
+            if str(i) not in told:
+                news.append(standing_new_say(r, agent, t0))
+            elif told[str(i)] != seen[str(i)]:
+                news.append(standing_change_say(r, agent, t0))
+        gone = [int(i) for i in told if str(i).isdigit() and int(i) not in active]
+        for r in read_rows(f"SELECT * FROM standing WHERE id IN ({','.join('?' * len(gone))}) ORDER BY id",
+                           tuple(gone)) if gone else []:
+            news.append(standing_end_say(r, r["ended_why"], r["ended"] is not None))
+    if seen != standing_told(cid):
+        kv_set(f"standing_told:{cid}", json.dumps(seen))
+    return news
+
+
+def standing_seen_here(agent, task, item):
+    """After a tool call changed item `item`: when the call came from a conversation window with the agent's tools,
+    whose tools work for its open conversation task `task`, that window knows the change already, so its next read
+    does not tell it, as a task session that makes a change is not told of it either."""
+    t = read_row("SELECT * FROM tasks WHERE id=?", (task,)) if task else None
+    told = standing_told(t["source_conversation"]) if is_conversation_task(t) else None
+    if told is None:
+        return                  # not a conversation window's call, or its next read starts the count
+    r = next((x for x in steering_items(agent) if x["id"] == item), None)
+    if r:
+        told[str(item)] = standing_digest(r)
+    else:
+        told.pop(str(item), None)
+    kv_set(f"standing_told:{t['source_conversation']}", json.dumps(told))
 
 
 def record_progress(target, value, source):
@@ -16528,6 +16612,7 @@ def standing_keep(agent, task, fields):
     t0 = now()
     with transaction():
         item = standing_new_rows(agent, fields, task, t0)
+    standing_seen_here(agent, task, item)
     team = team_below(agent) if fields["scope"] == "team" else []
     return (f"Kept as {iref(item)}. It steers your work from now on" + (f", and the work of {', '.join(team)}" if team
                                                                        else "")
@@ -16550,7 +16635,9 @@ def t_keep_instruction(agent, a):
 def t_set_target(agent, a):
     task = session_task(agent, a)
     if a.get("id") not in (None, ""):
-        return target_update(agent, parse_item(a["id"]), a)
+        return target_update(agent, parse_item(a["id"]), a, task)
+    if a.get("asked_by") not in (None, ""):
+        raise ToolError("asked_by goes with id, for a change. A new target names its message in source.")
     measure, how = item_field(a.get("measure"), "measure"), item_field(a.get("how"), "how")
     number = item_value(a.get("number"), "number")
     due = parse_wake(a["due"], "due", within=None) if a.get("due") not in (None, "") else None
@@ -16571,9 +16658,35 @@ def t_set_target(agent, a):
                                        "message": message})
 
 
-def target_update(agent, item, a):
-    """set_target with id: new values of one of the agent's own active targets. Its scope, its source and the words
-    that somebody else gave stay as it was kept; a new progress is the agent's own report of it."""
+def standing_change_said(old, new, asked_by, source):
+    """The owner's one quiet line about a change of what a target says, which `asked_by` asked for in message
+    `source` (target_update): "lead changed I-4 (90% of tickets by 30 November), as you asked in M-12: number from 90
+    to 80. Say 'end I-4' to stop it." Each changed value whole."""
+    ref, parts = iref(old["id"]), []
+    if new["words"] != old["words"]:
+        parts.append(f"its words now: {new['words']}")
+    if new["measure"] != old["measure"]:
+        parts.append(f"measure now: {new['measure']}")
+    if new["number"] != old["number"]:
+        parts.append(f"number from {item_number(old['number'])} to {item_number(new['number'])}")
+    if new["due"] != old["due"]:
+        parts.append(f"date from {item_day(old['due']) if old['due'] else 'none'} to {item_day(new['due'])}")
+    if new["how"] != old["how"]:
+        parts.append(f"how now: {new['how']}")
+    if new["check"] != old["check"]:
+        parts.append(f"its progress now comes from the check of wake-up rule {new['check']}")
+    who = "you" if asked_by == "owner" else standing_who(asked_by)
+    return (f"{new['agent']} changed {ref} ({clip(old['words'], 120)}), as {who} asked in {source}: "
+            + "; ".join(parts) + f". Say 'end {ref}' to stop it.")
+
+
+def target_update(agent, item, a, task):
+    """set_target with id: new values of one of the agent's own active targets. Its scope stays as it was kept, and a
+    new progress is the agent's own report of it. The agent's own target changes freely. What a target that somebody
+    else gave says -- its words, measure, number, date, how and check -- changes only on a message that asks for it,
+    named in asked_by (AUTONOMY.md P3), and the owner reads one quiet line about the change, as about a new item. New
+    words with asked_by are part of that message, which then is the item's source. Every other running session that
+    the target steers gets it as it reads now."""
     r = read_row("SELECT * FROM standing WHERE id=? AND kind='target'", (item,))
     if not r:
         raise ToolError(f"There is no target {iref(item)}.")
@@ -16581,10 +16694,12 @@ def target_update(agent, item, a):
         raise ToolError(f"{iref(item)} is {r['agent']}'s target, not yours.")
     if r["ended"]:
         raise ToolError(f"{iref(item)} ended {ago(r['ended'])} ago. Keep a new one with set_target.")
-    for field in ("scope", "source"):
-        if a.get(field) not in (None, ""):
-            raise ToolError(f"A target keeps the {field} it was kept with: end it with end_standing and keep a new one.")
-    change = {}
+    if a.get("scope") not in (None, ""):
+        raise ToolError("A target keeps the scope it was kept with: end it with end_standing and keep a new one.")
+    if a.get("source") not in (None, ""):
+        raise ToolError("A target keeps the source it was kept with. Name the message that asks for this change in "
+                        "asked_by.")
+    given, change = [k for k in TARGET_FIELDS if a.get(k) not in (None, "")], {}
     if a.get("measure") not in (None, ""):
         change["measure"] = item_field(a["measure"], "measure")
     if a.get("how") not in (None, ""):
@@ -16595,12 +16710,16 @@ def target_update(agent, item, a):
         change["due"] = parse_wake(a["due"], "due", within=None)
     if a.get("check") not in (None, ""):
         change["check"] = target_check(agent, a["check"])
-    own = r["author"] == agent and not r["message"]
     if a.get("words") not in (None, ""):
-        if not own:
-            raise ToolError(f"The words of {iref(item)} are {standing_who(r['author'], agent)}'s, as given.")
         change["words"] = item_words(a["words"])
-    elif own and r["words"] == target_words(r["measure"], r["number"], r["due"]) and \
+    change = {k: v for k, v in change.items() if v != r[k]}         # a value that it already has is no change
+    own, asked = r["author"] == agent and not r["message"], a.get("asked_by") not in (None, "") and bool(change)
+    if change and not own and not asked:
+        raise ToolError(f"{iref(item)} is the target that {standing_who(r['author'], agent)} gave in "
+                        f"{item_source(r)}: what it says changes only on a message that asks for it. Name that "
+                        f"message in asked_by (M-12 or CM-41), and give its own words in words when the wish itself "
+                        f"changes.")
+    if own and "words" not in change and r["words"] == target_words(r["measure"], r["number"], r["due"]) and \
             {"measure", "number", "due"} & set(change):
         new = dict(r)
         new.update(change)
@@ -16609,8 +16728,17 @@ def target_update(agent, item, a):
     if progress is not None and change.get("check", r["check"]):
         raise ToolError(f"{iref(item)} takes its progress only from its check: leave progress out.")
     if not change and progress is None:
+        if given:
+            return f"{iref(item)} already says this. Nothing changed."
         raise ToolError("Give what changes: measure, number, due, how, check, words or progress.")
     guard(agent, *[str(v) for v in change.values()])
+    source = None
+    if asked:
+        kind, author, conversation, message = standing_source(agent, a["asked_by"], change.get("words"))
+        source = (author, f"{SOURCE_PREFIX[kind]}-{message}")
+        if "words" in change:           # the words are that message's now, so the item is its author's
+            change.update(author_kind=kind, author=author, conversation=conversation, message=message)
+    t0 = now()
     with transaction():
         if change:
             DB.execute(f"UPDATE standing SET {', '.join(chr(34) + c + chr(34) + '=?' for c in change)} WHERE id=?",
@@ -16618,8 +16746,18 @@ def target_update(agent, item, a):
             history_rewrite("standing", item, iref(item))      # the history holds the target as it reads now (L5)
         if progress is not None:
             record_progress(item, progress, agent)
-    r = read_row("SELECT * FROM standing WHERE id=?", (item,))
-    return f"{iref(item)} stands as: {r['words']} [{target_detail(r, now())}]."
+        new = DB.execute("SELECT * FROM standing WHERE id=?", (item,)).fetchone()
+        if change:
+            if source:
+                DB.execute("INSERT INTO owner_reports(text,about,created,agent,in_reply_to) VALUES(?,?,?,?,NULL)",
+                           (standing_change_said(r, new, *source), f"standing {iref(item)} of {agent}", t0,
+                            manager_name()))
+            standing_news_rows(new, lambda reader: standing_change_say(new, reader, t0), agent, task, t0)
+            log_row(agent, f"changed {iref(item)}" + (f", as {source[0]} asked in {source[1]}" if source else ""))
+    if change:
+        standing_seen_here(agent, task, item)
+    return (f"{iref(item)} stands as: {new['words']} [{target_detail(new, t0)}]."
+            + (" The owner reads one quiet line about the change." if source else ""))
 
 
 def t_end_standing(agent, a):
@@ -16640,6 +16778,7 @@ def t_end_standing(agent, a):
     asked_by = standing_source(agent, a.get("asked_by"))[1] if a.get("asked_by") not in (None, "") else agent
     with transaction():
         standing_end_rows(r, agent, asked_by, why, now(), task)
+    standing_seen_here(agent, task, item)
     return (f"{iref(item)} ended" + (f", as {standing_who(asked_by, agent)} asked" if asked_by != agent else "")
             + ". New sessions no longer start with it, every other running session it steered is told, and the owner "
               "reads one quiet line.")
@@ -18526,7 +18665,8 @@ TOOLS = [
      "or because the owner, a person whose role allows it or another agent set it. check names one of your wake-up "
      "rules whose check prints lines: its first line \"progress <number>\" records the progress at each run, and the "
      "target takes its progress only from it. With id, change one of your own targets, or give its progress when it "
-     "has no check.",
+     "has no check. What a target that somebody else gave says changes only on the message that asks for it, named in "
+     "asked_by, and the owner reads one quiet line about the change.",
      S({"measure": {"type": "string", "description": "What is measured, for example: tickets with a first draft "
                                                      "within 2 hours, in percent"},
         "number": {"type": "number", "description": "The number to reach"},
@@ -18540,6 +18680,8 @@ TOOLS = [
         "words": {"type": "string", "description": "The target in one sentence: with source, the author's own words "
                                                    "as written there"},
         "id": {"type": "string", "description": "One of your targets to change, for example I-8"},
+        "asked_by": {"type": "string", "description": "With id: the message that asks for the change, M-12 or "
+                                                      "CM-41. New words are its own words"},
         "progress": {"type": "number", "description": "Where it stands now, for a target with no check"},
         "task_id": TASK_ID})),
     ("all", "end_standing", t_end_standing,
