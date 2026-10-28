@@ -395,13 +395,16 @@ def _fetch(url, token=None, timeout=CHANNEL_TIMEOUT):
         return 0, str(getattr(e, "reason", e))[:300], {}
 
 
-def latest(channel, keys, token=None, *, fetch=_fetch, timeout=CHANNEL_TIMEOUT):
+def latest(channel, keys, token=None, *, fetch=_fetch, timeout=CHANNEL_TIMEOUT, revision=None):
     """Poll the release channel once.
 
     Returns {"status", "manifest", "says", "entitlement"}: the manifest when one verified, else None with the one
     line that says why. `entitlement` is a fresh token the channel sent along, kept whatever the manifest did
-    (4.5: "Near expiry the hub asks for a fresh one with the old one"). It never raises."""
-    url = (channel or DEFAULT_CHANNEL).rstrip("/") + "/releases/latest"
+    (4.5: "Near expiry the hub asks for a fresh one with the old one"). It never raises.
+
+    With `revision` it asks for that one release, `GET /releases/<revision>`: the release that a newer one names as
+    its minimum (hub.poll_release). A manifest of any other revision is not taken."""
+    url = (channel or DEFAULT_CHANNEL).rstrip("/") + "/releases/" + (revision or "latest")
     status, body, _headers = fetch(url, token, timeout)
     if status == 0:
         return {"status": 0, "manifest": None, "entitlement": None, "says": "the release channel did not answer: " + body}
@@ -419,9 +422,13 @@ def latest(channel, keys, token=None, *, fetch=_fetch, timeout=CHANNEL_TIMEOUT):
     fresh = raw.get("entitlement") if isinstance(raw, dict) else None
     fresh = fresh if isinstance(fresh, str) and TOKEN.fullmatch(fresh) else None
     try:
-        return {"status": status, "manifest": check(raw, keys), "entitlement": fresh, "says": None}
+        manifest = check(raw, keys)
     except Untrusted as e:
         return {"status": status, "manifest": None, "entitlement": fresh, "says": str(e)}
+    if revision and manifest["revision"] != revision:
+        return {"status": status, "manifest": None, "entitlement": fresh,
+                "says": f"the release channel answered with another release than {revision[:12]}"}
+    return {"status": status, "manifest": manifest, "entitlement": fresh, "says": None}
 
 
 # ---------------------------------------------------------------- the update

@@ -27115,6 +27115,7 @@ def machine_rows():
 
 RELEASE_POLL = 900              # seconds between automatic polls of the channel
 RELEASE_ROWS = 10               # releases the app reads at once, newest first
+RELEASE_WALK = 50               # releases one poll goes back from the newest to the one this fleet can take
 RESTART_DELAY = 2               # seconds before the hub restarts itself, so this run's row is written first
 HUB_RESTART = ["systemctl", "--user", "restart", "fleet-hub"]       # CFG["hub_restart"] = [] turns it off
 # "verified" and "held" are a release this fleet knows about; "updating" is a run going on; the four of
@@ -27396,9 +27397,23 @@ def poll_release(fetch=None):
     """One poll of the channel, and what the hub keeps of it. Returns (the answer, the release's row or None).
 
     It is never called under LOCK, because it reaches the network. A manifest that does not verify leaves one line
-    in `releases_said` and nothing else: the hub does not record text it could not check."""
+    in `releases_said` and nothing else: the hub does not record text it could not check.
+
+    The release it answers is the one this fleet takes next. The newest one is not taken while this fleet lacks its
+    minimum (releases.Update step `minimum`), and the channel offers only the newest one, so the poll asks for the
+    release at that minimum, and so on back, and answers the first one whose minimum this fleet has (a marked
+    commit, COORDINATION.md "Readiness"). The rows are recorded oldest first, as the releases came."""
     token = entitlement_token()
-    answer = releases.latest(release_channel(), release_keys(), token, **({"fetch": fetch} if fetch else {}))
+    ask = {"fetch": fetch} if fetch else {}
+    answer = releases.latest(release_channel(), release_keys(), token, **ask)
+    chain, missed = [answer["manifest"]] if answer["manifest"] else [], None
+    while chain and len(chain) < RELEASE_WALK and not chain[-1]["hold"] and chain[-1]["minimum"] and \
+            git_kit("merge-base", "--is-ancestor", chain[-1]["minimum"], "HEAD")[0] != 0:
+        before = releases.latest(release_channel(), release_keys(), token, revision=chain[-1]["minimum"], **ask)
+        if not before["manifest"]:
+            missed = before["says"]
+            break
+        chain.append(before["manifest"])
     t0, row = now(), None
     with LOCK:
         kv_set("releases_checked", t0)
@@ -27411,7 +27426,11 @@ def poll_release(fetch=None):
             except (Refusal, releases.Untrusted) as e:
                 log("hub", f"the release channel sent an entitlement that the hub did not keep: {e}")
         if answer["manifest"]:
-            row = record_manifest(answer["manifest"], t0)
+            row = [record_manifest(manifest, t0) for manifest in reversed(chain)][0]
+            answer = dict(answer, manifest=chain[-1])
+            if missed:
+                log("hub", f"release {chain[-1]['version']} needs the release at {chain[-1]['minimum'][:12]} first, "
+                           f"and the release channel did not give it: {missed}")
         elif answer["says"]:
             log("hub", "the release channel: " + answer["says"])
     return answer, row
