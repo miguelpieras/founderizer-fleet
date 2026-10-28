@@ -1154,6 +1154,21 @@ def screen_settings(conf):
     return {"model": screen.get("model"), "effort": screen.get("effort")}
 
 
+def run_settings(conf, models=None):
+    """{"model", "effort"} that a new session of the agent starts with: its own, else the one default of its runtime's
+    own model list (models, a Lifecycle.read_models reading) and that entry's default effort when it chose no effort,
+    as a screen task gets them (screen_runner.default_model). Without them the runtime takes its own configuration's,
+    which can name a model that the account offers no more: a Mac's Codex config named one that its ChatGPT sign-in
+    did not offer, and every turn of a Codex agent there failed with model_not_found (28 October 2026). A reading of
+    another runtime, a failed one and a list without exactly one default give nothing; Claude's list marks none."""
+    model, effort = conf.get("model") or None, conf.get("effort") or None
+    if model is None and isinstance(models, dict) and models.get("ok") and models.get("runtime") == conf.get("runtime"):
+        defaults = [o for o in models.get("options") or [] if isinstance(o, dict) and o.get("default") is True]
+        if len(defaults) == 1 and isinstance(defaults[0].get("model"), str):
+            model, effort = defaults[0]["model"], effort or defaults[0].get("default_effort") or None
+    return {"model": model, "effort": effort}
+
+
 def model_flags(conf):
     """The requested model and effort for a new session, as the runtime's own flags (owner API 1.9); "" for the
     runtime's defaults. Screen tasks use the screen settings instead (screen_settings)."""
@@ -2593,6 +2608,7 @@ class Helper:
         self.step = None                # (name, task or None, monotonic start) of the main loop's step now (doing)
         self.start_reports = {}         # {task: the last start failure told to the hub} (report_start)
         self.screens = {}               # {window: {"last", "class", "told"}} of the screen watch (watch_screens)
+        self.model_list = None          # the latest good reading of the runtime's model list (runs)
         self.last_class = {}            # {window: the class its screen had when it went}
         if self.worker:
             self.tailer = Tailer(conf.get("runtime", ""), self.task_windows,
@@ -2851,7 +2867,7 @@ class Helper:
                 self.manager_pending = None         # it did not start: a new start
                 generation = manager_generation(self.agent)
                 token = manager_credential(self.agent, generation)
-                command, session, record, note = manager_start(self.agent, self.conf, generation, token,
+                command, session, record, note = manager_start(self.agent, self.run_conf(), generation, token,
                                                                fresh=self.manager_fresh)
                 save_handover(self.agent, start_handover(self.agent, generation))
                 if record:      # first: no window runs without it (a start that never begins is replaced next time)
@@ -3122,7 +3138,7 @@ class Helper:
         # for the parts of the rules that it starts with (plan P9.2).
         data = {} if resume else hub_opening(self.agent)
         recap = "" if resume else chat_recap(self.agent, data)
-        self.start(window, chat_command(self.agent, self.conf, generation, token=token, marker=marker, resume=resume,
+        self.start(window, chat_command(self.agent, self.run_conf(), generation, token=token, marker=marker, resume=resume,
                                         recap=recap, env=session_env(self.agent, self.conf, "chat"),
                                         rules=opening_rules(data)),
                    1, generation)
@@ -3259,7 +3275,7 @@ class Helper:
                         rules=data.get("rules")), cid, extra["generation"], session, needs="none")
                 else:
                     try:
-                        command = conversation_command(self.agent, self.conf, extra["generation"], cid,
+                        command = conversation_command(self.agent, self.run_conf(), extra["generation"], cid,
                                                        data.get("url") or HUB + str(data.get("path") or ""),
                                                        data.get("token"), data.get("prompt"),
                                                        runtime=data.get("runtime"), version=data.get("version"))
@@ -3302,7 +3318,7 @@ class Helper:
                 session = str(uuid.uuid4())     # a new id for every start, so a repeated start never reuses one
                 token = session_credential(self.agent, "task", extra.get("generation", ""), task=task,
                                            attempt=extra.get("attempt", 1))
-                self.start(task, lambda: session_command(self.agent, self.conf, ev["text"], task=task,
+                self.start(task, lambda: session_command(self.agent, self.run_conf(), ev["text"], task=task,
                     needs=needs, attempt=extra.get("attempt",1), generation=extra.get("generation",""),
                     session=session, token=token, env=session_env(self.agent, self.conf, "task"),
                     opening=extra.get("opening"), rules=extra.get("rules")),
@@ -3637,8 +3653,7 @@ class Helper:
             reuse, why = session_reuse(runtime, seen,
                                        dict(started_runs(start, runtime), account=account or None)
                                        if start.strip() else None,
-                                       {"runtime": runtime, "model": self.conf.get("model"),
-                                        "effort": self.conf.get("effort"), "account": account_now(self.agent, runtime)},
+                                       dict(self.runs(), runtime=runtime, account=account_now(self.agent, runtime)),
                                        reuse_settings(team), facts=facts_now(team, runtime))
             if reuse:
                 return False
@@ -3651,6 +3666,20 @@ class Helper:
             self.chat_fresh = True          # its next start begins a new conversation, with the hub's recap
             self.say(f"{window}: {why}, so it starts again on a new conversation with the hub's recap")
         return True
+
+    def runs(self):
+        """{"model", "effort"} of this agent's new sessions (run_settings), by the latest good reading of its runtime's
+        model list: the first one is read at once, and a reading that failed keeps the one before, so that a slow
+        model/list moves no session back to the runtime's own configuration."""
+        life = getattr(self, "lifecycle", None)
+        models = (life.models or life.read_models()) if life else None
+        if isinstance(models, dict) and models.get("ok"):
+            self.model_list = models
+        return run_settings(self.conf, getattr(self, "model_list", None))
+
+    def run_conf(self):
+        """The agent's settings as its new sessions start with them (runs)."""
+        return dict(self.conf, **self.runs())
 
     def window_reuse(self, target, window):
         """The session reuse rule (plan P9.10) for a task window or a tools-on conversation window of this agent's
@@ -3682,8 +3711,7 @@ class Helper:
         reuse, why = session_reuse(runtime, seen,
                                    dict(started_runs(start, runtime), account=account or None)
                                    if start.strip() else None,
-                                   {"runtime": runtime, "model": self.conf.get("model"),
-                                    "effort": self.conf.get("effort"), "account": account_now(self.agent, runtime)},
+                                   dict(self.runs(), runtime=runtime, account=account_now(self.agent, runtime)),
                                    reuse_settings(team), facts=facts_now(team, runtime))
         return reuse, why, int(attempt)
 
