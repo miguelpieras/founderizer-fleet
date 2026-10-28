@@ -66,7 +66,8 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             # AUTONOMY.md P2, P10 (lane L2): a conversation with the agent's own tools (conversation_work_command), a
             # closed one on the chosen runtime at its pinned version, and the records of a conversation's session
             "conversation_tasks",
-            "check_lines"]      # it runs checks that print lines, with the agent's read keys and its error output (P4)
+            "check_lines",      # it runs checks that print lines, with the agent's read keys and its error output (P4)
+            "chat_tools"]       # an owner chat whose tools changed starts again between turns, on its conversation
 # ---------------------------------------------------------------- the runtimes
 #
 # What the fleet knows about a runtime is here, in one entry for each provider, and nowhere else. hub.py, fleet.py and

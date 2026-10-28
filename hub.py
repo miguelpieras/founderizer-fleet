@@ -31667,6 +31667,10 @@ class Handler(BaseHTTPRequestHandler):
                                    "rules": rules_parts(agent)})
         if query.get("delivery") == "1" and agent != "owner":
             deadline, told = now() + wait, None
+            # The tool list that a new owner chat of this agent gets now: its helper starts a chat that started with
+            # another one again, between two turns, on the same conversation (Helper.restart_chat_for_tools).
+            chat_contract = tool_contract(agent, (kv_get("db_id"), "owner-chat", "1")) \
+                if role_of(agent) in ("worker", "lead") else None
             while True:
                 rows = q("SELECT * FROM events WHERE agent=? AND "
                          "((kind IN ('task','say') AND read_at IS NULL) OR (kind='chat') OR "
@@ -31753,7 +31757,7 @@ class Handler(BaseHTTPRequestHandler):
                 # Owner feature chat_warm: whether this agent's owner chat should run now, before any message, and
                 # whether its session has its tools. A change ends the wait, so the chat starts as soon as it may.
                 chat = {"warm": chat_wanted(agent, limited or pending or holding),
-                        "ready": chat_session_ready(agent)} if worker else None
+                        "ready": chat_session_ready(agent), "tools": chat_contract} if worker else None
                 if rows or now() >= deadline or told not in (None, chat):
                     break
                 told = chat

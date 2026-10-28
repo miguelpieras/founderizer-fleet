@@ -1163,6 +1163,10 @@ def model_flags(conf):
 
 
 CHAT_SIGNAL = "New fleet messages. Call read_messages now."     # the helper's signal to an owner chat window
+# The Fleet tools that a Claude owner chat may call: hub.CHAT_TOOLS, a junction that test_direct_chat and
+# test_chat_agents pin on both sides.
+CHAT_TOOLS = ("read_messages", "tell_owner", "message_owner", "message_agent", "see_responsibilities", "recall",
+              "start_task")
 # Characters of a chat's quoted first prompt. A tmux command must stay under 16 KiB (start_window; tmux refuses a
 # longer one with "command too long"), and a Codex chat has nowhere else to put its prompt. The instructions and the
 # profile are what the chat is, so the recap is what gives way.
@@ -1244,10 +1248,7 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
     elif conf.get("runtime") == "claude":
         if resume is not None and not THREAD_ID.fullmatch(str(resume)):
             raise Refused("a Claude chat resumes only a session id")
-        settings = {"permissions": {"allow": ["mcp__fleet__read_messages", "mcp__fleet__tell_owner",
-                                              "mcp__fleet__message_owner", "mcp__fleet__message_agent",
-                                              "mcp__fleet__see_responsibilities",
-                                              "mcp__fleet__recall", "mcp__fleet__start_task"], "deny": DENY}}
+        settings = {"permissions": {"allow": [f"mcp__fleet__{t}" for t in CHAT_TOOLS], "deny": DENY}}
         args = ["claude"] + (["--resume", resume] if resume else ["--session-id", marker] if marker else []) + \
             ["--permission-mode", "dontAsk", "--tools", "", "--strict-mcp-config",
              "--mcp-config", mcp_config_file(agent, "owner-chat", url, token) if token else
@@ -1406,8 +1407,9 @@ def chat_record_file(agent, runtime="codex", kind="chat"):
 
 
 def load_chat_record(agent, runtime="codex", kind="chat"):
-    """This agent's owner chat on one runtime as the helper started it: {generation, marker, session, started}; None
-    when there is none. Refused when it is there but cannot be read: then nothing may take its place."""
+    """This agent's owner chat on one runtime as the helper started it: {generation, marker, session, started, tools}
+    (tools: chat_tools of its last start; a chat that started before its helper kept it has none); None when there
+    is none. Refused when it is there but cannot be read: then nothing may take its place."""
     path, what = chat_record_file(agent, runtime, kind), "owner chat" if kind == "chat" else "manager session"
     if not os.path.lexists(path):
         return None
@@ -1419,6 +1421,16 @@ def load_chat_record(agent, runtime="codex", kind="chat"):
     if not isinstance(record, dict) or not isinstance(record.get("generation"), str):
         raise Refused(f"the {what} record {path} is not valid")
     return record
+
+
+def chat_tools(served):
+    """The tools that an owner chat starts with, as a short hash for its record: the hub's contract of the chat's tool
+    list (served: hub.tool_contract, which each poll gives in `chat`) and this helper's own list of them (CHAT_TOOLS,
+    the allow list of a Claude chat; a Codex chat takes what the hub serves). None from a hub that gives no contract
+    (an older hub): then nothing is compared (Helper.restart_chat_for_tools)."""
+    if not isinstance(served, str) or not served:
+        return None
+    return hashlib.sha256(json.dumps([served, CHAT_TOOLS]).encode()).hexdigest()[:12]
 
 
 def save_chat_record(agent, record, runtime="codex", kind="chat"):
@@ -3028,10 +3040,17 @@ class Helper:
                                         rules=opening_rules(data)),
                    1, generation)
         self.chat_started = (generation, (last[1] + 1) if resume is None and last and last[0] == generation else 1)
+        # what this start gave it, for the next helper in its record and for this one here (restart_chat_for_tools)
+        tools = self.chat_tools_for = chat_tools(getattr(self, "chat_served", None))
         if marker:      # Codex finds its thread by the marker later; Claude starts with the marker as session id
             save_chat_record(self.agent, {"generation": generation, "marker": marker if runtime == "codex" else None,
                                           "session": None if runtime == "codex" else marker,
-                                          "started": time.time()}, runtime)
+                                          "started": time.time(), "tools": tools}, runtime)
+        elif resume:    # the same conversation, with the tools of this start
+            with contextlib.suppress(Refused):
+                record = load_chat_record(self.agent, runtime)
+                if record and record.get("tools") != tools:
+                    save_chat_record(self.agent, dict(record, tools=tools), runtime)
         self.say(f"owner-chat: {'conversation ' + resume + ' continued' if resume else 'session started'}"
                  f"{' with the hub\'s recap of this chat' if recap else ''}; agent read and reply are still pending")
 
@@ -3041,25 +3060,62 @@ class Helper:
         should run and is not open starts here, so that his first message finds a session that can answer it, and
         the app shows "Setting up" until then. A new session's first signal waits only until the hub says it is
         ready, no longer the whole signal throttle (start), which guards against a line typed before the session
-        can take it. Called before the poll's events, so that "ready" is about the session that runs now."""
+        can take it. Called before the poll's events, so that "ready" is about the session that runs now. The poll
+        also gives the hub's contract of the chat's tool list (tools), which a start keeps in its record."""
         if not self.worker or not isinstance(chat, dict):
             return
         window = "owner-chat"
+        self.chat_served = chat.get("tools")
         if not chat.get("warm") or not generation:
             return
         try:
             if window in self.look():
                 # A chat of another hub generation cannot answer this hub, and no message of his could reach the
-                # app's chat to replace it (handle): it closes, and a new one starts.
+                # app's chat to replace it (handle): it closes, and a new one starts. A chat of this generation goes
+                # on, unless its tools changed (restart_chat_for_tools).
                 r = tmux("show-options", "-wv", "-t", f"{self.session}:={window}", "@fleet_attempt")
-                if r.returncode != 0 or r.stdout.strip() in ("", f"{generation}:1") or self.other_runtime_windows():
+                if r.returncode != 0 or not r.stdout.strip() or self.other_runtime_windows():
                     return
-                tmux("kill-window", "-t", f"{self.session}:={window}", check=True)
+                if r.stdout.strip() != f"{generation}:1":
+                    tmux("kill-window", "-t", f"{self.session}:={window}", check=True)
+                elif not self.restart_chat_for_tools(generation):
+                    return
             elif self.other_runtime_windows():      # the previous runtime's chat closes first (retire_old_chat)
                 return
             self.start_chat(generation)
         except Exception as e:      # the next poll tries again, and start_chat says how often
             self.say_chat(f"it did not start before a message: {e}")
+
+    def restart_chat_for_tools(self, generation):
+        """True when this closed the owner chat of this generation because its tools changed, so that keep_chat
+        starts it again at once on the same conversation (chat_resume), with the tools that the chat has now.
+
+        **A running chat never sees a new tool.** A session gets its tool list once, at its start, and the hub
+        announces no change of it (listChanged false), so a tool that a release gives the chat never reached a chat
+        that ran before it: Mia's chat of 26 October had no start_task on 28 October, and the owner's request there
+        could not open a task. So the record of each start keeps what it started with (chat_tools), and a chat whose
+        record says other tools than the poll's starts again. A record without them is a chat that started before
+        its helper kept them: it starts again too. Never a chat that this helper started with the poll's tools, also
+        when its record could not be written; only between two turns, never while a turn runs or a question waits on
+        its screen; and never a chat without a record of this generation, whose conversation could not be continued."""
+        runtime, target = self.conf.get("runtime"), f"{self.session}:=owner-chat"
+        tools = chat_tools(getattr(self, "chat_served", None))
+        if tools is None or runtime not in MANAGER_RUNTIMES or getattr(self, "chat_tools_for", None) == tools:
+            return False                # an older hub, a runtime without records, or this helper started it so
+        try:
+            record = load_chat_record(self.agent, runtime)
+        except Refused:
+            return False
+        if not record or record.get("generation") != generation or record.get("tools") == tools:
+            return False
+        screen = tmux("capture-pane", "-p", "-t", target)
+        if screen.returncode != 0 or shows_question(screen.stdout) or \
+                WORKING.search("\n".join(screen.stdout.rstrip().split("\n")[-15:])):
+            return False                # a turn runs, a question waits or it cannot be read: at a later poll
+        tmux("kill-window", "-t", target, check=True)
+        self.chat_started = None        # a chat closed for its tools is not a start that ended (start_chat)
+        self.say("owner-chat: its tools changed, so it starts again")
+        return True
 
     def handle(self, ev):
         kind, task = ev["kind"], ev.get("task")
