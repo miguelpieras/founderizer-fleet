@@ -1294,6 +1294,80 @@ CLAUDE_BUILT_INS = ("EndConversation", "DeferredToolPlaceholder")
 CLAUDE_VERSIONS = os.path.expanduser("~/.local/share/claude/versions")
 KEPT_RUNTIMES = os.path.join(HOME, "runtimes")
 RUNTIME_VERSION = re.compile(r"\d{1,4}\.\d{1,4}\.\d{1,6}")
+# The vendor's own release store, where its installer (claude.ai/install.sh) takes each version: <version>/manifest.json
+# names the SHA-256 of each platform's file, and <version>/<platform>/claude is that file.
+CLAUDE_RELEASES = "https://downloads.claude.ai/claude-code-releases"
+CLOSED_INSTALLS = {}        # {version: {"thread", "error"}} of the installs that this helper started (closed_program)
+
+
+class Installing(Refused):
+    """A closed conversation waits for the helper's install of its pinned version (closed_program)."""
+
+
+def claude_platform():
+    """This machine's platform in the vendor's own words, found as its installer finds it: darwin or linux, x64 or
+    arm64 (an x64 process under Rosetta takes the arm64 file), and -musl for a Linux on musl."""
+    system, machine = os.uname().sysname, os.uname().machine
+    arch = {"x86_64": "x64", "amd64": "x64", "arm64": "arm64", "aarch64": "arm64"}.get(machine)
+    if system not in ("Darwin", "Linux") or arch is None:
+        raise Refused(f"Claude Code has no file for {system} on {machine}")
+    if system == "Darwin":
+        translated = subprocess.run(["sysctl", "-n", "sysctl.proc_translated"], capture_output=True, text=True)
+        return f"darwin-{'arm64' if translated.stdout.strip() == '1' else arch}"
+    musl = any(os.path.exists(f"/lib/libc.musl-{m}.so.1") for m in ("x86_64", "aarch64"))
+    return f"linux-{arch}{'-musl' if musl else ''}"
+
+
+def install_closed(version):
+    """Claude Code <version> into KEPT_RUNTIMES from the vendor's own release store (AUTONOMY.md P10), as the vendor's
+    installer downloads it: this platform's file of that version, held to the SHA-256 that the version's manifest
+    names. The installer's next step (`claude install`, which moves the `claude` link) never runs, so the agent's own
+    Claude Code stays at its version. The file appears whole or not at all; raises on any failure. Each process
+    downloads into a file of its own, .claude-<version>.<pid>.part, and removes one that a helper which has ended left
+    behind."""
+    platform = claude_platform()
+    with urllib.request.urlopen(f"{CLAUDE_RELEASES}/{version}/manifest.json", timeout=60) as r:
+        manifest = json.loads(r.read(1 << 20))
+    platforms = manifest.get("platforms") if isinstance(manifest, dict) and manifest.get("version") == version else None
+    entry = platforms.get(platform) if isinstance(platforms, dict) else None
+    checksum = entry.get("checksum") if isinstance(entry, dict) else None
+    if not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum):
+        raise Refused(f"the vendor's manifest of Claude Code {version} names no file for {platform}")
+    os.makedirs(KEPT_RUNTIMES, mode=0o700, exist_ok=True)
+    for left in glob.glob(os.path.join(KEPT_RUNTIMES, f".claude-{version}.*.part")):
+        pid = left.rsplit(".", 2)[-2]
+        if pid.isdigit() and int(pid) != os.getpid() and process_gone(int(pid)):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(left)
+    part, digest = os.path.join(KEPT_RUNTIMES, f".claude-{version}.{os.getpid()}.part"), hashlib.sha256()
+    try:
+        with urllib.request.urlopen(f"{CLAUDE_RELEASES}/{version}/{platform}/claude", timeout=60) as r, \
+                open(os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o700), "wb") as f:
+            for block in iter(lambda: r.read(1 << 20), b""):
+                digest.update(block)
+                f.write(block)
+        if digest.hexdigest() != checksum:
+            raise Refused(f"the download of Claude Code {version} does not match the vendor's checksum")
+        os.replace(part, os.path.join(KEPT_RUNTIMES, f"claude-{version}"))
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(part)
+
+
+def install_thread(version, install):
+    print(time.strftime("%H:%M:%S"), f"Claude Code {version} is not on this machine: the helper installs it from the "
+                                     f"vendor for closed conversations", flush=True)
+    try:
+        install_closed(version)
+        print(time.strftime("%H:%M:%S"), f"Claude Code {version} is installed for closed conversations", flush=True)
+    except Exception as e:
+        install["error"] = str(e)[:200] if isinstance(e, Refused) else f"{type(e).__name__}: {str(e)[:160]}"
+        print(time.strftime("%H:%M:%S"), f"Claude Code {version} was not installed: {install['error']}", flush=True)
+
+
+def closed_installing():
+    """The version whose install runs now, else None: a closed conversation waits for it (Helper.handle)."""
+    return next((v for v, install in CLOSED_INSTALLS.items() if install["thread"].is_alive()), None)
 
 
 def closed_program(runtime, version):
@@ -1301,7 +1375,10 @@ def closed_program(runtime, version):
     conversations, at exactly the version that passed the lockdown test, whatever this agent's own runtime and its
     version are. Claude Code's installer keeps a few versions of its own, and the helper keeps a hard link to the
     pinned one, which costs nothing while the installer's file is there and keeps it when the installer removes it.
-    Refused when this machine has no such version: then no closed conversation of this agent starts here."""
+
+    A machine without that version gets it from the vendor (install_closed) in a thread of its own, and meanwhile the
+    conversation waits (Installing). A failed install is the reason for the next start, and the start after it tries
+    the install again."""
     if runtime != "claude" or not runtime_fact(runtime, "conversation"):
         raise Refused(f"closed conversations run on Claude Code here: {runtime} cannot be locked to the conversation tools")
     if not isinstance(version, str) or not RUNTIME_VERSION.fullmatch(version):
@@ -1314,9 +1391,19 @@ def closed_program(runtime, version):
     for path in (kept, vendor):
         if os.path.isfile(path) and os.access(path, os.X_OK):
             return path
-    raise Refused(f"Claude Code {version}, the version that closed conversations run at, is not on this machine: "
-                  f"install it once (the vendor's installer with that version), or set conversations.closed_version "
-                  f"to a version that passed the lockdown test")
+    install = CLOSED_INSTALLS.get(version)
+    if install and install["error"]:
+        CLOSED_INSTALLS.pop(version)
+        raise Refused(f"Claude Code {version}, the version that closed conversations run at, could not be installed "
+                      f"on this machine: {install['error']}")
+    if not (install and install["thread"].is_alive()):
+        install = {"error": None}
+        install["thread"] = threading.Thread(target=install_thread, args=(version, install), daemon=True,
+                                             name=f"install-claude-{version}")
+        CLOSED_INSTALLS[version] = install
+        install["thread"].start()
+    raise Installing(f"Claude Code {version}, the version that closed conversations run at, is being installed on "
+                     f"this machine")
 
 
 def conversation_folder(conversation):
@@ -3152,6 +3239,11 @@ class Helper:
                 if len([w for w in self.look() if CONVERSATION_WINDOW.fullmatch(w)]) >= CONVERSATION_WINDOWS and \
                         not self.free_conversation_slot(window):
                     raise Refused(f"{CONVERSATION_WINDOWS} conversation windows are open; {window} waits for one")
+                installing = closed_installing()
+                if installing and (self.conversation_modes or {}).get(cid) != "tools":
+                    # AUTONOMY.md P10: no start and no new credential while its runtime downloads; the hub holds the
+                    # message, and the first poll after the install starts the window
+                    raise Installing(f"{window} waits for Claude Code {installing}, which this helper installs")
                 if not self.conversation_may_start(window, self.newest.get(window, ev["id"])):
                     return
                 code, data = http("POST", f"/helper/conversations/{self.agent}/{cid}/start", {})
@@ -3166,11 +3258,16 @@ class Helper:
                         session, env=session_env(self.agent, self.conf, "task"), opening=data.get("opening"),
                         rules=data.get("rules")), cid, extra["generation"], session, needs="none")
                 else:
-                    self.start(window, conversation_command(self.agent, self.conf, extra["generation"], cid,
-                                                            data.get("url") or HUB + str(data.get("path") or ""),
-                                                            data.get("token"), data.get("prompt"),
-                                                            runtime=data.get("runtime"), version=data.get("version")),
-                               cid, extra["generation"])
+                    try:
+                        command = conversation_command(self.agent, self.conf, extra["generation"], cid,
+                                                       data.get("url") or HUB + str(data.get("path") or ""),
+                                                       data.get("token"), data.get("prompt"),
+                                                       runtime=data.get("runtime"), version=data.get("version"))
+                    except Installing:      # no window started, so the start guard counts no start
+                        last, count = self.conversation_starts[window]
+                        self.conversation_starts[window] = (last, count - 1)
+                        raise
+                    self.start(window, command, cid, extra["generation"])
                 if data.get("mode"):        # how it started, which Helper.retire_conversations holds to the hub's
                     tmux("set-option", "-w", "-t", f"{self.session}:={window}", "@fleet_conversation", data["mode"])
                 self.conversation_seen[window] = time.monotonic()
