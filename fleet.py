@@ -1331,7 +1331,7 @@ def conversation_command(agent, conf, generation, conversation, url, token, prom
     file (a tmux command must stay under 16 KiB). No hook, browser, catalog tool, API key or GitHub token, and no
     user, project or local settings, CLAUDE.md, memory, skill or plugin: test_conversation_lockdown proves the offered
     tools (the Fleet tools, and CLAUDE_BUILT_INS) and the prompt against stand-ins. The window starts in
-    conversation_folder; Claude Code asks its workspace trust question there unless it trusts CHATS.
+    conversation_folder, inside CHATS, which ready_runtime_config trusts, so Claude Code asks no workspace question.
 
     runtime and version (AUTONOMY.md P10, which the hub gives with contacts.v2): the runtime and the version of every
     closed conversation, whatever this agent's own runtime is (closed_program), with its updater off, and with the
@@ -2473,7 +2473,7 @@ class Helper:
         self.conversation_starts = {}   # {C-<id>: (newest message's event, starts for it)} (conversation_may_start)
         self.newest = {}                # {C-<id>: its newest pending event} of this poll (handle_events)
         self.conversations = None       # the ids of this agent's open conversations, from the hub's last poll
-        self.conversation_modes = None  # {id: "tools" or "closed"} of them, with contacts.v2 (AUTONOMY.md P2)
+        self.conversation_modes = False     # {id: "tools" or "closed"}, with contacts.v2 (P2); False before the poll
         self.outside, self.outside_lock = 0, threading.Lock()      # checks and login jobs that run now
         self.logins = set()             # the sign-ins that run now, by id (begin_signin)
         self.loop_wake = threading.Event()      # ends the loop's pause, so an owner's request acts at once
@@ -4410,8 +4410,12 @@ class Helper:
         """True when a conversation window started another way than the hub runs its conversation now (AUTONOMY.md
         P2): its person's role gained or lost its tools, or contacts.v2 changed. The hub's modes come with the poll
         that brings the message. Without them (contacts.v2 off, or an older hub) no conversation runs with tools, so a
-        window that started with them is one."""
+        window that started with them is one. A new helper, which each release starts, knows nothing before its first
+        poll, and then no window is switched: it closed every conversation with tools at each release (live check, 28
+        October 2026). No message reaches a window before that poll, which brings the modes first."""
         modes, kind = getattr(self, "conversation_modes", None), self.conversation_kind(window)
+        if modes is False:
+            return False
         if not isinstance(modes, dict):
             return kind == "tools"
         return modes.get(window[2:]) not in (None, kind)
@@ -5809,13 +5813,16 @@ def ready_runtime_config(home=None, kit=None):
     else: the agent's own session and the owner's sign-in both wait at it for a person who is never there. The
     wizard runs until `hasCompletedOnboarding` is in the runtime's own file, whatever else is in it, and it asks
     once more for each folder it is started in ("Do you trust the files in this folder?", kept per folder as
-    `hasTrustDialogAccepted`). The folder is the agent's own checkout, which the owner's own installer made. So the
-    helper writes those two answers and the theme with them, and touches no other key. True when it wrote one.
+    `hasTrustDialogAccepted`). The folders are the agent's own checkout, which the owner's own installer made, and
+    CHATS, whose trust covers each conversation's empty folder in it: without it, every closed conversation waited at
+    that question with "No, exit" picked (live check, 28 October 2026). So the helper writes those answers and the
+    theme with them, and touches no other key. True when it wrote one.
 
     It is the helper that does this, not the installer, because every machine of every fleet has a helper and it
     runs before the first session of its agent."""
-    path = os.path.join(home or os.path.expanduser("~"), ".claude.json")
-    folder = os.path.realpath(kit or KIT)
+    home = home or os.path.expanduser("~")
+    path = os.path.join(home, ".claude.json")
+    folders = (os.path.realpath(kit or KIT), os.path.realpath(os.path.join(home, os.path.basename(CHATS))))
     try:
         with open(path) as f:
             kept = json.load(f)
@@ -5826,15 +5833,16 @@ def ready_runtime_config(home=None, kit=None):
     projects = kept.get("projects")
     if not isinstance(projects, dict):
         projects = {}
-    mine = projects.get(folder) if isinstance(projects.get(folder), dict) else {}
-    if kept.get("hasCompletedOnboarding") and mine.get("hasTrustDialogAccepted"):
+    mine = {folder: projects[folder] if isinstance(projects.get(folder), dict) else {} for folder in folders}
+    if kept.get("hasCompletedOnboarding") and all(m.get("hasTrustDialogAccepted") for m in mine.values()):
         return False
     kept["hasCompletedOnboarding"] = True
     kept.setdefault("theme", "dark")
     # Its offer of the new renderer comes back until it has been shown three times, and it blocks the window while
     # it stands there. Nobody is at this terminal to take it, so it is counted out before it is ever drawn.
     kept["fullscreenUpsellSeenCount"] = max(int(kept.get("fullscreenUpsellSeenCount") or 0), 3)
-    projects[folder] = dict(mine, hasTrustDialogAccepted=True)
+    for folder, m in mine.items():
+        projects[folder] = dict(m, hasTrustDialogAccepted=True)
     kept["projects"] = projects
     try:
         tmp = path + ".fleet-new"
