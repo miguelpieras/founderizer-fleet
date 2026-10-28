@@ -4383,7 +4383,7 @@ def deliver_result(agent, a, files_said=None):
         # A task of a duty's case carries that case's key, so the work itself can contradict this lesson later.
         # This is the common path, not close_case: a worker cannot close its own case while its task is open.
         # What did not work takes no key: it is not a claim about an event coming back (AUTONOMY.md P7: an ordinary
-        # lesson, which the review lists when nothing confirms it).
+        # lesson, which only the agent's own work shows wrong; decision 39).
         case = case_row(t["duty_case"]) if t["duty_case"] else None
         with transaction():
             if learned:
@@ -4393,8 +4393,8 @@ def deliver_result(agent, a, files_said=None):
                 said += (f" {mref(mid)} keeps what you learned."
                          + (f" It claims to stop {cref(case)}'s key '{case['key']}' coming back, so the hub marks "
                             f"it contradicted if it does." if case else
-                            " Nothing can contradict it, because this was not a duty's case, so your review lists it "
-                            "when nothing has confirmed it for a while."))
+                            " Nothing can contradict it, because this was not a duty's case: only your own work can "
+                            "show it wrong."))
             if tried:
                 dead = memory_from_work(agent, MEMORY_TRIED + tried, DEAD_END_PREVENTS, about, now(), task=tid,
                                         beside=(mid,) if learned else ())
@@ -12788,16 +12788,13 @@ def duty_save(body, by, t0, duty_id=None, command=None):
 
 # What a review says about the lessons it lists (AUTONOMY.md P7, lane L6): the agent removes or rewrites them, and the
 # hub removes nothing by itself. Here and not in the memory region, because the review's texts below are built from it.
-MEMORY_REVIEW_WHAT = ("Call recall to read them: memory=\"M-<id>\" for one, stale=true for every one that is "
-                      "contradicted or unconfirmed. A CONTRADICTED one claimed to stop a case key that "
-                      "has come back since, so it was wrong, or right and never acted on: write it again so it says "
-                      "which, with remember instead_of=\"M-<id>\", which hands the new lesson the same claim, or "
-                      "remove it with forget and the reason. One that nothing has confirmed for a while is not "
-                      "thereby wrong: if your work still bears it out, write it again the same way, which dates it "
-                      "today; if not, forget it. Two that say much the same thing: keep one and forget the other, "
-                      "and if the one you keep needs words of the other, first write it again with remember "
-                      "instead_of. If they say different things after all, write one of them again in words that "
-                      "say how.")
+MEMORY_REVIEW_WHAT = ("Call recall to read them: memory=\"M-<id>\" for one, contradicted=true for every one that "
+                      "the work contradicted. A CONTRADICTED one claimed to stop a case key that has come back since, "
+                      "so it was wrong, or right and never acted on: write it again so it says which, with remember "
+                      "instead_of=\"M-<id>\", which hands the new lesson the same claim, or remove it with forget "
+                      "and the reason. Two that say much the same thing: keep one and forget the other, and if the "
+                      "one you keep needs words of the other, first write it again with remember instead_of. If they "
+                      "say different things after all, write one of them again in words that say how.")
 MEMORY_REVIEW_TASK = {
     "title": "Put your lessons in order",
     "details": "Lessons of your memory need looking at; they are listed below. " + MEMORY_REVIEW_WHAT + " Then give "
@@ -12885,18 +12882,18 @@ def duty_news(agent, since, seen):
 
 def duty_reviews(t0):
     """Plan C13: a holder's duties are reviewed when they have news, not once a day. AUTONOMY.md P7: so are an agent's
-    lessons, whether or not it holds a duty -- one contradicted, or not confirmed for MEMORY_KEYLESS_DAYS, or two that
-    the work wrote close to each other, that its last review did not list. An agent with news and no review open gets
-    one review, on the wake-up route: a task, or a message for the manager."""
+    lessons, whether or not it holds a duty -- one that the work contradicted, or two that the work wrote close to each
+    other, that its last review did not list; no clock adds one (decision 39). An agent with news and no review open
+    gets one review, on the wake-up route: a task, or a message for the manager."""
     holders = {r["agent"] for r in q("SELECT DISTINCT agent FROM responsibilities WHERE state='active'")}
-    for agent in sorted(holders | set(memory_reviewers(t0))):
+    for agent in sorted(holders | set(memory_reviewers())):
         if agent not in agents():
             continue
         last = duty_review_last(agent)
         if duty_review_open(last):
             continue
         news = duty_news(agent, float(last.get("at") or 0), set(last.get("seen") or []))
-        lessons = memory_review_items(agent, t0)
+        lessons = memory_review_items(agent)
         fresh = [line for mark, line in lessons if mark not in set(last.get("lessons") or [])]
         if not news and not fresh:
             continue
@@ -13750,9 +13747,9 @@ def t_change_duty(agent, a):
 # earlier rounds (reinforced, folded_into, archived, kind, cost_minutes, recheck) keep their data and are read; nothing
 # writes them any more.
 MEMORY_SHOWN = 12               # memories that one page of recall puts into a session
-# The defaults of the two settings of AUTONOMY.md section 4 (SETTINGS: memory.start_chars, memory.review_days).
+# The default of the setting memory.start_chars (AUTONOMY.md section 4). No clock decides anything about a lesson
+# (decision 39): the review lists the ones the work contradicted, and the agent removes or rewrites the rest itself.
 MEMORY_START_CHARS = 8000       # the size bound of the lessons in a start block: every match that fits, no row cap
-MEMORY_KEYLESS_DAYS = 60        # a lesson with no case key that nothing confirmed this long goes to the review
 MEMORY_TAGS_SHOWN = 20          # the busiest tags one answer names, with a count of the rest
 MEMORY_TEXT = 1200              # the lesson itself
 MEMORY_ABOUT = 60               # the tag: a product, a tool, a person, the fleet. The agent chooses its own.
@@ -13964,49 +13961,19 @@ def untrusted_said(m):
             + ("s" if m["read_untrusted"] != 1 else "") + " of outside text")
 
 
-def memory_review_days():
-    """The days after which a lesson that nothing has confirmed goes to the review: the setting memory.review_days
-    (AUTONOMY.md section 4), MEMORY_KEYLESS_DAYS by default. It reads team.json and no table, so start_text may call
-    it inside admit_task's transaction."""
-    return setting("memory.review_days")
-
-
-def memory_stale(m, t0):
-    """A keyless lesson that nothing has confirmed within the last MEMORY_KEYLESS_DAYS: the review lists it.
-
-    A lesson written when a case closed carries that case's key, so memory_contradicted can show it wrong; one out of
-    an ordinary task carries none, and nothing will ever contradict it. So the second kind goes to the agent's review
-    when nothing has confirmed it for a while, and the agent writes it again (remember instead_of, which dates it
-    today) or removes it. `reinforced_at` is an earlier round's confirmation, `created` the writing. The hub removes
-    nothing for being stale."""
-    last = m["reinforced_at"] or m["created"]
-    return bool(not m["prevents_key"] and t0 - last > memory_review_days() * 86400)
-
-
-def memory_wall(m, t0):
+def memory_wall(m):
     """How a dead end of an earlier round is introduced in a list and a reading, or "" for every other lesson. Since
-    P7 what did not work is an ordinary lesson (MEMORY_TRIED); the rows that earlier rounds marked keep their words."""
+    P7 what did not work is an ordinary lesson (MEMORY_TRIED); the rows that earlier rounds marked keep their words,
+    with what the work that found them cost and when, and their own check (memory_block)."""
     if m["kind"] != "dead_end":
         return ""
-    said = [x for x in (memory_spent(m["cost_minutes"]), f"written {goal_time(m['created']).split(' ')[0]}",
-                        "NOT TESTED SINCE" if memory_stale(m, t0) else "") if x]
+    said = [x for x in (memory_spent(m["cost_minutes"]), f"written {goal_time(m['created']).split(' ')[0]}") if x]
     return "DEAD END (" + ", ".join(said) + "):"
 
 
-def memory_asks(m, t0):
-    """What a session is told about an aged dead end of an earlier round, or "": check it before you spend again."""
-    if m["kind"] != "dead_end" or not memory_stale(m, t0):
-        return ""
-    return ("Nothing has tested this since it was written, and it is an observation about somebody else's system, "
-            "not a fact: check it cheaply before you spend again. "
-            + (f"How: {memory_said(m, 'recheck')} " if m["recheck"] else
-               "It records no cheap check, so weigh one attempt against what it cost. ")
-            + f"Then write what you found with remember instead_of=\"{mref(m['id'])}\", or forget it.")
-
-
-def memory_evidence(m, t0):
-    """What the fleet knows about one lesson, in a few words, or "". This is what a review of these lessons reads:
-    the hub counts, and the agent decides."""
+def memory_evidence(m):
+    """What the fleet knows about one lesson, in a few words, or "": what the work counted, and the claim that lets it
+    count. The hub counts, and the agent decides; no clock marks a lesson (AUTONOMY.md decision 39)."""
     said = []
     if m["contradicted"]:
         said.append(f"CONTRADICTED {m['contradicted']}×" + (f", last {goal_time(m['contradicted_at'])}"
@@ -14015,10 +13982,6 @@ def memory_evidence(m, t0):
         said.append(f"held {m['reinforced']}×")
     if m["prevents_key"]:
         said.append(f"claims to stop {rref(m['responsibility'])}/'{m['prevents_key']}'")
-    elif memory_stale(m, t0) and m["kind"] != "dead_end":
-        # A dead end says it in its own words (memory_wall, memory_asks), so saying it twice here would read as
-        # two different facts about one lesson.
-        said.append(f"not confirmed for {memory_review_days()} days: write it again or forget it")
     return "; ".join(said)
 
 
@@ -14066,6 +14029,7 @@ def memory_tag(value):
 # keeps every word and stays in the search; only its place at the start and in these answers went.
 MEMORY_ON_SHELF = "dropped IS NULL AND folded_into IS NULL AND archived IS NULL"
 MEMORY_STANDING = "dropped IS NULL"
+MEMORY_CONTRADICTED = "contradicted > 0"    # the lessons a review lists: the ones the work showed wrong (decision 39)
 
 
 def memory_live(agent, tag=None, every=False, limit=None):
@@ -14079,12 +14043,6 @@ def memory_live(agent, tag=None, every=False, limit=None):
         args.append(tag)
     return read_rows(f"SELECT * FROM memories WHERE agent=? AND {where} ORDER BY id DESC LIMIT ?",
                      (*args, min(limit or MEMORY_MOST, MEMORY_MOST)))
-
-
-def memory_stale_sql(t0):
-    """`memory_stale(m, t0) or m["contradicted"]` as SQL, so the review's one call does not load the store."""
-    return ("(contradicted > 0 OR (prevents_key IS NULL AND COALESCE(reinforced_at, created) < ?))",
-            [t0 - memory_review_days() * 86400])
 
 
 def memory_page(agent, where, args, page, order="id DESC"):
@@ -14112,32 +14070,22 @@ def memory_count(agent, where="", args=()):
     return read_row(f"SELECT COUNT(*) n FROM memories WHERE agent=? {where}", (agent, *args))["n"]
 
 
-def memory_held_until(m):
-    """When a keyless lesson that an earlier round's `held` bore out turns stale again, or None.
-
-    memory_stale's own clock: a hold keeps a keyless lesson out of the review for MEMORY_KEYLESS_DAYS and no longer.
-    A lesson with a case key never turns stale, so its hold has no end; one never held has no hold."""
-    if not m["reinforced"] or m["prevents_key"]:
-        return None
-    return (m["reinforced_at"] or m["created"]) + memory_review_days() * 86400
-
-
-def memory_view(agent, t0=None):
+def memory_view(agent):
     """One agent's lessons that stand, for the owner's route (owner feature agent_memory, GET /ui/memory/<agent>).
 
-    The ones the agent's own recall reads with no argument and with stale=true: not removed, not folded into a
-    summary, not archived (MEMORY_ON_SHELF), newest first and never more than MEMORY_MOST, with how many there are.
-    Each carries the hub's own evidence and nothing judged — the counts are the hub's and the decision stays the
-    agent's. It writes nothing, not even `recalls`, which counts what the agent's own reading printed. Every text is
+    The ones the agent's own recall reads with no argument: not removed, not folded into a summary, not archived
+    (MEMORY_ON_SHELF), newest first and never more than MEMORY_MOST, with how many there are. Each carries the hub's
+    own evidence and nothing judged — the counts are the hub's and the decision stays the agent's. No clock marks one
+    (AUTONOMY.md decision 39), so the `stale` and `held_until` of earlier rounds are gone: the app reads both as
+    absent. It writes nothing, not even `recalls`, which counts what the agent's own reading printed. Every text is
     masked as it is read, as notes_view does: a login registered after a lesson was written was never masked by the
     write."""
-    t0 = t0 if t0 is not None else now()
     return {"agent": agent, "total": memory_count(agent, f"AND {MEMORY_ON_SHELF}"),
             "lessons": [{"id": m["id"], "kind": m["kind"], "about": mask_secrets(m["about"]),
                          "text": mask_secrets(m["text"]), "prevents": mask_secrets(m["prevents"]),
                          "at": m["created"], "task": m["by_task"],
                          "contradicted": m["contradicted"], "contradicted_at": m["contradicted_at"],
-                         "stale": memory_stale(m, t0), "held": m["reinforced"], "held_until": memory_held_until(m),
+                         "held": m["reinforced"],
                          "cost_minutes": m["cost_minutes"],
                          "recheck": mask_secrets(m["recheck"]) if m["recheck"] else None}
                         for m in memory_live(agent)]}
@@ -14163,29 +14111,24 @@ def memory_said(m, key="text", limit=None):
     return said if limit is None or len(said) <= limit else said[:limit].rstrip() + "…"
 
 
-def memory_line(m, t0=None):
+def memory_line(m):
     """One memory in one line, for a list, with what the fleet knows about it."""
-    t0 = t0 if t0 is not None else now()
-    wall = memory_wall(m, t0)
+    wall, evidence = memory_wall(m), memory_evidence(m)
     return (f"  {mref(m['id'])} [{memory_said(m, 'about')}] " + (wall + " " if wall else "")
-            + f"{memory_said(m, limit=160)} ({untrusted_said(m)})"
-            + (f" — {memory_evidence(m, t0)}" if memory_evidence(m, t0) else ""))
+            + f"{memory_said(m, limit=160)} ({untrusted_said(m)})" + (f" — {evidence}" if evidence else ""))
 
 
-def memory_block(m, t0=None, full=False):
+def memory_block(m, full=False):
     """One memory for an agent's eyes. In full it also says where it came from and how often it was read, which is what
     a review of these lessons needs."""
-    t0 = t0 if t0 is not None else now()
     again = f"write it again with remember instead_of=\"{mref(m['id'])}\""
     out = [f"{mref(m['id'])} [{memory_said(m, 'about')}] written {goal_time(m['created'])} {untrusted_said(m)}"
            + (f", read {m['recalls']} time{'s' if m['recalls'] != 1 else ''}"
               + (f", last {goal_time(m['recalled'])}" if m["recalled"] else "") if full else "")]
-    if memory_wall(m, t0):
-        out.append("  " + memory_wall(m, t0))
+    if memory_wall(m):
+        out.append("  " + memory_wall(m))
     out.append("  " + mask_secrets(m["text"]).replace("\n", "\n  "))
-    if memory_asks(m, t0):
-        out.append("  " + memory_asks(m, t0))
-    elif m["kind"] == "dead_end" and m["recheck"]:
+    if m["kind"] == "dead_end" and m["recheck"]:
         out.append("  To find out cheaply whether it still holds: " + memory_said(m, "recheck"))
     else:
         out.append("  It is here to prevent: " + memory_said(m, "prevents"))
@@ -14199,18 +14142,11 @@ def memory_block(m, t0=None, full=False):
                       if m["contradicted"] else " It has not come back since, which is the only evidence any lesson "
                                                "here has."))
     elif m["kind"] != "dead_end":
-        # A dead end of an earlier round names no key either, and memory_wall and memory_asks have already said so
-        # in the words its own kind needs. The review reads what stands in the list, so a lesson an earlier round
-        # folded or archived is told nothing about it.
-        listed = not m["folded_into"] and not m["archived"]
-        out.append("  Nothing can contradict this one: it came out of an ordinary task and names no case key."
+        # A dead end of an earlier round names no key either, and memory_wall has already said what it is.
+        out.append("  Nothing can contradict this one: it came out of an ordinary task and names no case key, so only "
+                   "your own work can show it wrong."
                    + (f" The work bore it out {m['reinforced']} time{'s' if m['reinforced'] != 1 else ''}, last "
-                      f"{goal_time(m['reinforced_at'])}." if m["reinforced"] else "")
-                   + ("" if not listed else
-                      f" Nothing has confirmed it for {memory_review_days()} days, so your review lists it: if your "
-                      f"work still bears it out, {again}; if not, forget it." if memory_stale(m, t0) else
-                      f" After {memory_review_days()} days with nothing to confirm it, your review lists it; to "
-                      f"confirm it, {again}."))
+                      f"{goal_time(m['reinforced_at'])}." if m["reinforced"] else ""))
     if m["folded_into"]:
         out.append(f"  Off the start since a summary of yours covered it in an earlier round, "
                    f"{mref(m['folded_into'])}. Every word of it is here.")
@@ -14308,8 +14244,8 @@ def t_remember(agent, a):
         claim = (f"It takes over what {mref(instead['id'])} claimed: it stops {rref(instead['responsibility'])} "
                  f"opening a case with the key '{instead['prevents_key']}' again, so the work can show this one "
                  f"wrong as it showed that one. " if instead and instead["prevents_key"] else
-                 f"Nothing can contradict this one, because it names no case key, so after {memory_review_days()} days "
-                 f"with nothing to confirm it your review lists it. ")
+                 "Nothing can contradict this one, because it names no case key: only your own work can show it "
+                 "wrong. ")
         said = (f"{mref(mid)} is yours, about \"{tag}\". A task whose words name this tag or the lesson's own words "
                 f"starts with it, and recall with about=\"{tag}\" reads this tag. "
                 + (f"{mref(instead['id'])} is removed, naming this one. " if instead else "")
@@ -14336,9 +14272,9 @@ def memory_from_work(agent, text, prevents, about, t0, task=None, responsibility
 
     `responsibility` and `prevents_key` are what make the lesson checkable: a lesson written when a case closed
     claims to prevent that case's key, so when the key comes back duty_new_case can mark it contradicted. A lesson
-    out of an ordinary task has neither, and nothing can ever contradict it — which is why a keyless lesson goes to
-    the review when nothing confirms it, and a keyed one earns its life by not coming back. The two travel together:
-    a key without its duty names no case and a duty without a key claims nothing.
+    out of an ordinary task has neither, and nothing can ever contradict it: only the agent's own work shows it wrong,
+    and no clock does (AUTONOMY.md decision 39). The two travel together: a key without its duty names no case and a
+    duty without a key claims nothing.
 
     **Written whatever it is close to** (AUTONOMY.md P7). remember shows the agent its close lessons before it writes,
     and the agent decides; a delivery is the end of the task, where nobody is left to decide, and a lesson lost there
@@ -14407,47 +14343,41 @@ def memory_contradicted(duty_id, key, t0):
     return marked
 
 
-def memory_to_review(agent, t0):
-    """The lessons an agent's review lists (AUTONOMY.md P7, "review on news"): contradicted, or with no case key and
-    not confirmed for MEMORY_KEYLESS_DAYS. The contradicted first; bounded, and read only."""
-    where, args = memory_stale_sql(t0)
-    return read_rows(f"SELECT * FROM memories WHERE agent=? AND {MEMORY_ON_SHELF} AND {where} "
-                     "ORDER BY contradicted DESC, id LIMIT ?", (agent, *args, MEMORY_MOST))
+def memory_to_review(agent):
+    """The lessons an agent's review lists (AUTONOMY.md P7, "review on news"): the ones the work contradicted, the most
+    contradicted first. No clock adds one (decision 39). Bounded, and read only."""
+    return read_rows(f"SELECT * FROM memories WHERE agent=? AND {MEMORY_ON_SHELF} AND {MEMORY_CONTRADICTED} "
+                     "ORDER BY contradicted DESC, id LIMIT ?", (agent, MEMORY_MOST))
 
 
-def memory_reviewers(t0):
+def memory_reviewers():
     """The agents that hold a lesson their review would list (one read of the table), or a pair of lessons that the
     work wrote close to each other and that both still stand (memory_close_pairs)."""
-    where, args = memory_stale_sql(t0)
-    stale = {r["agent"] for r in read_rows(f"SELECT DISTINCT agent FROM memories WHERE {MEMORY_ON_SHELF} AND {where}",
-                                           args)}
+    listed = {r["agent"] for r in read_rows(f"SELECT DISTINCT agent FROM memories WHERE {MEMORY_ON_SHELF} AND "
+                                            f"{MEMORY_CONTRADICTED}")}
     paired = {r["k"][len(MEMORY_CLOSE_KEY):] for r in read_rows("SELECT k FROM kv WHERE k GLOB ?",
                                                                  (MEMORY_CLOSE_KEY + "*",))}
-    return sorted(stale | {agent for agent in paired - stale if memory_close_pairs(agent)})
+    return sorted(listed | {agent for agent in paired - listed if memory_close_pairs(agent)})
 
 
 def memory_review_mark(m):
-    """What a review saw of one lesson: its id and why it was listed. A lesson contradicted again is news again; one
-    listed and left as it was is not, so it starts no second review by itself."""
-    return f"{mref(m['id'])}:" + (f"c{m['contradicted']}" if m["contradicted"] else "s")
+    """What a review saw of one lesson: its id and how often it was contradicted. A lesson contradicted again is news
+    again; one listed and left as it was is not, so it starts no second review by itself."""
+    return f"{mref(m['id'])}:c{m['contradicted']}"
 
 
 def memory_review_lines(rows):
     """One line for each lesson a review lists: its id and why, and never its words. A review is a task that its
     requester reads too, and a lesson is its own agent's alone (memory_read_allowed)."""
-    return [f"{mref(m['id'])}: " + (f"contradicted {m['contradicted']}×, last {goal_time(m['contradicted_at'])}"
-                                    if m["contradicted"] else
-                                    f"nothing has confirmed it since "
-                                    f"{goal_time(m['reinforced_at'] or m['created']).split(' ')[0]}")
-            for m in rows]
+    return [f"{mref(m['id'])}: contradicted {m['contradicted']}×, last {goal_time(m['contradicted_at'])}" for m in rows]
 
 
-def memory_review_items(agent, t0):
+def memory_review_items(agent):
     """What an agent's review lists of its memory, as (mark, line): each lesson that memory_to_review gives, then each
     pair of lessons that the work wrote close to each other (memory_close_pairs). A line holds ids and the reason,
     never a lesson's words (memory_review_lines). The marks are what the review's record keeps, so that what one
     review listed and the agent kept as it was starts no second review by itself."""
-    rows = memory_to_review(agent, t0)
+    rows = memory_to_review(agent)
     return ([(memory_review_mark(m), line) for m, line in zip(rows, memory_review_lines(rows))]
             + [(f"{mref(held)}+{mref(new)}", f"{mref(held)} and {mref(new)} say much the same: keep one, and forget "
                                              f"the other.") for held, new in memory_close_pairs(agent)])
@@ -14458,7 +14388,7 @@ def memory_summary(rows, total, page, pages, heading, t0, more, full=False):
     memory_mark_read(rows, t0)
     out = [heading]
     for m in rows:
-        out += memory_block(m, t0) if full else [memory_line(m, t0)]
+        out += memory_block(m) if full else [memory_line(m)]
     if pages > 1:
         out.append(f"  (page {page} of {pages}, {total} in all. page={page + 1} for the next one"
                    + (f", or: {more}" if more else "") + ".)")
@@ -14473,11 +14403,9 @@ def memory_tail(agent, t0, out):
     """What the default answer ends with: the tags, what needs looking at, what an earlier round took off the list.
     Each one counted in SQL, because the store is never loaded to be described."""
     out.append(f"  Your tags: {memory_tags(agent)}.")
-    where, args = memory_stale_sql(t0)
-    look = memory_count(agent, f"AND {MEMORY_ON_SHELF} AND {where}", args)
+    look = memory_count(agent, f"AND {MEMORY_ON_SHELF} AND {MEMORY_CONTRADICTED}")
     if look:
-        out.append(f"  {look} of yours need{'s' if look == 1 else ''} looking at — contradicted, or with no case key "
-                   f"and nothing to confirm it for {memory_review_days()} days: recall stale=true.")
+        out.append(f"  {look} of yours {'is' if look == 1 else 'are'} contradicted: recall contradicted=true.")
     folded = memory_count(agent, "AND dropped IS NULL AND (folded_into IS NOT NULL OR archived IS NOT NULL)")
     if folded:
         out.append(f"  {folded} more, folded or archived in an earlier round, are not listed here: recall every=true "
@@ -14519,7 +14447,7 @@ def t_recall(agent, a):
                     f"{mask_secrets(m['drop_reason'] or '').rstrip('.')}. A removed lesson is not in your memory any "
                     f"more; your history keeps it, and read_history with ref=\"{mref(m['id'])}\" opens it.")
         memory_mark_read([m], t0)
-        return "\n".join(memory_block(memory_row(m["id"]), t0, full=True) + [tail])
+        return "\n".join(memory_block(memory_row(m["id"]), full=True) + [tail])
 
     # A search over every lesson that stands, folded and archived ones of earlier rounds too.
     words = str(a.get("search") or "").strip()
@@ -14538,23 +14466,20 @@ def t_recall(agent, a):
         return "\n".join(memory_summary(rows, len(hits), page, max(1, -(-len(hits) // MEMORY_SHOWN)), heading,
                                          t0, "Use other words.", full) + [tail])
 
-    # What the review reads: the contradicted ones, then the ones nothing has confirmed for a while.
-    if a.get("stale"):
-        where, wargs = memory_stale_sql(t0)
+    # What the review reads of the lessons themselves: the ones the work contradicted (AUTONOMY.md decision 39).
+    if a.get("contradicted"):
         rows, total, page, pages = memory_page(
-            agent, f"{MEMORY_ON_SHELF} AND {where}{extra}", [*wargs, *args], page, "contradicted DESC, id DESC")
+            agent, f"{MEMORY_ON_SHELF} AND {MEMORY_CONTRADICTED}{extra}", args, page, "contradicted DESC, id DESC")
         if not total:
-            return (f"Nothing of yours needs looking at: no lesson of yours is contradicted, and none is a keyless "
-                    f"one that nothing has confirmed for {memory_review_days()} days.")
+            return ("No lesson of yours is contradicted: no case key that one of them claimed to stop has come back "
+                    "since.")
         return "\n".join(memory_summary(rows, total, page, pages,
-                                        f"{total} lesson{'s' if total != 1 else ''} of yours to look at, the "
-                                        f"contradicted ones first:", t0, "", full)
+                                        f"{total} contradicted lesson{'s' if total != 1 else ''} of yours, the most "
+                                        f"contradicted first:", t0, "", full)
                          + ["A CONTRADICTED lesson claimed to stop a case key that has come back since: read that "
                             "case, then write it again so it says what you know now with remember "
                             "instead_of=\"M-<id>\", which carries the claim over, or remove it with forget and the "
-                            "reason. One with no key can never be contradicted: if your work still bears it out, "
-                            "write it again the same way, which dates it today; if not, forget it. The hub removes "
-                            "nothing by itself — counting is mechanical, deciding is yours."])
+                            "reason. The hub removes nothing by itself — counting is mechanical, deciding is yours."])
 
     tag = memory_tag(a["about"]) if a.get("about") not in (None, "") else None
     where = (MEMORY_STANDING if every else MEMORY_ON_SHELF) + extra
@@ -14630,12 +14555,11 @@ def notes_start_text(agent):
             "is wrong. see_notes reads the versions before.\n" + text.strip() + "\n")
 
 
-def memory_start_line(m, t0):
+def memory_start_line(m):
     """One lesson in a start block: whole, masked, with what the fleet counted about it and where it was written."""
-    evidence, wall, asks = memory_evidence(m, t0), memory_wall(m, t0), memory_asks(m, t0)
+    evidence, wall = memory_evidence(m), memory_wall(m)
     return (f"- {mref(m['id'])} [{memory_said(m, 'about')}] " + (wall + " " if wall else "") + memory_said(m)
-            + (" " + asks if asks else
-               f" To check it again: {memory_said(m, 'recheck')}" if m["kind"] == "dead_end" and m["recheck"] else "")
+            + (f" To check it again: {memory_said(m, 'recheck')}" if m["kind"] == "dead_end" and m["recheck"] else "")
             + (f" [{evidence}]" if evidence else "") + f" ({untrusted_said(m)})")
 
 
@@ -14666,7 +14590,7 @@ def memory_start_text(agent, task_id):
     # its bound whatever matched.
     t0, shown, more, room = now(), [], [], setting("memory.start_chars") - len(MEMORY_START_FOOT) - 400
     for m in rows:
-        line = memory_start_line(m, t0)
+        line = memory_start_line(m)
         if len(line) < room:
             shown.append(line)
             room -= len(line) + 1
@@ -18584,15 +18508,14 @@ TOOLS = [
      f"Your own lessons that stand, read back: one page of {MEMORY_SHOWN} at a time, shortened, with page= for the "
      "next one. The first shape that you give wins: memory=\"M-1\" gives that one whole, with where it was written "
      "and what the fleet has counted about it; search=\"<words>\" looks through every lesson that stands; "
-     "stale=true gives the ones your review lists, contradicted first; about=\"<tag>\" gives one tag. With none of "
-     "them: the newest, your busiest tags and how many need looking at. full=true gives a page whole, every=true "
-     "also lists the lessons an earlier round folded or archived, and since=\"2026-10-01\" limits a list to what you "
-     "wrote after that. A lesson you removed is not here: search_history finds it.",
+     "contradicted=true gives the ones the work contradicted, which your review lists; about=\"<tag>\" gives one "
+     "tag. With none of them: the newest, your busiest tags and how many are contradicted. full=true gives a page "
+     "whole, every=true also lists the lessons an earlier round folded or archived, and since=\"2026-10-01\" limits "
+     "a list to what you wrote after that. A lesson you removed is not here: search_history finds it.",
      S({"memory": {"type": "string", "description": "One lesson whole, for example M-1"},
         "about": {"type": "string", "description": "One of your tags, as you wrote it"},
         "search": {"type": "string", "description": "Words to look for in every lesson that stands"},
-        "stale": {"type": "boolean", "description": "True for the ones your review lists: contradicted, or not "
-                                                    "confirmed for a while"},
+        "contradicted": {"type": "boolean", "description": "True for the ones whose case key came back since"},
         "page": {"type": "integer", "description": f"Which page of {MEMORY_SHOWN}, from 1. Default 1."},
         "full": {"type": "boolean", "description": "True for this page whole instead of shortened"},
         "every": {"type": "boolean", "description": "True to list the folded and archived ones as well"},
@@ -23211,9 +23134,6 @@ SETTINGS = {
     "memory.start_chars": (MEMORY_START_CHARS, setting_int(1000, 100000),
                            "The size bound, in characters, of the lessons that a task's start block carries: every "
                            "lesson that matches the task and fits (AUTONOMY.md P7)."),
-    "memory.review_days": (MEMORY_KEYLESS_DAYS, setting_int(1, 3650),
-                           "The days after which a lesson that nothing has confirmed goes to its agent's review "
-                           "(AUTONOMY.md P7)."),
     # plan P9.10: the session reuse rule, which each helper reads from its own team.json (lifecycle.reuse_settings)
     "session_reuse": (dict(REUSE_SETTINGS), reuse_value,
                       "Session reuse (on), its growth factor (growth) and its margin in seconds (margin): a standing "
