@@ -2083,8 +2083,9 @@ def contacts_start_text(agent):
     names. "A person on your list" pointed at a list that no text showed, and a Codex agent took the person Test
     Manager for the fleet's manager agent and asked that agent instead (live check 13, 28 October 2026). A worker's
     and a lead's, with contacts.v2 on: no other agent has message_contact. Blocked people and roles with tools off are
-    not on it, because message_contact refuses them. Reads only (read_rows): start_text runs inside admit_task's
-    transaction."""
+    not on it, because message_contact always refuses them; a person with no chat yet is, and message_contact says so.
+    At most TEAM_CHARS of names, as the team directory, and then how many more. Reads only (read_rows): start_text runs
+    inside admit_task's transaction."""
     if role_of(agent) not in ("worker", "lead") or not contacts_v2():
         return ""
     people = [p for p in read_rows("SELECT p.* FROM people p JOIN person_agents a ON a.person=p.id WHERE a.agent=? "
@@ -2092,8 +2093,15 @@ def contacts_start_text(agent):
               if p["blocked"] is None and person_access(p)["tools"]]
     if not people:
         return ""
-    return ("\nPEOPLE ON YOUR LIST, whose role has tools on: "
-            + ", ".join(f"{p['name']} (P-{p['id']}, {p['role']})" for p in people)
+    kept, left = [], 0
+    for p in people:
+        item = f"{p['name']} (P-{p['id']}, {p['role']})"
+        if sum(len(x) + 2 for x in kept) + len(item) <= TEAM_CHARS:
+            kept.append(item)
+        else:
+            left += 1
+    return ("\nPEOPLE ON YOUR LIST, whose role has tools on: " + ", ".join(kept)
+            + (f", and {left} more, whom message_contact takes by their exact name or P-<id>" if left else "")
             + ". They are people, not agents: message_contact writes to them, and message_agent reaches only the "
               "agents of your team.\n")
 
