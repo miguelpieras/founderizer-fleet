@@ -555,15 +555,18 @@ MOTION = "CLAUDE_AX_SCREEN_READER=0"
 PRESENCE = 30           # seconds between two presence pings while the main loop is inside one step (Helper.presence)
 # Fleet's deny list for worker and lead Claude sessions.
 DENY = ["Read(~/.fleet/**)", "Edit(~/.fleet/**)", "Bash(*.fleet/*)"] + UNSEEN_TOOLS
+CHROME_TOOLS = "mcp__claude-in-chrome__*"      # the tools that Claude Code's --chrome adds to a browser task
 PROTECTED = ("fleet.py", "lifecycle.py", "onboard.py", "vault.py", "acp_runner.py", "screen_runner.py", "desktop.py", "FleetWorker.swift", "worker_install.py", "install-worker.sh", "Install Fleet Worker.command", "hub.py", "wakeups.py", "usage.py", "threads.py", "selftest.py", "test_logins.py", "verify.py", "verify_case.py", "pilot.py", "publish.py", "publish/**", "team.json", "bws.toml", "RULES.md", "rules/**", "CLAUDE.md", "AGENTS.md", "profiles/**")
 
 
-def settings_arg(agent, conf, task, tools=()):
+def settings_arg(agent, conf, task, tools=(), needs="none"):
     """Claude Code settings for one session: what runs without asking, what never runs, and the two hooks
     that carry a worker's permission prompts and activity to the hub. The owner's full-access manager has no
     Fleet-added deny rule that limits a command or a file, only UNSEEN_TOOLS, and starts with the recorded unattended
     permission-mode choice. tools: the catalog tools
-    of this task session, which the owner gave the agent; they run without asking (owner feature integrations)."""
+    of this task session, which the owner gave the agent; they run without asking (owner feature integrations).
+    needs: a browser task also runs Chrome's tools without asking. They come with {chrome} (--chrome), and a
+    full-access worker starts in dontAsk, which refuses every tool that its allow list does not name."""
     if not runtime_fact(conf.get("runtime"), "session_settings"):
         return ""
     if conf.get("role") == "manager":
@@ -575,8 +578,10 @@ def settings_arg(agent, conf, task, tools=()):
             # has every built-in tool but the ones that the owner took away. The owner chat, the manager and a
             # conversation window keep their own.
             deny += runtime_fact(conf.get("runtime"), "task_denied") or []
-        settings = {"permissions": {"allow": conf.get("allow", ["mcp__fleet__*"]) + [f"mcp__{t}__*" for t in tools],
-                                    "deny": deny}}
+        allow = conf.get("allow", ["mcp__fleet__*"]) + [f"mcp__{t}__*" for t in tools]
+        if needs == "browser" and CHROME_TOOLS not in allow:
+            allow.append(CHROME_TOOLS)
+        settings = {"permissions": {"allow": allow, "deny": deny}}
     settings["prefersReducedMotion"] = False        # the screen watch reads its counters (MOTION)
     if conf.get("role") in ("worker", "lead") and task:
         # Command hooks, because Claude Code will not send an HTTP hook to a private address.
@@ -929,7 +934,7 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
             first = f'-c project_doc_max_bytes={codex_rules_limit()} "$(cat {path}; rm -f {path})"'
     cmd = conf["start"].format(prompt=" ".join(x for x in (flags, first) if x),
                                chrome="--chrome" if needs == "browser" else "",
-                               settings=settings_arg(agent, conf, task, tools))
+                               settings=settings_arg(agent, conf, task, tools, needs))
     if conf.get("runtime") == "codex" and "--no-daemon" not in cmd:
         cmd = cmd.replace("codex ", "codex --no-daemon ", 1)
     if conf.get("runtime") == "codex":

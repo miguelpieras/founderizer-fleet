@@ -21207,6 +21207,8 @@ def save_agent_settings(agent, body):
     commit = commit_kit_file("team.json", data, f"Owner changed the settings of {agent}")
     apply_team(team)
     fields = {c["field"] for c in changed}
+    if "can" in fields:
+        kv_set(f"default_desktop:{agent}", 1)   # his own capabilities: default_access_sweep adds none of its Mac's
     # Also the manager's helper (lifecycle arms its update too): until it loads them, its settings stay pending, which
     # holds its runtime switch. Its running standing session keeps the settings that it started with.
     updates = [agent] if fields & {"model", "effort", "can", "screen"} and \
@@ -22041,6 +22043,7 @@ def tick():
             release_sweep(t0)               # owner feature releases: the automatic poll, when the owner opted in
             names_sweep(t0)                 # devops task 1.1: the Tailscale names, when the start found none
             history_sweep(t0)               # AUTONOMY.md P6: what was written since the last pass, into the history
+            default_access_sweep(t0)        # the owner, 28 October 2026: every agent's vault, and a Mac's desktop
         except Exception:
             traceback.print_exc()           # a goal or database check must not stop the timers below
         # close sessions of finished tasks
@@ -23936,6 +23939,7 @@ def save_vault(agent, body):
     receipt = {"agent": agent, "revision": rev, "sha256": current, "changed": [], "updates_requested": [],
                "settings_pending": settings_pending(agent), "activation": None, "open_tasks": open_tasks}
     if new == old:
+        kv_set(f"default_vault:{agent}", 1)     # the owner's own word on this vault: default_access_sweep keeps it
         return receipt
     key = offered_store(team, a["machine"])
     if new == "broker":
@@ -23955,12 +23959,93 @@ def save_vault(agent, body):
     data = (json.dumps(team, indent=2) + "\n").encode()
     commit = commit_kit_file("team.json", data, f"Owner {'gave' if new == 'broker' else 'removed'} the broker access "
                                                 f"of {agent}")
+    kv_set(f"default_vault:{agent}", 1)
     apply_team(team)
     updates = [agent] if request_update(agent, commit) == "requested" else []
     log("owner", f"{'gave' if new == 'broker' else 'removed'} the broker access of {agent} in {commit[:12]}")
     return dict(receipt, revision=commit, sha256=hashlib.sha256(data).hexdigest(),
                 changed=[{"field": "vault", "before": old, "after": new}], updates_requested=updates,
                 settings_pending=settings_pending(agent))
+
+
+# The owner, 28 October 2026: "it is essential that they all have access to secrets!", and "a mac studio server
+# should come by default with computer and browser use". So every worker and lead gets its machine's vault, and an
+# agent on a Mac the desktop of its Mac (with_desktop), with no click of his. The hub gives each once, and then it is
+# his: his own vault command, or a change of his to the agent's capabilities, ends that default for the agent
+# (default_vault:<agent>, default_desktop:<agent>, which a rename moves), so a "none" or a capability that he took
+# away stays. A vault is given when vault_grant says it can be, the rule of his own command: on a new machine that is
+# after its broker first reports, and until then the agent holds none.
+DEFAULT_ACCESS_EVERY = 60       # seconds between two passes of default_access_sweep
+DEFAULT_ACCESS = {"at": 0.0, "retry": {}}       # the last pass, and when an agent whose commit failed is tried again
+
+
+def default_access_sweep(t0):
+    """Give each worker and lead the defaults it lacks (give_defaults). A vault that cannot serve the agent yet and a
+    machine of no known kind wait for a later pass; a default with nothing left to give ends for that agent."""
+    if t0 - DEFAULT_ACCESS["at"] < DEFAULT_ACCESS_EVERY:
+        return
+    DEFAULT_ACCESS["at"] = t0
+    for name, a in list(agents().items()):
+        if a.get("role") not in ("worker", "lead") or DEFAULT_ACCESS["retry"].get(name, 0) > t0:
+            continue
+        vault, desktop = not kv_get(f"default_vault:{name}"), not kv_get(f"default_desktop:{name}")
+        if vault and a.get("vault", "none") != "none":
+            kv_set(f"default_vault:{name}", 1)          # it has a vault already
+            vault = False
+        if desktop and server_kind_of(TEAM, a.get("machine")) is not None and \
+                not with_desktop(json.loads(json.dumps(a)), TEAM):
+            kv_set(f"default_desktop:{name}", 1)        # Linux, or it holds its Mac's desktop already
+            desktop = False
+        vault = vault and bool((vault_grant(name, TEAM) or {}).get("ready"))
+        desktop = desktop and server_kind_of(TEAM, a.get("machine")) is not None
+        if vault or desktop:
+            try:
+                give_defaults(name, vault, desktop)
+            except Exception as e:          # a commit that failed now (a release on its way): again in ten minutes
+                DEFAULT_ACCESS["retry"][name] = t0 + 600
+                log("hub", f"could not give {name} its default access yet: {e}")
+
+
+def give_defaults(name, vault, desktop):
+    """One team.json commit of what default_access_sweep found missing for this agent, read again at the hub's
+    revision: its machine's vault (pinned as the owner's first grant pins it, save_vault) and its Mac's desktop. The
+    manager is told, as it is of the owner's own change to an agent's capabilities."""
+    rev = kit_revision(fresh=True)
+    team, _, _ = team_view(rev)
+    a = team["agents"].get(name)
+    if a is None:
+        return
+    given = []
+    if vault and a.get("vault", "none") == "none" and (vault_grant(name, team) or {}).get("ready"):
+        key = offered_store(team, a["machine"])
+        a["vault"], a["vault_recipient"] = "broker", key
+        if a["machine"] not in (team.get("vault_stores") or {}):
+            team["vault_stores"] = dict(team.get("vault_stores") or {}, **{a["machine"]: key})
+        given.append("its machine's vault")
+    added = with_desktop(a, team) if desktop else []
+    if added:
+        given.append("the " + " and ".join(added) + " of its Mac")
+    if given:
+        try:
+            validate_team(team)
+        except ValueError as e:
+            log("hub", f"gives {name} no default access: {e}")
+            given = []
+    if given:
+        data = (json.dumps(team, indent=2) + "\n").encode()
+        commit = commit_kit_file("team.json", data, f"Fleet gave {name} by default: {'; '.join(given)}")
+        apply_team(team)
+        log("hub", f"gave {name} by default {'; '.join(given)} in {commit[:12]}")
+        emit(manager_name(), "say", f"[hub] Fleet gave {name} by default {' and '.join(given)}: it can now use "
+                                    f"{', '.join(a.get('can') or []) or 'nothing'}"
+                                    + (", and its vault opens the logins it is given" if a.get("vault") == "broker"
+                                       else "") + ".")
+    # Done: given now, or nothing left to give. A vault that its machine cannot serve after all waits; an entry that
+    # validate_team refused ends both, and the log says why.
+    if vault and a.get("vault", "none") != "none":
+        kv_set(f"default_vault:{name}", 1)
+    if desktop:
+        kv_set(f"default_desktop:{name}", 1)
 
 
 def save_vault_create(agent, body):
@@ -24162,20 +24247,56 @@ JOB_OPEN = ("queued", "running", "needs_owner")
 JOB_STEPS = ("user", "runtime", "checkout", "service", "sign_in")       # `user`: the agent's own OS user, on Linux
 JOB_SILENT = 1800               # seconds after which an open job of a server without the job heartbeat has failed
 CODEX_SIGN_IN = RUNTIMES["codex"]["sign_in"]["url"]     # the link of its own device sign-in (sign_in_prompt)
+# A new agent's profile names no browser and no screen: what it holds is in its start text, from team.json
+# (holdings_start_text), and the agents of a Mac hold both (desktop_defaults). The words "It has no browser and no
+# screen" and "reject" such a task made ivy refuse the browser of its own Mac.
 SERVER_PROFILE = """# Profile: %(name)s
 
 Written by the owner. Agents cannot change it.
 
 **Character.** Fast and exact. Text in, text out.
 
-**Responsible for.** Research, writing, code and files on its server. It has no browser and no screen.
+**Responsible for.** Research, writing, code and files on its server.
 
 **May do without asking.** Anything its access allows: files, shell, git and the web, and every repository, service and login that it holds.
 
-**Must ask first.** New money, a new account, or a step that only the owner can take. A task that needs a browser or a screen: reject it and say why.
+**Must ask first.** New money, a new account, or a step that only the owner can take.
 
 **Logins it may use.** None until the owner adds them here.
 """
+# A Mac server comes with its desktop (the owner, 28 October 2026: "a mac studio server should come by default with
+# computer and browser use"): Google Chrome for a browser task, and for a screen task Codex with Computer Use, which
+# the ChatGPT app keeps here. A Linux server has neither.
+MAC_SCREEN_COMMAND = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
+
+
+def desktop_defaults(team, machine, runtime):
+    """The desktop that an agent on this machine holds by default, beyond the shell and the web: none on Linux or on
+    a machine of no known kind; on a Mac, the browser and the screen that its runtime can use (RUNTIME_CAN)."""
+    if server_kind_of(team, machine) != "mac":
+        return []
+    return [c for c in ("browser", "screen") if c in RUNTIME_CAN.get(runtime, set())]
+
+
+def with_desktop(entry, team):
+    """Give a team.json entry the desktop of its Mac (desktop_defaults), in place: those capabilities, the screen
+    runtime for the screen, and for the browser {chrome} in a start that takes {settings} (Claude Code's), which gives
+    a browser task its browser and nothing more (full_access reads a start without it the same). Only a runtime that
+    runs browser tasks gets the browser (RUNTIME_CAN). The names of what it added, [] for nothing."""
+    desktop, can = desktop_defaults(team, entry.get("machine"), entry.get("runtime")), list(entry.get("can") or [])
+    added = [c for c in desktop if c not in can]
+    if added:
+        entry["can"] = can = can + added
+    if "screen" in desktop and "screen" in can and not entry.get("screen_command"):
+        entry["screen_command"] = MAC_SCREEN_COMMAND
+        if "screen" not in added:
+            added.append("screen runtime")
+    start = entry.get("start") or ""
+    if "browser" in desktop and "browser" in can and "{chrome}" not in start and "{settings}" in start:
+        entry["start"] = start.replace("{settings}", "{chrome} {settings}", 1)
+        if "browser" not in added:
+            added.append("Chrome")
+    return added
 
 
 def server_names(team=None):
@@ -24465,7 +24586,8 @@ def server_agent_entry(team, agent, server, runtime, role, parent):
     runtime or keeps a policy for it ("start" and "allow"), from a server of the same kind first; never another agent's
     identity, placement or grants, and never the app-server policy. The first worker of a fleet has none to copy from,
     and takes the installer's own worker line (hubsetup.WORKER_STARTS) with the full-access allow list, never the
-    manager's. It can use shell and web, starts inactive and has no credential access."""
+    manager's. It can use shell and web, and on a Mac its desktop too (with_desktop). It starts inactive and with no
+    credential access, and default_access_sweep gives it its machine's vault once that vault can serve it."""
     kind, choices = server_kind_of(team, server), []
     for name, a in team["agents"].items():
         policy = a if a.get("runtime") == runtime else (a.get("runtime_policies") or {}).get(runtime)
@@ -24489,6 +24611,7 @@ def server_agent_entry(team, agent, server, runtime, role, parent):
             entry["allow"] = list(FULL_ACCESS[runtime]["allow"])
     entry.update({"role": role, "machine": server, "runtime": runtime, "can": ["shell", "web"], "active": False,
                   "vault": "none"})
+    with_desktop(entry, team)
     if parent:
         entry["reports_to"] = parent
     return entry
@@ -24655,7 +24778,8 @@ AGENT_COLUMNS = (
 # was removed by hand, so it goes first, and the renamed agent's own row takes the name.
 AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent", "machine_updates": "agent"}
 # The hub's own notes about one agent in kv, each kept under a prefix and the agent's name.
-AGENT_KV = ("tools:", "offline_told:", "runtime_since:", "switched:", "switching:", "history_agent:")
+AGENT_KV = ("tools:", "offline_told:", "runtime_since:", "switched:", "switching:", "history_agent:", "default_vault:",
+            "default_desktop:")
 
 
 def renamed_team(team, old, new):
