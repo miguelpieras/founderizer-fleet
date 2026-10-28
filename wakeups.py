@@ -63,6 +63,12 @@ class Org:
         self.features = features or (lambda agent: ())     # hub.helper_features: what an agent's helper reports
 
 
+def number_text(x):
+    """A number as an agent and the owner read it: a whole one whole, another to 15 digits. With :g a check's
+    10485760 read as 1.04858e+07 (28 October 2026)."""
+    return f"{int(x)}" if float(x).is_integer() else f"{x:.15g}"
+
+
 def team_authority(manager, agents):
     """A stand-in with the rules of hub.authority, for the tests of this module."""
     def authority(actor, target, action):
@@ -716,11 +722,11 @@ def check_text(c, target):
         return f"{code}; each line that it prints and its last run did not print wakes {target}"
     cond = c["condition"]
     if c.get("code") == "saved":        # an agent's value check reads as one line (plan P4)
-        return (f"{code}; it wakes {target} once when the value is {OPS[cond['op']]} {cond['value']:g}, and again "
+        return (f"{code}; it wakes {target} once when the value is {OPS[cond['op']]} {number_text(cond['value'])}, and again "
                 f"only after a quiet run")
     repeat = ("once, until a check is quiet again" if c["repeat_minutes"] is None else
               f"again {c['repeat_minutes']} minutes after the last wake-up completed, while the check still matches")
-    return f"{code}; it starts the wake-up when the value is {OPS[cond['op']]} {cond['value']:g}; {repeat}"
+    return f"{code}; it starts the wake-up when the value is {OPS[cond['op']]} {number_text(cond['value'])}; {repeat}"
 
 
 def run_text(r, when):
@@ -728,7 +734,7 @@ def run_text(r, when):
     if r.get("state") == "sent" and r.get("sent"):
         out += f", in flight since {when(r['sent'])}"
     if r.get("value") is not None:
-        out += f", value {r['value']:g}" + (f" ({lines_text([r['summary']])})" if r.get("summary") else "")
+        out += f", value {number_text(r['value'])}" + (f" ({lines_text([r['summary']])})" if r.get("summary") else "")
     if r.get("lines") is not None:
         n = len(r["lines"])
         out += f", printed {n} line{'' if n == 1 else 's'}"

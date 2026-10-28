@@ -3686,13 +3686,18 @@ class Helper:
         """{"model", "effort"} of this agent's new sessions (run_settings), by the latest good reading of its runtime's
         model list: a reading that failed keeps the one before, so that a slow model/list moves no session back to the
         runtime's own configuration. Until a first good one this helper reads the list itself, at most each
-        MODELS_RETRY seconds: the lifecycle keeps a failed reading for hours."""
+        MODELS_RETRY seconds, because the lifecycle keeps a failed reading for hours: its first sessions wait for
+        the first read, and a read again runs beside the main loop, which a list that keeps failing never holds."""
         life = getattr(self, "lifecycle", None)
         models = life.models if life else None
         if life and not (models or {}).get("ok") and getattr(self, "model_list", None) is None and \
                 time.monotonic() - getattr(self, "models_tried", float("-inf")) >= MODELS_RETRY:
             self.models_tried = time.monotonic()
-            models = life.read_models(force=models is not None)
+            if models is None:
+                models = life.read_models()
+            else:
+                threading.Thread(target=life.read_models, kwargs={"force": True}, daemon=True,
+                                 name="model-list").start()
         if isinstance(models, dict) and models.get("ok"):
             self.model_list = models
         return run_settings(self.conf, getattr(self, "model_list", None))
@@ -6073,9 +6078,9 @@ def ready_codex_trust(runtime, codex_home=None, kit=None):
     agent appends that block for the checkout and touches nothing else; another runtime's helper writes nothing there.
     A block for the checkout that is there already, whatever it says, is the owner's answer and stays; a file that
     Codex cannot read stays too, and so does one that the block would make unreadable (a `projects` inline table):
-    the file holds the owner's own Codex settings. A Python before 3.11 reads no TOML, so there it appends only to a
-    file with no `projects` in it. The installer's worker_install.trust_codex_checkout is the same rule for a new
-    Codex checkout. True when it wrote one."""
+    the file holds the owner's own Codex settings. A Python before 3.11 reads no TOML, so there the folder's own quoted
+    key is the owner's answer and a `projects` inline table takes no block, as in the installer's
+    worker_install.trust_codex_checkout, the same rule for a new Codex checkout. True when it wrote one."""
     if runtime != "codex":
         return False
     root = codex_home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
@@ -6091,8 +6096,9 @@ def ready_codex_trust(runtime, codex_home=None, kit=None):
         f'\n[projects.{json.dumps(folder, ensure_ascii=False)}]\ntrust_level = "trusted"\n'
     try:
         import tomllib
-    except ImportError:
-        if "projects" in text:
+    except ImportError:             # a Python before 3.11: the folder's own key is the owner's answer, and an
+        if json.dumps(folder) in text or json.dumps(folder, ensure_ascii=False) in text or f"'{folder}'" in text \
+                or re.search(r"(?m)^[ \t]*projects[ \t]*=", text):      # inline projects table takes no block
             return False
     else:
         try:
@@ -6104,10 +6110,11 @@ def ready_codex_trust(runtime, codex_home=None, kit=None):
         except (ValueError, KeyError, TypeError):   # tomllib.TOMLDecodeError, before or after the block
             return False
     try:
+        block.encode("utf-8")       # a folder name with a byte that is not UTF-8 (a lone surrogate) cannot go in
         os.makedirs(root, mode=0o700, exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
             f.write(block)
-    except OSError:
+    except (OSError, ValueError):
         return False
     return True
 

@@ -14833,7 +14833,7 @@ def history_standing(r):
     words, so it is the owner's chat as well."""
     text = f"{iref(r['id'])} {r['kind']}" + (" for the team" if r["scope"] == "team" else "") + \
         f" from {r['author']}: {r['words']}" + \
-        (f"\nMeasure: {r['measure']}" + (f", {r['number']:g}" if r["number"] is not None else "") if r["measure"]
+        (f"\nMeasure: {r['measure']}" + (f", {item_number(r['number'])}" if r["number"] is not None else "") if r["measure"]
          else "") + (f"\nHow: {r['how']}" if r["how"] else "")
     return [history_rec(a, "standing", iref(r["id"]), text, r["created"],
                         person=r["author"] if r["author"] != a else None, owner_chat=r["author_kind"] == "owner")
@@ -16300,7 +16300,7 @@ def standing_who(author, reader=None):
 
 
 def item_number(x):
-    return f"{int(x)}" if float(x).is_integer() else f"{x:g}"
+    return wakeups.number_text(x)
 
 
 def item_day(ts):
@@ -20839,7 +20839,7 @@ def lines_said(t, r, lines, kind):
 def value_said(t, r, spec, body):
     """The message that tells a value check's open wake that its value matches its condition again (plan P4)."""
     cond = spec["condition"]
-    return (f"[hub] Trigger {t['id']}'s check matches again in run {r['id']}: it gave {body['value']:g}, and the "
+    return (f"[hub] Trigger {t['id']}'s check matches again in run {r['id']}: it gave {item_number(body['value'])}, and the "
             f"condition is {CHECK_OPS[cond['op']]} {item_number(cond['value'])}. Its summary, untrusted data, JSON-encoded: "
             f"{wakeups.lines_text([body.get('summary') or ''])[1:-1]}. It belongs to this wake-up. Read the source "
             f"data again before you act.")
