@@ -2638,7 +2638,8 @@ def stable_extra(agent, opening):
 
 def attempt_rows(t, reason, event, t0, counted=False):
     """Inside a transaction: the next attempt of task row `t` and its start event. A new attempt number without its
-    start event would leave a task that no helper starts."""
+    start event would leave a task that no helper starts. Every new attempt of a task is made here (a restart, a
+    fresh start, a reminder, a usage-limit reset, a resume), so the owner's unread steers move to it here too."""
     DB.execute("UPDATE tasks SET attempt=attempt+1, restarts=restarts+?, missing_since=?, started=?, nudge_level=0 "
                "WHERE id=?", (1 if counted else 0, t0 if counted else None, t0, t["id"]))
     # plan C10: a new attempt moves the task again, so what its stuck notice said is over (tasks_stuck), and a new
@@ -2654,6 +2655,7 @@ def attempt_rows(t, reason, event, t0, counted=False):
     event_rows([event], t0)
     waiting_say_rows(t["owner"], t["id"])
     feedback_rows(t["owner"], t0)
+    carry_steers(t)
 
 
 PROMPT_REPLACED = "The session that asked was replaced before a decision reached it, so it did not run."
@@ -2704,22 +2706,19 @@ def fresh_attempt(t, why):
     the attempt before it did (attempt_event), and its unread messages wait for it, the owner's steers included
     (carry_steers). Not a restart that counts, because nothing was lost. Check fresh_refusal first. Returns the new
     attempt."""
-    event = attempt_event(t, f"Its session was {why}, so this session starts fresh, with what the attempt before it "
-                             f"did.")
-    with transaction():
-        attempt_rows(t, FRESH_REASON, event, now())
-        carry_steers(t)
+    new_attempt(t, FRESH_REASON, note=f"Its session was {why}, so this session starts fresh, with what the attempt "
+                                      f"before it did.")
     log("hub", f"{tref(t['id'])} starts fresh in attempt {t['attempt'] + 1}: its session was {why}")
     return t["attempt"] + 1
 
 
 def carry_steers(t):
-    """Inside the transaction of a fresh attempt of task row `t`: the owner's steers that the session it replaces had
-    not read move to the new attempt, unread. A steer is bound to its attempt (owner API 1.4), and read_messages and
-    the delivery give a later attempt none, so a steer written while that session was quiet was never read. A fresh
-    attempt is the same work in a new session; a restart keeps 1.4, and the owner sees its steer as not delivered.
-    The other events of an attempt need nothing: its start is replaced, and fresh_refusal refuses while a hold, a
-    prompt or a job is open."""
+    """Inside the transaction that makes the next attempt of task row `t` (attempt_rows): the owner's steers that no
+    session of it has read move to the new attempt, unread. A steer is bound to its attempt (owner API 1.4), and
+    read_messages and the delivery give a later attempt none, so a steer written while its session was quiet, or
+    gone, was never read (the review's R2 and the verifier's D2, 27 and 28 October 2026). It is the owner's word
+    about the task, so it goes with the task; a steer that a session read stays with its attempt. The other events
+    of an attempt need nothing: its start is replaced, and its hold, prompts and jobs end or wait as before."""
     in_transaction("carry_steers")
     for e in read_rows("SELECT id, extra FROM events WHERE task=? AND kind='say' AND read_at IS NULL AND "
                        "json_extract(extra, '$.steer')=1", (t["id"],)):
