@@ -4866,6 +4866,7 @@ def cmd_run(args):
     # The helper's start runs the manager session once. With a key it needs its credential, so the start waits in the
     # loop below until the hub answers; a session that runs already, or one closed later, is left as it is.
     ready_runtime_config()          # before the first session: nobody is there to answer the runtime's first screen
+    ready_codex_trust(conf.get("runtime"))      # and Codex's own; a switch to Codex starts a new helper too
     h.manager_due = conf.get("role") == "manager" and h.manager_first()
     print(f"helper for {agent} is running; persistent inbox delivery; sessions in {h.session}", flush=True)
     collector = Collector(KIT, agent, conf["runtime"],
@@ -5855,6 +5856,45 @@ def ready_runtime_config(home=None, kit=None):
             json.dump(kept, f)
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
+    except OSError:
+        return False
+    return True
+
+
+def ready_codex_trust(runtime, codex_home=None, kit=None):
+    """Codex asks its own question at the first start in a folder ("Trust this folder? ... 1. Trust and continue,
+    2. Quit"), kept by the git root of that folder, so a trusted parent does not count. A Codex agent's owner chat and
+    its conversation waited at it in the agent's checkout, for a person who is never there (live check, 28 October
+    2026). The answer is one block of Codex's own config.toml, in the form Codex writes it, so the helper of a Codex
+    agent appends that block for the checkout and touches nothing else; another runtime's helper writes nothing there.
+    A block for the checkout that is there already, whatever it says, is the owner's answer and stays; a file that
+    Codex cannot read stays too. True when it wrote one."""
+    if runtime != "codex":
+        return False
+    root = codex_home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    path, folder = os.path.join(root, "config.toml"), os.path.realpath(kit or KIT)
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        text = ""
+    except OSError:
+        return False
+    try:
+        import tomllib
+        projects = tomllib.loads(text).get("projects")
+        if folder in (projects if isinstance(projects, dict) else {}):
+            return False
+    except ImportError:             # a Python before 3.11: the folder named anywhere in the file is the owner's
+        if folder in text:
+            return False
+    except ValueError:              # tomllib.TOMLDecodeError: a block appended to it would not make it readable
+        return False
+    try:
+        os.makedirs(root, mode=0o700, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(("\n" if text and not text.endswith("\n") else "") +
+                    f'\n[projects.{json.dumps(folder)}]\ntrust_level = "trusted"\n')
     except OSError:
         return False
     return True
