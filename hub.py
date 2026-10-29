@@ -1832,11 +1832,15 @@ def t_read_messages(agent, a):
         if chat_context(agent):
             chat_fence(agent)
             rows = q("SELECT e.* FROM events e JOIN ui_requests u ON u.event_id=e.id "
-                     "WHERE e.agent=? AND e.kind='chat' AND NOT EXISTS "
+                     "WHERE e.agent=? AND e.kind='chat' AND u.kind IS NOT 'answer' AND NOT EXISTS "
                      "(SELECT 1 FROM owner_reports r WHERE r.agent=? AND r.in_reply_to=u.request_id) ORDER BY e.id", (agent, agent))
-            # chat apps round 2: an agent's message comes until it is read; it needs no reply
+            # chat apps round 2: an agent's message comes until it is read; it needs no reply. So does the owner's
+            # answer to a secret request of this chat (secret_requests): tell_owner cannot name it, so it never clears
             rows = sorted(rows + q("SELECT e.* FROM events e JOIN agent_messages m ON m.event_id=e.id WHERE e.agent=? "
-                                   "AND e.kind='chat' AND e.read_at IS NULL", (agent,)), key=lambda r: r["id"])
+                                   "AND e.kind='chat' AND e.read_at IS NULL", (agent,))
+                          + q("SELECT e.* FROM events e JOIN ui_requests u ON u.event_id=e.id WHERE e.agent=? "
+                              "AND e.kind='chat' AND u.kind='answer' AND e.read_at IS NULL", (agent,)),
+                          key=lambda r: r["id"])
         elif agents()[agent].get("role") in ("worker", "lead"):
             tid = parse_task(a.get("task_id"))
             t = fence(agent, tid)
@@ -6739,7 +6743,7 @@ def t_raise_needs_you(agent, a):
 # (POST /ui/secrets/grant), and only then does the request get its answer (POST /ui/needs/<id>/secret), whose words
 # are the hub's own, read from the catalog: the name, the reference and who holds it. No value passes the manager,
 # its runtime or this file, and an answer in words is refused, so a key cannot reach the chat by that route either.
-SECRET_REQUESTS_OPEN = 5        # requests of the manager's that may wait for the owner at once: each rings his phone
+SECRET_REQUESTS_OPEN = 5        # requests of one agent's that may wait for the owner at once: each rings his phone
 SECRET_SITE_MAX = 200
 SECRET_WHY_MAX = 1000
 SECRET_GIVE_MAX = 12
@@ -6815,7 +6819,10 @@ def t_request_secret(agent, a):
             raise ToolError(f"The fleet already holds the API key {env}, as {have}, so there is nothing to type: "
                             f"{route}. If its value is wrong or was revoked, tell the owner with raise_needs_you that "
                             f"{have} must be removed on the Secrets page; then request_secret asks for the new one.")
-    waiting = q("SELECT * FROM needs WHERE kind='secret' AND answer IS NULL ORDER BY id")
+    # Each agent's own requests only: another agent's is neither counted nor named, because its answer goes to that
+    # agent (a worker's or a lead's request, raised in its owner chat, is answered there: owner_message_rows), so no
+    # agent waits on it. The manager's brief names the asker of each open item.
+    waiting = q("SELECT * FROM needs WHERE kind='secret' AND answer IS NULL AND by=? ORDER BY id", (agent,))
     for r in waiting:
         old = need_secret(r)
         if old.get("kind") == kind and old.get("env" if kind == "api_key" else "site") == spec.get(
@@ -6823,7 +6830,7 @@ def t_request_secret(agent, a):
             return (f"N-{r['id']} already asks the owner for {secret_asked(old)}, so nothing was raised again. His "
                     f"answer arrives as a message in this session.")
     if len(waiting) >= SECRET_REQUESTS_OPEN:
-        raise ToolError(f"{len(waiting)} secret requests already wait for the owner: "
+        raise ToolError(f"{len(waiting)} of your secret requests already wait for the owner: "
                         + ", ".join(f"N-{r['id']}" for r in waiting) + ". Wait for his answers before you ask for more.")
     guard(agent, why, site)
     title = ("Enter the API key " + env) if kind == "api_key" else f"Enter a login for {secret_site_host(site)}"
@@ -6838,9 +6845,10 @@ def t_request_secret(agent, a):
             f"never its value. Never ask him for it in words in the meantime.")
 
 
-def secret_answer_text(ref, entry, spec):
+def secret_answer_text(ref, entry, spec, worker=False):
     """The words that answer a secret request, read from the catalog and team.json at the moment of the answer: the
-    secret's name, its reference and who holds it. Never a value: the hub has none."""
+    secret's name, its reference and who holds it. Never a value: the hub has none. A worker's or a lead's answer
+    names no grant tool, which only the manager has, and no delivery notice, which only the manager gets."""
     api = entry.get("kind") == "api_key"
     name = entry.get("env") or entry.get("title") or ref
     held = resource_holders("secret", ref)
@@ -6852,9 +6860,10 @@ def secret_answer_text(ref, entry, spec):
         f"{h['agent']} ({'reads it as $' + name if h['level'] == 'read' else 'uses it through its vault'})"
         for h in held) + ": each has it in a task session that starts once the vault of its machine has it.")
                  if held else "No agent holds it yet.")
-    words += delivery_words(ref, [h["agent"] for h in held])
-    words.append(f'You may give it with grant_access(resource="secret:{ref}"), up to {top}.' if top else
-                 "Only the owner gives it to an agent: it is not in the grantable pool.")
+    words += delivery_words(ref, [h["agent"] for h in held], told=not worker)
+    if not worker:
+        words.append(f'You may give it with grant_access(resource="secret:{ref}"), up to {top}.' if top else
+                     "Only the owner gives it to an agent: it is not in the grantable pool.")
     words.append("Its value is in the vault: neither this message nor you have it.")
     return " ".join(words)
 
@@ -6880,7 +6889,7 @@ def answer_secret(body, request_id, client):
         if (entry.get("kind") or "login") != spec.get("kind", "api_key"):
             raise Refusal(409, f"this request asks for {secret_asked(spec)}, and {ref} is "
                                f"{'an API key' if entry.get('kind') == 'api_key' else 'a login'}")
-        text = secret_answer_text(ref, entry, spec)
+        text = secret_answer_text(ref, entry, spec, worker=role_of(need["by"]) in ("worker", "lead"))
     else:
         text = "Not given" + (f": {body['decline']}" if body["decline"] else ".") + \
             " Do not ask for it in words instead."
@@ -6969,10 +6978,11 @@ def latest_deposits(ref):
                                        "GROUP BY machine)", (ref,))}
 
 
-def delivery_words(ref, holders):
+def delivery_words(ref, holders, told=True):
     """What the hub knows of this secret in the vaults of these agents' machines, in sentences: its deliveries there,
     and a machine that could take one and got none. A machine that takes no delivery is left out, because what its
-    vault holds is not the hub's to say: one that reads the owner's Bitwarden project can have it already."""
+    vault holds is not the hub's to say: one that reads the owner's Bitwarden project can have it already. told: the
+    reader gets the delivery notice (finish_deposit tells the manager only)."""
     machines, done, by = deposit_machines(), latest_deposits(ref), {}
     for m in sorted({agents()[a]["machine"] for a in holders if a in agents()}):
         state = deposit_view(done[m])["state"] if m in done else "none" if machines.get(m, {}).get("carrier") else None
@@ -6983,7 +6993,7 @@ def delivery_words(ref, holders):
         return ("the vault of " if len(names) == 1 else "the vaults of ") + \
             (names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1])
     said = {"delivered": lambda v: f"{v[0].upper()}{v[1:]} {'has' if v.startswith('the vault ') else 'have'} it.",
-            "waiting": lambda v: f"It is on its way to {v}: the hub tells you when it is there.",
+            "waiting": lambda v: f"It is on its way to {v}" + (": the hub tells you when it is there." if told else "."),
             "failed": lambda v: f"It did not reach {v}: the owner delivers it again from the app.",
             "none": lambda v: f"The owner has not delivered it to {v}."}
     return [said[state](vaults(by[state])) for state in ("delivered", "waiting", "failed", "none") if state in by]
@@ -7830,6 +7840,12 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     chat app (origin): the answer of the need, one event and one ui_requests row. The caller checked everything.
     Returns the event ID."""
     worker_chat = need is None and agents()[recipient].get("role") in ("worker", "lead")
+    # owner feature secret_requests: a worker or a lead asks only in its owner chat, so his answer goes back there,
+    # read once as an agent's message is: it is no message of his that waits for a reply. A removed agent, or one whose
+    # runtime has no chat now, gets the answer as before, which nothing reads.
+    asker = agents().get(recipient) or {}
+    secret_chat = need is not None and need["kind"] == "secret" and asker.get("role") in ("worker", "lead") and \
+        owner_chat(asker)
     if need is None:
         text = owner_message_text(request_id, value, recipient, origin, replaces, files)
     else:
@@ -7845,11 +7861,13 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
             DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, "owner", f"UI {kind} {request_id} "
                        f"accepted as the answer of N-{need['id']} in C-{need['conversation']}"))
             return event_id
-        text = text.rstrip() + attachment_words(files)
+        text = text.rstrip() + attachment_words(files) + (" It needs no reply." if secret_chat else "")
     generation = DB.execute("SELECT v FROM kv WHERE k='db_id'").fetchone()
-    extra = json.dumps({"generation": generation["v"] if generation else None}) if worker_chat else "{}"
+    generation = generation["v"] if generation else None
+    extra = json.dumps({"generation": generation} if worker_chat else
+                       {"generation": generation, "need": need["id"]} if secret_chat else {})
     event_id = DB.execute("INSERT INTO events(agent,kind,text,created,extra) VALUES(?,?,?,?,?)",
-                          (recipient, "chat" if worker_chat else "say", text, t0, extra)).lastrowid
+                          (recipient, "chat" if worker_chat or secret_chat else "say", text, t0, extra)).lastrowid
     DB.execute("INSERT INTO ui_requests(request_id,kind,need_id,text,event_id,created,client,recipient,"
                "replaces_request_id,origin) VALUES(?,?,?,?,?,?,?,?,?,?)",
                (request_id, kind, need["id"] if need is not None else None, value, event_id, t0, client, recipient,
@@ -18019,8 +18037,12 @@ def resume_lines(t0):
         out.append("  decide_report.")
     needs = q("SELECT * FROM needs WHERE answer IS NULL ORDER BY id")
     if needs:
-        out.append("With the owner: " + ", ".join(f"N-{r['id']} {clip(r['title'], 60)}" for r in needs[:RESUME_ROWS])
-                   + ". Do not raise them again.")
+        # an item that another agent raised (its secret request, its conversation's question) is answered to it alone,
+        # so the manager raises its own when its work needs the same (t_request_secret)
+        out.append("With the owner: " + ", ".join(f"N-{r['id']} {clip(r['title'], 60)}"
+                                                  + (f" (asked by {r['by']})" if r["by"] != manager_name() else "")
+                                                  for r in needs[:RESUME_ROWS])
+                   + ". Do not raise your own again: an item asked by another agent is answered to that agent alone.")
     decided = q("SELECT ts, what FROM log WHERE agent=? ORDER BY id DESC LIMIT ?", (manager_name(), RESUME_ROWS * 2))
     if decided:
         out.append("What you did last: " + "; ".join(f"{clip(r['what'], 70)} ({ago(r['ts'])} ago)"
@@ -31773,10 +31795,12 @@ class Handler(BaseHTTPRequestHandler):
                         h = q1("SELECT state, kind FROM holds WHERE id=?", (extra.get("hold"),))
                         if not h or h["state"] != "requested" or h["kind"] != extra.get("action"):
                             continue
-                    if r["kind"] == "chat" and (r["read_at"] is not None if extra.get("agent_message") else q1(
+                    if r["kind"] == "chat" and (r["read_at"] is not None
+                                                if extra.get("agent_message") or extra.get("need") else q1(
                         "SELECT r.id FROM owner_reports r JOIN ui_requests u ON r.in_reply_to=u.request_id "
                         "WHERE u.event_id=? AND r.agent=?", (r["id"], agent))):
-                        continue        # an owner chat comes until its reply; an agent's message until it is read
+                        continue        # an owner chat comes until its reply; an agent's message, and his answer to
+                                        # a secret request of the chat (owner_message_rows), until it is read
                     if r["kind"] == "task" and (not t or t["state"] in TERMINAL or extra.get("attempt",1) != t["attempt"]):
                         continue
                     if r["kind"] == "say" and worker and (not t or t["state"] in TERMINAL):

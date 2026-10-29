@@ -1189,9 +1189,10 @@ def model_flags(conf):
 
 CHAT_SIGNAL = "New fleet messages. Call read_messages now."     # the helper's signal to an owner chat window
 # The Fleet tools that a Claude owner chat may call: hub.CHAT_TOOLS, a junction that test_direct_chat and
-# test_chat_agents pin on both sides.
+# test_chat_agents pin on both sides. request_secret is allowed here one release before the hub offers it to a
+# worker's chat (owner feature secret_requests), so that no machine that has not updated yet refuses it.
 CHAT_TOOLS = ("read_messages", "tell_owner", "message_owner", "message_agent", "see_responsibilities", "recall",
-              "start_task")
+              "start_task", "request_secret")
 # Characters of a chat's quoted first prompt. A tmux command must stay under 16 KiB (start_window; tmux refuses a
 # longer one with "command too long"), and a Codex chat has nowhere else to put its prompt. The instructions and the
 # profile are what the chat is, so the recap is what gives way.
