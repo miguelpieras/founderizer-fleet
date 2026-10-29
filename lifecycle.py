@@ -37,6 +37,12 @@ RESTART_GRACE = 120         # seconds this process may live on after it asked fo
 CONFIG_BRANCH = "config"    # the configuration ref that the fleet runs: the hub writes it, the code branch waits
                             # for a deployment (RULES.md "Where work goes")
 BRANCH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,100}")
+# An agent's own skills (runtime gaps, design v4 D): skills/<agent>/<name>/SKILL.md on the configuration ref, and a few
+# small files beside it, which the hub writes for that agent and nothing else writes. A script among them is no Fleet
+# code: no helper loads it, so a checkout that gained one runs the code it ran before (Lifecycle.running).
+SKILLS = "skills"
+SKILL_NAME = r"[a-z0-9][a-z0-9-]{0,63}"         # a skill's folder, which is its name
+SKILL_FILE = r"(?:[A-Za-z0-9_][A-Za-z0-9._-]{0,63}/){0,2}[A-Za-z0-9_][A-Za-z0-9._-]{0,63}"   # a file in that folder
 
 
 FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "agent_key", "broker_callers",
@@ -916,12 +922,12 @@ class Lifecycle:
 
     def running(self):
         """The revision this helper runs: its checkout when it started, or a later checkout that changed none of
-        the files a helper loads (Python files and team.json), for example task outputs or a profile."""
+        the files a helper loads (Python files and team.json), for example task outputs, a profile or a skill."""
         head = self.revision()
         if head and self.loaded and head != self.loaded:
             code, out, _ = self.run(["git", "-C", self.kit, "diff", "--name-only", self.loaded, head])
-            if code == 0 and not any((p.endswith(".py") and not OWNER_ONLY.search(p)) or p == "team.json"
-                                     for p in out.split()):
+            if code == 0 and not any((p.endswith(".py") and not OWNER_ONLY.search(p)
+                                      and not p.startswith(SKILLS + "/")) or p == "team.json" for p in out.split()):
                 self.loaded = head
         return self.loaded or head
 

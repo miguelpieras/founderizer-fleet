@@ -489,8 +489,9 @@ def schema_summary(out):
 # code; these paths come back exactly as the pinned revision has them. All of `knowledge/` is here, and not only
 # `knowledge/owner/`: an agent writes the knowledge files its profile lists (hub.write_knowledge), so a release that
 # replaced them would revert what the fleet learned. An install still seeds them, the way it seeds the manager's
-# profile; only an update leaves them alone.
-OWNER_PATHS = ("team.json", "profiles", "knowledge")
+# profile; only an update leaves them alone. `skills/` is each agent's own procedures (hub.write_skill), for the same
+# reason.
+OWNER_PATHS = ("team.json", "profiles", "knowledge", "skills")
 
 
 def _owner_file(path):

@@ -59,6 +59,7 @@ from lifecycle import (APP_SERVER, APP_SERVER_RUNTIME, DEPLOY_APP_NOTE, GITHUB_T
                        REPO_ACCESS, REPO_NAME, REUSE_SETTINGS, RUNTIMES, RUNTIME_RESULTS, SWITCH_RUNTIMES, TOOL_CATALOG,
                        app_server_task, mcp_server, mcp_variable, no_sign_in, reuse_value, runtime_fact,
                        runtimes_with, switch_target, tool_catalog, tool_needs)
+from lifecycle import SKILL_FILE, SKILL_NAME, SKILLS        # design v4 D: an agent's own skills
 
 DESKTOP = Frames()
 
@@ -11279,8 +11280,10 @@ def same_code(rev, desired):
             return False            # an unknown commit: not cached, it can arrive later
         if len(_code_diffs) > 512:
             _code_diffs.clear()
+        # A skill's script is no Fleet code either (design v4 D1): no helper runs it, so a checkout without the
+        # skill an agent wrote a minute ago is not behind.
         _code_diffs[(rev, desired)] = not any(FLEET_FILES.search(p) and not OWNER_ONLY.search(p)
-                                              for p in out.split("\n") if p)
+                                              and not p.startswith(SKILLS + "/") for p in out.split("\n") if p)
     return _code_diffs[(rev, desired)]
 
 
@@ -11373,8 +11376,11 @@ def request_update(agent, desired):
 # What the hub may write on the configuration ref: the owner's own files. knowledge/ is all of it, and not only
 # knowledge/owner/, because an agent writes the knowledge files its profile lists (write_knowledge) and a file the hub
 # can write but a release can replace is drift by construction. publish.py already calls all of knowledge/ the fleet's
-# own (OWNER_FILES), and releases.OWNER_PATHS is the other half of this line.
-CONFIG_FILES = re.compile(r"(?!.*\.\.)(?:team\.json|profiles/[A-Za-z0-9._-]+\.md|knowledge/[A-Za-z0-9._/-]+\.md)\Z")
+# own (OWNER_FILES), and releases.OWNER_PATHS is the other half of this line. skills/ is each agent's own (design v4
+# D1): skills/<agent>/<name>/SKILL.md and the few small files beside it, at most two folders deep and never hidden. It
+# is in all three lists a release before the tool that writes it, so no release ever reverts a skill.
+CONFIG_FILES = re.compile(r"(?!.*\.\.)(?:team\.json|profiles/[A-Za-z0-9._-]+\.md|knowledge/[A-Za-z0-9._/-]+\.md|"
+                          rf"{SKILLS}/[a-z][a-z0-9-]{{1,30}}/{SKILL_NAME}/{SKILL_FILE})\Z")
 
 
 def commit_kit_file(path, data, message, more=None, author=None, allow=None):
@@ -26014,7 +26020,7 @@ def owner_files():
     """The owner's own configuration from the hub's checkout: exactly the paths the hub itself may write
     (CONFIG_FILES). Everything else in the checkout is code, and a new machine gets that from the release."""
     root, paths, found = kit_dir(), ["team.json"], {}
-    for folder in ("profiles", "knowledge"):
+    for folder in ("profiles", "knowledge", SKILLS):
         for here, _dirs, names in os.walk(os.path.join(root, folder)):
             paths += [os.path.relpath(os.path.join(here, name), root) for name in names]
     for path in sorted(paths):
@@ -26273,8 +26279,8 @@ fleet {manifest['fleet_id']}, at revision {(manifest['revision'] or 'unknown')[:
 
 - `{BACKUP_DB}`: every record the hub holds — tasks and their results, goals, duties and their cases, every
   conversation, the grants record, the log, and the `fleet_id` your subscription is tied to.
-- `{BACKUP_CONFIG}`: your own configuration — `team.json`, each agent's profile, and your own knowledge. These
-  live only in the hub machine's checkout, so they go with that disk.
+- `{BACKUP_CONFIG}`: your own configuration — `team.json`, each agent's profile and skills, and your own
+  knowledge. These live only in the hub machine's checkout, so they go with that disk.
 - `{BACKUP_MANIFEST}`: what is in this copy, with the SHA-256 of each file.
 {central_in}
 ## What is NOT in it
