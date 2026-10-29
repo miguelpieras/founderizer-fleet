@@ -92,7 +92,9 @@ WORKER_TOOLS = EVERY_AGENT + ["list_my_tasks", "report_progress", "read_attachme
                               # plan C17 (the owner, 26 October 2026): a worker writes its own duties
                               "set_duty", "change_duty",
                               # AUTONOMY.md P8: its own costs, and a lead its team's
-                              "see_history"]
+                              "see_history",
+                              # the owner, 29 October 2026: it asks him itself for a secret that its task needs
+                              "request_secret"]
 # A lead: its own task's worker tools, and the eleven team tools of RULES.md -- the first nine limited to that
 # task's subtasks, the two duty writes to its own team. No check ever listed a lead's tools, because the hub these
 # checks start has no lead -- which is how LEAD_TEAM_TOOLS came to hold nine where RULES.md named eight, for weeks.

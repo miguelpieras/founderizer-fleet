@@ -2154,6 +2154,8 @@ def allowance_start_text(agent, task_id):
 # was named nowhere an agent reads at the moment it would reach for it. The third is the one that was missing
 # altogether (asking_and_waiting): an agent that is merely unsure had to choose between stopping its work and
 # guessing, and rule 4 forbids the guess, so the cheapest thing it could do was the forbidden one.
+SECRET_SELF = (" Only a key or a login that the fleet does not hold you ask the owner for yourself, with "
+               "request_secret: this task waits for his answer.")
 RULE_FOUR = (" Never contact the owner: if you are blocked, use ask_my_requester. If you are only UNSURE and not "
              "blocked, ask anyway and say in default what you will go on with: the task does not pause, your "
              "requester can still change it, and the record says this was decided by your reading and not by it. "
@@ -2246,6 +2248,8 @@ def task_start_text(agent, task_id, resume=False, note="", row=None, opening=Non
              f'Call the fleet tool list_my_tasks with task_id "{tref(task_id)}". First check what '
              f'was already done (rule 9: check before repeating), then continue and finish with '
              f'deliver_result.' if resume else task_itself(task_id)) + RULE_FOUR
+    # owner feature secret_requests: the one thing that it asks the owner for itself, in a task that no contact drives
+    said += "" if contact_session(agent, ("", tref(task_id), "1")) else SECRET_SELF
     # manager_as_lead: when this task is one part of a split piece of work, which piece and who holds the other
     # parts -- a part that does not know it is a part does the whole piece.
     part = part_start_text(task_id)
@@ -4061,9 +4065,10 @@ def access_needed(value, level=None):
     if len(rid) > 200 or not resource_parts(rid)[0]:
         raise ToolError(f"needs_access must be <kind>:<what>, with a kind of {', '.join(sorted(RESOURCE_LEVELS))}: "
                         f"repo:acme/web, secret:bws://<uuid>, gmail:a@b.com, drive:a@b.com or tool:<MCP server>. "
-                        f"Leave it out for a question that is not about access, and for a key or a login that the "
-                        f"fleet does not hold at all, which has no reference yet: say in the question which one and "
-                        f"what for, and the owner is asked for it.")
+                        f"Leave it out for a question that is not about access. A key or a login that the fleet does "
+                        f"not hold at all has no reference yet: ask the owner for it yourself with request_secret; if "
+                        f"this session has no request_secret, leave needs_access out and say in the question which one "
+                        f"and what for.")
     kind = resource_parts(rid)[0]
     if want and want not in RESOURCE_LEVELS[kind]:
         raise ToolError(f"needs_level must be one of {', '.join(RESOURCE_LEVELS[kind])} for a "
@@ -4467,9 +4472,9 @@ LEAD_TEAM_TOOLS = ("create_task", "cancel_task", "restart_task", "answer", "chec
 WORKER_OWN_TOOLS = ("set_duty", "change_duty")
 # The one tool that only the owner chat of a worker or a lead has: it opens the work the owner asks for there.
 CHAT_ONLY = ("start_task",)
-# The tools that a worker or a lead has only in its owner chat, where the owner talks to it, and the manager wherever
-# it works: its replies to him, and his secure form for a secret that he wants it to use (secret_requests).
-WORKER_CHAT_ONLY = ("tell_owner", "request_secret")
+# The tool that a worker or a lead has only in its owner chat, where the owner talks to it, and the manager wherever
+# it works: its replies to him.
+WORKER_CHAT_ONLY = ("tell_owner",)
 
 
 def role_offers(role, r, name):
@@ -6759,6 +6764,8 @@ def t_raise_needs_you(agent, a):
 # in words is refused, so a key cannot reach the chat by that route either.
 SECRET_REQUESTS_OPEN = 5        # requests of one agent's that may wait for the owner at once: each rings his phone
 SECRET_ASKS_PER_MESSAGE = 5     # a worker's or a lead's requests in reply to one owner message, answered ones too
+SECRET_ASKS_PER_TASK = 5        # a task's requests in all, answered ones too
+SECRET_HOST_MAX = 80            # "Enter the API key " + 60 + " for " + 80 is under PUSH_TEXT: no push cuts it
 SECRET_SITE_MAX = 200
 SECRET_WHY_MAX = 1000
 SECRET_GIVE_MAX = 12
@@ -6803,11 +6810,35 @@ def secret_reply(agent, reply):
     return newest
 
 
+def secret_same(spec, kind, env, site):
+    """True when a request's spec asks for the same thing: an API key by its variable, a login by its host."""
+    if spec.get("kind") != kind:
+        return False
+    if kind == "api_key":
+        return spec.get("env") == env
+    return secret_site_host(spec.get("site") or "") == secret_site_host(site)
+
+
+def secret_parked(task_id, nid):
+    """The task whose session just asked waits on that request (secret_wait); a task that already waits on a question
+    or a prompt keeps it, and that wait's end puts this one in its place (secret_rewait)."""
+    with transaction():         # a first call of a session finds its task still submitted (task_started)
+        DB.execute("UPDATE tasks SET state='input-required', waiting_on=? WHERE id=? AND state IN "
+                   "('submitted','working')", (f"N-{nid}", task_id))
+
+
 def t_request_secret(agent, a):
-    """The manager asks wherever it works. A worker or a lead asks only in its owner chat (tools_for), in reply to his
-    newest message (secret_reply), and proposes only itself: his answer comes back to that chat (owner_message_rows)."""
+    """The manager asks wherever it works. A worker or a lead asks in its owner chat, in reply to his newest message
+    (secret_reply), or in a task session that no contact drives, and then that task waits for his answer
+    (secret_wait). Its request proposes only itself, and his answer comes back to that chat or to those tasks."""
     worker = role_of(agent) in ("worker", "lead")
-    reply = secret_reply(agent, a.get("in_reply_to")) if worker else None
+    chat = worker and chat_context(agent)
+    tid = None
+    if worker and not chat:
+        if contact_session(agent):      # tools_for leaves it out there: no contact makes him type a secret
+            raise ToolError("You have no tool named request_secret.")
+        tid = parse_task(a.get("task_id") or (getattr(CALL, "context", None) or ("", ""))[1])
+    reply = secret_reply(agent, a.get("in_reply_to")) if chat else None
     kind = str(a.get("kind") or "api_key").strip()
     if kind not in SECRET_KINDS:
         raise ToolError('kind is "api_key", a key that an agent reads as a variable or that its vault sends with '
@@ -6824,9 +6855,15 @@ def t_request_secret(agent, a):
     if site and (len(site) > SECRET_SITE_MAX or not SECRET_SITE.fullmatch(site)):
         raise ToolError(f"site is the address where the secret is used, with https://, at most {SECRET_SITE_MAX} "
                         f"characters: a login's sign-in page, or the API an agent calls with the key.")
+    # The host is what he reads to see where his value goes, in the card's title and in the push, which cuts a title
+    # longer than PUSH_TEXT: a host of at most SECRET_HOST_MAX keeps every title whole
+    if site and len(secret_site_host(site)) > SECRET_HOST_MAX:
+        raise ToolError(f"The host of site is at most {SECRET_HOST_MAX} characters: the owner reads it in full.")
     if kind == "login" and not site:
         raise ToolError("A login needs site: the address of its sign-in page, with https://, so the owner knows "
                         "which account you mean and the vault knows where to sign in.")
+    if kind == "api_key" and worker and not site:
+        raise ToolError("An API key that your vault uses needs site: the address of the API that it is sent to.")
     if kind == "login" and provider_site(urllib.parse.urlsplit(site).hostname):
         raise ToolError("Fleet keeps no login of a model provider: " + ", ".join(PROVIDER_SITES) + ". The owner "
                         "signs in to their own account in their own session, through the provider's own flow.")
@@ -6847,7 +6884,8 @@ def t_request_secret(agent, a):
                             f'it, or for an API key "read", which puts the key into its sessions as the variable.')
     spec = {"kind": kind, **({"env": env} if env else {}), **({"site": site} if site else {}),
             **({"give": dict(sorted(give.items()))} if give else {}),
-            **({"reply": reply["request_id"]} if worker else {})}      # the owner message it answers
+            **({"reply": reply["request_id"]} if chat else {}),         # the owner message it answers
+            **({"tasks": [tid]} if tid else {})}                        # the task that waits on it
     if kind == "api_key":
         have = next((ref for ref, e in sorted(logins().items())
                      if e.get("kind") == "api_key" and e.get("env") == env), None)
@@ -6855,7 +6893,8 @@ def t_request_secret(agent, a):
             mine = any(h["agent"] == agent for h in resource_holders("secret", have))
             raise ToolError(f"The fleet already holds the API key {env}, as {have}, so there is nothing to type: "
                             + ("you hold it already." if mine else
-                               f"ask the manager for it with message_agent, naming secret:{have}."))
+                               f'ask your requester for it with ask_my_requester and needs_access="secret:{have}".'
+                               if tid else f"ask the manager for it with message_agent, naming secret:{have}."))
         if have:
             rid = f"secret:{have}"
             top = (resource_pool().get(rid) or {}).get("max")
@@ -6865,34 +6904,99 @@ def t_request_secret(agent, a):
             raise ToolError(f"The fleet already holds the API key {env}, as {have}, so there is nothing to type: "
                             f"{route}. If its value is wrong or was revoked, tell the owner with raise_needs_you that "
                             f"{have} must be removed on the Secrets page; then request_secret asks for the new one.")
+    waits = ("This task waits for his answer: end your turn. If he saves it, this session goes on once your machine's "
+             "vault has it; if he declines, his words come here.")
+    if tid:
+        # One request of an agent for one thing that tasks wait on: a task joins it while it is open, or saved for
+        # this agent and on its way to its machine, so his one answer reaches every task of it and rings him once
+        for r in q("SELECT * FROM needs WHERE kind='secret' AND by=? ORDER BY id", (agent,)):
+            old = need_secret(r)
+            # a task's request has the key "tasks", also once its last waiting task ended after his save
+            if "tasks" not in old or not secret_same(old, kind, env, site):
+                continue
+            mine = old.get("saved") and not old.get("woken") and any(
+                h["agent"] == agent for h in resource_holders("secret", old["saved"]))
+            if r["answer"] is not None and not mine:
+                continue
+            with transaction():
+                now_spec = need_secret(DB.execute("SELECT * FROM needs WHERE id=?", (r["id"],)).fetchone()) or {}
+                if tid not in (now_spec.get("tasks") or []):
+                    now_spec["tasks"] = (now_spec.get("tasks") or []) + [tid]
+                    DB.execute("UPDATE needs SET secret=? WHERE id=?", (json.dumps(now_spec), r["id"]))
+            secret_parked(tid, r["id"])
+            if mine:
+                told = " " + " ".join(delivery_words(old["saved"], [agent], told=False)) if old.get("told") else ""
+                secret_wakes()      # a delivery that ended before this task joined wakes it now, not at the next tick
+                now_row = read_row("SELECT * FROM needs WHERE id=?", (r["id"],))
+                if now_row and (need_secret(now_row) or {}).get("woken"):
+                    words = secret_woken_words(now_row, need_secret(now_row))
+                    # this result gives the wake's words, so its message to this task is read: no signal repeats them
+                    q("UPDATE events SET read_at=? WHERE task=? AND kind='say' AND read_at IS NULL AND text=?",
+                      (now(), tid, words))
+                    return words.removeprefix("[hub] ")
+                return (f"N-{r['id']}: the owner saved {secret_asked(old)} for you, and this task waits on it too."
+                        f"{told} End your turn: this session goes on once your machine's vault has it.")
+            return f"N-{r['id']} already asks the owner for {secret_asked(old)}, and this task waits on it too. {waits}"
+    if worker and kind == "login":
+        held = next((ref for ref in sorted(granted_logins(agent)) if secret_site_host(site) ==
+                     str((logins().get(ref) or {}).get("title") or "").split(" · ")[0]), None)
+        if held:
+            raise ToolError(f"You hold a login for {secret_site_host(site)} already, as {held}: "
+                            + ("open the work that needs it with start_task." if chat else "sign in with it."))
+    if worker:
+        # His decline holds for that thing until he writes to this agent again or steers a task of it after it
+        for r in q("SELECT * FROM needs WHERE kind='secret' AND by=? AND answer LIKE 'Not given%' ORDER BY id DESC",
+                   (agent,)):
+            if not secret_same(need_secret(r), kind, env, site):
+                continue
+            if not (q1("SELECT 1 FROM ui_requests WHERE recipient=? AND kind='message' AND created>? LIMIT 1",
+                       (agent, r["answered"])) or
+                    q1("SELECT 1 FROM events WHERE agent=? AND kind='say' AND json_extract(extra, '$.steer') IS NOT "
+                       "NULL AND created>? LIMIT 1", (agent, r["answered"]))):
+                raise ToolError(f"He declined N-{r['id']}: {r['answer']} " +
+                                ("Ask again only after he writes to you again." if chat else
+                                 "Go on without it, or deliver what you can; ask again only after he writes to you "
+                                 "or steers this task."))
+            break
     # Each agent's own requests only: another agent's is neither counted nor named, because its answer goes to that
-    # agent (a worker's or a lead's request, raised in its owner chat, is answered there: owner_message_rows), so no
-    # agent waits on it. The manager's brief names the asker of each open item.
+    # agent, so no agent waits on it; the chat's own requests and the tasks' are each their own place. The manager's
+    # brief names the asker of each open item.
     waiting = q("SELECT * FROM needs WHERE kind='secret' AND answer IS NULL AND by=? ORDER BY id", (agent,))
     for r in waiting:
         old = need_secret(r)
-        if old.get("kind") == kind and old.get("env" if kind == "api_key" else "site") == spec.get(
-                "env" if kind == "api_key" else "site"):
-            return (f"N-{r['id']} already asks the owner for {secret_asked(old)}, so nothing was raised again. His "
-                    f"answer {'comes to this chat' if worker else 'arrives as a message in this session'}.")
+        if bool(old.get("tasks")) != bool(tid) or not secret_same(old, kind, env, site):
+            continue
+        return (f"N-{r['id']} already asks the owner for {secret_asked(old)}, so nothing was raised again. His "
+                f"answer {'comes to this chat' if chat else 'arrives as a message in this session'}.")
     if len(waiting) >= SECRET_REQUESTS_OPEN:
         raise ToolError(f"{len(waiting)} of your secret requests already wait for the owner: "
                         + ", ".join(f"N-{r['id']}" for r in waiting)
-                        + (". Tell him in this chat which one you need first." if worker else
+                        + (". Tell him in this chat which one you need first." if chat else
+                           ". Go on with what does not need them, or deliver what you can." if tid else
                            ". Wait for his answers before you ask for more."))
     # One message of his answers at most five requests, answered and declined ones too: by the message they cite, so
     # an older message cited while a newer one was unread uses up nothing of the newer one
-    if worker and sum(need_secret(r).get("reply") == reply["request_id"] for r in
-                      q("SELECT * FROM needs WHERE kind='secret' AND by=?", (agent,))) >= SECRET_ASKS_PER_MESSAGE:
+    if chat and sum(need_secret(r).get("reply") == reply["request_id"] for r in
+                    q("SELECT * FROM needs WHERE kind='secret' AND by=?", (agent,))) >= SECRET_ASKS_PER_MESSAGE:
         raise ToolError(f"{SECRET_ASKS_PER_MESSAGE} requests already answer his newest message: tell him what else you "
                         f"need, and ask for it when he writes again.")
+    if tid and q1("SELECT COUNT(*) n FROM needs n, json_each(n.secret, '$.tasks') j WHERE n.kind='secret' AND "
+                  "j.value=?", (tid,))["n"] >= SECRET_ASKS_PER_TASK:
+        raise ToolError(f"This task has asked the owner for {SECRET_ASKS_PER_TASK} secrets already: deliver what you "
+                        f"can, and say in the result what else it needs.")
     guard(agent, why, site)
-    title = ("Enter the API key " + env) if kind == "api_key" else f"Enter a login for {secret_site_host(site)}"
+    host = secret_site_host(site) if site else ""
+    title = (f"Enter the API key {env}" + (f" for {host}" if host else "")) if kind == "api_key" else \
+        f"Enter a login for {host}"
     with LOCK:                  # lane L2: an id that no removed item had (unused_id)
         nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,kind,secret) VALUES(?,?,?,?,?,?,?,?)",
                   (unused_id("needs"), title, why, SECRET_TODO, now(), agent, "secret", json.dumps(spec)))
+    if tid:
+        secret_parked(tid, nid)
     emit("owner", "notify", f"Needs you N-{nid}: {title}")
     ping_need(nid)
+    if tid:
+        return f"Asked the owner for {secret_asked(spec)} as N-{nid}. {waits} Never ask him for it in words."
     if worker:
         # A chat app shows no form, so the agent sends him one line there. Under the app's chat the form is right below
         # its reply, and a sentence about it is one he removes (UI-PATTERNS.md): these words give it none to copy.
@@ -8885,7 +8989,8 @@ CONVERSATION_CLOSED_TOOLS = ("read_messages", "reply", "ask_team")
 # nothing and asks no requester, a reminder would park a task that the next reply ends, and a lead's subtask would
 # hang on it. Larger work, a follow-up at a later time and a lead's parts go to open_work, whose task has them all.
 CONVERSATION_NOT_WORK = ("deliver_result", "ask_my_requester", "set_reminder", "create_task", "cancel_task",
-                         "restart_task", "answer", "check_result", "decide_permission", "decide_report")
+                         "restart_task", "answer", "check_result", "decide_permission", "decide_report",
+                         "request_secret")         # no contact makes the owner type a secret (secret_requests)
 # The helper feature of conversations with contacts.v2: a session with the agent's own tools, a closed one on the
 # chosen runtime at its pinned version, and the records of both kinds (lifecycle.FEATURES)
 CONVERSATION_TASKS = "conversation_tasks"
@@ -18749,24 +18854,27 @@ TOOLS = [
                                    "never sees it) or, for an API key, read (the key is in its sessions as env). "
                                    "The owner can change this before he saves."}},
        ["why"])),
-    # A worker's and a lead's own entry: only in its owner chat (WORKER_CHAT_ONLY), in reply to the owner's message
+    # A worker's and a lead's own entry: in its owner chat, in reply to the owner's message, and in a task session
+    # that no contact drives (tools_for), where the task waits for his answer
     ("worker", "request_secret", t_request_secret,
-     "Ask the owner for a key or a login that he wants you to use and that the fleet does not hold, in reply to his "
-     "newest message to you. He types it into a secure form, so the value goes straight into the vault and never "
-     "passes you, your runtime or a chat: never ask him for one in words. Your request proposes only you as its "
-     "holder, and he chooses in his form. His answer comes to this chat as a message that needs no reply: its name, "
-     "its reference (bws://...) and who holds it, never the value. Open the work that needs it with start_task only "
-     "after his answer: a task session that starts before it does not have it.",
+     "Ask the owner for a key or a login that the fleet does not hold: one that he wants you to use, in your owner "
+     "chat in reply to his newest message to you, or one that your task needs, in its session. He types it into a "
+     "secure form, so the value goes straight into the vault and never passes you, your runtime or a chat: never ask "
+     "him for one in words. Your request proposes only you as its holder, and he chooses in his form. His answer names "
+     "it, its reference (bws://...) and who holds it, never the value. In your chat it comes as a message that needs "
+     "no reply, and you open the work that needs it with start_task only after it. In a task, the task waits for it: "
+     "end your turn, and if he saves it, this session goes on once your machine's vault has it.",
      S({"kind": {"type": "string", "enum": list(SECRET_KINDS),
                  "description": "api_key (the default): a key that your vault sends with call_api. login: a user name "
                                 "and a password that your vault signs in with."},
         "env": {"type": "string", "description": "An API key's variable name, for example STRIPE_SECRET_KEY"},
         "site": {"type": "string", "description": "The address where it is used, with https://: a login's sign-in "
-                                                  "page (required for a login), or the API that you call with it"},
+                                                  "page, or the API that your vault sends the key to (required)"},
         "why": {"type": "string", "description": "What the work needs it for, in a sentence or two: the owner "
                                                  "reads it before he types the value"},
-        "in_reply_to": {"type": "string", "description": "The request_id of the owner's newest message to you"}},
-       ["why", "in_reply_to"])),
+        "in_reply_to": {"type": "string", "description": "In your owner chat: the request_id of the owner's newest "
+                                                         "message to you"}},
+       ["why", "site"])),
     # owner API 1.13: the standing duties of an agent (RESPONSIBILITIES.md)
     ("all", "see_responsibilities", t_see_responsibilities,
      "See the duties that you hold: their watches, their open cases and what is not in order. A duty stays; it "
@@ -19218,6 +19326,8 @@ def tools_for(agent, context=None):
             (name in conversation if conversation is not None else
              name in CHAT_TOOLS if chat else
              not (role in ("worker", "lead") and name in WORKER_CHAT_ONLY) and name not in CONVERSATION_ONLY + CHAT_ONLY) and
+            # owner feature secret_requests: a task that a conversation opened, or a part of one, asks him for none
+            (name != "request_secret" or not contact_session(agent, context)) and
             # AUTONOMY.md P2: message_contact only once contacts.v2 is on
             (name != "message_contact" or contacts_v2()) and
             # create_login and save_key: off until the owner allows the agent
