@@ -440,6 +440,8 @@ class Runner:
             fd = os.open(self.records_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
             self.records = os.fdopen(fd, "a", encoding="utf-8")
         overrides = [x for name in self.off for x in ("-c", f"features.{name}=false")]     # none for a screen task
+        # AUTONOMY.md decision 41: no request_user_input to refuse (decide) either, so the model never reaches for it
+        overrides += fleet.CODEX_NO_ASKING
         self.child = subprocess.Popen([self.command,"app-server",*overrides,"--stdio"], cwd=fleet.KIT,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr, start_new_session=True)
         def stop(_signum, _frame):

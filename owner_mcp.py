@@ -327,6 +327,9 @@ PAGES = {
     "notes": ("/ui/notes/{agent}", "one agent's own working notes and every version of them (give agent). The agent "
                                    "writes these, never the owner: the profile is the owner's words and this is the "
                                    "agent's own"),
+    "skills": ("/ui/skills", "every agent's own skills, or one agent's (give agent): each one's name, description, "
+                             "path and files, and its newest commit with the task it was written in and that task's "
+                             "reads of outside text. The agents write them; remove_skill removes one"),
     "chat_link": ("/ui/chat-apps/{name}/link", "one WhatsApp account's link state and its current QR text (give "
                                                "name, the account id). The QR is only here, and it dies in seconds"),
 }
@@ -1080,6 +1083,11 @@ def tools():
               "attachment": S["int"], "path": S["text"], "delete": S["bool"], **rid}, (),
              plain("/ui/knowledge", ("title", "text", "source", "url", "attachment", "path", "delete"),
                    "this knowledge file")),
+        tool("remove_skill", "Remove one agent's own skill: its folder skills/<agent>/<name>/ leaves the "
+                             "configuration ref in one commit, and the agent's next sessions no longer list it. The "
+                             "agents write their skills themselves; fleet_read(page=\"skills\") lists them.",
+             {"agent": S["text"], "name": S["text"], **rid}, ("agent", "name"),
+             plain("/ui/skills/remove", ("agent", "name"), "the removal of this skill")),
         tool("save_person", "The people who may write to an agent from Discord or WhatsApp: add one, change one, or "
                             "remove one with delete true and its id. role is one of the roles that "
                             "fleet_read(page=\"people\") lists; agents are the agents they may reach; daily is their "

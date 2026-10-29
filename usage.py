@@ -92,6 +92,9 @@ def account_key(provider, identity):
 def transcript_tokens(runtime, kit, home=None):
     home, kit = Path(home or Path.home()), str(Path(kit).resolve())
     if runtime == "claude":
+        # Every level below the project folder: a subagent's transcript is <session>/subagents/agent-<id>.jsonl, and
+        # a workflow agent's <session>/subagents/workflows/<run>/agent-<id>.jsonl (AUTONOMY.md decision 41), whose
+        # rows carry the root session's id and their own usage, so they count in that session's totals
         root = home / ".claude/projects" / re.sub(r"[^A-Za-z0-9-]", "-", kit)
         paths = root.glob("**/*.jsonl")
     else:

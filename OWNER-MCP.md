@@ -143,6 +143,7 @@ would read as an empty fleet instead of as a mistake.
 | `save_login` | `/ui/team/logins` | The owner's title for one vault login, by its `bws://` reference. The label only. |
 | `machine_access` | `/ui/team/access` | How the fleet reaches a machine: its SSH user, port, Screen Sharing. |
 | `save_knowledge` | `/ui/knowledge` | The owner's own knowledge files: text, a page the hub fetches, a kept file, a delete. |
+| `remove_skill` | `/ui/skills/remove` | Remove one agent's own skill in one commit. The agents write their skills; `fleet_read(page="skills")` lists them. |
 | `save_person` / `person_handle` | `/ui/people`, `/ui/people/<id>/handles` | The people who may write to an agent, and their chat handles. |
 | `save_role` | `/ui/roles` | The roles those people hold: a name, a prompt in the owner's words, tools on or off, a daily limit for a closed role. A held role is not deleted. |
 | `save_settings` | `/ui/settings` | The fleet's settings in `team.json`, such as `contacts.v2`, and the runtime facts the owner changes (`cache_seconds`, `compact_tokens`, `token_weights`, `routine`); null gives each its default. |

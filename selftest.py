@@ -69,20 +69,24 @@ def start_hub(name, addresses, *flags, agents=None, extra=None):
 # The tools of each role, by name, in RULES.md's own groups: the ones every agent has, then the manager's own with
 # its two duty writes, or the ones of a worker's task. set_reminder is in the first group since asking_and_waiting,
 # because "come back to this at this time" was the manager's alone and belongs to every agent that has to wait.
+# message_owner left it on 29 October 2026 (the owner: only the manager and his chats message him directly): a
+# worker's or a lead's owner chat has it, and its task sessions do not.
 # A count says only that something moved; a set says which tool moved, and RULES.md names every one of these.
 # The tools a grant adds are not here: start_hub drops the grants.
 EVERY_AGENT = ["read_messages", "search_knowledge", "write_knowledge", "see_responsibilities", "open_case",
                "record_step", "close_case", "attach_watch", "see_notes", "write_notes", "remember", "recall",
-               "forget", "see_triggers", "save_trigger", "change_trigger", "set_reminder", "message_owner",
+               "forget", "see_triggers", "save_trigger", "change_trigger", "set_reminder",
                "message_agent",
                # AUTONOMY.md P3: standing instructions and targets, in every session with the agent's tools
                "keep_instruction", "set_target", "end_standing", "see_standing",
                # AUTONOMY.md P6: everything an agent took part in, searched and read back
-               "search_history", "read_history"]
+               "search_history", "read_history",
+               # design v4 D2: an agent's own skills
+               "write_skill"]
 MANAGER_TOOLS = EVERY_AGENT + ["create_task", "cancel_task", "restart_task", "answer", "check_result",
                                "decide_permission", "see_team", "see_capacity", "see_goals",
                                "update_goal", "record_spend", "raise_needs_you", "request_secret", "tell_owner",
-                               "grant_access",
+                               "message_owner", "grant_access",
                                "set_duty", "change_duty", "see_history", "decide_report",
                                # AUTONOMY.md P8: the one changer of the agents with no lead
                                "set_agent_model"]

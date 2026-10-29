@@ -107,9 +107,15 @@ def diff_counts(diff):
 
 
 NOTICE = re.compile(r"<task-notification>.*?</task-notification>", re.S)
-# The statuses of a notice that ends a background command or a monitor. A notice without one is a monitor's event, and
-# its call stays open (plan C1: background work is a fact of the attempt until its own end notice).
+# The statuses of a notice that ends a background command, a monitor or a workflow (completed, failed or killed). A
+# notice without one is a monitor's event, and its call stays open (plan C1: background work is a fact of the attempt
+# until its own end notice).
 SHELL_ENDS = ("completed", "failed", "stopped", "killed")
+# The Claude Code tools whose result can say that they run on in the background, with the id of their end notice.
+# Workflow (AUTONOMY.md decision 41) always does: its result is async_launched with a taskId.
+BACKGROUND_TOOLS = ("Bash", "Monitor", "Workflow")
+# The description in a Workflow script's meta literal, which Claude Code shows as the call's own title
+WORKFLOW_DESCRIPTION = re.compile(r"""\bdescription\s*:\s*(["'`])((?:\\.|(?!\1).)*?)\1""")
 
 
 def notice_tag(notice, name):
@@ -170,8 +176,9 @@ class Translator:
         self.prefix = prefix        # a subagent's records: its starting call's id
         self.agents = {}            # open subagent call -> its agent (Claude agent id, Codex thread id), once launched
         self.pending = {}           # Claude: async subagent call -> agent id, until its end notice
-        self.shells = {}            # Claude: background command or monitor call -> its task id, until its end notice
-        self.shell_calls = {}       # Claude: Bash and Monitor calls of this session -> the tool's name
+        self.shells = {}            # Claude: background command, monitor or workflow call -> its task id, until its
+                                    # end notice
+        self.shell_calls = {}       # Claude: BACKGROUND_TOOLS calls of this session -> the tool's name
         self.turn = False           # Claude: a turn of the main session runs
         self.ends = 0               # Claude: the turn ends of the main session so far (Helper.interrupt reads it)
         self.delivered = False      # Claude: the session called deliver_result
@@ -368,9 +375,10 @@ class Translator:
                 body = text_of(block.get("content")).strip()
                 tool = self.shell_calls.pop(call, None)
                 running = result.get("backgroundTaskId") if tool == "Bash" else result.get("taskId") if tool == "Monitor" \
-                    else None
+                    or (tool == "Workflow" and result.get("status") == "async_launched") else None
                 if isinstance(running, str) and running.strip() and not block.get("is_error"):
-                    # A command that runs on in the background, or a monitor: open until its own end notice.
+                    # A command that runs on in the background, a monitor or a workflow: open until its own end notice,
+                    # so that nothing takes its session for one that waits on nothing.
                     self.shells[call] = running.strip()
                     out.append({"type": "tool_call_update", "tool_call_id": call, "status": "in_progress",
                                 "background": True, "interrupted": False, "output": clip(body, OUTPUT)})
@@ -425,8 +433,12 @@ class Translator:
         value = args.get(field) if field else next((v for v in args.values() if isinstance(v, str) and v.strip()), "")
         detail = first_line(value)
         self.open.add(call)
-        if name in ("Bash", "Monitor"):
+        if name in BACKGROUND_TOOLS:
             self.shell_calls[call] = name           # a result with a task id makes it a background call
+        if name == "Workflow":                      # its saved name, else its script's own description
+            found = WORKFLOW_DESCRIPTION.search(str(args.get("script") or ""))
+            detail = first_line(args.get("name") or (found.group(2) if found else "") or
+                                os.path.basename(str(args.get("scriptPath") or "")))
         if self.prefix is None:                     # the helper closes a delivered task at the end of its turn
             self.after = self.after or (self.delivered and not name.startswith("mcp__fleet__"))
             self.delivered = self.delivered or name == "mcp__fleet__deliver_result"
@@ -539,6 +551,12 @@ class Translator:
             call = clip(item.get("id") or "", 100)
             if thread and call in self.agents and not self.agents[call]:
                 self.agents[call], self.threads[thread] = thread, call
+                if call in self.open:
+                    # A Codex subagent runs on beside its parent's turn, as a Claude async agent does, so it is
+                    # background work until its own end (live_reason, fresh_refusal, open_agents; AUTONOMY.md
+                    # decision 41 gives every agent its runtime's own way to split work)
+                    return [{"type": "tool_call_update", "tool_call_id": call, "status": "in_progress",
+                             "background": True, "interrupted": False}]
             return []
         call = self.threads.get(thread)
         if not call or kind not in ("completed", "interrupted"):

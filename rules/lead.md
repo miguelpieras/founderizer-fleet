@@ -2,7 +2,7 @@
 
 ## Who answers to whom
 
-- A **lead** works like a worker, one session per task, and leads the agents that report to it. In the session of its task it gives parts of that task to its team with `create_task`; each becomes a subtask, and the subtask's result, questions and permission prompts arrive in that same session. It delivers its task only when the subtasks are finished and it has checked each result with `check_result`, because after that nobody can. While its subtasks run and none of them waits on it for an answer or a decision, it is quiet on purpose: what its team waits on comes to it at the end of its turn, and nothing else asks it. Standing work of its own team it writes as a duty itself, with `set_duty` and `change_duty`.
+- A **lead** works like a worker, one session per task, and leads the agents that report to it. In the session of its task it gives parts of that task to its team with `create_task`; each becomes a subtask, and the subtask's result, questions and permission prompts arrive in that same session. It delivers its task only when the subtasks are finished and it has checked each result with `check_result`, because after that nobody can. A question of its team that it cannot answer itself it passes up with `answer(question_id, pass_up=true)`, with a note in `text` when that helps: the question moves to its own requester, the asker's task keeps waiting, its own work goes on, and it may still answer it while nobody above has. While its subtasks run and none of them waits on it for an answer or a decision, it is quiet on purpose: what its team waits on comes to it at the end of its turn, and nothing else asks it. Standing work of its own team it writes as a duty itself, with `set_duty` and `change_duty`.
 
 ## The fleet tools
 

@@ -73,7 +73,12 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             # closed one on the chosen runtime at its pinned version, and the records of a conversation's session
             "conversation_tasks",
             "check_lines",      # it runs checks that print lines, with the agent's read keys and its error output (P4)
-            "chat_tools"]       # an owner chat whose tools changed starts again between turns, on its conversation
+            "chat_tools",       # an owner chat whose tools changed starts again between turns, on its conversation
+            "stuck_screens",    # a question that stands on a screen nobody reads ends its session (runtime gaps C1, C2)
+            # AUTONOMY.md decision 41: a task session runs Workflow, and its records keep a workflow open until its own
+            # end notice; no session of it offers a tool that asks a person on its screen
+            "workflow_tasks",
+            "stable_skills"]    # a session's stable text lists the agent's own skills (skills_text, design v4 D3)
 # ---------------------------------------------------------------- the runtimes
 #
 # What the fleet knows about a runtime is here, in one entry for each provider, and nowhere else. hub.py, fleet.py and
@@ -97,8 +102,10 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
 #                     The separately opted-in app_server_pair has different permissions.
 #   manager_access    the form a manager of this runtime starts with, {start}; None when it cannot be the manager.
 #                     The owner's correction of 13 October 2026: Claude Code with every built-in tool and no
-#                     permission check (its settings turn the start prompt off and add no Fleet deny rule), and
-#                     Codex as its own full_access. A switch of the manager keeps this access both ways.
+#                     permission check (its settings turn the start prompt off and add no Fleet deny rule that
+#                     limits a command or a file), and Codex as its own full_access; since AUTONOMY.md decision 41
+#                     every built-in tool but its runtime's manager_denied. A switch of the manager keeps this access
+#                     both ways.
 #   first_worker      the start the hub installer writes for the first worker of a fleet, which has no other worker to
 #                     copy from (hubsetup.WORKER_STARTS), with the allow list of full_access; None when it writes none.
 #                     It is the full-access form (the owner, 26 October 2026: workers act without asking), with the
@@ -149,8 +156,14 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
 #   routine           the model and effort of routine work on it, {model, effort}, None for the runtime's own
 #                     default model: what an agent's one changer reaches for first (plan P9.7, P8)
 #   task_denied       the built-in tools that the owner took away from its task sessions, which their settings deny
-#                     (AUTONOMY.md decision 36, helper feature task_denied): every other tool stays, also a tool that a
-#                     later version adds or renames; None where it has none of them
+#                     (AUTONOMY.md decisions 36 and 41, helper feature task_denied): every other tool stays, also a
+#                     tool that a later version adds or renames; None where it has none of them
+#   task_allowed      the built-in tools that its task sessions run without asking, beside the agent's own allow
+#                     list, because its permission mode would refuse them unasked (decision 41); None for none
+#   conversation_denied   what the settings of a conversation with the agent's own tools deny (decision 41): a
+#                     task session's list and the tools that only task work has; None where it has none of them
+#   manager_denied    what the manager's settings deny of its built-in tools, which are otherwise all its own (the
+#                     owner, 13 October 2026; decision 41): the ones that ask a person on a screen that nobody reads
 #   task_opening      how a task session that opens with its stable text first (helper feature stable_start, plan
 #                     P9.2) gets its task: "read", in its first read_messages answer, because the rules and the
 #                     profile are its appended system prompt; "prompt", at the end of its first prompt, because it
@@ -211,6 +224,10 @@ RUNTIMES = {
         "compact_tokens": 200000,
         "routine": {"model": None, "effort": "low"},
         "task_denied": None,            # Codex has none of the tools that the owner took away
+        "task_allowed": None,
+        # Its ask tools go with a start option in every session instead (fleet.CODEX_UNATTENDED, decision 41)
+        "conversation_denied": None,
+        "manager_denied": None,
         "task_opening": "prompt",
         # gpt-6.1-sol's list prices as public price pages gave them on 27 October 2026, NOT checked on OpenAI's own
         # pricing page: the owner sets the right ones with runtime_facts. OpenAI charges no more for a cache write
@@ -263,10 +280,21 @@ RUNTIMES = {
         "compact_tokens": 200000,       # fleet.STANDING_COMPACT, the window that Fleet starts its standing sessions with
         "routine": {"model": "sonnet", "effort": "low"},
         # The owner, 27 October 2026: "Yes, remove Artifact, Workflow, AskUserQuestion, ReportFindings, Skill and
-        # ListAgents from agent task sessions." These six and nothing else: on Claude Code 2.1.301, 2.1.304, 2.1.308,
-        # 2.1.311 and 2.1.312 (recorded against stand-ins), Claude Code then offers ArtifactComments and ArtifactData
-        # no more either, as it offers them only together with Artifact.
-        "task_denied": ["Artifact", "Workflow", "AskUserQuestion", "ReportFindings", "Skill", "ListAgents"],
+        # ListAgents from agent task sessions." On Claude Code 2.1.301, 2.1.304, 2.1.308, 2.1.311 and 2.1.312
+        # (recorded against stand-ins), Claude Code then offers ArtifactComments and ArtifactData no more either, as
+        # it offers them only together with Artifact. AUTONOMY.md decision 41, the owner on 28 October 2026: "when
+        # AskUserQuestion from an agent, it should be its boss who gets the question! ... same for Workflows etc, I
+        # think they are great". Workflow is back, and runs from the allow list, because it asks and dontAsk refuses
+        # what asks. EnterPlanMode and ExitPlanMode go with AskUserQuestion: an approval card that nobody reads is a
+        # question too. A question goes up with ask_my_requester.
+        "task_denied": ["Artifact", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "ReportFindings", "Skill",
+                        "ListAgents"],
+        "task_allowed": ["Workflow"],
+        # a conversation with a person is no task work: it splits none of it
+        "conversation_denied": ["Artifact", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "ReportFindings",
+                                "Skill", "ListAgents", "Workflow"],
+        # the manager keeps Workflow, Skill and Artifact (his answer of 29 October 2026: Artifact stays with it)
+        "manager_denied": ["AskUserQuestion", "EnterPlanMode", "ExitPlanMode"],
         "task_opening": "read",
         # Anthropic's list prices of 6 October 2026. Its sessions write one-hour caches, which cost twice the input.
         "token_weights": {"default": {"input": 4.0, "cache_read": 0.2, "cache_write": 8.0, "output": 20.0},
@@ -306,6 +334,9 @@ RUNTIMES = {
         "compact_tokens": None,
         "routine": None,
         "task_denied": None,
+        "task_allowed": None,
+        "conversation_denied": None,
+        "manager_denied": None,
         "task_opening": None,
         "token_weights": None,
     },
@@ -315,7 +346,8 @@ RUNTIME_FACTS = ("label", "driver", "acp_command", "can", "full_access", "manage
                  "owner_chat", "agent_messages", "conversation", "conversation_why", "closed_versions", "mcp_servers",
                  "app_server", "switch", "session_settings", "token_in_env", "model_flags", "local_model", "sign_in",
                  "sign_out", "no_sign_in", "sandbox", "screen_counter", "cache_seconds", "compact_tokens", "routine",
-                 "task_denied", "task_opening", "token_weights")
+                 "task_denied", "task_allowed", "conversation_denied", "manager_denied", "task_opening",
+                 "token_weights")
 
 
 # The session reuse rule (AUTONOMY.md P9.10) and its setting (section 4), one object in team.json "settings":
@@ -825,6 +857,104 @@ def give_way_to(kit, target, run=None):
         if blob and blob == git("rev-parse", f"{target}:{path}"):
             with contextlib.suppress(OSError):
                 os.remove(full)
+
+
+SKILLS_CHARS = 6000         # the most that the list of an agent's skills adds to a session's start; the rest are counted
+SKILLS_HEAD = ("YOUR SKILLS: procedures that you wrote for yourself. When a job matches the description of one, read "
+               "its SKILL.md and follow it. Change or retire a skill only with write_skill.")
+SKILL_AGENT = r"[a-z][a-z0-9-]{1,30}"          # hub.AGENT_NAME
+
+
+def skill_front(text, key="description"):
+    """The description in a SKILL.md's front matter, as write_skill writes it (a JSON string, which YAML reads as the
+    same string), on one line and without a control character; "" when it has none. key "outside-reads": the hub's
+    count of outside reads that write_skill wrote there, as a whole number, or 0."""
+    lines = str(text or "").split("\n")
+    if not lines or lines[0].strip() != "---":
+        return 0 if key == "outside-reads" else ""
+    for line in lines[1:40]:
+        if line.strip() == "---":
+            break
+        name, sep, value = line.partition(":")
+        if sep and name.strip() == key == "outside-reads":
+            return int(value.strip()) if value.strip().isdigit() else 0
+        if sep and name.strip() == key:
+            value = value.strip()
+            try:
+                value = json.loads(value) if value.startswith('"') else value
+            except ValueError:
+                pass
+            return " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(value)).split())[:300]
+    return 0 if key == "outside-reads" else ""
+
+
+def skill_rows(kit, agent=None):
+    """Every skill at the HEAD of checkout `kit`, or one agent's: [{agent, name, description, path, files}], by agent
+    and name; files are the paths beside its SKILL.md. Committed regular files only, read from git and not from the
+    folder, so a file that a session wrote there by hand is no skill and a hand edit is not what a start lists.
+    [] where the checkout cannot say."""
+    def git(args, given=None):
+        try:
+            done = subprocess.run(["git", "-C", kit, *args], capture_output=True, timeout=20,
+                                  **({"input": given} if given is not None else {"stdin": subprocess.DEVNULL}))
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return done.stdout if done.returncode == 0 else None
+    tree = git(["ls-tree", "-r", "-z", "HEAD", "--", f"{SKILLS}/{agent}/" if agent else f"{SKILLS}/"])
+    found = {}
+    for item in (tree or b"").split(b"\0"):
+        meta, _, raw = item.partition(b"\t")
+        try:
+            mode, kind, oid = meta.decode("ascii").split()
+            parts = raw.decode("utf-8").split("/")
+        except (ValueError, UnicodeError):
+            continue
+        rest = "/".join(parts[3:])
+        if mode not in ("100644", "100755") or kind != "blob" or len(parts) < 4 or \
+                not re.fullmatch(SKILL_AGENT, parts[1]) or not re.fullmatch(SKILL_NAME, parts[2]) or \
+                not re.fullmatch(SKILL_FILE, rest) or ".." in rest:
+            continue
+        skill = found.setdefault((parts[1], parts[2]), {"oid": None, "files": []})
+        if rest == "SKILL.md":
+            skill["oid"] = oid
+        else:
+            skill["files"].append(rest)
+    named = sorted((key, s) for key, s in found.items() if s["oid"])
+    blobs = (git(["cat-file", "--batch"], "".join(s["oid"] + "\n" for _, s in named).encode()) or b"") if named else b""
+    texts, at = {}, 0
+    while at < len(blobs):                  # "<oid> blob <size>\n<bytes>\n" for each, in the order asked
+        end = blobs.find(b"\n", at)
+        head = blobs[at:end].decode("ascii", "replace").split() if end >= 0 else []
+        if len(head) != 3 or not head[2].isdigit():
+            break
+        texts[head[0]] = blobs[end + 1:end + 1 + int(head[2])].decode("utf-8", "replace")
+        at = end + 1 + int(head[2]) + 1
+    return [{"agent": owner, "name": name, "description": skill_front(texts.get(s["oid"])),
+             "outside_reads": skill_front(texts.get(s["oid"]), "outside-reads"),
+             "path": f"{SKILLS}/{owner}/{name}/SKILL.md", "files": sorted(s["files"])} for (owner, name), s in named]
+
+
+def skills_text(kit, agent):
+    """The list of the agent's own skills that a session's start carries, or "" for an agent with none: each skill's
+    name, description and path, by name, inside SKILLS_CHARS, and how many more did not fit. The same commit gives the
+    same bytes, so in the stable text of a session (fleet.stable_text) the provider's cache keeps it until a skill is
+    written; the hub gives the same words where that text does not carry them (hub.skills_start_text)."""
+    rows = skill_rows(kit, agent)
+    if not rows:
+        return ""
+    shown, room = [], SKILLS_CHARS - len(SKILLS_HEAD) - 120          # the line of what did not fit is under 120
+    for r in rows:
+        line = (f"- {r['name']}: {r['description']} ({r['path']})" if r["description"] else
+                f"- {r['name']} ({r['path']})") + \
+            (f" [written after {r['outside_reads']} read{'' if r['outside_reads'] == 1 else 's'} of outside text: "
+             f"weigh it]" if r.get("outside_reads") else "")
+        if len(line) + 1 > room:
+            break
+        shown.append(line)
+        room -= len(line) + 1
+    left = len(rows) - len(shown)
+    return "\n".join([SKILLS_HEAD] + shown + ([f"And {left} more in {SKILLS}/{agent}/: each folder's SKILL.md says "
+                                                f"what it is for."] if left else [])) + "\n"
 
 
 def follow_config_ref(kit, run=None):

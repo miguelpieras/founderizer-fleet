@@ -59,7 +59,7 @@ from lifecycle import (APP_SERVER, APP_SERVER_RUNTIME, DEPLOY_APP_NOTE, GITHUB_T
                        REPO_ACCESS, REPO_NAME, REUSE_SETTINGS, RUNTIMES, RUNTIME_RESULTS, SWITCH_RUNTIMES, TOOL_CATALOG,
                        app_server_task, mcp_server, mcp_variable, no_sign_in, reuse_value, runtime_fact,
                        runtimes_with, switch_target, tool_catalog, tool_needs)
-from lifecycle import SKILL_FILE, SKILL_NAME, SKILLS        # design v4 D: an agent's own skills
+from lifecycle import SKILL_FILE, SKILL_NAME, SKILLS, skill_front, skill_rows, skills_text   # design v4 D: agents' skills
 
 DESKTOP = Frames()
 
@@ -1238,12 +1238,44 @@ EVENT = "INSERT INTO events(agent,kind,task,text,created,extra) VALUES(?,?,?,?,?
 
 def filed_under(agent, kind, task):
     """The task that a message for this agent is filed under: a lead reads its subtasks' news in the session of the
-    parent task."""
+    parent task, and a question that a lead under it passed up (answer pass_up) in the session of its own task above
+    that lead's: the walk goes up the parent chain to the task this lead requested. read_row only, so it is safe
+    inside a transaction (owner_message_rows answers a question there)."""
     if task and kind == "say" and role_of(agent) == "lead":
-        t = q1("SELECT owner, requester, parent FROM tasks WHERE id=?", (task,))
-        if t and t["owner"] != agent and t["requester"] == agent and t["parent"]:
-            return t["parent"]
+        t = read_row("SELECT * FROM tasks WHERE id=?", (task,))
+        link = chain_link(agent, t) if t and t["owner"] != agent else None
+        if link and link["parent"]:
+            return link["parent"]
     return task
+
+
+CHAIN_MAX = 12          # tasks of one parent chain that a walk reads: a lead's lead's lead is far less
+
+
+def task_chain(t):
+    """Task row `t` and the tasks above it, nearest first. read_row only."""
+    out, seen = [], set()
+    while t is not None and t["id"] not in seen and len(out) < CHAIN_MAX:
+        seen.add(t["id"])
+        out.append(t)
+        t = read_row("SELECT * FROM tasks WHERE id=?", (t["parent"],)) if t["parent"] else None
+    return out
+
+
+def chain_link(agent, t):
+    """The task in task row `t`'s chain that `agent` requested: `t` itself for its own requester, the subtask of a
+    lead's lead for that lead's lead, and so on. None when `agent` requested none of them."""
+    return next((x for x in task_chain(t) if x["requester"] == agent), None)
+
+
+def questions_under(lead, task_id):
+    """The open questions that `lead` reads in the session of its task `task_id`: the ones it holds and the ones it
+    passed up (answer pass_up), about the tasks below that one. The holder is the questions' `requester`, which
+    pass_up moves, so see_team, requester_chase, waits_on_parts and answer all read the one column. read_rows only."""
+    rows = read_rows(f"SELECT q.* FROM questions q JOIN tasks t ON t.id=q.task WHERE q.answer IS NULL AND "
+                     f"{OPEN_TASK.replace('state', 't.state')} ORDER BY q.id")
+    return [r for r in rows if (r["requester"] == lead or lead in question_passers(r)) and
+            filed_under(lead, "say", r["task"]) == task_id]
 
 
 def emit(agent, kind, text, task=None, extra=None):
@@ -1602,13 +1634,18 @@ def migrate():
         # the resource that a blocked ask names (needs_access), the level of it that the task needs (needs_level:
         # null when any level does), and what the asker said it would go on with when it asked without stopping
         # (asking_and_waiting): the record of what was decided by default
-        "questions": {"access": "TEXT", "assumed": "TEXT", "access_level": "TEXT"},
+        "questions": {"access": "TEXT", "assumed": "TEXT", "access_level": "TEXT",
+                      # the owner, 28 October 2026 ("Agent -> Lead -> Manager -> Me"): the agents that passed it up
+                      # (answer pass_up), first first, as a JSON list, while `requester` is the one that holds it now;
+                      # and who answered it, an agent or "owner" (null: its holder, as before)
+                      "passed": "TEXT", "answered_by": "TEXT"},
         "reminders": {"agent": "TEXT", "task": "INTEGER", "created": "REAL", "fired": "REAL", "goal": "INTEGER"},
         "reports": {"feedback_shown": "REAL"},     # plan C10: a decision shows in its sender's start once
         "needs": {"kind": "TEXT", "conversation": "INTEGER",   # owner feature conversations: ask_owner, request_work
                   "options": "TEXT", "chosen": "INTEGER",     # owner feature need_options: the agent's own answers
                   "answered_by": "TEXT",      # null is the owner; "P-<id> <name>" is the deputy of that conversation
-                  "secret": "TEXT"},          # owner feature secret_requests: what request_secret asks for, never a value
+                  "secret": "TEXT",           # owner feature secret_requests: what request_secret asks for, no value
+                  "question": "INTEGER"},     # the question that the manager took to the owner (raise_needs_you)
         "owner_reports": {"agent": "TEXT NOT NULL DEFAULT 'manager'", "in_reply_to": "TEXT",
                           "pushed": "INTEGER NOT NULL DEFAULT 0"},     # chat apps round 2: message_owner
         "chat_out": {"recipient": "TEXT"},          # chat apps round 2: a Discord user ID when chat is null
@@ -1840,7 +1877,10 @@ def t_read_messages(agent, a):
             rows = sorted(rows + q("SELECT e.* FROM events e JOIN agent_messages m ON m.event_id=e.id WHERE e.agent=? "
                                    "AND e.kind='chat' AND e.read_at IS NULL", (agent,))
                           + q("SELECT e.* FROM events e JOIN ui_requests u ON u.event_id=e.id WHERE e.agent=? "
-                              "AND e.kind='chat' AND u.kind='answer' AND e.read_at IS NULL", (agent,)),
+                              "AND e.kind='chat' AND u.kind='answer' AND e.read_at IS NULL", (agent,))
+                          # and so does the result of a task that this chat opened (chat_result)
+                          + q("SELECT * FROM events WHERE agent=? AND kind='chat' AND read_at IS NULL AND "
+                              "json_extract(extra, '$.task_result') IS NOT NULL", (agent,)),
                           key=lambda r: r["id"])
         elif agents()[agent].get("role") in ("worker", "lead"):
             tid = parse_task(a.get("task_id"))
@@ -2156,7 +2196,8 @@ def allowance_start_text(agent, task_id):
 # guessing, and rule 4 forbids the guess, so the cheapest thing it could do was the forbidden one.
 SECRET_SELF = (" Only a key or a login that the fleet does not hold you ask the owner for yourself, with "
                "request_secret: this task waits for his answer.")
-RULE_FOUR = (" Never contact the owner: if you are blocked, use ask_my_requester. If you are only UNSURE and not "
+RULE_FOUR = (" Never contact the owner from here: if you are blocked, use ask_my_requester, and your line takes the "
+             "question up as far as it must go, the owner last. If you are only UNSURE and not "
              "blocked, ask anyway and say in default what you will go on with: the task does not pause, your "
              "requester can still change it, and the record says this was decided by your reading and not by it. "
              "Never a default for access, money or anything that leaves the building. If you are not blocked but "
@@ -2177,13 +2218,16 @@ def start_text(agent, task_id, resume=False, note="", row=None, opening=None, fi
     the agent's own notes, its lessons and its holdings, and a login registered after any of them was stored was
     never masked at the write. opening: how a session with its stable text first gets this block (stable_opening),
     or None for a session that is told to read the rules and its profile here. first: part 1 when the session is not
-    a task's own: a conversation's brief, whose conversation task this is (conversation_brief, lane L2)."""
+    a task's own: a conversation's brief, whose conversation task this is (conversation_brief, lane L2). The agent's
+    skills belong to the stable text; this block lists them only where that text does not (skills_start_text)."""
     return mask_secrets(
         (first if first is not None else
          task_start_text(agent, task_id, resume, note, row, opening))   # 1. the task or wake (L8)
         + holdings_team_text(agent, task_id)                            # 2. holdings and the team directory (L8)
         + standing_start_text(agent)                                    # 3. standing items (L3)
-        + notes_start_text(agent) + memory_start_text(agent, task_id)   # 4. matching lessons (L6)
+        + notes_start_text(agent)                                       # 4. its notes, its skills where its
+        + skills_start_text(agent, bool(opening))                       #    stable text lists none (design v4 D3)
+        + memory_start_text(agent, task_id)                             #    and the matching lessons (L6)
         + checks_start_text(agent, task_id)                             # 5. the agent's checks (L4)
     )
 
@@ -2258,9 +2302,10 @@ def task_start_text(agent, task_id, resume=False, note="", row=None, opening=Non
         team = ", ".join(n for n in agents() if reports_to(n) == agent) or "nobody yet"
         said += (f' You lead {team}. Give parts of {tref(task_id)} to them with create_task: each becomes a subtask of '
                  f'{tref(task_id)}. Their results, questions and permission prompts arrive in this session: check each '
-                 f'result with check_result, answer with answer, and decide prompts with decide_permission. Deliver '
-                 f'{tref(task_id)} only when its subtasks are finished. Standing work of your team is yours to write '
-                 f'as a duty, with set_duty and change_duty: your team\'s and your own, and nobody else\'s. '
+                 f'result with check_result, answer with answer, and decide prompts with decide_permission. A question '
+                 f'that you cannot answer goes up with answer(question_id, pass_up=true), and your work goes on. '
+                 f'Deliver {tref(task_id)} only when its subtasks are finished. Standing work of your team is yours to '
+                 f'write as a duty, with set_duty and change_duty: your team\'s and your own, and nobody else\'s. '
                  f'{manager_name()} stays the authority over every duty of the fleet, so it reads what you write and '
                  f'it writes a duty outside your team.')
     if resume:
@@ -2536,6 +2581,15 @@ def live_reason(t, state):
     return None
 
 
+def open_agents(t):
+    """The titles of the subagents and workflows that run in the background of task row `t`'s current attempt, the
+    first started first: each counts as work until its own end notice (plan C1, live_reason), and a delivery stops it
+    with the session (AUTONOMY.md decision 41). A background command or monitor is none of them. Commits nothing."""
+    calls = (turn_state(t["id"], t["attempt"]) or {}).get("calls") or {}
+    return [c[0] or "a subagent" for c in sorted(calls.values(), key=lambda c: c[1] or 0)
+            if c[2] and not str(c[0] or "").startswith(SHELL_TITLES)]
+
+
 def turn_end_check(t, state, t0, force=False):
     """The decision at one stored turn end of task row `t`'s current attempt (plan C9), once for each (attempt, turn
     index) unless forced (a line that was not taken changes what waits). Returns what it did, for the log and tests."""
@@ -2606,21 +2660,33 @@ def requester_chase(agent, t0, task=None):
     """What `agent` read as a requester and left open (plan C9): each blocking question, permission prompt, result to
     check and report to decide, once each, in one message: (its text, the keys it names; chased keeps them once the
     message is written), or None when nothing new is left open. For the manager at its
-    closing empty read, and for a lead at a turn end of its task session (task: that task, whose subtasks it is)."""
+    closing empty read, and for a lead at a turn end of its task session (task: that task, whose subtasks it is).
+
+    A question is its holder's, the `requester` that answer pass_up moves: a lead's are the ones filed under the
+    session's task, however far down their task is (questions_under). The manager's also hold what a lead can no
+    longer act on (lead_left): its questions, prompts and results, as report_for_manager hands it the reports."""
     scope = (f"AND t.parent={task['id']}" if task else "")
     # what it read: an item from before its newest read, which is when the message that told it was in front of it
     read = q1("SELECT MAX(read_at) at FROM events WHERE agent=?", (agent,))["at"] or 0
+    for_lead = not task and agent == manager_name()         # the manager acts for a lead that cannot
     items = []
-    for r in q(f"SELECT q.id, q.task, q.text FROM questions q JOIN tasks t ON t.id=q.task WHERE q.requester=? AND "
-               f"q.answer IS NULL AND q.assumed IS NULL AND q.asked<? AND {OPEN_TASK.replace('state', 't.state')} "
-               f"{scope}", (agent, read)):
-        items.append((f"Q-{r['id']}", f"Q-{r['id']} on {tref(r['task'])} waits for your answer: {clip(r['text'], 160)}"))
-    for r in q(f"SELECT p.id, p.task, p.tool FROM prompts p JOIN tasks t ON t.id=p.task WHERE t.requester=? AND "
-               f"p.decision IS NULL AND p.created<? {scope}", (agent, read)):
-        items.append((f"P-{r['id']}", f"P-{r['id']} on {tref(r['task'])} waits for decide_permission ({r['tool']})"))
-    for r in q(f"SELECT t.id, t.title, t.state FROM tasks t WHERE t.requester=? AND t.state IN "
-               f"('completed','failed','rejected') AND t.accepted IS NULL AND t.delivered<? {scope}", (agent, read)):
-        items.append((tref(r["id"]), f"{tref(r['id'])} ({clip(r['title'], 80)}) ended {r['state']}: check_result"))
+    asked = questions_under(agent, task["id"]) if task else \
+        q(f"SELECT q.* FROM questions q JOIN tasks t ON t.id=q.task WHERE q.answer IS NULL AND "
+          f"{OPEN_TASK.replace('state', 't.state')} ORDER BY q.id")
+    for r in asked:
+        if r["requester"] == agent or (for_lead and lead_left(r["requester"], get_task(r["task"]))):
+            if r["assumed"] is None and r["asked"] < read:
+                items.append((f"Q-{r['id']}", f"Q-{r['id']} on {tref(r['task'])} waits for your answer: "
+                                              f"{clip(r['text'], 160)}"))
+    for r in q(f"SELECT p.id, p.task, p.tool, t.requester FROM prompts p JOIN tasks t ON t.id=p.task WHERE "
+               f"(t.requester=? OR ?) AND p.decision IS NULL AND p.created<? {scope}", (agent, for_lead, read)):
+        if r["requester"] == agent or lead_left(r["requester"], get_task(r["task"])):
+            items.append((f"P-{r['id']}", f"P-{r['id']} on {tref(r['task'])} waits for decide_permission "
+                                          f"({r['tool']})"))
+    for r in q(f"SELECT t.* FROM tasks t WHERE (t.requester=? OR ?) AND t.state IN ('completed','failed','rejected') "
+               f"AND t.accepted IS NULL AND t.delivered<? {scope}", (agent, for_lead, read)):
+        if r["requester"] == agent or lead_left(r["requester"], r):
+            items.append((tref(r["id"]), f"{tref(r['id'])} ({clip(r['title'], 80)}) ended {r['state']}: check_result"))
     for r in open_reports(kinds=False):
         sub = q1("SELECT parent FROM tasks WHERE id=?", (r["from_task"],)) if task and r["from_task"] else None
         mine = (r["to_agent"] == agent and (not task or (sub and sub["parent"] == task["id"]))) or \
@@ -2685,8 +2751,14 @@ def attempt_rows(t, reason, event, t0, counted=False):
     DB.execute("UPDATE tasks SET attempt=attempt+1, restarts=restarts+?, missing_since=?, started=?, nudge_level=0 "
                "WHERE id=?", (1 if counted else 0, t0 if counted else None, t0, t["id"]))
     # plan C10: a new attempt moves the task again, so what its stuck notice said is over (tasks_stuck), and a new
-    # session has no frozen screen (C2)
-    DB.execute("DELETE FROM kv WHERE k IN (?,?)", (f"stuck_notice:{t['id']}", f"screen_frozen:{t['id']}"))
+    # session has no frozen screen (C2), and no question or usage-limit menu on it yet (runtime gaps C1)
+    DB.execute("DELETE FROM kv WHERE k IN (?,?,?,?)", (f"stuck_notice:{t['id']}", f"screen_frozen:{t['id']}",
+                                                       f"screen_question:{t['id']}", f"screen_limit:{t['id']}"))
+    # So the task no longer waits on the old session's screen: it waits on the question that it asked, if one is open,
+    # as when the question on its screen goes (helper_dialog). A question that the new session shows reaches the
+    # requester again (screen_told); until the review of 29 October 2026 the wait stayed, and that one reached nobody.
+    DB.execute("UPDATE tasks SET waiting_on=(SELECT 'Q-' || id FROM questions WHERE task=? AND answer IS NULL AND "
+               "assumed IS NULL ORDER BY id LIMIT 1) WHERE id=? AND waiting_on='its screen'", (t["id"], t["id"]))
     DB.execute("UPDATE attempts SET ended=COALESCE(ended,?) WHERE task=? AND attempt=?", (t0, t["id"], t["attempt"]))
     DB.execute("INSERT INTO attempts(task,attempt,created,reason) VALUES(?,?,?,?)", (t["id"], t["attempt"] + 1, t0, reason))
     # The session that asked is gone, and a prompt never expires by itself (plan C7): it ends here, unanswered.
@@ -2753,6 +2825,105 @@ def fresh_attempt(t, why):
                                       f"before it did.")
     log("hub", f"{tref(t['id'])} starts fresh in attempt {t['attempt'] + 1}: its session was {why}")
     return t["attempt"] + 1
+
+
+# Runtime gaps C1 (29 October 2026): a question on a task session's own screen that no hook carries stopped every
+# recovery. A line typed there could answer it, so nothing was typed, and the requester was told to have somebody look
+# at that machine, where nobody sits. A helper with stuck_screens says, with the question, the attempt of the window
+# that it read and whether the session stood still since the question showed: no record and no running turn on its
+# screen. Then the hub starts the task once in a new attempt, whose start closes that window (Helper.handle), when
+# nothing that the session holds open would be lost (fresh_refusal); the next such question of the task goes to its
+# requester. A card in the middle of a turn is refused there, and the requester's restart_task is the backstop. The
+# runtime's usage-limit menu is not such a question: the helper never answers it, because one of its choices buys
+# usage, and the reset of the hold starts the task again (resume_held).
+STUCK_SCREENS = "stuck_screens"     # the helper feature: it says whether a screen stood still, and names the limit menu
+SCREEN_REASON = "screen question"   # the reason of the one new attempt that a question on its screen gives a task
+LIMIT_RESET = "limit reset"         # the reason of the new attempt that a usage limit's reset starts
+
+
+def screen_mark(task_id):
+    """What its helper last said of a question on the screen of a task's session (runtime gaps C1): {attempt, at,
+    still}, or None. A read that commits nothing."""
+    row = read_row("SELECT v FROM kv WHERE k=?", (f"screen_question:{task_id}",))
+    try:
+        mark = json.loads(row["v"]) if row else None
+    except (TypeError, ValueError):
+        return None
+    return mark if isinstance(mark, dict) else None
+
+
+def screen_stuck(t):
+    """True when the session of task row `t` stands at a question on its own screen (runtime gaps C1): its helper said
+    that nothing moved since the question showed, and no record of the attempt reached the hub since that word. It
+    runs nothing that a release could cut (running_turns). A session whose records move still counts, whatever its
+    screen shows: a screen's class is a guess, and a diff on it can hold the words of a question."""
+    mark = screen_mark(t["id"])
+    if not mark or mark.get("attempt") != t["attempt"] or mark.get("still") is not True:
+        return False
+    return not read_row("SELECT 1 FROM thread_events WHERE task=? AND attempt=? AND created>? LIMIT 1",
+                        (t["id"], t["attempt"], mark.get("at") or 0))
+
+
+def screen_next(requester):
+    """The requester's last step for a question on a session's own screen (runtime gaps A6). A lead has no
+    raise_needs_you, so it passes it up to its own requester instead."""
+    step = "raise a Needs-you item" if requester == manager_name() else "pass it up to your own requester"
+    return f"{step} only if the same question comes back"
+
+
+def screen_told(t, agent, why):
+    """Tell the requester of task row `t`, once while it waits on its screen, that its session shows a question there
+    (runtime gaps C1, A6): restart_task first. why: what follows the words "on its own screen"."""
+    if t["waiting_on"] == "its screen":
+        return
+    q("UPDATE tasks SET waiting_on='its screen' WHERE id=?", (t["id"],))
+    emit(t["requester"], "say", f"[hub] {agent}'s session for {tref(t['id'])} ({t['title']}) shows a question on its "
+         f"own screen{why}. Start it again with restart_task (expected_attempt {t['attempt']}); "
+         f"{screen_next(t['requester'])}.", task=t["id"])
+    log("hub", f"{tref(t['id'])} on {agent} is stuck at a question on its screen")
+
+
+def screen_attempt(t, agent):
+    """The one new attempt that a question on the screen of task row `t` gives it (runtime gaps C1). None when it
+    started one; else why it did not, in the words that screen_told puts after the question."""
+    if kv_get(f"screen_restart:{t['id']}"):
+        return ", again: the hub already started it once more for such a question"
+    refused = fresh_refusal(t, t["attempt"])
+    if refused:
+        return f", which no person reads, and the hub starts no new session while {refused}"
+    event = attempt_event(t, "Its session showed a question on its own screen, which no person reads, so this session "
+                             "starts fresh with what the attempt before it did. Ask with ask_my_requester when you "
+                             "need an answer.")
+    with transaction():
+        attempt_rows(t, SCREEN_REASON, event, now())
+        DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                   (f"screen_restart:{t['id']}", str(t["attempt"] + 1)))
+    log("hub", f"{tref(t['id'])} on {agent} starts again in attempt {t['attempt'] + 1}: its session stood at a "
+               f"question on its screen")
+    return None
+
+
+def limit_reset_text(t):
+    return (f"Your usage limit has reset. Continue {tref(t['id'])}. First check what was already done (rule 9): never "
+            f"repeat an outside action that already happened.")
+
+
+def limit_menu_reset(t):
+    """True when the usage limit behind the menu that the session of task row `t` shows is over (runtime gaps C1): no
+    limit holds its agent, the last thing the attempt did is a usage limit, and the limit that its record started has
+    ended, or the record's own reset is past. A menu whose record has not reached the hub yet waits for the hold that
+    the record starts, whose reset starts the task again (resume_held)."""
+    if active_limit(t["owner"]):
+        return False
+    last = read_row("SELECT type, data, created FROM thread_events WHERE task=? AND attempt=? AND "
+                    "type NOT IN ('session','model','result') ORDER BY id DESC LIMIT 1", (t["id"], t["attempt"]))
+    data = json.loads(last["data"]) if last and last["type"] == "error" else {}
+    if data.get("code") != "usage_limit":
+        return False
+    resets = data.get("resets_at")
+    return bool(isinstance(resets, (int, float)) and resets <= now() or read_row(
+        "SELECT 1 FROM agent_limits WHERE agent=? AND ended IS NOT NULL AND ended>=? LIMIT 1",
+        (t["owner"], last["created"])))
 
 
 def carry_steers(t):
@@ -3064,11 +3235,11 @@ def t_restart_task(agent, a):
     expected = a.get("expected_attempt")
     if isinstance(expected, bool) or not isinstance(expected, int) or expected < 1:
         raise ToolError("expected_attempt must be the attempt that failed: a whole number of 1 or more.")
-    t = get_task(tid, requester=agent)
+    t = requested_task(agent, tid)          # the manager restarts for a lead that cannot (acts_for)
     in_scope(agent, t)
     if t["state"] in TERMINAL:
         raise ToolError(f"{tref(tid)} is already {t['state']}.")
-    allowed, why = authority(agent, t["owner"], "task")
+    allowed, why = restart_authority(agent, t)
     if not allowed:
         raise ToolError(why)
     unsettled = [x for x in access_asks(t) if not x["enough"]]
@@ -3129,6 +3300,14 @@ def t_restart_task(agent, a):
     return text
 
 
+def restart_authority(agent, t):
+    """(allowed, why) of a restart of task row `t` by `agent`: the one authority rule over its owner, or the manager
+    acting for a lead that cannot (lead_left), because the manager is the authority over the whole fleet."""
+    if agent != t["requester"] and acts_for(agent, t):
+        return True, None
+    return authority(agent, t["owner"], "task")
+
+
 def restart_continue(hold_id):
     """The second half of restart_task, once for each restart: after the helper confirmed the stop, one new attempt
     with a check. In every other case the task stays held, and the restart's requester gets the reason. The release
@@ -3159,7 +3338,7 @@ def restart_continue(hold_id):
 
     if h["state"] == "not_confirmed":
         return held(f"{t['owner']}'s helper did not confirm the stop ({h['detail']}).", stopped=False)
-    allowed, why = authority(r["by"], t["owner"], "task")
+    allowed, why = restart_authority(r["by"], t)
     if not allowed:
         return held(why)
     lim = active_limit(t["owner"])
@@ -3210,6 +3389,10 @@ def restart_continue(hold_id):
         for x in asked:
             DB.execute("UPDATE questions SET answer=?, answered=?, waiting=0 WHERE id=?",
                        (RESTART_ANSWER.format(by=r["by"], task=name), t0, x))
+        if asked:           # and a Needs-you item raised for one of them asks the owner nothing any more
+            question_needs_close(f"id IN ({','.join('?' * len(asked))})", asked,
+                                 f"Closed: {r['by']} restarted {name}, and its question ended with the session that "
+                                 f"asked it.", t0)
         # The requester acted: its restart counts no loss, and the losses in a row count again from nothing (plan C6).
         DB.execute("UPDATE tasks SET restarts=0 WHERE id=?", (tid,))
         if asked:
@@ -3410,18 +3593,18 @@ def screen_failed(key, seq, error):
 
 def resume_held(lim, t0):
     """One held agent's working tasks, each resumed one time: a message when its session still runs, a new attempt
-    when it does not. The new attempt is not counted, so a reset never spends one of the three session restarts."""
+    when it does not, or when its window still shows its runtime's usage-limit menu, where no line can be typed
+    (runtime gaps C1). The new attempt is not counted, so a reset never spends one of the three session restarts."""
     done = []
     for t in q("SELECT * FROM tasks WHERE owner=? AND state='working' ORDER BY id", (lim["agent"],)):
         if active_hold(t["id"]) or parked(t["id"]) or (turn_state(t["id"], t["attempt"]) or {}).get("running"):
             continue            # a parked task comes back at its own time (reminder_sweep); a running turn needs nothing
-        text = (f"Your usage limit has reset. Continue {tref(t['id'])}. First check what was already done (rule 9): "
-                f"never repeat an outside action that already happened.")
-        if session_alive(lim["agent"], t["id"]):
+        text = limit_reset_text(t)
+        if session_alive(lim["agent"], t["id"]) and kv_get(f"screen_limit:{t['id']}") != str(t["attempt"]):
             emit(lim["agent"], "say", "[hub] " + text, task=t["id"])
             done.append(f"{tref(t['id'])} (message)")
         else:
-            new_attempt(t, "limit reset", text)
+            new_attempt(t, LIMIT_RESET, text)
             done.append(f"{tref(t['id'])} (new session)")
     return done
 
@@ -4076,7 +4259,7 @@ def access_needed(value, level=None):
     return rid, want or None
 
 
-def access_route(asker, rid, requester, want=None):
+def access_route(asker, rid, requester, want=None, restarts=None):
     """The access a task is blocked on, and what the one who gets the ask can do about it, in the words of its own
     tools: give it from the grantable pool, give that part of the work to the agent that already holds it, or take it
     to the owner because the fleet does not hold it at all. Where the access can be there, the line ends with the one
@@ -4085,7 +4268,13 @@ def access_route(asker, rid, requester, want=None):
     refuse. It is read at the moment it is shown, so a grant that was made in the meantime shows at once.
 
     want: the level the ask named. A level the agent does not reach is access it does not have, so the line names the
-    level in the grant and never reads such an ask as satisfied by the lower hold it already had."""
+    level in the grant and never reads such an ask as satisfied by the lower hold it already had.
+
+    requester: the reader, the agent that holds the question now. A lead passes up what it cannot settle (answer
+    pass_up), so the one that reads this line is not always the one that restarts the task: restarts names that one,
+    the task's requester (only it restarts its subtask). When another agent holds the access, the route is the one
+    this reader can take (the owner, 29 October 2026): the manager gives that part to the holder, and so does a lead
+    whose team the holder is in; a lead passes it up otherwise. The owner is asked only for what no agent holds."""
     kind, what = resource_parts(rid)
     if not kind or role_of(asker) not in ("worker", "lead"):
         # A question outlives its asker and its kind: a line that is shown long after the ask never raises.
@@ -4100,27 +4289,34 @@ def access_route(asker, rid, requester, want=None):
     level = want or top
     refused = grant_check(asker, rid, level) if level else None
     manager = role_of(requester) == "manager"
+    own = restarts in (None, requester)
+    restart = ("restart_task starts this task again in a session that has it" if own else
+               f"{restarts}, its requester, starts it again with restart_task in a session that has it")
     out = [f"ACCESS NEEDED: {asker} needs {resource_phrase(kind, what)} ({rid})" + (f" at {want}" if want else "") +
            ", and team.json gives it " +
            (f"at {mine} already, so its next session has it: a running session keeps what it started with, so "
-            f"restart_task starts this task again in a session that has it." if enough else
+            f"{restart}." if enough else
             f"at {mine} only, which does not reach {want}." if mine else "none of it.")]
+    in_team = False
     if others:
+        holder = others[0]["agent"]
+        in_team = manager or authority(requester, holder, "task")[0]
         out.append("Held now by " + ", ".join(f"{h['agent']} ({h['level']})" for h in others) +
-                   f": {others[0]['agent']} can do this part of the work, or answer the question from it.")
+                   f": {holder} can do this part of the work, or answer the question from it" +
+                   (f": give that part to {holder} with create_task." if in_team else ", and it is outside your team."))
     if not enough and level and not refused:
-        out.append(f'It is in the grantable pool, up to {top}: grant_access(agent="{asker}", resource="{rid}", '
-                   f'level="{level}") settles it. The grant reaches its next session, so restart_task then starts '
-                   f'this task again in a session that has it.' if manager else
-                   f"It is in the grantable pool, up to {top}, and only the manager gives it: ask the manager with "
-                   f"message_agent, naming {rid}" + (f" at {want}" if want else "") + ". Once it is granted, "
-                   f"restart_task starts this task again in a session that has it.")
+        out.append((f'It is in the grantable pool, up to {top}: grant_access(agent="{asker}", resource="{rid}", '
+                    f'level="{level}") settles it. The grant reaches its next session, so ' +
+                    ("restart_task then starts this task again in a session that has it." if own else
+                     f"{restarts}, its requester, then starts it again with restart_task.")) if manager else
+                   f"It is in the grantable pool, up to {top}, and only the manager gives it.")
     elif not enough and refused:
         out.append(refused if manager else f"The manager cannot settle it either: {refused[0].lower()}{refused[1:]}")
-    elif not enough:
-        out.append("The owner set no standing for it" + ("" if others else " and no agent holds it") + ", so the "
-                   "manager cannot give it: " + ("raise a Needs-you item and say what the work needs it for."
-                                                 if manager else "pass it to the manager with message_agent."))
+    elif not enough and not others:
+        out.append("The owner set no standing for it and no agent holds it, so the manager cannot give it" +
+                   (": raise a Needs-you item and say what the work needs it for." if manager else "."))
+    if not enough and not manager and not in_team:
+        out.append(f"Pass the question up with answer(..., pass_up=true): once it is settled, {restart}.")
     if kind == "repo" and "deploy" in (level, mine):
         # The one step no grant of ours reaches: the App's own permissions, which only the owner adds and accepts.
         out.append(("A grant is not the whole of it: " if not enough else "If GitHub refused its token: ") +
@@ -4357,6 +4553,12 @@ def outputs_sentence(agent, t, answer, delivered=False):
             + (f" and {len(names) - 10} more" if len(names) > 10 else "") + "." + (" " + left if left else ""))
 
 
+# AUTONOMY.md decision 41: the answer to the first completed delivery of an attempt whose subagent or workflow runs
+DELIVER_RUNNING = ("{task} is not delivered yet: your session has {calls} running in its background, and a delivery "
+                   "now stops it with the session. Wait for its end notice, which comes to this session by itself, "
+                   "then deliver. If you are done without it, call deliver_result again: it goes through.")
+
+
 def t_deliver_result(agent, a):
     """deliver_result, called without LOCK (call_tool): it waits for the session's helper to send the files of the
     task's outputs folder, which the hub commits before the task closes (deliver_outputs). Every refusal comes before
@@ -4411,6 +4613,14 @@ def deliver_result(agent, a, files_said=None):
         raise ToolError(f"{tref(tid)} has subtask results that you have not checked: "
                         f"{', '.join(tref(r['id']) for r in unchecked)}. Check each with check_result first: after "
                         f"you deliver, nobody can.")
+    # AUTONOMY.md decision 41: a completed delivery while a subagent or a workflow of the session runs is refused once
+    # in each attempt, and the next one goes through: an end notice that never matches its call keeps it open until
+    # the session ends, so a second refusal would be a wall (failed and rejected always go through)
+    running = open_agents(t)
+    if files_said is None and outcome == "completed" and running and \
+            kv_get(f"deliver_running:{tid}") != str(t["attempt"]):
+        kv_set(f"deliver_running:{tid}", t["attempt"])
+        raise ToolError(DELIVER_RUNNING.format(task=tref(tid), calls="; ".join(running)))
     if files_said is None:
         return t
     if note:
@@ -4438,7 +4648,9 @@ def deliver_result(agent, a, files_said=None):
                          + (f" It claims to stop {cref(case)}'s key '{case['key']}' coming back, so the hub marks "
                             f"it contradicted if it does." if case else
                             " Nothing can contradict it, because this was not a duty's case: only your own work can "
-                            "show it wrong."))
+                            "show it wrong.")
+                         + " When what you learned is the steps of a job that will come back, they are a skill: "
+                           "write it with write_skill before you deliver the next one.")
             if tried:
                 dead = memory_from_work(agent, MEMORY_TRIED + tried, DEAD_END_PREVENTS, about, now(), task=tid,
                                         beside=(mid,) if learned else ())
@@ -4449,14 +4661,17 @@ def deliver_result(agent, a, files_said=None):
     duty_after_deliver(t, agent, outcome)       # owner API 1.13: a case whose steps are all recorded closes itself
     left = case_left_open(case_id=t["duty_case"]) if t["duty_case"] else None
     left = case_left_open_text(left) + " " if left else ""
+    stopped = f"Still running in its session when it delivered, so stopped with it: {'; '.join(running)}. " \
+        if running else ""
     emit(t["requester"], "say",
          f"[hub] Result for {tref(tid)} ({t['title']}) from {agent}: {outcome}. Done: {what.rstrip('.')}. "
          f"Output: {(where or '-').rstrip('.')}. " + (files_said + " " if files_said else "") +
-         f"Checked: {(how or '-').rstrip('.')}. "
+         f"Checked: {(how or '-').rstrip('.')}. " + stopped
          + went_on_with(tid) + step_stands_text(t["step"]) + left +
          f"-- Check it, then call check_result(task_id=\"{tref(tid)}\", accepted=true or false).", task=tid)
     return f"Delivered. {tref(tid)} is {outcome}." + (" " + files_said if files_said else "") + \
-        f"{said} You are done with it: stop now and end your turn; your session closes when it ends."
+        (f" Still running, and it stops with your session: {'; '.join(running)}; your requester is told." if running
+         else "") + f"{said} You are done with it: stop now and end your turn; your session closes when it ends."
 
 
 # set_duty and change_duty are here again by the owner's decision of 20 October 2026 ("manager should also act as a
@@ -4472,9 +4687,13 @@ LEAD_TEAM_TOOLS = ("create_task", "cancel_task", "restart_task", "answer", "chec
 WORKER_OWN_TOOLS = ("set_duty", "change_duty")
 # The one tool that only the owner chat of a worker or a lead has: it opens the work the owner asks for there.
 CHAT_ONLY = ("start_task",)
-# The tool that a worker or a lead has only in its owner chat, where the owner talks to it, and the manager wherever
-# it works: its replies to him.
-WORKER_CHAT_ONLY = ("tell_owner",)
+# The tools that a worker or a lead has only in its owner chat, where the owner talks to it, and the manager wherever
+# it works: its replies to him, and a message to him first (the owner, 29 October 2026: only the manager and his
+# chats message him directly, reversing his "any agent can write to the owner first" of 16 October). A task
+# session reaches him only up its line, except for a key or a login that the fleet does not hold, which it asks
+# him for itself (request_secret, secret_requests); a conversation with the agent's tools, which a person drives,
+# reaches him not at all.
+WORKER_CHAT_ONLY = ("tell_owner", "message_owner")
 
 
 def role_offers(role, r, name):
@@ -4501,16 +4720,46 @@ def lead_task(agent):
 def in_scope(agent, t):
     """A lead's team tools reach only the subtasks of the task whose session calls them, and only while the lead still
     has authority over the subtask's owner. A lead whose worker left its team keeps the records but acts on nothing
-    more."""
+    more. A question that a lead under it passed up is about a task further down: the walk goes up the parent chain to
+    the subtask that this lead requested (chain_link), and the authority is over that subtask's owner, its own lead."""
     parent = lead_task(agent)
     if parent is None:
         return
-    if t["parent"] != parent:
+    link = chain_link(agent, t)
+    if not link or link["parent"] != parent:
         raise ToolError(f"{tref(t['id'])} is not a subtask of {tref(parent)}, the task of this session.")
-    allowed, reason = authority(agent, t["owner"], "task")
+    allowed, reason = authority(agent, link["owner"], "task")
     if not allowed:
         raise ToolError(f"{reason} You can no longer act on {tref(t['id'])}. Tell your requester with ask_my_requester; "
                         f"the owner can stop it in Fleet.")
+
+
+def lead_left(lead, t):
+    """True when `lead`, the requester of task row `t` or the holder of a question about it, can no longer act on it,
+    so that the manager acts for it (the owner, 29 October 2026; report_for_manager's rule since 22 October): it is
+    no lead any more, the task of its session above `t` has ended, or it lost its authority over the agent below it on
+    that chain. Never for the manager, which acts for itself. read_row only."""
+    if not lead or lead == manager_name():
+        return False
+    if role_of(lead) != "lead":
+        return True
+    link = chain_link(lead, t) if t is not None else None
+    up = read_row("SELECT state FROM tasks WHERE id=?", (link["parent"],)) if link and link["parent"] else None
+    return up is None or up["state"] in TERMINAL or not authority(lead, link["owner"], "task")[0]
+
+
+def acts_for(agent, t):
+    """True when `agent` decides as the requester of task row `t`: it is that requester, or it is the manager and the
+    lead that requested it cannot act on it any more (lead_left)."""
+    return t["requester"] == agent or (agent == manager_name() and lead_left(t["requester"], t))
+
+
+def requested_task(agent, task_id):
+    """get_task(requester=agent), with the manager acting for a lead that cannot (acts_for)."""
+    t = get_task(task_id)
+    if not acts_for(agent, t):
+        raise ToolError(f"{tref(task_id)} was not requested by you.")
+    return t
 
 
 def stop_for_cancel(t):
@@ -4622,13 +4871,17 @@ def lead_overview(agent, parent):
                ["  Decide each with decide_report: " + "; ".join(REPORT_DECISIONS) + "."]
     ids = [t["id"] for t in rows if t["state"] not in TERMINAL] or [0]
     marks = ",".join("?" * len(ids))
-    out += ["", "OPEN QUESTIONS"] + [f"  Q-{r['id']} from {r['asker']} on {tref(r['task'])}: {r['text']}" +
+    out += ["", "OPEN QUESTIONS"] + [f"  Q-{r['id']} from {r['asker']} on {tref(r['task'])}" +
+                                     (f", passed up to you by {', '.join(question_passers(r))}"
+                                      if r["requester"] == agent and question_passers(r) else
+                                      f", passed up by you: {r['requester']} holds it, and you may still answer it"
+                                      if r["requester"] != agent else "") + f": {r['text']}" +
                                      (f" NOT WAITING: it goes on with \"{r['assumed']}\". Answer only if that is "
                                       f"wrong." if r["assumed"] else "") +
-                                     (f" {access_route(r['asker'], r['access'], agent, r['access_level'])}"
-                                      if r["access"] else "")
-                                     for r in
-                                     q(f"SELECT * FROM questions WHERE answer IS NULL AND task IN ({marks})", ids)]
+                                     (" " + access_route(r["asker"], r["access"], agent, r["access_level"],
+                                                         restarter(get_task(r["task"])))
+                                      if r["access"] and r["requester"] == agent else "")
+                                     for r in questions_under(agent, parent)]
     out += ["", "PERMISSION PROMPTS WAITING"] + [f"  P-{r['id']} from {r['agent']} on {tref(r['task'])}: {r['tool']}: "
                                                 f"{r['input']}" for r in
                                                 q(f"SELECT * FROM prompts WHERE decision IS NULL AND task IN ({marks})", ids)]
@@ -4849,61 +5102,230 @@ def t_resolve_outcome(agent, a):
     return f"O-{oid}: {finding}. No unknown outcomes are left. Continue the task, and never repeat an action that was done."
 
 
+def question_passers(qu):
+    """The agents that passed question row `qu` up (answer pass_up), first first, so the first of them is the one it
+    was asked of. [] for a question that nobody passed, and for a row of a release before the column."""
+    try:
+        got = json.loads(qu["passed"]) if "passed" in qu.keys() and qu["passed"] else []
+    except (TypeError, ValueError):
+        return []
+    return [str(x) for x in got] if isinstance(got, list) else []
+
+
+def asked_of(qu):
+    """The agent that question row `qu` was asked of: its first holder, before anybody passed it up."""
+    passers = question_passers(qu)
+    return passers[0] if passers else qu["requester"]
+
+
+def may_answer(agent, qu, t):
+    """Who answers question row `qu` about task row `t` (the owner, 28 October 2026: "if the lowest level can handle
+    it, that's it!"): the agent that holds it now and every agent that passed it up, because nobody skips a level and
+    the first answer wins; and the manager for a holder that cannot act on it any more (lead_left)."""
+    return agent == qu["requester"] or agent in question_passers(qu) or \
+        (agent == manager_name() and t is not None and lead_left(qu["requester"], t))
+
+
+def restarter(t):
+    """Who restarts task row `t` with restart_task: its requester, or the manager for a lead that cannot (lead_left)."""
+    return manager_name() if lead_left(t["requester"], t) else t["requester"]
+
+
+def access_held(qu):
+    """(kind, what, level) of the ask for access of question row `qu` when its asker holds enough of it now, by
+    team.json, else None. A running session keeps what it started with, so only a new session of the task can use
+    it. Read before the answer, because an answered question is no ask any more."""
+    kind, what = resource_parts(qu["access"]) if qu["access"] else (None, None)
+    got = next((h["level"] for h in resource_holders(kind, what) if h["agent"] == qu["asker"]), None) if kind else None
+    return (kind, what, got) if got and level_at_least(kind, got, qu["access_level"]) else None
+
+
+NEED_CLOSED_BY = "Fleet"        # needs.answered_by of an item that the hub closed, as contacts.v2 closes one
+
+
+def question_needs_close(where, args, why, t0):
+    """Inside the caller's transaction: the open Needs-you items raised for the questions that `where` selects
+    (raise_needs_you question_id) close, as an item that the hub ends: it leaves Needs you, and no ping goes for it."""
+    DB.execute(f"UPDATE needs SET answer=?, answered=?, answered_by=? WHERE answer IS NULL AND question IN "
+               f"(SELECT id FROM questions WHERE {where})", (why, t0, NEED_CLOSED_BY, *args))
+
+
+def answer_rows(qu, t, text, by, t0):
+    """Inside the caller's transaction, with DB.execute and read_rows only, because the owner's answer runs it inside
+    his own (owner_message_rows): the first answer of question row `qu` about task row `t`, by `by`, an agent or
+    "owner". None when the question had one already, because the first answer wins and an answer holds. Else
+    {"held": access_held, "restarter": the agent told to restart the task, or None}.
+
+    The task that waited on it works again; its asker reads the answer in that task's session, with who gave it when
+    that is not the agent it asked; the agent that holds it hears of it when another level answered first; an ask for
+    access that the asker holds now goes to the one that restarts the task, because only a new session can use it
+    (only the requester of a subtask restarts it); and a Needs-you item raised for the question closes."""
+    qid, tid = qu["id"], qu["task"]
+    if DB.execute("UPDATE questions SET answer=?, answered=?, answered_by=? WHERE id=? AND answer IS NULL",
+                  (text, t0, by, qid)).rowcount != 1:
+        return None
+    who = "the owner" if by == "owner" else by
+    # Only the question the task actually waits on releases it. Answering one of two open questions used to set
+    # the task working whichever one it was, so answering a question it was not waiting on let a paused session
+    # be told to continue -- and a question asked with a default is never the one a task waits on at all.
+    # A question on the session's own screen writes "its screen" over Q-<id> (helper_dialog), and the move after
+    # it clears even that, so the task can no longer say which question holds it. Then the last blocking one
+    # answered is the one: before, the task stayed input-required for good, and nothing nudged it.
+    waits = t["waiting_on"] if t else None
+    if t and t["state"] == "input-required" and (waits == f"Q-{qid}" or (
+            waits in (None, "its screen") and not qu["assumed"] and not read_row(
+                "SELECT 1 FROM questions WHERE task=? AND id<>? AND answer IS NULL AND assumed IS NULL LIMIT 1",
+                (tid, qid)))):
+        DB.execute("UPDATE tasks SET state='working', waiting_on=NULL WHERE id=?", (tid,))
+        secret_rewait(tid)      # it still waits on the owner's secret (secret_requests)
+    # activity()'s two writes, as plain statements
+    DB.execute("UPDATE tasks SET last_activity=? WHERE id=?", (t0, tid))
+    DB.execute("UPDATE duty_cases SET first_step=? WHERE id=(SELECT duty_case FROM tasks WHERE id=?) AND "
+               "first_step IS NULL AND state='open'", (t0, tid))
+    # Every answer is a message: no ask waits inside its call any more.
+    rows = [(qu["asker"], f"[hub] Answer to your question Q-{qid} on {tref(tid)}" +
+             (f", answered by {who}" if by != asked_of(qu) else "") + f": {text} -- " +
+             (f"You went on with: {qu['assumed']} If this answer says otherwise, check what you already did on "
+              f"that reading before you continue (rule 9)." if qu["assumed"] else "Continue the task."), None)]
+    holder = qu["requester"]
+    if by not in (holder, "owner") and holder in agents() and not lead_left(holder, t):
+        rows.append((holder, f"[hub] Q-{qid} on {tref(tid)}, which was with you, was answered by {who}: "
+                             f"{clip(text, 300)} Nothing more to do about it.", QUIET_SAY))
+    held = access_held(qu) if t is not None and t["state"] not in TERMINAL else None
+    restarts = restarter(t) if held else None
+    if held and by != restarts:
+        rows.append((restarts, f"[hub] Q-{qid} of {qu['asker']} on {tref(tid)} ({t['title']}) was answered by {who}, "
+                               f"and {qu['asker']} holds {resource_phrase(*held[:2])} at {held[2]} now. The session of "
+                               f"{tref(tid)} cannot use it: a running session keeps what it started with, and you "
+                               f"restart it: restart_task(task_id=\"{tref(tid)}\", expected_attempt={t['attempt']}, "
+                               f"...) starts it once more in a session that has the access, with everything it "
+                               f"already did.", None))
+    for to, said, extra in rows:
+        DB.execute(EVENT, (to, "say", filed_under(to, "say", tid), said, t0, json.dumps(extra or {})))
+    question_needs_close("id=?", (qid,), f"Closed: Q-{qid} was answered by {who}: {clip(text, 300)}", t0)
+    return {"held": held, "restarter": restarts if held else None}
+
+
+PASS_NOTE_MAX = 1000            # characters of the note that a lead adds when it passes a question up
+
+
+def holder_above(agent, t):
+    """Who a question that `agent` holds about task row `t` goes to when it passes it up, one level up its line: the
+    requester of its own task in that chain, in whose session the question reached it; else the agent it reports to.
+    None when nobody stands there."""
+    own = next((x for x in task_chain(t) if x["owner"] == agent), None)
+    up = own["requester"] if own else reports_to(agent)
+    return up if up and up != agent and up in agents() else None
+
+
+def pass_notice(qu, t, by, up, reader, passed, note):
+    """The message that a question passed up to `up` is for `reader`: `up` itself, or the manager when `up` cannot act
+    on it (lead_left). It carries the asker's words, the note of the one that passed it, the route of an ask for
+    access, and what the reader can do with it."""
+    qid, manager = qu["id"], role_of(reader) == "manager"
+    return (f"[hub] Question Q-{qid} from {qu['asker']} on {tref(t['id'])} ({t['title']}), passed up to " +
+            ("you" if reader == up else f"{up}, which cannot act on it now, so it is yours,") + f" by {by}" +
+            (f", who adds: {full_stop(note)}" if note else ".") + f" It asks: {qu['text']} " +
+            (access_route(qu["asker"], qu["access"], reader, qu["access_level"], restarter(t)) + " "
+             if qu["access"] else "") +
+            f"-- {tref(t['id'])} waits for the answer. Answer with answer(question_id=\"Q-{qid}\", text=...)" +
+            (f", or, when only the owner can settle it, take it to him with raise_needs_you(..., "
+             f"question_id=\"Q-{qid}\"): his answer goes back to {qu['asker']} by itself." if manager else
+             f", or pass it up once more with answer(question_id=\"Q-{qid}\", pass_up=true).") +
+            f" {', '.join(passed)} passed it and may still answer it: the first answer wins.")
+
+
+def pass_question(agent, qid, note):
+    """answer with pass_up (the owner, 28 October 2026: "when AskUserQuestion from an agent, it should be its boss who
+    gets the question! Agent -> Lead -> Manager -> Me. if the lowest level can handle it, that's it!"): the question
+    moves from its holder to the holder's own requester, and keeps who passed it. The asker's task keeps waiting for
+    the answer; the passer's own task goes on, because a subtask that waits on a question held above it is work in
+    progress (waits_on_parts). Who passed it may still answer it. The manager's last step is raise_needs_you with the
+    question's id, never a pass, and a question asked with a default blocks nobody, so it has nothing to pass up."""
+    if len(note) > PASS_NOTE_MAX:
+        raise ToolError(f"The note that goes up with the question is at most {PASS_NOTE_MAX} characters.")
+    if note:
+        guard(agent, note)
+    with LOCK:
+        qu = q1("SELECT * FROM questions WHERE id=?", (qid,))
+        if not qu:
+            raise ToolError(f"There is no question Q-{qid}.")
+        if role_of(agent) == "manager":
+            raise ToolError(f"Nobody stands above you but the owner. Answer Q-{qid} yourself, or, when only he can "
+                            f"settle it, take it to him with raise_needs_you(..., question_id=\"Q-{qid}\"): his "
+                            f"answer goes back to {qu['asker']} by itself.")
+        if agent in question_passers(qu):
+            raise ToolError(f"You passed Q-{qid} up already, and it is with {qu['requester']} now: a question passes "
+                            f"each level once. You may still answer it while nobody above you has.")
+        if qu["requester"] != agent:
+            raise ToolError(f"Q-{qid} was not asked of you.")
+        t = q1("SELECT * FROM tasks WHERE id=?", (qu["task"],))
+        in_scope(agent, t)
+        if qu["answer"] is not None:
+            raise ToolError(f"Q-{qid} is already answered.")
+        if qu["assumed"] is not None:
+            raise ToolError(f"Q-{qid} blocks nobody: {qu['asker']} goes on with \"{qu['assumed']}\", so there is "
+                            f"nothing to pass up. Answer it only if that reading is wrong.")
+        if t["state"] in TERMINAL:
+            raise ToolError(f"{tref(t['id'])} is already {t['state']}: nothing waits for this answer.")
+        up = holder_above(agent, t)
+        if not up:
+            raise ToolError(f"Nobody stands above you in the line of {tref(t['id'])}. Answer Q-{qid} yourself.")
+        reader = manager_name() if lead_left(up, t) else up
+        passed = question_passers(qu) + [agent]
+        said = pass_notice(qu, t, agent, up, reader, passed, note)
+        t0 = now()
+        with transaction():
+            DB.execute("UPDATE questions SET requester=?, passed=? WHERE id=? AND answer IS NULL",
+                       (up, json.dumps(passed), qid))
+            event_rows([(reader, "say", filed_under(reader, "say", t["id"]), said, None)], t0)
+        log(agent, f"passed Q-{qid} up to {up}")
+    return (f"Q-{qid} is with {up} now. {tref(t['id'])} keeps waiting for its answer, and your own work goes on: the "
+            f"hub counts {tref(t['id'])} as work in progress for you. You may still answer Q-{qid} yourself while "
+            f"nobody above you has: the first answer wins.")
+
+
 def t_answer(agent, a):
     qid = parse_id(a.get("question_id"), "question")
     text = str(a.get("text") or "").strip()
+    pass_up = a.get("pass_up")
+    if isinstance(pass_up, str):
+        pass_up = pass_up.strip().lower() in ("true", "yes", "1")
+    if pass_up:
+        return pass_question(agent, qid, text)
     if not text:
-        raise ToolError("Give the answer text.")
+        raise ToolError("Give the answer text, or pass the question up with pass_up=true.")
     guard(agent, text)
     with LOCK:
         qu = q1("SELECT * FROM questions WHERE id=?", (qid,))
         if not qu:
             raise ToolError(f"There is no question Q-{qid}.")
-        if qu["requester"] != agent:
-            raise ToolError(f"Q-{qid} was not asked of you.")
-        in_scope(agent, q1("SELECT * FROM tasks WHERE id=?", (qu["task"],)))
-        if qu["answer"] is not None:
-            raise ToolError(f"Q-{qid} is already answered.")
-        # An ask for access that is settled now: the answer reaches the session that cannot use it, so say the step
-        # that can (restart_task). Read before the answer, because an answered question is no ask any more.
-        kind, what = resource_parts(qu["access"]) if qu["access"] else (None, None)
-        got = next((h["level"] for h in resource_holders(kind, what) if h["agent"] == qu["asker"]), None) if kind else None
-        if got and not level_at_least(kind, got, qu["access_level"]):
-            got = None      # it holds less than the ask named, so no new session of this task can use it either
-        q("UPDATE questions SET answer=?, answered=? WHERE id=?", (text, now(), qid))
         t = q1("SELECT * FROM tasks WHERE id=?", (qu["task"],))
-        # Only the question the task actually waits on releases it. Answering one of two open questions used to set
-        # the task working whichever one it was, so answering a question it was not waiting on let a paused session
-        # be told to continue -- and a question asked with a default is never the one a task waits on at all.
-        # A question on the session's own screen writes "its screen" over Q-<id> (helper_dialog), and the move after
-        # it clears even that, so the task can no longer say which question holds it. Then the last blocking one
-        # answered is the one: before, the task stayed input-required for good, and nothing nudged it.
-        waits = t["waiting_on"] if t else None
-        if t and t["state"] == "input-required" and (waits == f"Q-{qid}" or (
-                waits in (None, "its screen") and not qu["assumed"] and not q1(
-                    "SELECT 1 FROM questions WHERE task=? AND id<>? AND answer IS NULL AND assumed IS NULL LIMIT 1",
-                    (t["id"], qid)))):
-            q("UPDATE tasks SET state='working', waiting_on=NULL WHERE id=?", (t["id"],))
-            with transaction():
-                secret_rewait(t["id"])      # it still waits on the owner's secret (secret_requests)
-        activity(qu["task"])
-        # Every answer is a message: no ask waits inside its call any more.
-        emit(qu["asker"], "say",
-             f"[hub] Answer to your question Q-{qid} on {tref(qu['task'])}: {text} -- " +
-             (f"You went on with: {qu['assumed']} If this answer says otherwise, check what you already did on "
-              f"that reading before you continue (rule 9)." if qu["assumed"] else "Continue the task."),
-             task=qu["task"])
+        if not may_answer(agent, qu, t):
+            raise ToolError(f"Q-{qid} was not asked of you.")
+        in_scope(agent, t)
+        if qu["answer"] is not None:
+            by = qu["answered_by"] or qu["requester"]
+            raise ToolError(f"Q-{qid} is already answered" + ("" if by == agent else f", by {by}") + ": an answer "
+                            f"holds, and the first one wins.")
+        with transaction():
+            done = answer_rows(qu, t, text, agent, now())
     if t and t["state"] in TERMINAL:
         return f"Answered Q-{qid}. {tref(t['id'])} is already {t['state']}, so no session of it reads this answer."
     if qu["assumed"]:
         return (f"Answered Q-{qid}. {qu['asker']} did not wait for you: it went on with \"{qu['assumed']}\", so your "
                 f"answer may be correcting work already done. It reads the answer in the session of "
                 f"{tref(qu['task'])} and checks that work itself (rule 9).")
-    if got:
-        return (f"Answered Q-{qid}. {qu['asker']} holds {resource_phrase(kind, what)} at {got} now, but the session of "
-                f"{tref(qu['task'])} cannot use it: a running session keeps what it started with. Your answer does not "
-                f"change that, and the task needs no follow-up: restart_task starts {tref(qu['task'])} once more in a "
-                f"session that has the access, with everything it already did.")
+    if done["held"]:
+        kind, what, got = done["held"]
+        said = (f"Answered Q-{qid}. {qu['asker']} holds {resource_phrase(kind, what)} at {got} now, but the session of "
+                f"{tref(qu['task'])} cannot use it: a running session keeps what it started with. ")
+        if done["restarter"] != agent:
+            return said + (f"Only {done['restarter']}, which restarts {tref(qu['task'])}, can give it a session "
+                           f"that has the access, and it was told to.")
+        return said + (f"Your answer does not change that, and the task needs no follow-up: restart_task starts "
+                       f"{tref(qu['task'])} once more in a session that has the access, with everything it already "
+                       f"did.")
     return f"Answered Q-{qid}."
 
 
@@ -4914,7 +5336,7 @@ def t_check_result(agent, a):
         accepted = accepted.strip().lower() in ("true", "yes", "1", "accept", "accepted")
     note = str(a.get("note") or "").strip()
     guard(agent, note)
-    t = get_task(tid, requester=agent)
+    t = requested_task(agent, tid)          # the manager checks for a lead that cannot (acts_for)
     in_scope(agent, t)
     if t["state"] not in TERMINAL:
         raise ToolError(f"{tref(tid)} is still {t['state']}; there is no result to check yet.")
@@ -4993,16 +5415,16 @@ def t_decide_permission(agent, a):
         if not p["task"]:                   # every prompt is decided by the requester of its task
             raise ToolError(f"P-{pid} belongs to no task, so no one can decide it.")
         t = q1("SELECT * FROM tasks WHERE id=?", (p["task"],)) if p["task"] else None
-        if t and t["requester"] != agent:
+        if t and not acts_for(agent, t):        # the manager decides for a lead that cannot
             raise ToolError(f"P-{pid} is for {t['requester']} to decide: it requested {tref(t['id'])}.")
         if t:
             in_scope(agent, t)
         if p["decision"] == "expired":
             raise ToolError(late_permission_word(agent, p, decision, reason))
-        if p["decision"] == "screen":
+        if p["decision"] == "screen":       # runtime gaps A6: a new session first, a person only if it comes back
             raise ToolError(f"P-{pid} is no longer with the hub: {p['reason']} decide_permission cannot answer a "
-                            f"question on a screen. Someone must look at that machine: raise a Needs-you item, or "
-                            f"cancel the task.")
+                            f"question on a screen. Start {tref(p['task'])} again with restart_task; "
+                            f"{screen_next(agent)}.")
         if p["decision"]:
             raise ToolError(f"P-{pid} was already decided: {p['decision']}.")
         if p["kind"] == "code":            # plan P4: a check runs only on its own agent's machine, unapproved
@@ -6743,13 +7165,47 @@ def t_raise_needs_you(agent, a):
         raise ToolError(mine)
     guard(agent, title, why, todo, *(json.loads(options) if options else ()))
     with LOCK:                  # lane L2: an id that no removed item had (unused_id)
-        nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options) VALUES(?,?,?,?,?,?,?)",
-                  (unused_id("needs"), title, why, todo, now(), agent, options))
+        qu = need_question(agent, a.get("question_id"))
+        if qu:                  # the asker's own words, which the owner answers
+            why += f" Quoting {qu['asker']} (Q-{qu['id']} on {tref(qu['task'])}): \"{clip(qu['text'], 1000)}\""
+        nid = ins("INSERT INTO needs(id,title,why,todo,raised,by,options,question) VALUES(?,?,?,?,?,?,?,?)",
+                  (unused_id("needs"), title, why, todo, now(), agent, options, qu["id"] if qu else None))
     emit("owner", "notify", f"Needs you N-{nid}: {title}")
     ping_need(nid)                                      # owner feature push: the phone rings, also when it is closed
     picks = (" The owner sees your options and presses one: " + ", ".join(json.loads(options)) +
              ". His answer is the words of the one he presses, or anything else he writes instead.") if options else ""
-    return f"Raised N-{nid}. The owner's answer will arrive as a message in this session.{picks}"
+    linked = (f" It is for Q-{qu['id']}: his answer goes to {qu['asker']} as the answer of Q-{qu['id']} by itself, "
+              f"and if Q-{qu['id']} is answered another way or {tref(qu['task'])} ends first, N-{nid} closes by "
+              f"itself." if qu else "")
+    return f"Raised N-{nid}. The owner's answer will arrive as a message in this session.{linked}{picks}"
+
+
+def need_question(agent, ref):
+    """The question that a Needs-you item takes to the owner (raise_needs_you question_id), checked, or None without
+    one. The manager's last step for a question that came up its line (the owner, 28 October 2026: "Agent -> Lead ->
+    Manager -> Me"): only one that it holds, or holds for a lead that cannot act on it, that blocks its asker, whose
+    task is open, and that no other open item asks already."""
+    if ref in (None, ""):
+        return None
+    qid = parse_id(ref, "question")
+    qu = q1("SELECT * FROM questions WHERE id=?", (qid,))
+    if not qu:
+        raise ToolError(f"There is no question Q-{qid}.")
+    t = q1("SELECT * FROM tasks WHERE id=?", (qu["task"],))
+    if qu["requester"] != agent and not lead_left(qu["requester"], t):
+        raise ToolError(f"Q-{qid} is with {qu['requester']}, which answers it or passes it up to you.")
+    if qu["answer"] is not None:
+        raise ToolError(f"Q-{qid} is already answered.")
+    if qu["assumed"] is not None:
+        raise ToolError(f"Q-{qid} blocks nobody: {qu['asker']} goes on with \"{qu['assumed']}\", so the owner is not "
+                        f"needed for it. Answer it only if that reading is wrong.")
+    if not t or t["state"] in TERMINAL:
+        raise ToolError(f"{tref(qu['task'])} has ended, so nothing waits for Q-{qid} any more.")
+    other = q1("SELECT id FROM needs WHERE question=? AND answer IS NULL", (qid,))
+    if other:
+        raise ToolError(f"N-{other['id']} already takes Q-{qid} to the owner: his answer goes to {qu['asker']} by "
+                        f"itself.")
+    return qu
 
 
 # ---------------------------------------------------------------- secret requests (owner feature secret_requests)
@@ -7911,10 +8367,14 @@ def owner_message(agent, reply):
 
 def t_start_task(agent, a):
     """The owner asks a worker or a lead for work in its own chat, and it opens the task itself (plan C17; the owner,
-    26 October 2026: no unnecessary gates). The task is the agent's own, with the manager as its requester, which
-    checks its result as for every task and is told at once, quietly. Only a message of the owner's own that this
-    chat has read starts work, and one message is one task: its request UUID is this call's request_id, so the same
-    message again gives the same task."""
+    26 October 2026: no unnecessary gates). The task is the agent's own, with its line as its requester (the manager,
+    or its lead, in whose one task for its team's results it is a subtask, as open_work's work is: wakeups.wake_route),
+    which checks its result as for every task and is told at once, quietly. Only a message of the owner's own that
+    this chat has read starts work, and one message is one task: its request UUID is this call's request_id, so the
+    same message again gives the same task. Its result comes back into this chat by itself (chat_result).
+
+    The checks of create_task that apply run here, and not check_task: its lead_task reads this call's context, which
+    is the owner chat of the agent and no session of the lead's."""
     chat_fence(agent)
     source = owner_message(agent, a.get("in_reply_to"))
     title, done_when = str(a.get("title") or "").strip(), str(a.get("done_when") or "").strip()
@@ -7923,19 +8383,32 @@ def t_start_task(agent, a):
                                   {"title": title, "done_when": done_when})
     if stored:
         return stored["text"]
-    mgr = manager_name()
-    f = check_task(mgr, {"owner": agent, "title": title, "done_when": done_when,
-                         "details": "The owner asked for this in his own words, in " + agent + "'s chat: " +
-                                    clip(source["text"] or "", 2000),
-                         "why": f"The owner asked {agent} for it in its own chat."})
+    if not title or not done_when:
+        raise ToolError("A task needs a title and a done_when line.")
+    route, why_not = wakeups.wake_route(wake_org(), agent)        # authority() and the agent active, at each step
+    if route is None or route["kind"] != "task":
+        raise ToolError(f"No task can be opened for you: {why_not or 'there is no line to request it'}")
+    requester = route["requester"]
+    busy = desktop_refusal(agent, "none", requester)               # the task needs no browser and no screen
+    if busy:
+        raise ToolError(busy)
+    details = "The owner asked for this in his own words, in " + agent + "'s chat: " + clip(source["text"] or "", 2000)
+    why = f"The owner asked {agent} for it in its own chat."
+    guard(agent, details, why)
     t0 = now()
     with transaction():
-        tid = admit_task(mgr, f)
-        text = (f"Opened {tref(tid)} ({title}) for you, with {mgr} as its requester. It starts in its own task "
-                f"session; tell the owner with tell_owner that it started, and do the work there, not here.")
+        parent = lead_batch_rows(requester, t0) if route["parent"] else None    # plan P9.11: the lead's one task
+        tid = admit_task(requester, {"owner": agent, "title": title, "details": details, "done_when": done_when,
+                                     "needs": "none", "goal": "", "goal_id": None, "parent": parent, "step": None,
+                                     "follows": None, "case_id": None, "why": why})
+        text = (f"Opened {tref(tid)} ({title}) for you, with {requester} as its requester. It starts in its own task "
+                f"session; tell the owner with tell_owner that it started, and do the work there, not here. Its "
+                f"result comes back into this chat by itself when it ends: then tell him with message_owner.")
         keep_command(command, {"task": tid, "text": text}, t0)
-    emit(mgr, "say", f"[hub] The owner asked {agent} for work in its own chat, and {agent} opened {tref(tid)} "
-                     f"({title}). You are its requester: check its result when it comes.", task=tid, extra=QUIET_SAY)
+    emit(requester, "say", f"[hub] The owner asked {agent} for work in its own chat, and {agent} opened {tref(tid)} "
+                           f"({title}). You are its requester: check its result when it comes. The result also goes "
+                           f"back into {agent}'s chat by itself, so do not pass it on to him.", task=tid,
+         extra=QUIET_SAY)
     log(agent, f"opened {tref(tid)} from the owner's message {source['request_id']}")
     return text
 
@@ -8191,6 +8664,9 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
                        f"accepted as the answer of N-{need['id']} in C-{need['conversation']}"))
             return event_id
         text = text.rstrip() + attachment_words(files) + (" It needs no reply." if secret_chat else "") + note
+        asker = need_question_rows(need, value, t0)        # a question the manager took to him gets his words
+        if asker:
+            text += f" The hub gave it to {asker} as the answer to Q-{need['question']}: do not pass it on again."
     generation = DB.execute("SELECT v FROM kv WHERE k='db_id'").fetchone()
     generation = generation["v"] if generation else None
     extra = json.dumps({"generation": generation} if worker_chat else
@@ -8208,6 +8684,19 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
     DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, "owner", f"UI {kind} {request_id} accepted as "
                f"M-{event_id} for {recipient}" + (f" from {origin['account']}" if origin else "")))
     return event_id
+
+
+def need_question_rows(need, value, t0):
+    """Inside the owner's answer (owner_message_rows, the legacy /needs route), with DB.execute and read_rows only:
+    his answer to a Needs-you item that the manager raised for a question (raise_needs_you question_id) answers that
+    question too, as his own, straight back to the agent that asked (the owner, 28 October 2026: "Agent -> Lead ->
+    Manager -> Me"). Returns the asker, or None for an item of no question and for a question answered first."""
+    qid = need["question"] if "question" in need.keys() else None
+    qu = read_row("SELECT * FROM questions WHERE id=?", (qid,)) if qid else None
+    t = read_row("SELECT * FROM tasks WHERE id=?", (qu["task"],)) if qu else None
+    if not qu or not t or qu["answer"] is not None:
+        return None
+    return qu["asker"] if answer_rows(qu, t, value, "owner", t0) else None
 
 
 def chat_source(agent, reply, about):
@@ -8944,8 +9433,13 @@ def end_waits(task_id):
         if open_ or role_of(m["sender"]) == "manager":
             emit(m["sender"], "say", f"[hub] AM-{m['id']} reached {tref(task_id)}, which ended before it read it.",
                  task=m["sender_task"] if open_ else None)
+    t = q1("SELECT state FROM tasks WHERE id=?", (task_id,))
+    with transaction():                 # a Needs-you item raised for one of its questions asks the owner nothing now
+        question_needs_close("task=? AND answer IS NULL", (task_id,), f"Closed: {tref(task_id)} ended "
+                             f"({t['state'] if t else 'gone'}) before an answer came, so nothing waits for it.", now())
     conversation_result(task_id)        # AUTONOMY.md P2: a task that a conversation opened tells it its result
     secret_waits_end(task_id)           # owner feature secret_requests: its waits on the owner's secrets end with it
+    chat_result(task_id)                # and one that an owner chat opened (start_task) tells that chat
 
 
 def wait_sweep(t0):
@@ -8988,8 +9482,9 @@ CONVERSATION_CLOSED_TOOLS = ("read_messages", "reply", "ask_team")
 # What a task session has and a conversation with tools has not: the reply ends a conversation task, so it delivers
 # nothing and asks no requester, a reminder would park a task that the next reply ends, and a lead's subtask would
 # hang on it. Larger work, a follow-up at a later time and a lead's parts go to open_work, whose task has them all.
+# A skill is the agent's own procedure (design v4 D2), so a session that a contact's words drive writes none.
 CONVERSATION_NOT_WORK = ("deliver_result", "ask_my_requester", "set_reminder", "create_task", "cancel_task",
-                         "restart_task", "answer", "check_result", "decide_permission", "decide_report",
+                         "restart_task", "answer", "check_result", "decide_permission", "decide_report", "write_skill",
                          "request_secret")         # no contact makes the owner type a secret (secret_requests)
 # The helper feature of conversations with contacts.v2: a session with the agent's own tools, a closed one on the
 # chosen runtime at its pinned version, and the records of both kinds (lifecycle.FEATURES)
@@ -10243,6 +10738,32 @@ def conversation_result(task_id):
     log(conv["agent"], f"the result of {tref(task_id)} went back into C-{conv['id']}")
 
 
+def start_task_source(t):
+    """The request UUID of the owner's message that task row `t` was opened from in its agent's owner chat
+    (start_task), or None: start_task keeps its receipt under that UUID, with the task."""
+    row = q1("SELECT request_id FROM tool_commands WHERE agent=? AND tool='start_task' AND "
+             "json_extract(receipt, '$.task')=?", (t["owner"], t["id"]))
+    return row["request_id"] if row else None
+
+
+def chat_result(task_id):
+    """A task that an agent opened from its owner chat (start_task) ended: its result goes back into that chat by
+    itself, as open work goes back into its conversation (conversation_result), and the chat tells the owner with
+    message_owner (the owner, 29 October 2026: only the manager and his chats write to him first). Its requester
+    checks the result as for every task, and was told not to pass it on. Called from end_waits; committing."""
+    t = q1("SELECT * FROM tasks WHERE id=?", (task_id,))
+    source = start_task_source(t) if t else None
+    a = (agents().get(t["owner"]) or {}) if source else {}
+    if not source or a.get("role") not in ("worker", "lead") or not owner_chat(a):
+        return
+    said = (f"[hub] {tref(task_id)} ({clip(t['title'] or '', 120)}), which you opened from the owner's message "
+            f"{source} in this chat, is {t['state']}: {clip(t['what'] or '', 3000)}"
+            + (f" Where: {clip(t['where_'], 300)}" if t["where_"] else "") +
+            " Tell him in a few words what came of it, with message_owner. It needs no other reply.")
+    emit(t["owner"], "chat", said, extra={"generation": kv_get("db_id"), "task_result": task_id})
+    log(t["owner"], f"the result of {tref(task_id)} went back into its owner chat")
+
+
 def conversation_pass_rows(conv, person, tid, rows, t0):
     """Inside the caller's transaction (AUTONOMY.md P2, decision 40): the person's messages `rows` reach the session
     of open work `tid` as one message, each with its header and as one JSON string that no line of theirs can end.
@@ -10323,7 +10844,9 @@ def conversation_brief(agent, conv, person, t):
         lines += ["", "What was said before, oldest first:"] + \
                  [f"{said[r['who']]}: {clip(r['text'], 600)}" for r in reversed(rows)]
     first = "\n".join(lines) + "\n"
-    return start_text(agent, t["id"], first=first) if t else mask_secrets(first)
+    # how this session started (conversation_start), which says whether its stable text lists the agent's skills
+    return start_text(agent, t["id"], first=first, opening=stable_opening(agent, "none")) if t else \
+        mask_secrets(first)
 
 
 def conversation_work_prompt(agent, conv, person, opening=None):
@@ -13236,22 +13759,26 @@ DUTY_REVIEW_TASK = {
                "something they do not say, or showed that something in them is wrong. Leave them "
                "as they are when nothing changed: a version that says the same thing is noise. "
                + NOTES_RULE +
-               " Then the lessons of your memory that this review lists below, if it lists any. "
+               " Then your skills, if you have any (your start lists them): change one with write_skill where the "
+               "work since the last review showed a step of it wrong or missing, and retire one that no job needs "
+               "any more; leave the others as they are. "
+               "Then the lessons of your memory that this review lists below, if it lists any. "
                + MEMORY_REVIEW_WHAT +
                " A lesson whose key has not come back is the best-evidenced kind you hold, and what that evidence "
                "says is that nothing has refuted it, not that it was right. Leave it alone. "
                "Then give one line for each duty in your result: is it in order, and what did "
-               "you do; one line saying whether you changed your notes and what taught you; and "
+               "you do; one line saying whether you changed your notes and what taught you; one line naming the "
+               "skills you changed or retired; and "
                "one line saying how many lessons you wrote again and how many you removed, without their words. "
                "Ask your requester only for what the duty does not cover.",
     "done_when": "Each duty of this agent is in order, or its problem is named in the result, "
                  "each case that waited has its first step, the notes are either rewritten or "
-                 "left as they are on purpose, and every lesson listed below has been written again "
-                 "or removed, or the result says why it was kept as it is."}
+                 "left as they are on purpose, and so are the skills, and every lesson listed below has been "
+                 "written again or removed, or the result says why it was kept as it is."}
 DUTY_REVIEW_SAY = ("[hub] Your duties have news since your last review:\n{news}\nPut them in order as their words "
                    "say: build the mechanism of a duty that has no watch, repair a broken watch and work a case that "
                    "waits. Then read your notes with see_notes, and rewrite what the work since your last review "
-                   "showed you.")
+                   "showed you; change a skill of yours that it showed wrong with write_skill.")
 
 
 def duty_review_last(agent):
@@ -15088,7 +15615,7 @@ HISTORY_CASE = re.compile(r"R-\d+/C-\d+")
 HISTORY_OWNER_TASK = "The owner asked for this in his own words, in "     # how t_start_task's details begin
 # A fleet tool call that acted outside the hub's own rows, which no other stream has: what it was given is the record.
 HISTORY_CALLS = tuple(t for t in OUTWARD_TOOLS if t not in ("message_owner", "reply", "message_contact")) + \
-    ("write_knowledge", "save_trigger", "change_trigger", "set_reminder")
+    ("write_knowledge", "write_skill", "save_trigger", "change_trigger", "set_reminder")
 # A tool call whose output says what happened. A read's or a search's output is the text of a file it read, which is
 # that file's and not the agent's.
 HISTORY_OUTPUTS = ("execute", "fetch", "edit", "delete", "move", "other")
@@ -15279,10 +15806,12 @@ def history_question(qu):
 
 
 def history_answer(qu):
-    """The answer to a question, in the history of both."""
-    return [history_rec(a, "question", f"Q-{qu['id']}", f"Q-{qu['id']} answered by {qu['requester']}: "
+    """The answer to a question, in the history of both: its asker, and whoever answered it, which is its holder, a
+    level that passed it up, the manager for a lead that cannot, or the owner (answered_by)."""
+    by = (qu["answered_by"] if "answered_by" in qu.keys() else None) or qu["requester"]
+    return [history_rec(a, "question", f"Q-{qu['id']}", f"Q-{qu['id']} answered by {by}: "
                         f"{qu['answer'] or ''}", qu["answered"], person=other, task=qu["task"])
-            for a, other in history_pairs(qu["asker"], qu["requester"])]
+            for a, other in history_pairs(qu["asker"], by if by != "owner" else qu["requester"])]
 
 
 def history_report(r):
@@ -16108,6 +16637,259 @@ def t_write_knowledge(agent, a):
         keep_command(command, {"path": path, "commit": commit, "text": said}, t0)
     log(agent, f"wrote {path} as {commit[:12]}: {why}")
     return said
+
+
+# ---------------------------------------------------------------- skills/, each agent's own (runtime gaps, design v4 D)
+# The owner, 28 October 2026: "we should support SKILLS! ... agents could learn and create skills on their own, and
+# update them! and I should be able to instruct an agent to create a skill"; 29 October: each agent's own only.
+#
+# A skill is a procedure that an agent will follow again: skills/<agent>/<name>/SKILL.md on the configuration ref, with
+# the front matter that both runtimes read (name, description) and its text, and at most a few small files beside it
+# (a script, a template). The agent writes it directly, as it writes a knowledge file, and each write is one commit
+# with its name, its why and where it was written: the task, and the hub's own count of the outside text that task had
+# read (save_provenance), which a later reader weighs as it weighs a lesson's (RULES.md, "Your memory"). The owner
+# reads that commit and reverts it in one step, or removes the skill (POST /ui/skills/remove). "Make a skill for X" in
+# an agent's chat is work: the chat opens a task with start_task, and the task writes it.
+#
+# No runtime's own skill place is used. A session's start lists the agent's skills in the stable text that its helper
+# writes from its checkout (lifecycle.skills_text, plan P9.2), on every runtime, and the session reads a SKILL.md by its
+# path. So the desktop user's own skills on a Mac never reach an agent, and an agent's never reach his own sessions.
+SKILL_DESCRIPTION = 300         # characters of a skill's description: one line of the list in every start
+SKILL_MD_MAX = 16 * 1024        # bytes of a SKILL.md, its front matter included
+SKILL_FILES = 8                 # files beside a SKILL.md
+SKILL_FILE_MAX = 32 * 1024      # bytes of each of them
+SKILLS_MAX = 40                 # skills of one agent
+SKILLS_FEATURE = "stable_skills"    # the helper feature: a session's stable text lists the agent's skills
+SKILLS_LISTED = {}              # the list of one agent's skills at one revision of the hub checkout (skills_listed)
+# publish.SHAPES, repeated: publish.py is not part of a fleet, so the hub cannot import it, and test_skills keeps the two
+# equal. A private key written out, as a block and not as a mention of its marker.
+SECRET_SHAPES = ((re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[ \t]*\n(?:[A-Za-z0-9+/=]{16,80}[ \t]*\n){2,}"),
+                  "a private key, written out"),)
+
+
+def skill_allow(agent, name):
+    """The paths that one write of this skill may touch (commit_kit_file's allow): its own folder, and nothing else."""
+    return re.compile(re.escape(f"{SKILLS}/{agent}/{name}/") + rf"(?!.*\.\.){SKILL_FILE}\Z")
+
+
+def skill_files(rev, agent, name):
+    """The paths of one skill's folder at revision `rev`, relative to it: "SKILL.md" and the files beside it."""
+    folder = f"{SKILLS}/{agent}/{name}/"
+    code, out, _ = git_kit("ls-tree", "-r", "-z", "--name-only", rev, "--", folder)
+    return sorted(p[len(folder):] for p in out.split("\0") if p.startswith(folder)) if code == 0 else []
+
+
+def skill_md(name, description, text, reads=None):
+    """A SKILL.md as both runtimes read one: YAML front matter with its name and description, then its text. The
+    description is written as a JSON string, which YAML reads as the same string whatever it holds. reads: the hub's
+    count of the outside text that the writing session had read, which the start list shows beside the skill so that
+    a later session weighs it as it weighs a lesson (the final review of 29 October 2026); none for a count of 0."""
+    body = text.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    return (f"---\nname: {name}\ndescription: {json.dumps(description, ensure_ascii=False)}\n" +
+            (f"outside-reads: {int(reads)}\n" if reads else "") + f"---\n\n{body}\n").encode()
+
+
+def skill_text(value, what, limit, one_line=False):
+    """One text field of write_skill: the text, or a ToolError that says what it must be."""
+    try:
+        text = goal_text(value, what, limit, one_line)
+    except ValueError as e:
+        raise ToolError(f"{e}.") from None
+    if one_line and CONTROL.search(text):
+        raise ToolError(f"{what} must be one line of plain text, without a control character.")
+    return text
+
+
+def skill_message(agent, name, why, retired):
+    """The commit message of one write: who did what and why, where it was written, and the owner's control. Its last
+    lines are git trailers, which GET /ui/skills reads back."""
+    task, reads = save_provenance(agent)
+    where = f"in {tref(task)}" if task else ("in the manager's standing session" if agent == manager_name() else
+                                             "outside a task session")
+    if reads is not None:
+        where += (f", whose session had made {reads} read{'' if reads == 1 else 's'} of outside text before it (the "
+                  f"hub's own count, so a zero means that it counted nothing, never that nothing came from outside)")
+    trailers = ([f"Fleet-Task: {tref(task)}"] if task else []) + \
+        ([f"Fleet-Outside-Reads: {reads}"] if reads is not None else [])
+    return (f"{agent} {'retired' if retired else 'wrote'} the skill {name}: {why}\n\n"
+            f"Written {where}. An agent writes its own skills, directly and without asking (the owner, 29 October "
+            f"2026: each agent's own). The owner reads this commit in the configuration ref and reverts it in one "
+            f"step." + ("\n\n" + "\n".join(trailers) if trailers else "") + "\n")
+
+
+def t_write_skill(agent, a):
+    """write_skill: one of the agent's own skills, written whole, or retired (design v4 D2). Not under LOCK, as
+    write_knowledge: the commit waits for git and for the configuration ref's origin."""
+    name = str(a.get("name") or "").strip()
+    if not re.fullmatch(SKILL_NAME, name):
+        raise ToolError("name is the skill's folder: 1 to 64 characters of a-z, 0-9 and -, with a letter or a digit "
+                        "first, for example deploy-acme-web.")
+    retire = a.get("retire")
+    if retire not in (None, True, False):
+        raise ToolError("retire is true, to retire the skill, or left out.")
+    why = skill_text(a.get("why"), "why", 300, True)
+    rev = kit_revision(fresh=True)
+    if not rev:
+        raise ToolError("The hub cannot read its own revision now, so nothing was written. Call write_skill again "
+                        "with the same request_id.")
+    folder, have = f"{SKILLS}/{agent}/{name}/", skill_files(rev, agent, name)
+    if retire:
+        if any(a.get(k) is not None for k in ("description", "text", "files")):
+            raise ToolError("retire takes the name and the why, and nothing else.")
+        if "SKILL.md" not in have:
+            raise ToolError(f"You have no skill {name}. Your skills are listed in the start of your session.")
+        guard(agent, why)
+        changes = {folder + p: None for p in have}
+        fields = {"name": name, "retire": True, "why": why}
+    else:
+        description = skill_text(a.get("description"), "description", SKILL_DESCRIPTION, True)
+        if not isinstance(a.get("text"), str):
+            raise ToolError("text is the SKILL.md's whole text, after its front matter: the steps of the procedure.")
+        text = skill_text(a["text"], "text", SKILL_MD_MAX)
+        files = a.get("files")
+        if files is not None and not isinstance(files, dict):
+            raise ToolError("files is an object of each file's path inside the skill and its whole text, for example "
+                            '{"check.sh": "..."}, or left out to keep the files the skill has.')
+        if files is not None and len(files) > SKILL_FILES:
+            raise ToolError(f"A skill has at most {SKILL_FILES} files beside its SKILL.md.")
+        for path, body in (files or {}).items():
+            if not re.fullmatch(SKILL_FILE, str(path)) or ".." in str(path) or str(path).lower() == "skill.md":
+                raise ToolError(f"{path!r} is not a file name in a skill: letters, digits, . _ and -, at most two "
+                                f"folders deep, no name that starts with a dot or a dash, and not SKILL.md, which "
+                                f"text writes.")
+            if not isinstance(body, str) or "\0" in body:
+                raise ToolError(f"{path} must be text: a skill keeps small text files, such as a script.")
+            if len(body.encode()) > SKILL_FILE_MAX:
+                raise ToolError(f"{path} is larger than {SKILL_FILE_MAX // 1024} KiB. A skill keeps small files; a "
+                                f"large one belongs in the repository the work is about.")
+        # The mark follows the text: a session that read no outside text and writes the skill again keeps the
+        # count of the session before it (the final review of 29 October 2026), so a rewrite never clears it.
+        before = git_blob(rev, folder + "SKILL.md") if "SKILL.md" in have else None
+        reads = max(save_provenance(agent)[1] or 0,
+                    skill_front(before.decode("utf-8", "replace") if before else "", "outside-reads"))
+        content = {folder + "SKILL.md": skill_md(name, description, text, reads)}
+        if len(content[folder + "SKILL.md"]) > SKILL_MD_MAX:
+            raise ToolError(f"A SKILL.md is at most {SKILL_MD_MAX // 1024} KiB with its front matter. Say the steps in "
+                            f"fewer words, or put a long part in a file beside it.")
+        content.update({folder + p: body.encode() for p, body in (files or {}).items()})
+        if "SKILL.md" not in have and len(skill_rows(kit_dir(), agent)) >= SKILLS_MAX:
+            raise ToolError(f"You have at most {SKILLS_MAX} skills. Retire one that no job needs any more "
+                            f"(retire=true), or fold two that do the same job into one.")
+        guard(agent, why, description, text, *(files or {}), *(files or {}).values())
+        for what, body in [("text", text), *((files or {}).items())]:
+            if any(shape.search(body) for shape, _ in SECRET_SHAPES):
+                raise ToolError(f"Blocked: {what} holds {SECRET_SHAPES[0][1]}. A skill never carries a login or a "
+                                f"key: name the login (bws://<uuid>) and let your helper use it.")
+        changes = {path: data for path, data in content.items() if git_blob(rev, path) != data}
+        if files is not None:           # given, the files are the skill's whole set: the others go
+            changes.update({folder + p: None for p in have if p != "SKILL.md" and folder + p not in content})
+        fields = {"name": name, "retire": False, "why": why, "sha256": hashlib.sha256(json.dumps(
+            [description, text, files], sort_keys=True, ensure_ascii=False).encode()).hexdigest()}
+    command, stored = agent_write(agent, "write_skill", a, fields)
+    if stored:
+        return stored["text"]
+    t0 = now()
+    if not changes:
+        said = f"The skill {name} already reads as you wrote it, so nothing was committed."
+        with transaction():
+            keep_command(command, {"name": name, "commit": None, "text": said}, t0)
+        return said
+    first, *rest = sorted(changes)
+    try:
+        commit = commit_kit_file(first, changes[first], skill_message(agent, name, why, bool(retire)),
+                                 more={p: changes[p] for p in rest}, author=agent, allow=skill_allow(agent, name))
+    except Refusal as e:
+        raise ToolError(f"The skill {name} was not written: {e}. Nothing changed, so call write_skill again with the "
+                        f"same request_id.") from None
+    if retire:
+        said = (f"The skill {name} is retired: {folder} left the configuration ref in {commit[:12]}. Your next "
+                f"sessions no longer list it.")
+    else:
+        beside = len([p for p in skill_files(commit, agent, name) if p != "SKILL.md"])
+        said = (f"The skill {name} is written as {commit[:12]} on the configuration ref: {folder}SKILL.md"
+                + (f" and {beside} file{'' if beside == 1 else 's'} beside it" if beside else "")
+                + ". Your next sessions list it in their start, and you read it when a job matches. The owner reads "
+                  "this commit and reverts it in one step.")
+    with transaction():
+        keep_command(command, {"name": name, "commit": commit, "text": said}, t0)
+    log(agent, f"{'retired' if retire else 'wrote'} the skill {name} as {commit[:12]}: {why}")
+    return said
+
+
+def skills_listed(agent):
+    """lifecycle.skills_text of the hub checkout at its revision, kept for that revision: a start reads it often, and
+    only a commit changes it. Reads git only, so a start text inside admit_task's transaction may call it."""
+    rev = kit_revision()
+    if not rev:
+        return ""
+    key = (kit_dir(), rev, agent)
+    if key not in SKILLS_LISTED:
+        if len(SKILLS_LISTED) > 256:
+            SKILLS_LISTED.clear()
+        SKILLS_LISTED[key] = skills_text(kit_dir(), agent)
+    return SKILLS_LISTED[key]
+
+
+def skills_start_text(agent, stable):
+    """Design v4 D3: the list of the agent's own skills, for a start whose stable text does not carry it -- a session
+    that reads its rules as files (stable False: a screen or app-server task, an ACP runtime, an older helper), or one
+    whose helper writes no skills into that text yet (helper feature stable_skills). "" for every other start and for
+    an agent with no skill. read_row only: start_text runs inside admit_task's transaction."""
+    if stable:
+        st = read_row("SELECT data FROM machine_status WHERE agent=?", (agent,))
+        try:
+            features = (json.loads(st["data"]).get("features") or []) if st else []
+        except (TypeError, ValueError):
+            features = []
+        if SKILLS_FEATURE in features:
+            return ""
+    listed = skills_listed(agent)
+    return "\n" + listed if listed else ""
+
+
+def skill_commits():
+    """{(agent, name): its newest commit} of every skill of the hub checkout's history: the commit, its time, and the
+    task and outside reads that its own trailers name (skill_message), or None where it names none."""
+    code, out, _ = git_kit("log", "-n", "2000", "--format=%x1e%H%x1f%ct%x1f%B%x1f", "--name-only", "HEAD", "--",
+                           SKILLS + "/")
+    found = {}
+    for chunk in (out.split("\x1e") if code == 0 else []):
+        parts = chunk.split("\x1f")
+        if len(parts) != 4 or not parts[1].strip().isdigit():
+            continue
+        commit, at, body, names = parts
+        lines = dict(re.findall(r"^(Fleet-Task|Fleet-Outside-Reads): (\S+)$", body, re.M))
+        reads = lines.get("Fleet-Outside-Reads")
+        for path in names.split("\n"):
+            bits = path.strip().split("/")
+            if len(bits) >= 4 and bits[0] == SKILLS:
+                found.setdefault((bits[1], bits[2]), {
+                    "commit": commit.strip(), "at": int(at), "task": lines.get("Fleet-Task"),
+                    "outside_reads": int(reads) if reads and reads.isdigit() else None})
+    return found
+
+
+def skills_view(agent=None):
+    """GET /ui/skills: every agent's own skills at the hub's revision, or one agent's, each with its newest commit."""
+    last = skill_commits()
+    return [dict(r, **last.get((r["agent"], r["name"]), {"commit": None, "at": None, "task": None,
+                                                           "outside_reads": None}))
+            for r in skill_rows(kit_dir(), agent)]
+
+
+def skill_remove(agent, name):
+    """POST /ui/skills/remove: the owner removes one agent's skill, its whole folder, in one commit of his own. Agents
+    write their skills themselves; beside a revert, this is the owner's one step on them."""
+    rev = kit_revision(fresh=True)
+    if not rev:
+        raise Refusal(503, "the hub cannot read its own revision")
+    paths = [f"{SKILLS}/{agent}/{name}/{p}" for p in skill_files(rev, agent, name)]
+    if not paths:
+        raise Refusal(404, f"{agent} has no skill {name}")
+    commit = commit_kit_file(paths[0], None, f"Owner removed the skill {name} of {agent}",
+                             more={p: None for p in paths[1:]})
+    log("owner", f"removed the skill {name} of {agent} in {commit[:12]}")
+    return {"agent": agent, "name": name, "removed": True, "files": paths, "commit": commit}
 
 # ---------------------------------------------------------------- Grantable resources (owner feature resource_grants)
 # What a duty can need, as the owner already holds it. A resource is one such thing, and its id is "<kind>:<what>":
@@ -17370,14 +18152,15 @@ def report_for_manager(r):
     that task has ended -- the lead delivered it, or its requester canceled it -- no such session will come, and an
     agent that is no longer a lead holds no decide_report at all. Such a report used to wait for ever: the manager
     was refused it as another agent's, the lead was refused it in its next task, and the owner's screen asked him to
-    have it decided. The manager is the authority over the whole fleet, so it is the one left to decide it."""
+    have it decided. The manager is the authority over the whole fleet, so it is the one left to decide it. A lead
+    that lost its authority over the agent that reported cannot decide either (lead_left, the owner, 29 October
+    2026), and the same rule hands its questions, permission prompts and results to the manager."""
     if r["to_agent"] == manager_name():
         return False
     if role_of(r["to_agent"]) != "lead":
         return True
-    sub = q1("SELECT parent FROM tasks WHERE id=?", (r["from_task"],)) if r["from_task"] else None
-    parent = q1("SELECT state FROM tasks WHERE id=?", (sub["parent"],)) if sub and sub["parent"] else None
-    return parent is None or parent["state"] in TERMINAL
+    sub = read_row("SELECT * FROM tasks WHERE id=?", (r["from_task"],)) if r["from_task"] else None
+    return sub is None or lead_left(r["to_agent"], sub)
 
 
 def managers_reports():
@@ -18198,14 +18981,59 @@ def circles_waiting(t0):
 
 def reports_waiting(t0):
     """The reports that wait for a decision whose receiver had a turn after the message that named them and left it
-    unread (plan C10: requester_chase names each one once), oldest first."""
+    unread (plan C10: requester_chase names each one once), oldest first. A lead's goes to the manager first
+    (lead_unread_sweep), and only one that the manager left unread too reaches the owner's screen."""
     out = []
     for r in open_reports(kinds=False):
         receiver = manager_name() if report_for_manager(r) else r["to_agent"]
         told = kv_get(f"chased:{receiver}:{upref(r['id'])}")
-        if told and not_acting(receiver, int(told)):
+        if told and not_acting(receiver, int(told)) and up_unread(receiver, upref(r["id"])):
             out.append(r)
     return out
+
+
+def up_unread(receiver, key):
+    """True when what `receiver` left unread is the owner's to see now: the manager's own, or a lead's that the
+    manager was told of (lead_unread_sweep) and left unread too (the owner, 29 October 2026: the manager acts for a
+    lead that does not, and his Health screen shows only what the manager leaves as well)."""
+    if receiver in (None, manager_name()):
+        return True
+    told = kv_get(f"lead_unread:{key}")
+    return bool(told) and not_acting(manager_name(), int(told))
+
+
+def lead_unread_sweep(t0):
+    """From the hub tick: what a lead had a turn after and left unread -- the notice that a task it requested is
+    stuck (tasks_stuck), a report that it was named and did not decide (reports_waiting) -- goes to the manager, once
+    for each notice, before the owner's Health screen shows it (up_unread). So does a stuck notice of a lead that
+    cannot act on its task any more (lead_left), whose session reads nothing. The manager asks the lead, or acts where
+    it may."""
+    mgr, lines, keys = manager_name(), [], []
+    for t in q(f"SELECT * FROM tasks WHERE {OPEN_TASK} ORDER BY id"):
+        told = kv_get(f"stuck_notice:{t['id']}")
+        key = f"stuck:{t['id']}:{told}"
+        if not told or t["requester"] in (None, mgr) or kv_get(f"lead_unread:{key}") or \
+                active_hold(t["id"]) or active_limit(t["owner"]) or parked(t["id"]) or \
+                not (not_acting(t["requester"], int(told)) or lead_left(t["requester"], t)):
+            continue
+        lines.append(f"{tref(t['id'])} ({clip(t['title'], 60)}, owner {t['owner']}): {t['requester']} was told that "
+                     f"it is stuck")
+        keys.append(key)
+    for r in open_reports(kinds=False):
+        receiver, key = r["to_agent"], upref(r["id"])
+        told = kv_get(f"chased:{receiver}:{key}")
+        if not told or receiver == mgr or role_of(receiver) != "lead" or report_for_manager(r) or \
+                kv_get(f"lead_unread:{key}") or not not_acting(receiver, int(told)):
+            continue
+        lines.append(f"{key} [{r['kind']}] from {r['from_agent']}: {receiver} was named it to decide")
+        keys.append(key)
+    if not lines:
+        return
+    event = emit(mgr, "say", "[hub] A lead had a turn after these and left them unread:\n" +
+                 "\n".join(f"  {line}" for line in lines) + "\nAsk the lead with message_agent, or settle them "
+                 "yourself where it cannot act any more. The owner sees them only if you leave them too.")
+    for key in keys:
+        kv_set(f"lead_unread:{key}", event)
 
 
 # A task that nothing is moving (tasks_stuck). Every alarm the hub raises about one task goes to its requester once,
@@ -18216,7 +19044,8 @@ def reports_waiting(t0):
 def tasks_stuck(t0):
     """[(when its requester was told, one line)] of the open tasks whose requester had a turn after the notice that
     the task is stuck and left that notice unread, oldest first. A requester that read the notice decides, and the
-    owner is told only what the manager (or a lead) already had in front of it and did not settle.
+    owner is told only what the manager (or a lead) already had in front of it and did not settle: a lead's goes to
+    the manager first (lead_unread_sweep), and shows here only when the manager left it unread too.
 
     **Deliberate quiet is not stuckness**: a held task, a task whose agent is at its usage limit and a parked task are
     left out whole."""
@@ -18225,7 +19054,9 @@ def tasks_stuck(t0):
         if active_hold(t["id"]) or active_limit(t["owner"]) or parked(t["id"]):
             continue
         told = kv_get(f"stuck_notice:{t['id']}")
-        if not told or not not_acting(t["requester"], int(told)):
+        if not told or not (not_acting(t["requester"], int(told)) or (t["requester"] not in (None, manager_name())
+                                                                     and lead_left(t["requester"], t))) or \
+                not up_unread(t["requester"], f"stuck:{t['id']}:{told}"):        # a lead's: the manager's first
             continue
         if not t["live_path"] and t["stalled_since"]:      # liveness found it with no path
             says = f"has no live path and is still {t['state']}: {t['stalled_reason'] or 'no reason recorded'}"
@@ -18415,6 +19246,8 @@ def manager_resume_text(parts=True):
                         + "\n".join(resume_lines(t0))
                         + team_start_text(manager_name())               # the team directory (P9.1)
                         + standing_start_text(manager_name()).rstrip("\n")   # its standing items (L3, 6.4)
+                        # its skills, where its stable text does not list them (design v4 D3)
+                        + skills_start_text(manager_name(), not parts).rstrip("\n")
                         + manager_checks_text(t0).rstrip("\n")         # its checks and its reports' new ones (L4)
                         + "\nThen call read_messages: its read is the receipt.")
 
@@ -18483,7 +19316,8 @@ TOOLS = [
      "having in your next sessions, say it in learned, with what you expect it to prevent: this is the only moment "
      "an ordinary task offers, and nothing will ask again. And if you hit a wall — a thing that cannot be done the "
      "way you tried, an approach that wasted hours — say that in tried: what does not work costs the same hours "
-     "every time somebody walks into it.",
+     "every time somebody walks into it. The steps of a job that will come back are a skill: write it with "
+     "write_skill before you deliver.",
      S({"task_id": TASK_ID, "outcome": {"type": "string", "enum": ["completed", "failed", "rejected"]},
         "what_was_done": STR, "where_output_is": STR, "how_checked": STR,
         "note": {"type": "string", "description": "Your last progress note, if you have one: it is kept with the "
@@ -18695,9 +19529,16 @@ TOOLS = [
                                                     "the task reported, or the access that is settled now"}},
        ["task_id", "request_id", "expected_attempt", "reason"])),
     ("manager", "answer", t_answer,
-     "Answer a worker's question.",
-     S({"question_id": {"type": "string", "description": "Question id, for example Q-4"}, "text": STR},
-       ["question_id", "text"])),
+     "Answer a question that is with you: its asker's task goes on with your words. The lowest level that can answer "
+     "does. A lead that cannot passes it up with pass_up=true, and a note in text if that helps: it moves to the "
+     "lead's own requester, the asker's task keeps waiting, and the lead's own work goes on. Whoever passed a question "
+     "may still answer it, and the first answer wins. The manager passes nothing up: what only the owner can settle "
+     "goes to him with raise_needs_you and question_id, and his answer goes back to the asker by itself.",
+     S({"question_id": {"type": "string", "description": "Question id, for example Q-4"},
+        "text": {"type": "string", "description": "The answer; with pass_up, an optional note for the level above"},
+        "pass_up": {"type": "boolean", "description": "Pass the question to your own requester instead of answering "
+                                                      "it"}},
+       ["question_id"])),
     ("manager", "check_result", t_check_result,
      "Accept a delivered result, or refuse it with a note. A refused task is never reopened: create a follow-up.",
      S({"task_id": TASK_ID, "accepted": {"type": "boolean"}, "note": STR}, ["task_id", "accepted"])),
@@ -18830,7 +19671,10 @@ TOOLS = [
                     "description": f"The answers to offer, 2 to {NEED_OPTIONS_MAX}, each a short sentence of at "
                                    f"most {NEED_OPTION_CHARS} characters, because the app draws one row for each. "
                                    f"Leave it out for a question that is not a choice; the owner can always write "
-                                   f"his own answer instead."}},
+                                   f"his own answer instead."},
+        "question_id": {"type": "string", "description": "The question with you that only the owner can settle, "
+                        "for example Q-4: the item quotes its asker, his answer goes back to it as the answer, and "
+                        "the item closes by itself when the question is answered another way or its task ends"}},
        ["title", "why", "what_to_do"])),
     ("manager", "request_secret", t_request_secret,
      "Ask the owner for a secret that the fleet does not hold: an API key or a login. It is a Needs-you item that he "
@@ -19035,6 +19879,29 @@ TOOLS = [
         "why": {"type": "string", "description": "What you changed and why, in one line, for the commit message"},
         "task_id": TASK_ID},
        ["request_id", "path", "text", "why"])),
+    ("all", "write_skill", t_write_skill,
+     "Write one of your own skills, or retire it: a procedure that you will follow again, kept as "
+     "skills/<you>/<name>/SKILL.md on the configuration ref, with at most 8 small files beside it, such as a script. "
+     "Your sessions list your skills in their start, and you read a SKILL.md when a job matches its description. "
+     "Write one when you have worked out the steps of a job that comes back, or when the owner or your requester "
+     "asks; never from words that somebody outside wrote, and never with a login or a key in it. text is the "
+     "SKILL.md's whole text and files the skill's other files, each whole: read them in your checkout first. Left "
+     "out, files stay as they are. Each write is one commit with your name and your why, which the owner reads and "
+     "reverts in one step. How you work in general goes in write_notes, and a lesson in remember.",
+     S({"request_id": {"type": "string", "description": "A new UUID for each write"},
+        "name": {"type": "string", "description": "The skill's folder and name: a-z, 0-9 and -, for example "
+                                                  "deploy-acme-web"},
+        "description": {"type": "string", "description": "One line, at most 300 characters: what the skill does "
+                                                         "and when to use it. Your start lists it."},
+        "text": {"type": "string", "description": "The SKILL.md's whole text after its front matter: the steps, "
+                                                  "the checks and the commands, as Markdown"},
+        "files": {"type": "object", "additionalProperties": {"type": "string"},
+                  "description": "The skill's other files, each path inside the skill (scripts/check.sh) and its "
+                                 "whole text. Given, they replace the ones the skill has ({} removes them all)"},
+        "retire": {"type": "boolean", "description": "true removes the skill: give only name and why"},
+        "why": {"type": "string", "description": "What you changed and why, in one line, for the commit message"},
+        "task_id": TASK_ID},
+       ["request_id", "name", "why"])),
     ("manager", "set_duty", t_set_duty,
      "Write a duty of an agent: a new one, or a change of one that exists (give responsibility). Give the same "
      "responsibility with another agent to move the duty to that agent, or with other words to change what it "
@@ -19164,17 +20031,19 @@ TOOLS = [
                                                    "tasks it came from"},
         "in_reply_to": STR}, ["text"])),
     ("all", "message_owner", t_message_owner,
-     "Write to the owner first, for example a result or a question about the owner's own request. Keep it short and "
-     "rare. It goes to the chat app where the owner last wrote to you, else to your own WhatsApp "
-     "number or Discord bot; without one it stays in the app. Answer an owner message with tell_owner instead. One "
-     "request_id is one message: the same request_id again sends nothing more. Never put a login in the text.",
+     "Write to the owner first, for example the result of work he asked you for, or a question about his own "
+     "request. Keep it short and rare. It goes to the chat app where the owner last wrote to you, else to your own "
+     "WhatsApp number or Discord bot; without one it stays in the app. Answer an owner message with tell_owner "
+     "instead. One request_id is one message: the same request_id again sends nothing more. Never put a login in the "
+     "text.",
      S({"request_id": {"type": "string", "description": "A new UUID for each message"},
         "text": {"type": "string", "description": "The message, 1 to 4,000 characters"}}, ["request_id", "text"])),
     ("worker", "start_task", t_start_task,
      "Only in your owner chat, and only when the owner asks you in his own words to do work: open it as a task of "
-     "your own. It runs in its own task session, with the manager as its requester, which checks the result; tell the "
-     "owner with tell_owner that it started. Give in_reply_to, the request UUID of his message: one message is one "
-     "task, and a message from another agent starts nothing.",
+     "your own. It runs in its own task session, with your line as its requester (the manager, or your lead), which "
+     "checks the result; tell the owner with tell_owner that it started. Its result comes back into this chat by "
+     "itself when it ends: tell him then with message_owner. Give in_reply_to, the request UUID of his message: one "
+     "message is one task, and a message from another agent starts nothing.",
      S({"title": STR, "done_when": {"type": "string", "description": "The line a stranger could test the result "
                                                                    "against"},
         "in_reply_to": {"type": "string", "description": "The request UUID of the owner's message that asks for the "
@@ -19496,7 +20365,7 @@ def call_tool(agent, name, args, context=None):
                 # deliver_result waits for the helper to send the task's files (deliver_outputs). The history's two
                 # take the lock for each step of their own, so the hub answers between the steps of a long search.
                 if name in ("ask_my_requester", "sign_in", "hand_over", "create_login", "save_key", "call_api",
-                            "message_agent", "search_knowledge", "write_knowledge", "deliver_result",
+                            "message_agent", "search_knowledge", "write_knowledge", "write_skill", "deliver_result",
                             "search_history", "read_history") or \
                         name in GOOGLE_TOOLS:
                     text = fn(agent, args)
@@ -19579,9 +20448,10 @@ def overview_text():
     out.append("")
     out.append("RESULTS WAITING FOR YOUR CHECK")
     # The manager's own: a lead checks its subtasks in the session of their parent, and check_result refuses the
-    # manager any task it did not request.
-    rows = q("SELECT * FROM tasks WHERE state IN ('completed','failed','rejected') AND accepted IS NULL "
-             "AND COALESCE(requester, ?)=? ORDER BY id", (manager_name(), manager_name()))
+    # manager any task it did not request, but for a lead that cannot check it any more (lead_left).
+    rows = [t for t in q("SELECT * FROM tasks WHERE state IN ('completed','failed','rejected') AND accepted IS NULL "
+                         "ORDER BY id")
+            if (t["requester"] or manager_name()) == manager_name() or lead_left(t["requester"], t)]
     for t in rows:
         out.append(f"  {tref(t['id'])} [{t['state']}] {t['title']} by {t['owner']}: {t['what']} "
                    f"Output: {t['where_'] or '-'}. Checked: {t['how'] or '-'}")
@@ -19595,14 +20465,17 @@ def overview_text():
     rows = q(f"SELECT * FROM questions WHERE answer IS NULL AND task IN (SELECT id FROM tasks WHERE {OPEN_TASK}) "
              f"ORDER BY id")
     for r in rows:
+        holder = r["requester"]
         out.append(f"  Q-{r['id']} from {r['asker']} on {tref(r['task'])}, waiting {ago(r['asked'])}"
-                   + (f", asked of {r['requester']}, which answers it"
-                      if r["requester"] not in (None, manager_name()) else "")
+                   + (f", passed up by {', '.join(question_passers(r))}" if question_passers(r) else "")
+                   + (f", with {holder}, which cannot act on it any more: you answer it"
+                      if holder not in (None, manager_name()) and lead_left(holder, get_task(r["task"])) else
+                      f", asked of {holder}, which answers it" if holder not in (None, manager_name()) else "")
                    + f": {r['text']}" +
                    (f" NOT WAITING: it goes on with \"{r['assumed']}\". Answer only if that is wrong."
                     if r["assumed"] else "") +
-                   (f" {access_route(r['asker'], r['access'], r['requester'], r['access_level'])}"
-                    if r["access"] else ""))
+                   (" " + access_route(r["asker"], r["access"], holder, r["access_level"],
+                                       restarter(get_task(r["task"]))) if r["access"] else ""))
     if not rows:
         out.append("  none")
     out.append("")
@@ -19611,7 +20484,10 @@ def overview_text():
              "ORDER BY p.id")
     for r in rows:
         out.append(f"  P-{r['id']} from {r['agent']} on {tref(r['task'])}"
-                   + (f", for {r['requester']} to decide" if r["requester"] not in (None, manager_name()) else "")
+                   + ((f", for {r['requester']} to decide" if not r["task"] or
+                       not lead_left(r["requester"], get_task(r["task"])) else
+                       f", for {r['requester']}, which cannot decide it any more: you decide it")
+                      if r["requester"] not in (None, manager_name()) else "")
                    + f": {r['tool']}: {r['input']}")
     if not rows:
         out.append("  none")
@@ -19626,7 +20502,8 @@ def overview_text():
     rows = q("SELECT * FROM needs ORDER BY id")
     for r in rows:
         state = f'answered: "{r["answer"]}"' if r["answer"] is not None else "open"
-        out.append(f"  N-{r['id']} {r['title']} -- {state}")
+        out.append(f"  N-{r['id']} {r['title']}" + (f" (for Q-{r['question']})" if r["question"] else "") +
+                   f" -- {state}")
     if not rows:
         out.append("  none")
     rows = q("SELECT key, COUNT(*) c FROM outbox GROUP BY key ORDER BY key")
@@ -22046,10 +22923,26 @@ def waits_on_parts(task_id):
 
     A subtask that is input-required waits on the lead itself -- its question or its permission prompt is the lead's
     to answer -- and nothing measures that subtask's silence. So then the lead's own silence counts again, or a lead
-    that never answers would reach nobody above it."""
-    parts = q(f"SELECT id, state FROM tasks WHERE parent=? AND {OPEN_TASK}", (task_id,))
+    that never answers would reach nobody above it. Two things changed that with pass_up (the owner, 28 October 2026):
+    a subtask that waits on a question its lead passed up waits on the line above, so for its lead it is work in
+    progress; and a question that a lead under this one passed up to it waits on this lead, however far down."""
+    parts = q(f"SELECT id, state, waiting_on FROM tasks WHERE parent=? AND {OPEN_TASK}", (task_id,))
+    if not parts:
+        return False
+    t = q1("SELECT owner FROM tasks WHERE id=?", (task_id,))
+    lead = t["owner"] if t else None
+    if any(r["requester"] == lead and r["assumed"] is None for r in questions_under(lead, task_id)):
+        return False
     # a subtask that waits on the owner's secret waits on him, not on its lead (secret_requests)
-    return bool(parts) and all(p["state"] != "input-required" or secret_wait(p["id"]) for p in parts)
+    return all(p["state"] != "input-required" or passed_above(p, lead) or secret_wait(p["id"]) for p in parts)
+
+
+def passed_above(p, lead):
+    """True when subtask row `p` waits on a question that `lead`, its lead, passed up (answer pass_up), which another
+    level holds now: then it waits on the line above and not on the lead."""
+    m = re.fullmatch(r"Q-(\d+)", p["waiting_on"] or "")
+    qu = read_row("SELECT * FROM questions WHERE id=?", (int(m.group(1)),)) if m else None
+    return bool(qu) and qu["answer"] is None and qu["requester"] != lead and lead in question_passers(qu)
 
 
 def unfile_notices(task_id):
@@ -22389,7 +23282,9 @@ def manager_flag_update(t0):
             kind = "limited"
             flag = (f"The manager reached its usage limit. Its messages wait until {clock(lim['until'])}"
                     + ("." if lim["reset_known"] else ", one hour after the limit was seen, because no reset time was given.")
-                    + " If its session shows the rate-limit menu, answer it on that machine. The helper never answers it.")
+                    # runtime gaps C1: a helper with stuck_screens starts a session that still shows the menu again
+                    + ("" if STUCK_SCREENS in helper_features(mgr) else " If its session shows the rate-limit menu, "
+                       "answer it on that machine. The helper never answers it."))
         asks, shown = kv_get("mgr_screen"), kv_get("mgr_screen_shown")
         if shown or asks:           # it stays until the question goes or the manager reads (plan C10: no 90 s life)
             kind = "screen"
@@ -22480,6 +23375,7 @@ def tick():
             goal_sweep(t0)
             duty_sweep(t0)              # owner API 1.13: the duties that are not in order
             circle_sweep(t0)            # what looks like running in circles
+            lead_unread_sweep(t0)       # what a lead left unread, to the manager before the owner's screen
             allowance_sweep(t0)         # the manager's own allowance, while it can still act on it
             integrity_check(t0)
             expire_handovers(t0)
@@ -25278,10 +26174,10 @@ def rename_rows(old, new, t0):
 
 def rename_agent(agent, body):
     """POST /ui/team/agents/<agent>/rename: the agent's new name, everywhere. One commit moves its team.json entry,
-    every reference to it and its profile; one transaction moves every record of it; and its server's service gets
-    the job to move its checkout and its service to the new name, under the OS user it already has, so it keeps its
-    runtime and its sign-in. Not the manager, and not while the agent has an open task: a task session carries the
-    name it started with."""
+    every reference to it, its profile and its skills; one transaction moves every record of it; and its server's
+    service gets the job to move its checkout and its service to the new name, under the OS user it already has, so it
+    keeps its runtime and its sign-in. Not the manager, and not while the agent has an open task: a task session
+    carries the name it started with."""
     new, t0 = body["name"], now()
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
@@ -25327,6 +26223,11 @@ def rename_agent(agent, body):
     data = (json.dumps(renamed, indent=2) + "\n").encode()
     more = None if profile is None else {f"profiles/{agent}.md": None,
                                          f"profiles/{new}.md": renamed_profile(profile, agent, new)}
+    # its skills move with it, byte for byte (design v4 D1): skills/<agent>/ is its own folder, as its profile is
+    code, out, _ = git_kit("ls-tree", "-r", "-z", "--name-only", rev, "--", f"{SKILLS}/{agent}/")
+    for path in (p for p in out.split("\0") if p.startswith(f"{SKILLS}/{agent}/")) if code == 0 else ():
+        more = dict(more or {}, **{path: None, f"{SKILLS}/{new}/" + path[len(f"{SKILLS}/{agent}/"):]:
+                                   git_blob(rev, path)})
     commit = commit_kit_file("team.json", data, f"Owner renamed agent {agent} to {new}", more=more)
     manager = next(n for n, x in renamed["agents"].items() if x.get("role") == "manager")
     with transaction():
@@ -27082,7 +27983,7 @@ def health_view():
     if wedged:
         warn("tasks_stuck",
              f"{len(wedged)} open task(s) are stuck and nothing is moving them. Their requester was told about each, "
-             f"had a turn since and did not read it: "
+             f"had a turn since and did not read it (for a lead's, {manager_name().capitalize()} too): "
              + " | ".join(line for _, line in wedged[:2])
              + (f" | and {len(wedged) - 2} more." if len(wedged) > 2 else ""),
              f"Open {manager_name().capitalize()} and tell it what to do about them: wait, cancel each and give the "
@@ -27681,7 +28582,8 @@ def running_turns(owner=None, t0=None):
     online and its session is open or starting now, and the turn state of its current attempt (plan C1) says that a
     turn runs, or says nothing yet: a session's first turn, or a runtime that reports no turns. Where the hub has no
     window list of the helper, an open task counts unless its turn state says it is between turns. An offline helper's
-    sessions do not reach the hub, so a restart cuts nothing of theirs, and they never keep a release waiting."""
+    sessions do not reach the hub, so a restart cuts nothing of theirs, and they never keep a release waiting, and
+    neither does a session that stands at a question on its own screen with nothing moving (screen_stuck)."""
     t0 = t0 or now()
     rows = q(f"SELECT id, owner, attempt, state, source_conversation, source_message FROM tasks WHERE {OPEN_TASK}" +
              (" AND owner=?" if owner else "") + " ORDER BY id", (owner,) if owner else ())
@@ -27695,6 +28597,8 @@ def running_turns(owner=None, t0=None):
         online, row, step = helpers[t["owner"]]
         if not online:
             continue
+        if screen_stuck(t):
+            continue                        # runtime gaps C1: it stands at a question on its screen, and runs nothing
         state = turn_state(t["id"], t["attempt"])
         if state is None and is_conversation_task(t) and not conversation_signalled(t):
             continue                        # its signal waits in the hub: nothing runs it, however long that is
@@ -30279,6 +31183,33 @@ class Handler(BaseHTTPRequestHandler):
             result = dict(notes_view(agent), db=generation)
         return self.json(200, scrub(result), {"Cache-Control": "no-store"})
 
+    def ui_skills(self, query):
+        """GET /ui/skills (design v4 D7): every agent's own skills at the hub's revision, or one agent's (agent=<name>),
+        each with its newest commit. The agents write them; no screen shows them, and the admin MCP reads them."""
+        if not self.ui_allowed():
+            return
+        generation = kv_get("db_id")
+        if query.get("db") != generation:
+            return self.json(409, {"error": "hub generation changed; refresh state"})
+        agent = query.get("agent") or None
+        if agent is not None and agent not in agents():
+            return self.json(404, {"error": "no such agent"})
+        result = {"db": generation, "agent": agent, "skills": skills_view(agent)}
+        return self.json(200, scrub(result), {"Cache-Control": "no-store"})
+
+    def ui_skill_remove(self):
+        """POST /ui/skills/remove (design v4 D7): the owner removes one agent's skill, its whole folder, in one commit
+        of his own. It needs no base: what it removes is named, and a skill that is gone already is a 404."""
+        def read(data):
+            self.only(data, ("agent", "name"))
+            agent, name = data.get("agent"), data.get("name")
+            if not isinstance(agent, str) or not AGENT_NAME.match(agent):
+                raise ValueError("agent must be an agent name")
+            if not isinstance(name, str) or not re.fullmatch(SKILL_NAME, name):
+                raise ValueError("name must be a skill's name: a-z, 0-9 and -, with a letter or a digit first")
+            return {"agent": agent, "name": name}
+        return self.ui_command("skills/remove", read, lambda body: skill_remove(body["agent"], body["name"]))
+
     def ui_memory(self, agent, query):
         """GET /ui/memory/<agent> (owner feature agent_memory): one agent's lessons that stand, each with the hub's
         own evidence. The agent writes these, not the owner, so there is no owner write; a read changes nothing."""
@@ -31917,6 +32848,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_notes(parts[2], query)
         if len(parts) == 3 and parts[:2] == ["ui", "memory"] and AGENT_NAME.match(parts[2]):
             return self.ui_memory(parts[2], query)
+        if parts == ["ui", "skills"]:               # design v4 D7
+            return self.ui_skills(query)
         if parts == ["ui", "history"]:              # AUTONOMY.md P6
             return self.ui_history(query)
         if parts == ["ui", "costs"]:                # AUTONOMY.md P8
@@ -32167,11 +33100,13 @@ class Handler(BaseHTTPRequestHandler):
                         if not h or h["state"] != "requested" or h["kind"] != extra.get("action"):
                             continue
                     if r["kind"] == "chat" and (r["read_at"] is not None
-                                                if extra.get("agent_message") or extra.get("need") else q1(
+                                                if extra.get("agent_message") or extra.get("need") or
+                                                extra.get("task_result") else q1(
                         "SELECT r.id FROM owner_reports r JOIN ui_requests u ON r.in_reply_to=u.request_id "
                         "WHERE u.event_id=? AND r.agent=?", (r["id"], agent))):
-                        continue        # an owner chat comes until its reply; an agent's message, and his answer to
-                                        # a secret request of the chat (owner_message_rows), until it is read
+                        continue        # an owner chat comes until its reply; an agent's message, his answer to
+                                        # a secret request of the chat (owner_message_rows), and the result of a task
+                                        # that the chat opened (chat_result), until it is read
                     if r["kind"] == "task" and (not t or t["state"] in TERMINAL or extra.get("attempt",1) != t["attempt"]):
                         continue
                     if r["kind"] == "say" and worker and (not t or t["state"] in TERMINAL):
@@ -32459,6 +33394,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_profile_save(parts[2])
         if parts == ["ui", "knowledge"]:
             return self.ui_knowledge_change()
+        if parts == ["ui", "skills", "remove"]:     # design v4 D7
+            return self.ui_skill_remove()
         if len(parts) == 4 and parts[:2] == ["helper", "login"]:        # owner feature machine_signin
             return self.machine_login(parts[2], parts[3], post=True)
         if len(parts) == 4 and parts[:2] == ["ui", "machines"] and parts[3] == "signin":
@@ -32618,8 +33555,13 @@ class Handler(BaseHTTPRequestHandler):
                     conversation_answer(row, answer, now())
                 log("owner", f"answered N-{nid} in C-{row['conversation']}")
             elif row and answer and row["answer"] is None:
-                q("UPDATE needs SET answer=?, answered=?, chosen=? WHERE id=?", (answer, now(), chosen, nid))
-                emit(row["by"], "say", f"[owner] Answer to Needs-you N-{nid} ({row['title']}): {answer}")
+                t0 = now()
+                with transaction():         # and a question that the item took to him gets his words (A2)
+                    DB.execute("UPDATE needs SET answer=?, answered=?, chosen=? WHERE id=?", (answer, t0, chosen, nid))
+                    asker = need_question_rows(row, answer, t0)
+                    event_rows([(row["by"], "say", None, f"[owner] Answer to Needs-you N-{nid} ({row['title']}): "
+                                 f"{answer}" + (f" The hub gave it to {asker} as the answer to Q-{row['question']}: do "
+                                                f"not pass it on again." if asker else ""), None)], t0)
                 log("owner", f"answered N-{nid}")
             return self.back()
         if parts == ["outbox"]:
@@ -32771,14 +33713,24 @@ class Handler(BaseHTTPRequestHandler):
         """The helper found a question on a session's own screen and did not type over it. kind (plan C2, the screen
         watch): "shown" when it appeared, "gone" when it went, each told once; none is a helper without the watch,
         which tells only when a message waits to be typed, and again each minute for the manager. "frozen" and
-        "moving" are the same watch's running screen that stopped moving, and its moving again."""
+        "moving" are the same watch's running screen that stopped moving, and its moving again.
+
+        Runtime gaps C1, from a helper with stuck_screens: "limit" is the runtime's usage-limit menu, which the hold
+        of the limit covers, and "closed" the manager's session that its helper closed for a question on its screen.
+        attempt is the attempt of the task window that the helper read, so a late word of an earlier window changes
+        nothing, and still says with "shown" that nothing moved since the question showed (screen_attempt)."""
         if agent not in agents():
             return self.json(404, {"error": "unknown agent"})
         if not self.allowed(agent):
             return
-        kind = self.form().get("kind") if self.body() else None
-        if kind not in (None, "shown", "gone", "untaken", "start_failed", "frozen", "moving"):
-            return self.json(400, {"error": "kind is shown, gone, untaken, start_failed, frozen or moving"})
+        body = self.form() if self.body() else {}
+        kind, seen, still = body.get("kind"), body.get("attempt"), body.get("still")
+        if kind not in (None, "shown", "gone", "untaken", "start_failed", "frozen", "moving", "limit", "closed"):
+            return self.json(400, {"error": "kind is shown, gone, untaken, start_failed, frozen, moving, limit or "
+                                            "closed"})
+        if seen is not None and (isinstance(seen, bool) or not isinstance(seen, int) or seen < 1) or \
+                still is not None and not isinstance(still, bool):
+            return self.json(400, {"error": "attempt is a whole number of 1 or more, and still is true or false"})
         if kind == "start_failed":
             # plan C6: why the start of a task's session failed, once for each distinct reason: kept for the loss
             # that it causes, and told to the requester once
@@ -32813,7 +33765,19 @@ class Handler(BaseHTTPRequestHandler):
                 manager_flag_update(now())
             elif kind is None:
                 kv_set("mgr_screen", now())         # the timers turn this into a banner and a notification
+            elif kind == "closed":
+                # runtime gaps C1: its helper closed its session at a question on its screen, which no person reads,
+                # and starts it again on the same conversation: once until that session makes a model call. Its
+                # question reached nobody, and the next session hears it here; the owner's flag has nothing to show.
+                kv_set("mgr_screen_shown", None)
+                kv_set("mgr_screen", None)
+                emit(agent, "say", "[hub] Your session showed a question on its own screen, and no person reads that "
+                     "screen: your question reached nobody. Its helper closed that session and started it again on "
+                     "the same conversation. Decide it yourself, or ask the owner with raise_needs_you.")
+                log("hub", "the manager's session started again: it stood at a question on its screen")
+                manager_flag_update(now())
             else:       # the watch says when it goes, so the banner stays until then and not for 90 seconds
+                # (runtime gaps C1: a usage-limit menu is the limit's own, and its flag says so)
                 kv_set("mgr_screen_shown", now() if kind == "shown" else None)
                 if kind == "gone":
                     kv_set("mgr_screen", None)
@@ -32824,6 +33788,10 @@ class Handler(BaseHTTPRequestHandler):
         except ToolError:
             return self.json(200, {})
         t = q1("SELECT * FROM tasks WHERE id=?", (tid,))
+        if t and seen is not None and seen != t["attempt"]:
+            return self.json(200, {})       # runtime gaps C1: a late word of an earlier attempt's window
+        if kind == "closed":
+            return self.json(200, {})       # a word about the manager's session only
         if kind == "frozen":
             # plan C2: its runtime may have stopped in the middle of a turn. The requester is told once, and the task
             # waits on its screen until it moves again; nothing is ended
@@ -32837,6 +33805,9 @@ class Handler(BaseHTTPRequestHandler):
                 log("hub", f"{tref(tid)} on {agent}: its running screen stopped moving")
             return self.json(200, {})
         if kind in ("gone", "moving"):
+            if kind == "gone":      # runtime gaps C1: no question and no usage-limit menu on its screen now
+                kv_set(f"screen_question:{tid}", None)
+                kv_set(f"screen_limit:{tid}", None)
             if kind == "moving":
                 if not kv_get(f"screen_frozen:{tid}"):
                     return self.json(200, {})
@@ -32855,6 +33826,18 @@ class Handler(BaseHTTPRequestHandler):
                 if kind == "gone":
                     log("hub", f"{tref(tid)} on {agent}: the question on its screen went")
             return self.json(200, {})
+        if kind == "limit":
+            # runtime gaps C1: its runtime's usage-limit menu, which the helper never answers. The hold covers it, and
+            # its reset starts the task in a new attempt instead of a line that could not be typed (resume_held); a
+            # word that comes after the reset starts that attempt now.
+            with LOCK:
+                if t and t["owner"] == agent and t["state"] not in TERMINAL:
+                    kv_set(f"screen_limit:{tid}", t["attempt"])
+                    if limit_menu_reset(t) and not fresh_refusal(t, t["attempt"]):
+                        new_attempt(t, LIMIT_RESET, limit_reset_text(t))
+                        log("hub", f"{tref(tid)} on {agent} starts again: its screen showed the usage-limit menu after "
+                                   f"the reset")
+            return self.json(200, {})
         carried = q1("SELECT id FROM prompts WHERE task=? AND decision IS NULL AND kind<>'code'", (tid,))
         if carried and PROMPT_POLLS in helper_features(agent):
             # plan C7: this helper tells a question only when no permission hook of the task runs, so this one is
@@ -32865,12 +33848,17 @@ class Handler(BaseHTTPRequestHandler):
             log("hub", f"P-{carried['id']} of {tref(tid)} moved to {agent}'s screen")
         elif q1("SELECT id FROM prompts WHERE task=? AND decision IS NULL", (tid,)):
             return self.json(200, {})       # that question is a permission prompt the hub is already carrying
-        if t and t["state"] not in TERMINAL and t["waiting_on"] != "its screen":
-            q("UPDATE tasks SET waiting_on='its screen' WHERE id=?", (tid,))
-            emit(t["requester"], "say",
-                 f"[hub] {agent}'s session for {tref(tid)} shows a question on its own screen that the hub cannot answer. "
-                 f"Someone must look at that machine: raise a Needs-you item, or cancel the task.", task=tid)
-            log("hub", f"{tref(tid)} on {agent} is stuck at a question on its screen")
+        if not t or t["state"] in TERMINAL:
+            return self.json(200, {})
+        if kind != "shown" or still is None or t["owner"] != agent or STUCK_SCREENS not in helper_features(agent):
+            screen_told(t, agent, " that the hub cannot answer")        # a helper without stuck_screens, as before
+            return self.json(200, {})
+        with LOCK:
+            # runtime gaps C1: kept for running_turns; a session that still moves is decided when it stands still
+            kv_set(f"screen_question:{tid}", json.dumps({"attempt": t["attempt"], "at": now(), "still": still}))
+            why = screen_attempt(q1("SELECT * FROM tasks WHERE id=?", (tid,)), agent) if still else None
+            if why:
+                screen_told(t, agent, why)
         self.json(200, {})
 
     def helper_key(self, agent):
@@ -33948,7 +34936,8 @@ def rpc(agent, m, headers, context=None, credential=None):
                                        "to an agent with message_agent and its AM id in in_reply_to. Discussion only; "
                                        "no task execution here: when the owner asks you in his own words to do work, "
                                        "open it with start_task and the request UUID of his message, and it runs in "
-                                       "its own task session. A key or a login that he wants you to use and the "
+                                       "its own task session; its result comes back here by itself, and you tell "
+                                       "him with message_owner. A key or a login that he wants you to use and the "
                                        "fleet does not hold: ask him with request_secret, in reply to his message, "
                                        "never in words."
                                        if chat_context(agent, context) else

@@ -64,7 +64,8 @@ from threads import MARKER, THREAD_ID, CodexFiles, Tailer, Translator, complete_
 from usage import Collector, local_model, timestamp
 from lifecycle import (GITHUB_TOKEN, MCP_PROGRAM, REPO_ACCESS, REPO_NAME, RUNTIMES, TOOL_CATALOG, Lifecycle,
                        Updating, app_server_task, exe, facts_now, follow_config_ref, mcp_variable, no_sign_in,
-                       reuse_settings, runtime_fact, runtimes_with, session_reuse, tool_catalog, tool_needs)
+                       reuse_settings, runtime_fact, runtimes_with, session_reuse, skills_text, tool_catalog,
+                       tool_needs)
 from desktop import Publisher
 
 KIT = os.path.dirname(os.path.abspath(__file__))
@@ -328,6 +329,19 @@ CODEX_APPROVE = "-c " + shlex.quote('mcp_servers.fleet.default_tools_approval_mo
 # Codex's terminal UI shows an update menu at its start when a newer version exists, and an unattended session would
 # wait there for ever. Codex updates stay the owner's; Fleet's sessions do not ask (Codex 0.160: a top-level option).
 CODEX_NO_UPDATE_CHECK = ["-c", "check_for_update_on_startup=false"]
+# AUTONOMY.md decision 41 (the owner, 28 October 2026: "when AskUserQuestion from an agent, it should be its boss who
+# gets the question!"): no person reads a Fleet session's screen. Codex 0.163 offers request_user_input and its async
+# form by default, and their question reaches nobody; this option takes both away, in the terminal and in the
+# app-server (screen_runner.py), and a question goes up with ask_my_requester.
+CODEX_NO_ASKING = ["-c", "tools.experimental_request_user_input.enabled=false"]
+# And in every terminal session (a task, an owner chat, the manager), the same decision: the rate-limit model nudge and
+# the model-migration notice, which wait at the start for a choice, stay hidden; and no skill is listed to the model,
+# bundled ones included, and none is written to $CODEX_HOME/skills/.system, so only the fleet's own words name one
+# (a SKILL.md stays readable by its path). Only as -c: Codex 0.163 warns about a key it does not know and starts,
+# where --enable, --disable or --strict-config with an unknown name stops it.
+CODEX_UNATTENDED = CODEX_NO_ASKING + ["-c", "notice.hide_rate_limit_model_nudge=true",
+                                      "-c", "notice.hide_gpt5_1_migration_prompt=true",
+                                      "-c", "skills.include_instructions=false", "-c", "skills.bundled.enabled=false"]
 
 
 def in_checkout(command):
@@ -500,6 +514,18 @@ def screen_class(screen):
     return "idle" if IDLE_PROMPT.search(tail) else "unknown"
 
 
+def screen_report(kind, attempt=None, still=None):
+    """The body of one report of the screen watch (hub Handler.helper_dialog). Runtime gaps C1 (helper feature
+    stuck_screens): the attempt of the task window that it read, and with a question whether its session stood still
+    since the question showed: no record, and no running turn on its screen."""
+    body = {"kind": kind}
+    if attempt is not None:
+        body["attempt"] = attempt
+    if still is not None:
+        body["still"] = still
+    return body
+
+
 def shows_question(screen):
     tail = "\n".join(screen.rstrip().split("\n")[-15:])
     if FOOTER.search(tail) or PANEL.search(tail.split("\n")[-1]) or (TRUST_NO.search(tail) and TRUST_YES.search(tail)):
@@ -507,10 +533,11 @@ def shows_question(screen):
     return bool((PICKED.search(tail) or YES_FIRST.search(tail)) and len(CHOICE.findall(tail)) >= 2)
 
 
-def type_into(session, name, text):
+def type_into(session, name, text, asks=True):
     """Type one line into a session. Returns "typed"; "asks" when the session shows a question of its own
     (a stray key there could answer it); "reading" when someone is scrolled back in its window (keys would
-    not reach the session); or "gone" when the session is not there."""
+    not reach the session); or "gone" when the session is not there. asks=False for a runner's window, which prints
+    its agent's own words and never asks on its screen, so a "1. Yes" there is no question (runtime gaps review)."""
     target = f"{session}:={name}"
     r = tmux("display-message", "-p", "-t", target, "#{pane_in_mode}")
     if r.returncode != 0:
@@ -520,7 +547,7 @@ def type_into(session, name, text):
     r = tmux("capture-pane", "-p", "-t", target)
     if r.returncode != 0:
         return "gone"
-    if shows_question(r.stdout):
+    if asks and shows_question(r.stdout):
         return "asks"
     line = " ".join(CONTROL.sub(" ", text).split())
     if line.endswith(";"):
@@ -529,7 +556,7 @@ def type_into(session, name, text):
         if keys == ("Enter",):
             time.sleep(0.6)     # let the session take the text in before the Enter
             r = tmux("capture-pane", "-p", "-t", target)
-            if r.returncode == 0 and shows_question(r.stdout):
+            if asks and r.returncode == 0 and shows_question(r.stdout):
                 return "asks"   # a question opened since: an Enter would answer it (plan C5)
         r = tmux("send-keys", "-t", target, *keys)
         if r.returncode != 0:
@@ -564,27 +591,38 @@ PROTECTED = ("fleet.py", "lifecycle.py", "onboard.py", "vault.py", "acp_runner.p
 def settings_arg(agent, conf, task, tools=(), needs="none"):
     """Claude Code settings for one session: what runs without asking, what never runs, and the two hooks
     that carry a worker's permission prompts and activity to the hub. The owner's full-access manager has no
-    Fleet-added deny rule that limits a command or a file, only UNSEEN_TOOLS, and starts with the recorded unattended
-    permission-mode choice. tools: the catalog tools
+    Fleet-added deny rule that limits a command or a file, only UNSEEN_TOOLS and its runtime's manager_denied, and
+    starts with the recorded unattended permission-mode choice. tools: the catalog tools
     of this task session, which the owner gave the agent; they run without asking (owner feature integrations).
     needs: a browser task also runs Chrome's tools without asking. They come with {chrome} (--chrome), and a
     full-access worker starts in dontAsk, which refuses every tool that its allow list does not name."""
-    if not runtime_fact(conf.get("runtime"), "session_settings"):
+    runtime = conf.get("runtime")
+    if not runtime_fact(runtime, "session_settings"):
         return ""
     if conf.get("role") == "manager":
-        settings = {"skipDangerousModePermissionPrompt": True, "permissions": {"allow": [], "deny": list(UNSEEN_TOOLS)}}
+        # AUTONOMY.md decision 41: every built-in tool but the ones that ask a person on its screen, where nobody
+        # reads them; the manager's questions go to the owner with raise_needs_you
+        deny = UNSEEN_TOOLS + (runtime_fact(runtime, "manager_denied") or [])
+        settings = {"skipDangerousModePermissionPrompt": True, "permissions": {"allow": [], "deny": deny}}
     else:
         deny = DENY + [f"Edit(/{KIT}/{name})" for name in PROTECTED]
-        if task and task != "conversation":
-            # AUTONOMY.md decision 36 (helper feature task_denied): a task session, a duty's case and a wake included,
-            # has every built-in tool but the ones that the owner took away. The owner chat, the manager and a
-            # conversation window keep their own.
-            deny += runtime_fact(conf.get("runtime"), "task_denied") or []
         allow = conf.get("allow", ["mcp__fleet__*"]) + [f"mcp__{t}__*" for t in tools]
+        if task and task != "conversation":
+            # AUTONOMY.md decisions 36 and 41 (helper features task_denied and workflow_tasks): a task session, a
+            # duty's case and a wake included, has every built-in tool but the ones that the owner took away, and
+            # runs Workflow without asking. The owner chat has no built-in tool, and the manager has its own list.
+            deny += runtime_fact(runtime, "task_denied") or []
+            allow += [name for name in runtime_fact(runtime, "task_allowed") or [] if name not in allow]
+        elif task == "conversation":
+            # a conversation with the agent's own tools: a task session's list, and Workflow, which is task work
+            deny += runtime_fact(runtime, "conversation_denied") or []
         if needs == "browser" and CHROME_TOOLS not in allow:
             allow.append(CHROME_TOOLS)
         settings = {"permissions": {"allow": allow, "deny": deny}}
     settings["prefersReducedMotion"] = False        # the screen watch reads its counters (MOTION)
+    # AUTONOMY.md decision 41: what an agent learns is the fleet's (its notes and its memory, which the owner reads),
+    # never a memory folder of Claude Code's own that a later session would load unseen
+    settings["autoMemoryEnabled"] = False
     if conf.get("role") in ("worker", "lead") and task:
         # Command hooks, because Claude Code will not send an HTTP hook to a private address.
         hook = f"{shlex.quote(sys.executable)} {shlex.quote(os.path.join(KIT, 'fleet.py'))} hook"
@@ -807,12 +845,14 @@ STABLE_WHERE = {"read": ("The task is the first answer of read_messages.",
 CODEX_RULES_BYTES = 32 * 1024   # Codex's own default project_doc_max_bytes, which a longer AGENTS.md would be cut at
 
 
-def stable_text(agent, opening, parts, head=None):
+def stable_text(agent, opening, parts, head=None, skills=True):
     """The stable start of a session of `agent` whose runtime reads its rules by `opening` (plan P9.2), or None when
     this checkout cannot give it: a file is missing, or for a session that reads RULES.md as its folder's AGENTS.md,
     that AGENTS.md is not RULES.md byte for byte (a checkout of the code repository, whose AGENTS.md is the
     developers'). head: what comes first, a task session's line by default, the owner chat's instructions, or ""
-    for the standing manager session, whose first prompt says who it is. The same files give the same bytes."""
+    for the standing manager session, whose first prompt says who it is. The same files give the same bytes.
+    skills: the list of the agent's own skills comes last (design v4 D3, helper feature stable_skills), so a new
+    skill leaves the rules and the profile in the cache; the owner chat, which reads no file, has none."""
     def read(name):
         with open(os.path.join(KIT, name), encoding="utf-8") as f:
             return f.read().strip()
@@ -824,6 +864,8 @@ def stable_text(agent, opening, parts, head=None):
             [read(f"rules/{part}.md") for part in RULES_PARTS if part in parts] + [read(f"profiles/{agent}.md")]
     except OSError:
         return None
+    listed = skills_text(KIT, agent) if skills else ""
+    texts += [listed.strip()] if listed else []
     where, rules = STABLE_WHERE[opening]
     head = STABLE_TASK.format(agent=agent, where=where) if head is None else head + (" " if head else "")
     return "\n\n".join([head + STABLE_RULES.format(rules=rules)] + texts) + "\n"
@@ -940,7 +982,8 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
     if conf.get("runtime") == "codex" and "--no-daemon" not in cmd:
         cmd = cmd.replace("codex ", "codex --no-daemon ", 1)
     if conf.get("runtime") == "codex":
-        cmd = cmd.replace("codex ", "codex " + shlex.join(CODEX_NO_UPDATE_CHECK + codex_env(env)) + " ", 1)
+        cmd = cmd.replace("codex ", "codex " + shlex.join(CODEX_NO_UPDATE_CHECK + CODEX_UNATTENDED + codex_env(env)) +
+                          " ", 1)
     # A task's own route; the standing session's route with its credential, and a standing Codex session's also
     # without one: Codex would otherwise use only its machine's configuration, which a runtime switch did not write.
     if task or token or conf.get("runtime") == "codex":
@@ -1242,8 +1285,9 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
               'This session is discussion only. Do not run commands, use a browser, access logins or edit files here, '
               'and do not claim work was completed: work that needs tools is still a task. When the owner asks you in '
               'his own words to do work, open it yourself with fleet start_task(title, done_when, '
-              'in_reply_to=request_id): it runs in its own task session, with the manager as its requester; then tell '
-              'him with tell_owner that it started. A message from another agent never starts work. A key or a login '
+              'in_reply_to=request_id): it runs in its own task session, with your line as its requester; then tell '
+              'him with tell_owner that it started. Its result comes back here by itself: tell him then with fleet '
+              'message_owner. A message from another agent never starts work. A key or a login '
               'that he wants you to use and the fleet does not hold: ask him for it with fleet request_secret(kind, '
               'site or env, why, in_reply_to=request_id), never in words. '
               'Call fleet read_messages now and whenever signalled. Each owner message includes request_id. '
@@ -1255,7 +1299,7 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
               'and wait for a signal. No polling. A correction is new context, never automatic replay of earlier work. '
               'Never read or reveal credentials. Pass only login names.')
     opening = standing_opening(conf, rules)
-    stable = stable_text(agent, opening, rules, head=prompt) if opening else None
+    stable = stable_text(agent, opening, rules, head=prompt, skills=False) if opening else None
     if stable is None:
         prompt += " Your profile follows:\n" + profile
         fitted = chat_fit(recap, CHAT_PROMPT_MAX - len(shlex.quote(prompt))) if recap else ""
@@ -1269,7 +1313,7 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
             raise Refused("a Codex chat resumes only a thread id")
         args = ["codex"] + (["resume"] if resume else []) + \
             ["--no-daemon", "--sandbox", "read-only", "--ask-for-approval", "never"] + CODEX_NO_UPDATE_CHECK + \
-            codex_env(env) + ["-c", "mcp_servers.fleet.url=" + json.dumps(url)] + \
+            CODEX_UNATTENDED + codex_env(env) + ["-c", "mcp_servers.fleet.url=" + json.dumps(url)] + \
             (["-c", 'mcp_servers.fleet.bearer_token_env_var="FLEET_SESSION_TOKEN"'] if token else []) + \
             ["-c", "features.multi_agent=false", "-c", 'web_search="disabled"'] + shlex.split(model_flags(conf)) + \
             (["-c", f"project_doc_max_bytes={codex_rules_limit()}"] if stable is not None else []) + \
@@ -1278,7 +1322,9 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
     elif conf.get("runtime") == "claude":
         if resume is not None and not THREAD_ID.fullmatch(str(resume)):
             raise Refused("a Claude chat resumes only a session id")
-        settings = {"permissions": {"allow": [f"mcp__fleet__{t}" for t in CHAT_TOOLS], "deny": DENY}}
+        # no memory folder of Claude Code's own either (AUTONOMY.md decision 41, settings_arg)
+        settings = {"autoMemoryEnabled": False,
+                    "permissions": {"allow": [f"mcp__fleet__{t}" for t in CHAT_TOOLS], "deny": DENY}}
         args = ["claude"] + (["--resume", resume] if resume else ["--session-id", marker] if marker else []) + \
             ["--permission-mode", "dontAsk", "--tools", "", "--strict-mcp-config",
              "--mcp-config", mcp_config_file(agent, "owner-chat", url, token) if token else
@@ -2012,20 +2058,26 @@ def limit_menu(runtime, path):
     """True when a session's conversation file ends with its usage limit: the question that its screen shows then is
     the runtime's usage-limit menu. The helper never answers that menu (one of its choices buys extra usage), but a
     switch may close the session without an answer: nothing is chosen, and the conversation stays."""
+    return limit_record(runtime, path) is not None
+
+
+def limit_record(runtime, path):
+    """The usage-limit record that a session's conversation file ends with, or None (limit_menu); its resets_at is the
+    provider's reset, when it gave one."""
     if not path or runtime not in MANAGER_RUNTIMES:
-        return False
+        return None
     try:
         with open(path, "rb") as stream:
             stream.seek(max(0, os.path.getsize(path) - 256 * 1024))
             rows = complete_rows(stream.read())
     except OSError:
-        return False
+        return None
     translator, last = Translator(runtime), None
     for row in rows:
         for record in translator.records(row):
             if record.get("type") not in ("session", "model", "result"):
                 last = record           # the last thing that the session did
-    return bool(last and last.get("type") == "error" and last.get("code") == "usage_limit")
+    return last if last and last.get("type") == "error" and last.get("code") == "usage_limit" else None
 
 
 HANDOVER_MAX = 256      # message ids in one runtime's list of a hand-over: the hub takes no more (hub.HANDOVER_MAX)
@@ -2592,7 +2644,6 @@ class Helper:
         self.fresh_at = None            # when this helper last started one so (restart_fresh)
         self.compact_restarted = False  # the session without STANDING_COMPACT was closed once (restart_fresh)
         self.manager_pending = None     # (session id, note) of a start whose tmux reading failed (start_manager)
-        self.manager_asked = None       # when this helper last told the hub of a question on its screen
         # {pid: args} of its processes that did not end when it closed, also from before a restart of this helper
         self.manager_left = load_closing(agent) if conf.get("role") == "manager" else {}
         self.manager_left_start = closing_start(agent) if self.manager_left else True     # due when they have ended
@@ -2626,6 +2677,9 @@ class Helper:
         self.screens = {}               # {window: {"last", "class", "told"}} of the screen watch (watch_screens)
         self.model_list = None          # the latest good reading of the runtime's model list (runs)
         self.last_class = {}            # {window: the class its screen had when it went}
+        # runtime gaps C1, C2: {window: when this helper closed it at a question that nobody reads} (stuck_allowed), and
+        # the hub's end of the manager's usage limit, from its answer to the limit's report (report_limit)
+        self.stuck_closed, self.manager_limit_until = {}, None
         if self.worker:
             self.tailer = Tailer(conf.get("runtime", ""), self.task_windows,
                                  lambda batch: http("POST", f"/helper/events/{agent}", batch, timeout=15), kit=KIT,
@@ -2652,16 +2706,34 @@ class Helper:
         when it shows and not only when a message must be typed, and the manager's banner goes when the question does.
         The first agreed reading of a window says its state either way, so a hub that holds a question from before
         this helper started hears that it went. A running screen that stopped moving is told the same way: "frozen"
-        once, and "moving" once when it changes again."""
-        live = [w for w in windows(self.session) if w != "home"]
+        once, and "moving" once when it changes again.
+
+        Runtime gaps C1 and C2 (helper feature stuck_screens): nobody sits at these screens. A task window's report
+        names its attempt, and with a question whether the session stood still since the question showed (no record
+        and no running turn on its screen), on which the hub starts the task once more; its runtime's usage-limit menu
+        is told as "limit", which the hold covers. The manager's session and an owner chat or a conversation window
+        that stand still at a question close once instead (stuck_manager, close_stuck), and a window of the same name
+        that replaces a closed one starts with a watch of its own."""
+        r = tmux("list-windows", "-t", self.session, "-F", "#{window_name}\t#{window_id}\t#{@fleet_attempt}")
+        live = {name: (wid, attempt) for name, wid, attempt in
+                ((line.split("\t") + ["", ""])[:3] for line in (r.stdout.split("\n") if r.returncode == 0 else []))
+                if name and name != "home"}
         for window in [w for w in self.screens if w not in live]:
             self.last_class[window] = self.screens.pop(window).get("class")     # for report_start
-        for window in live:
+        for window, (wid, attempt) in live.items():
             r = tmux("capture-pane", "-p", "-t", f"{self.session}:={window}")
             if r.returncode != 0:
                 continue
-            seen = self.screens.setdefault(window, {"last": None, "class": None, "told": None})
+            seen = self.screens.get(window)
+            if seen is None or seen.get("wid") != wid:
+                seen = self.screens[window] = {"last": None, "class": None, "told": None, "wid": wid}
+            number = attempt.rpartition(":")[2]
+            attempt = int(number) if re.fullmatch(r"T-\d+", window) and re.fullmatch(r"[1-9]\d{0,8}", number) else None
             reading = screen_class(r.stdout)
+            if reading == "question" and window not in STANDING_WINDOWS and self.runner(f"{self.session}:={window}"):
+                # The review of 29 October 2026: a runner prints its agent's own words as they come, and nothing in it
+                # asks on its screen, so a "1. Yes" or an "Esc to cancel" there is no question
+                reading = "unknown"
             # "frozen" (plan C2): the same running screen as the reading kept in `still`, FROZEN_GAP seconds or more
             # after it, with its counter and no new record, on a runtime whose counter was read live
             # (lifecycle.RUNTIMES "screen_counter"). A change of screen or of records starts the comparison again.
@@ -2673,6 +2745,13 @@ class Helper:
                     reading = "frozen"
             else:
                 seen["still"] = (r.stdout, at, records)
+            # Runtime gaps C1: a question stands still from its first reading while no record comes, and a record
+            # starts that again. A screen's class is a guess (screen_class), so no window closes on one while its
+            # records move or its screen shows a running turn.
+            quiet = reading == "question" and seen["last"] == "question" and seen.get("asked") == (records,) and \
+                not WORKING.search(tail)
+            if reading != "question" or seen["last"] != "question" or seen.get("asked") != (records,):
+                seen["asked"] = (records,) if reading == "question" else None
             agreed, seen["last"] = reading == seen["last"], reading
             if not agreed:
                 seen["idle_run"] = 0
@@ -2682,41 +2761,182 @@ class Helper:
             if reading == "idle":
                 self.idle_at[window] = time.monotonic()
             if window != "manager" and not re.fullmatch(r"T-\d+", window):
+                if quiet and (window == "owner-chat" or CONVERSATION_WINDOW.fullmatch(window)) and \
+                        seen.get("closing") != (records,):
+                    seen["closing"] = (records,)        # one try while nothing moves
+                    self.close_stuck(window)            # runtime gaps C2
                 continue
             if seen.get("frozen") != (reading == "frozen"):
                 # told once when it stops moving, and once when it moves again (Handler.helper_dialog); the first
                 # agreed reading says it either way, so a mark from before this helper started clears
                 try:
                     code, _ = http("POST", f"/helper/dialog/{self.agent}/{window}",
-                                   {"kind": "frozen" if reading == "frozen" else "moving"}, timeout=10)
+                                   screen_report("frozen" if reading == "frozen" else "moving", attempt), timeout=10)
                 except (urllib.error.URLError, OSError, ValueError):
                     code = None         # told at the next round
                 if code in (200, 400):  # 400: a hub without these kinds, which is not asked again
                     seen["frozen"] = reading == "frozen"
-            kind = "shown" if reading == "question" else "gone"
-            if seen["told"] == kind:
+            menu = None
+            if reading == "question":       # runtime gaps C1: read again only when its records changed
+                if seen.get("menu_at") != (records,):
+                    seen["menu"], seen["menu_at"] = self.window_limit(window), (records,)
+                menu = seen["menu"]
+            kind = "gone" if reading != "question" else "limit" if menu else "shown"
+            if window == "manager" and kind != "gone":
+                if self.manager_seen_old is not None and self.manager_seen_old[2] is not None:
+                    continue            # the previous runtime's session, which its switch closes at a question too
+                if kind == "limit" and self.limit_over(menu):
+                    kind = "shown"          # its limit is over: the menu is a question that nobody answers now
+                if kind == "shown" and not quiet:
+                    continue                # told when it stands still, unless it is closed then: no flag before it
+                if kind == "shown" and seen.get("closing") != (records,):
+                    seen["closing"] = (records,)        # one try while nothing moves
+                    if self.stuck_manager():
+                        if not menu:        # its question reached nobody, which the hub tells its next session
+                            with contextlib.suppress(urllib.error.URLError, OSError, ValueError):
+                                http("POST", f"/helper/dialog/{self.agent}/manager", screen_report("closed"),
+                                     timeout=10)
+                        continue
+            told = "shown still" if kind == "shown" and quiet else kind
+            if seen["told"] == told:
                 continue
             if kind == "shown" and window != "manager" and hook_waits(self.agent, window):
                 continue                # plan C7: the hub carries this question as a permission prompt
             try:
-                code, _ = http("POST", f"/helper/dialog/{self.agent}/{window}", {"kind": kind}, timeout=10)
+                code, _ = http("POST", f"/helper/dialog/{self.agent}/{window}",
+                               screen_report(kind, attempt, quiet if kind == "shown" else None), timeout=10)
+                if code == 400 and kind == "limit":     # a hub before runtime gaps C1: a question, as before
+                    code, _ = http("POST", f"/helper/dialog/{self.agent}/{window}",
+                                   screen_report("shown", attempt, quiet), timeout=10)
             except (urllib.error.URLError, OSError, ValueError):
                 continue                # told at the next round
             if code == 200:
-                seen["told"] = kind
+                seen["told"] = told
 
     def records_at(self, window):
         """When a record file of this window's sessions last changed, or None when it has none yet: a screen that does
-        not change is frozen only when its session wrote nothing between the two readings (watch_screens)."""
-        tailer = getattr(self, "tailer", None)
-        if not tailer:
-            return None
-        with tailer.lock:
-            paths = [f.path for f in tailer.feeds.values() if f.name == window and f.path]
+        not change is frozen only when its session wrote nothing between the two readings (watch_screens), and a
+        question stands still only while its session writes nothing (runtime gaps C1, C2)."""
         try:
-            return max((os.path.getmtime(p) for p in paths), default=None)
+            return max((os.path.getmtime(p) for p in self.record_files(window)), default=None)
         except OSError:
             return None
+
+    def record_files(self, window):
+        """The record files of a window's sessions: the record reader's (a task, a tools-on conversation and the
+        manager), else for runtime gaps C2 an owner chat's recorded conversation and a closed conversation's own
+        transcripts, which its folder's Claude project holds and no other session writes there."""
+        tailer = getattr(self, "tailer", None)
+        if tailer:
+            with tailer.lock:
+                paths = [f.path for f in tailer.feeds.values() if f.name == window and f.path]
+            if paths:
+                return paths
+        runtime = self.conf.get("runtime")
+        if window == "owner-chat" and runtime in MANAGER_RUNTIMES:
+            try:
+                session = (load_chat_record(self.agent, runtime) or {}).get("session")
+            except Refused:
+                return []
+            if runtime == "claude":
+                return [p for p in [claude_chat_file(session)] if p]
+            return codex_threads(session) if THREAD_ID.fullmatch(str(session or "")) else []
+        if CONVERSATION_WINDOW.fullmatch(window):
+            root = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+            folder = os.path.join(root, "projects", re.sub(r"[^A-Za-z0-9-]", "-",
+                                                           os.path.realpath(os.path.join(CHATS, window[2:]))))
+            return [p for p in glob.glob(os.path.join(folder, "*.jsonl")) if not os.path.islink(p)]
+        return []
+
+    def last_call(self, window):
+        """When a session of this window last made a model call, by its record files (claude_context, codex_context),
+        or None when none shows one."""
+        calls = []
+        for path in self.record_files(window):
+            seen = (codex_context if os.path.basename(path).startswith("rollout-") else claude_context)(path)
+            if seen:
+                calls.append(seen[2])
+        return max(calls, default=None)
+
+    def window_limit(self, window):
+        """The usage-limit record that the newest record file of this window ends with (limit_record), or None: the
+        question on its screen is then its runtime's usage-limit menu (runtime gaps C1)."""
+        try:
+            paths = sorted(self.record_files(window), key=os.path.getmtime)
+        except OSError:
+            return None
+        return limit_record(self.conf.get("runtime"), paths[-1]) if paths else None
+
+    def limit_over(self, menu):
+        """True when the usage limit behind the manager's menu is over (runtime gaps C1): by the provider's reset in its
+        record, else by the end of the hub's hold, from its answer to the limit's report (report_limit)."""
+        reset = menu.get("resets_at") or self.manager_limit_until
+        return isinstance(reset, (int, float)) and time.time() >= reset
+
+    def background_open(self, window):
+        """True while a session of this window has background work open by its own records: an async subagent or
+        workflow, a background command or a monitor (threads.Translator pending, shells and background). Their records
+        are their own, and the session's main record file stands still meanwhile, so a screen that reads as a question
+        then is no stuck session (the review of 29 October 2026). A window that no feed reads counts as having none:
+        the owner chat, and a closed conversation, whose tools are Fleet's only."""
+        tailer = getattr(self, "tailer", None)
+        if not tailer:
+            return False
+        with tailer.lock:
+            translators = [f.translator for f in tailer.feeds.values() if f.name == window]
+        # A Codex subagent is a spawn call with its thread that is still open (threads.Translator.codex_activity)
+        return any(t.pending or t.shells or t.background or
+                   any(thread and call in t.open for call, thread in t.agents.items()) for t in translators)
+
+    def stuck_allowed(self, window):
+        """Runtime gaps C1, C2: a standing window that this helper closed at a question closes so again only after a
+        session of it made a model call since (last_call): a question that each new session shows at its start, before
+        its first call, is closed one time and then left, for the manager's flag."""
+        closed = self.stuck_closed.get(window)
+        return closed is None or (self.last_call(window) or 0) > closed
+
+    def stuck_manager(self):
+        """Runtime gaps C1 for the standing manager session, whose screen stood still at a question since it showed:
+        nobody sits at that screen, so its helper closes it, and its watch starts it again on the same conversation
+        (manage). One time for each started session until it made a model call (stuck_allowed), the bound that
+        restart_fresh keeps too. Not while a workflow or a background command of it runs (background_open), nor while
+        a start or a runtime switch replaces that session anyway. True when it closed it."""
+        if self.conf.get("role") != "manager" or not self.stuck_allowed("manager") or self.background_open("manager"):
+            return False
+        if self.manager_due or self.manager_left or self.manager_retiring is not None or self.outdated() or \
+                self.window_runtime("manager") != self.conf.get("runtime"):
+            return False
+        with contextlib.suppress(subprocess.CalledProcessError, Refused):
+            tmux("kill-window", "-t", f"{self.session}:=manager")
+        self.stuck_closed["manager"], self.manager_due = time.time(), True
+        self.say("manager: its session stood at a question on its screen, which nobody reads, so it starts again on "
+                 "the same conversation")
+        return True
+
+    def close_stuck(self, window):
+        """Runtime gaps C2: an owner chat or a conversation window whose screen stood still at a question since it
+        showed. Nobody sits there, no line can be typed while it shows, and the hub has no turn state of these windows,
+        so the chat would stay deaf for good and two such conversation windows would take every slot of the agent
+        (CONVERSATION_WINDOWS). It closes one time, and not again until a session of it made a model call
+        (stuck_allowed). The owner chat starts again with the hub's recap (keep_chat, start_chat), and the person's
+        next message starts a conversation window whose prompt carries it. True when it closed the window."""
+        if not self.stuck_allowed(window) or self.background_open(window):
+            return False
+        if window == "owner-chat" and (self.retired_left or self.window_runtime(window) != self.conf.get("runtime")):
+            return False                # the previous runtime's chat closes the switch's way (retire_old_chat)
+        if window != "owner-chat" and self.conversation_kind(window) == "tools" and \
+                hook_waits(self.agent, "conversation"):
+            return False                # plan C7: the hub carries this question as a permission prompt
+        with contextlib.suppress(subprocess.CalledProcessError, Refused):
+            tmux("kill-window", "-t", f"{self.session}:={window}")
+        self.stuck_closed[window] = time.time()
+        if window == "owner-chat":      # a new conversation with the hub's recap, and no start that ended
+            self.chat_fresh, self.chat_started = True, None
+        else:
+            self.conversation_seen.pop(window, None)
+        self.say(f"{window}: it stood at a question on its screen, which nobody reads, so it is closed; it starts "
+                 f"again with the hub's recap")
+        return True
 
     def presence(self):
         """The presence thread: a ping while the main loop is inside a step, with the window list when tmux answers.
@@ -3069,14 +3289,18 @@ class Helper:
         text = (CONVERSATION_SIGNAL if CONVERSATION_WINDOW.fullmatch(window) else
                 f'New fleet messages. Call read_messages(task_id="{window}") now.'
                 if self.worker and window != "owner-chat" else CHAT_SIGNAL)
-        got = type_into(self.session, window, text)
+        # A runner's window prints its agent's own words and never asks, so its line is typed whatever it shows
+        if re.fullmatch(r"T-\d+", window) and self.runner(target):
+            got = type_into(self.session, window, text, asks=False)
+        else:
+            got = type_into(self.session, window, text)
         self.signalled[window] = time.monotonic()
         if got == "typed":
             self.typed_at[window] = time.monotonic()
             self.lines[window] = {"wid": wid, "ids": ids, "at": time.monotonic(), "retold": line is not None,
                                   "reported": False}
-        if got == "asks" and window != "owner-chat" and not CONVERSATION_WINDOW.fullmatch(window):
-            http("POST", f"/helper/dialog/{self.agent}/{window}", {})
+        # "asks": its screen shows a question, which the screen watch tells (watch_screens). Until runtime gaps C1 this
+        # told it too, before the watch could say whether the session stood still or showed its usage-limit menu.
         self.say(f"{window}: inbox signal {got}{' again' if line else ''}; only read_messages acknowledges delivery")
 
     def turn_runs(self, window, target):
@@ -3620,8 +3844,8 @@ class Helper:
         if self.manager_due or self.manager_left or self.manager_retiring is not None or self.outdated():
             return                      # a start or a switch is already going to give it the current list
         target = f"{self.session}:=manager"
-        if self.window_runtime("manager") is None or self.working(target):
-            return                      # nothing to close, or a turn runs: at the next round
+        if self.window_runtime("manager") is None or self.working(target) or self.background_open("manager"):
+            return                      # nothing to close, a turn runs, or a workflow or a command: at a later round
         with contextlib.suppress(subprocess.CalledProcessError, Refused):
             tmux("kill-window", "-t", target)
         self.lifecycle.tools_changed = False
@@ -3657,8 +3881,9 @@ class Helper:
         r = tmux("display-message", "-p", "-t", target, "#{@fleet_session}\t#{@fleet_account}\t#{pane_start_command}")
         screen = tmux("capture-pane", "-p", "-t", target)
         if r.returncode != 0 or screen.returncode != 0 or shows_question(screen.stdout) or \
-                WORKING.search("\n".join(screen.stdout.rstrip().split("\n")[-15:])):
-            return False                # unknown, a question waits on its screen, or a turn runs: not now
+                WORKING.search("\n".join(screen.stdout.rstrip().split("\n")[-15:])) or self.background_open(window):
+            return False                # unknown, a question waits on its screen, a turn runs, or background work
+                                        # (a workflow or a command, whose records are their own): not now
         session, account, start = (r.stdout.rstrip("\n").split("\t", 2) + ["", "", ""])[:3]
         if window == "manager" and runtime == "claude" and start.strip() and \
                 "CLAUDE_CODE_AUTO_COMPACT_WINDOW=" not in start and not self.compact_restarted:
@@ -3772,8 +3997,8 @@ class Helper:
         grown past its start or on another runtime, model, effort or account. The message stays unread, so the next poll
         starts a new window, whose first read is the hub's brief with its recap (conversation_brief). A closed
         conversation keeps its own rule (retire_conversations)."""
-        if self.conversation_kind(window) != "tools":
-            return False
+        if self.conversation_kind(window) != "tools" or self.background_open(window):
+            return False        # its background command or async agent would stop with it (runtime gaps review)
         decided = self.window_reuse(target, window)
         if decided is None or decided[0]:
             return False
@@ -4003,10 +4228,11 @@ class Helper:
         for r in batch["events"]:
             if r["type"] == "error" and r.get("code") == "usage_limit" and r.get("ts") and \
                     (r.get("resets_at") or time.time() - r["ts"] < 900):
-                code, _ = http("POST", f"/helper/limit/{self.agent}",      # the hub holds only its runtime's limit
-                               {"resets_at": r.get("resets_at"), "runtime": self.conf.get("runtime")}, timeout=10)
+                code, held = http("POST", f"/helper/limit/{self.agent}",   # the hub holds only its runtime's limit
+                                  {"resets_at": r.get("resets_at"), "runtime": self.conf.get("runtime")}, timeout=10)
                 if code != 200:
                     return code, {}
+                self.manager_limit_until = held.get("until") if isinstance(held, dict) else None   # limit_over
                 self.say(f"manager: usage limit reported to the hub, reset {r.get('resets_at')}")
         turn = {"session": batch.get("session"), "running": self.manager_turn.get("session") == batch.get("session")
                 and self.manager_turn.get("running", False)}
@@ -4372,8 +4598,9 @@ class Helper:
         runs the previous runtime, as retire_old_chat closes a chat. The start lock is held from the first reading of
         that session until every process of it has ended, so that no start runs meanwhile. It closes only when its
         conversation and record stay for a switch back (manager_keeps), after two readings at least RETIRE_QUIET
-        seconds apart with no running turn, no question on its screen, the same screen and the same conversation file
-        time; a question counts as answered when it is the runtime's usage-limit menu (limit_menu). True once this
+        seconds apart with no running turn, the same screen and the same conversation file time. A question on its
+        screen, its runtime's usage-limit menu (limit_menu) included, closes with it unanswered: nobody sits at that
+        screen, and the switch waited for a person until the second review of 29 October 2026. True once this
         helper closed it and its processes have ended: then the new runtime's session is due. The session's processes
         are kept in a file from just before the close until they have ended (save_closing), so that this holds across
         a restart of the helper. When the owner closes that session by hand meanwhile, the switch goes on in the same
@@ -4480,15 +4707,13 @@ class Helper:
         screen = tmux("capture-pane", "-p", "-t", target)
         asks = screen.returncode == 0 and shows_question(screen.stdout)
         if asks and limit_menu(old, keeps):     # its runtime's usage-limit menu: the close answers nothing in it
-            asks = False
             self.say_manager(f"manager: the session of the previous runtime ({old}) waits in its usage-limit menu; it "
                              f"closes without an answer there, so that no choice of that menu is made")
-        if screen.returncode != 0 or WORKING.search("\n".join(screen.stdout.rstrip().split("\n")[-15:])) or asks:
+        elif asks:      # the second review of 29 October 2026: nobody sits at that screen, and a close answers nothing
+            self.say_manager(f"manager: the session of the previous runtime ({old}) shows a question on its screen, "
+                             f"which nobody reads; it closes without an answer when it stays quiet")
+        if screen.returncode != 0 or WORKING.search("\n".join(screen.stdout.rstrip().split("\n")[-15:])):
             self.manager_retiring = None
-            if asks:
-                self.say_manager(f"manager: the session of the previous runtime ({old}) shows a question on its "
-                                 f"screen; it closes when the question is answered")
-                self.report_question()
             return False
         try:
             mark = (screen.stdout, os.path.getmtime(keeps) if keeps else None)
@@ -4525,16 +4750,6 @@ class Helper:
             self.lifecycle.report()     # still pending: the hub keeps the manager's messages until they end
             return False
         return self.release_manager(True)
-
-    def report_question(self):
-        """Tell the hub that the manager session's screen shows a question (Handler.helper_dialog), which the owner
-        then sees. During a switch no inbox signal reaches that session to find it. Again each minute while it stays,
-        because the hub shows it for 90 seconds."""
-        if self.manager_asked is not None and time.monotonic() - self.manager_asked < 60:
-            return
-        self.manager_asked = time.monotonic()
-        with contextlib.suppress(urllib.error.URLError, OSError, ValueError):
-            http("POST", f"/helper/dialog/{self.agent}/manager", {}, timeout=10)
 
     def manager_gone(self):
         """True when no standing manager window is there and nothing is closing or starting one, so its start is due
@@ -4670,7 +4885,7 @@ class Helper:
         """A conversation that waits for a window takes the slot of the least recently used open one that runs no
         turn and has nothing unread (plan C5), instead of waiting for a clock to close it. True when one closed."""
         quiet = [w for w in self.look() if CONVERSATION_WINDOW.fullmatch(w) and w != wanted and w not in self.newest
-                 and (self.screens.get(w) or {}).get("class") == "idle"]
+                 and (self.screens.get(w) or {}).get("class") == "idle" and not self.background_open(w)]
         if not quiet:
             return False
         window = min(quiet, key=lambda w: max(self.conversation_seen.get(w, 0), self.signalled.get(w, 0)))
@@ -4951,25 +5166,35 @@ class Helper:
         return True, ended if isinstance(ended, int) and not isinstance(ended, bool) and ended > 0 else 0
 
     def control(self, task, extra):
-        """Pause: interrupt and keep the session. Stop: interrupt, then close it. The hub works out unknown outcomes."""
+        """Pause: interrupt and keep the session. Stop: interrupt, then close it. The hub works out unknown outcomes.
+
+        A stop closes the session also when no interrupt confirms, and the closing confirms it (the second review of
+        29 October 2026): a Claude session at a card of its own shows no running turn to interrupt, and its records
+        still show the turn, so a requester's restart_task stopped nothing, and the task stayed held. The requester
+        decided the stop, and the hub keeps the outcome of each call of the turn unknown until it is settled."""
         ran, stop = task in self.look(), extra.get("action") == "stop"
         generation = str(extra.get("generation") or "")
         proved, requests_ended = self.end_requests(task, extra)    # first: a request of the task must not go on
         before = self.task_work(task, generation, keep_runtime=False)    # all of the task, before anything closes
         confirmed, detail = self.interrupt(task)
+        forced = stop and not confirmed and task in self.look()
+        if forced:
+            confirmed = True
         flushed = self.tailer.flush(task)       # every record before the result, while the window still exists
         if flushed is None:
             raise Refused("the session records could not be sent to the hub")
         ended = 0
-        # A stopped turn is not enough: a command that it started can still run (Codex background sessions).
-        if confirmed and task in self.look():
+        # A stopped turn is not enough: a command that it started can still run (Codex background sessions). A stop
+        # with no confirmed interrupt ends them with the session, after the close.
+        if confirmed and task in self.look() and not forced:
             confirmed, ended, left = self.quiesce(task, generation, keep_runtime=True)
             detail = detail if confirmed else f"processes of the task still run: {left}"
         if confirmed and stop and task in self.look():
             tmux("kill-window", "-t", f"{self.session}:={task}")
             time.sleep(1)
             confirmed = task not in self.look()
-            detail = "interrupted and closed" if confirmed else "the session window did not close"
+            detail = ("the session window did not close" if not confirmed else
+                      f"closed with no confirmed interrupt ({detail})" if forced else "interrupted and closed")
         if confirmed and task not in self.look():       # a closed session leaves nothing of the task behind
             confirmed, more, left = self.quiesce(task, generation, keep_runtime=False, also=before)
             ended += more
