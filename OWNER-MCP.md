@@ -178,7 +178,7 @@ server is not allowed to carry.
 
 1. **Bring a new credential into the fleet.** The subscription token the shop issues for this
    fleet (`POST /ui/releases/entitlement`), the GitHub App's private key, a chat app's bot token,
-   Google's Connect, a vault login (also the one a manager asks for with `request_secret`, whose
+   Google's Connect, a vault login (also the one an agent asks for with `request_secret`, whose
    answer, `POST /ui/needs/<id>/secret`, only the app's secure form gives, once the value is in the
    vault) and the Tailscale auth key itself. Each is the owner's account,
    the owner's money and the owner's liability (RULES.md, "Access that the fleet already holds"),

@@ -4461,6 +4461,9 @@ LEAD_TEAM_TOOLS = ("create_task", "cancel_task", "restart_task", "answer", "chec
 WORKER_OWN_TOOLS = ("set_duty", "change_duty")
 # The one tool that only the owner chat of a worker or a lead has: it opens the work the owner asks for there.
 CHAT_ONLY = ("start_task",)
+# The tools that a worker or a lead has only in its owner chat, where the owner talks to it, and the manager wherever
+# it works: its replies to him, and his secure form for a secret that he wants it to use (secret_requests).
+WORKER_CHAT_ONLY = ("tell_owner", "request_secret")
 
 
 def role_offers(role, r, name):
@@ -6682,9 +6685,9 @@ def need_is_notice(*texts):
 
 # A key, a password or a token is never asked for in words (owner feature secret_requests). The hub masks only the
 # values it already knows, so a key that the owner types into a chat or into the answer of a Needs-you item is in the
-# manager's conversation, its runtime's own transcript and these records before anything can mask it. request_secret
-# asks for one instead: the owner types it into the app's secure form, which writes it into the vault, and the
-# manager gets its name and its reference. An item that sends the owner to an app of his own (Fleet Vault, the
+# agent's conversation, its runtime's own transcript and these records before anything can mask it. request_secret
+# asks for one instead: the owner types it into the app's secure form, which writes it into the vault, and the agent
+# that asked gets its name and its reference. An item that sends the owner to an app of his own (Fleet Vault, the
 # Secrets page) asks for no value in words, and passes.
 ASKS_FOR_SECRET = re.compile(
     r"\b(?:send|paste|share|provide|forward|reply with|answer with|write)\b[^.;:!?\n]{0,40}?"
@@ -6738,23 +6741,26 @@ def t_raise_needs_you(agent, a):
 # ---------------------------------------------------------------- secret requests (owner feature secret_requests)
 # The owner, 22 October 2026: "can we setup a system so that I can enter secrets/api keys in an input to the manager,
 # so he can save them into the fleet?" The manager asks with request_secret, and that is a Needs-you item of its own
-# kind. The app answers it with its secure form: the owner types the value, Fleet Vault on his Mac writes it into the
-# vault, the hub registers its fingerprints and its catalog entry (POST /ui/secrets/add) and the agents he chose
-# (POST /ui/secrets/grant), and only then does the request get its answer (POST /ui/needs/<id>/secret), whose words
-# are the hub's own, read from the catalog: the name, the reference and who holds it. No value passes the manager,
-# its runtime or this file, and an answer in words is refused, so a key cannot reach the chat by that route either.
+# kind; since 28 October 2026 a worker or a lead also asks in its owner chat, in reply to his message ("If I tell the
+# agent that I want to use the ahrefs website, it can ask me for credentials"). The app answers it with its secure
+# form: the owner types the value, Fleet Vault on his Mac writes it into the vault, the hub registers its fingerprints
+# and its catalog entry (POST /ui/secrets/add) and the agents he chose (POST /ui/secrets/grant), and only then does
+# the request get its answer (POST /ui/needs/<id>/secret), whose words are the hub's own, read from the catalog: the
+# name, the reference and who holds it. No value passes the agent that asked, its runtime or this file, and an answer
+# in words is refused, so a key cannot reach the chat by that route either.
 SECRET_REQUESTS_OPEN = 5        # requests of one agent's that may wait for the owner at once: each rings his phone
+SECRET_ASKS_PER_MESSAGE = 5     # a worker's or a lead's requests in reply to one owner message, answered ones too
 SECRET_SITE_MAX = 200
 SECRET_WHY_MAX = 1000
 SECRET_GIVE_MAX = 12
 SECRET_DECLINE_MAX = 300
 SECRET_SITE = re.compile(r"https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?(?:[/?#][^\s]*)?")
 SECRET_TODO = ("Open this request in Founderizer on your Mac and type it into its secure form: it goes straight into "
-               "the vault, and no agent sees it, the manager included. The request takes no answer in words, so a "
-               "key cannot land in a chat by mistake.")
+               "the vault, and no agent sees it. The request takes no answer in words, so a key cannot land in a "
+               "chat by mistake.")
 SECRET_NO_WORDS = ("N-{id} asks for a secret, so it takes no answer in words: a key typed here would be in the "
-                   "manager's conversation before anything could mask it. Answer it in Founderizer on the owner's "
-                   "Mac, whose secure form puts the value into the vault.")
+                   "conversation of the agent that asked before anything could mask it. Answer it in Founderizer on "
+                   "the owner's Mac, whose secure form puts the value into the vault.")
 
 
 def secret_site_host(site):
@@ -6770,7 +6776,29 @@ def secret_asked(spec):
     return f"a login for {secret_site_host(spec['site'])}" if spec.get("site") else "a login"
 
 
+def secret_reply(agent, reply):
+    """The owner message that a worker's or a lead's secret request answers: his newest message to it that its chat
+    read (a ui_requests row of kind message). An agent's message has no such row and cannot be cited, so his own
+    messages limit the requests and the rings: one message of his answers at most SECRET_ASKS_PER_MESSAGE."""
+    try:
+        reply = str(uuid.UUID(str(reply or "")))
+    except ValueError:
+        raise ToolError("in_reply_to is the request_id of the owner's message that you answer: ask him for a secret "
+                        "only in reply to what he wrote.") from None
+    newest = q1("SELECT u.request_id, u.created, u.origin FROM ui_requests u JOIN events e ON e.id=u.event_id "
+                "WHERE u.recipient=? AND u.kind='message' AND u.need_id IS NULL AND e.read_at IS NOT NULL "
+                "ORDER BY e.id DESC LIMIT 1", (agent,))
+    if not newest or newest["request_id"] != reply:
+        raise ToolError("in_reply_to must name the owner's newest message to you: call read_messages first, then "
+                        "reply to his newest message.")
+    return newest
+
+
 def t_request_secret(agent, a):
+    """The manager asks wherever it works. A worker or a lead asks only in its owner chat (tools_for), in reply to his
+    newest message (secret_reply), and proposes only itself: his answer comes back to that chat (owner_message_rows)."""
+    worker = role_of(agent) in ("worker", "lead")
+    reply = secret_reply(agent, a.get("in_reply_to")) if worker else None
     kind = str(a.get("kind") or "api_key").strip()
     if kind not in SECRET_KINDS:
         raise ToolError('kind is "api_key", a key that an agent reads as a variable or that its vault sends with '
@@ -6790,11 +6818,14 @@ def t_request_secret(agent, a):
     if kind == "login" and not site:
         raise ToolError("A login needs site: the address of its sign-in page, with https://, so the owner knows "
                         "which account you mean and the vault knows where to sign in.")
+    if kind == "login" and provider_site(urllib.parse.urlsplit(site).hostname):
+        raise ToolError("Fleet keeps no login of a model provider: " + ", ".join(PROVIDER_SITES) + ". The owner "
+                        "signs in to their own account in their own session, through the provider's own flow.")
     why = str(a.get("why") or "").strip()
     if not why or len(why) > SECRET_WHY_MAX:
         raise ToolError(f"why is what the work needs it for, in 1 to {SECRET_WHY_MAX} characters: the owner reads "
                         f"it before he types the value.")
-    give = a.get("give_to") or {}
+    give = {agent: "use"} if worker else a.get("give_to") or {}
     if not isinstance(give, dict) or len(give) > SECRET_GIVE_MAX:
         raise ToolError(f'give_to maps up to {SECRET_GIVE_MAX} agents to "use" or "read", for example '
                         f'{{"studio": "read"}}.')
@@ -6806,10 +6837,16 @@ def t_request_secret(agent, a):
             raise ToolError(f'{name} gets "use", which lets its vault use the secret for it without it ever seeing '
                             f'it, or for an API key "read", which puts the key into its sessions as the variable.')
     spec = {"kind": kind, **({"env": env} if env else {}), **({"site": site} if site else {}),
-            **({"give": dict(sorted(give.items()))} if give else {})}
+            **({"give": dict(sorted(give.items()))} if give else {}),
+            **({"reply": reply["request_id"]} if worker else {})}      # the owner message it answers
     if kind == "api_key":
         have = next((ref for ref, e in sorted(logins().items())
                      if e.get("kind") == "api_key" and e.get("env") == env), None)
+        if have and worker:
+            mine = any(h["agent"] == agent for h in resource_holders("secret", have))
+            raise ToolError(f"The fleet already holds the API key {env}, as {have}, so there is nothing to type: "
+                            + ("you hold it already." if mine else
+                               f"ask the manager for it with message_agent, naming secret:{have}."))
         if have:
             rid = f"secret:{have}"
             top = (resource_pool().get(rid) or {}).get("max")
@@ -6828,10 +6865,18 @@ def t_request_secret(agent, a):
         if old.get("kind") == kind and old.get("env" if kind == "api_key" else "site") == spec.get(
                 "env" if kind == "api_key" else "site"):
             return (f"N-{r['id']} already asks the owner for {secret_asked(old)}, so nothing was raised again. His "
-                    f"answer arrives as a message in this session.")
+                    f"answer {'comes to this chat' if worker else 'arrives as a message in this session'}.")
     if len(waiting) >= SECRET_REQUESTS_OPEN:
         raise ToolError(f"{len(waiting)} of your secret requests already wait for the owner: "
-                        + ", ".join(f"N-{r['id']}" for r in waiting) + ". Wait for his answers before you ask for more.")
+                        + ", ".join(f"N-{r['id']}" for r in waiting)
+                        + (". Tell him in this chat which one you need first." if worker else
+                           ". Wait for his answers before you ask for more."))
+    # One message of his answers at most five requests, answered and declined ones too: by the message they cite, so
+    # an older message cited while a newer one was unread uses up nothing of the newer one
+    if worker and sum(need_secret(r).get("reply") == reply["request_id"] for r in
+                      q("SELECT * FROM needs WHERE kind='secret' AND by=?", (agent,))) >= SECRET_ASKS_PER_MESSAGE:
+        raise ToolError(f"{SECRET_ASKS_PER_MESSAGE} requests already answer his newest message: tell him what else you "
+                        f"need, and ask for it when he writes again.")
     guard(agent, why, site)
     title = ("Enter the API key " + env) if kind == "api_key" else f"Enter a login for {secret_site_host(site)}"
     with LOCK:                  # lane L2: an id that no removed item had (unused_id)
@@ -6839,6 +6884,14 @@ def t_request_secret(agent, a):
                   (unused_id("needs"), title, why, SECRET_TODO, now(), agent, "secret", json.dumps(spec)))
     emit("owner", "notify", f"Needs you N-{nid}: {title}")
     ping_need(nid)
+    if worker:
+        # A chat app shows no form, so the agent sends him one line there. Under the app's chat the form is right below
+        # its reply, and a sentence about it is one he removes (UI-PATTERNS.md): these words give it none to copy.
+        line = (' He wrote from a chat app, where the form cannot show: send him this line there, "The form is in '
+                'Founderizer on your Mac. Never send it here."' if reply["origin"] else "")
+        return (f"Asked the owner for {secret_asked(spec)} as N-{nid}.{line} His answer comes to this chat as a message "
+                f"that needs no reply. Open the work that needs it with start_task only after his answer: a task "
+                f"session that starts before it does not have it. Never ask him for it in words.")
     return (f"Asked the owner for {secret_asked(spec)} as N-{nid}. He types it into the secure form of N-{nid} in "
             f"Founderizer on his Mac: it goes straight into the vault, and neither you nor any other agent ever sees "
             f"it. His answer arrives as a message in this session with its name, its reference and who holds it, "
@@ -9095,7 +9148,7 @@ def conversation_tools(agent, context=None):
     if not conversation_works(person):
         return CONVERSATION_CLOSED_TOOLS
     return tuple(name for _r, name, _fn, _desc, _schema in TOOLS
-                 if name not in CONVERSATION_ONLY + CHAT_ONLY + CONVERSATION_NOT_WORK + ("tell_owner",)) + \
+                 if name not in CONVERSATION_ONLY + CHAT_ONLY + CONVERSATION_NOT_WORK + WORKER_CHAT_ONLY) + \
         CONVERSATION_WORK_TOOLS
 
 
@@ -18514,6 +18567,24 @@ TOOLS = [
                                    "never sees it) or, for an API key, read (the key is in its sessions as env). "
                                    "The owner can change this before he saves."}},
        ["why"])),
+    # A worker's and a lead's own entry: only in its owner chat (WORKER_CHAT_ONLY), in reply to the owner's message
+    ("worker", "request_secret", t_request_secret,
+     "Ask the owner for a key or a login that he wants you to use and that the fleet does not hold, in reply to his "
+     "newest message to you. He types it into a secure form, so the value goes straight into the vault and never "
+     "passes you, your runtime or a chat: never ask him for one in words. Your request proposes only you as its "
+     "holder, and he chooses in his form. His answer comes to this chat as a message that needs no reply: its name, "
+     "its reference (bws://...) and who holds it, never the value. Open the work that needs it with start_task only "
+     "after his answer: a task session that starts before it does not have it.",
+     S({"kind": {"type": "string", "enum": list(SECRET_KINDS),
+                 "description": "api_key (the default): a key that your vault sends with call_api. login: a user name "
+                                "and a password that your vault signs in with."},
+        "env": {"type": "string", "description": "An API key's variable name, for example STRIPE_SECRET_KEY"},
+        "site": {"type": "string", "description": "The address where it is used, with https://: a login's sign-in "
+                                                  "page (required for a login), or the API that you call with it"},
+        "why": {"type": "string", "description": "What the work needs it for, in a sentence or two: the owner "
+                                                 "reads it before he types the value"},
+        "in_reply_to": {"type": "string", "description": "The request_id of the owner's newest message to you"}},
+       ["why", "in_reply_to"])),
     # owner API 1.13: the standing duties of an agent (RESPONSIBILITIES.md)
     ("all", "see_responsibilities", t_see_responsibilities,
      "See the duties that you hold: their watches, their open cases and what is not in order. A duty stays; it "
@@ -18934,7 +19005,7 @@ TOOLS = [
 # it is responsible for and what it has learned; a duty is still written by the manager (owner API 1.13) and a memory
 # in a task session, never in a chat window.
 CHAT_TOOLS = ("read_messages", "tell_owner", "message_owner", "message_agent", "see_responsibilities", "recall",
-              "start_task")
+              "start_task", "request_secret")
 
 
 def tool_contract(agent, context=None):
@@ -18964,7 +19035,7 @@ def tools_for(agent, context=None):
             role_offers(role, r, name) and
             (name in conversation if conversation is not None else
              name in CHAT_TOOLS if chat else
-             not (role in ("worker", "lead") and name == "tell_owner") and name not in CONVERSATION_ONLY + CHAT_ONLY) and
+             not (role in ("worker", "lead") and name in WORKER_CHAT_ONLY) and name not in CONVERSATION_ONLY + CHAT_ONLY) and
             # AUTONOMY.md P2: message_contact only once contacts.v2 is on
             (name != "message_contact" or contacts_v2()) and
             # create_login and save_key: off until the owner allows the agent
@@ -33570,7 +33641,9 @@ def rpc(agent, m, headers, context=None, credential=None):
                                        "to an agent with message_agent and its AM id in in_reply_to. Discussion only; "
                                        "no task execution here: when the owner asks you in his own words to do work, "
                                        "open it with start_task and the request UUID of his message, and it runs in "
-                                       "its own task session."
+                                       "its own task session. A key or a login that he wants you to use and the "
+                                       "fleet does not hold: ask him with request_secret, in reply to his message, "
+                                       "never in words."
                                        if chat_context(agent, context) else
                                        f"Team tools of Founderizer. You are '{agent}'. Execution work is a task; follow RULES.md.")}
         elif method == "ping":
