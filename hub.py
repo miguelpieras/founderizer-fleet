@@ -2511,6 +2511,9 @@ def live_reason(t, state):
     found = q1("SELECT id FROM prompts WHERE task=? AND decision IS NULL ORDER BY id", (tid,))
     if found:
         return "prompt", f"P-{found['id']}"
+    found = secret_wait(tid)            # owner feature secret_requests: the owner's secret, until it reaches the task
+    if found:
+        return "need", f"N-{found['id']}"
     if waits_on_parts(tid):
         return "parts", "its open subtasks"
     if unread_for(t):
@@ -2687,6 +2690,7 @@ def attempt_rows(t, reason, event, t0, counted=False):
                "kind<>'code'", (t0, PROMPT_REPLACED, t["id"]))
     DB.execute("UPDATE tasks SET state='working', waiting_on=NULL WHERE id=? AND state='input-required' AND "
                "waiting_on LIKE 'P-%'", (t["id"],))
+    secret_rewait(t["id"])          # the owner's secret holds it still (secret_requests)
     event_rows([event], t0)
     waiting_say_rows(t["owner"], t["id"])
     feedback_rows(t["owner"], t0)
@@ -3206,6 +3210,7 @@ def restart_continue(hold_id):
         DB.execute("UPDATE tasks SET restarts=0 WHERE id=?", (tid,))
         if asked:
             DB.execute("UPDATE tasks SET state='working', waiting_on=NULL WHERE id=? AND state='input-required'", (tid,))
+        secret_rewait(tid)          # a restart answers no secret request: the new session waits on it too
         DB.execute("UPDATE restart_holds SET state='done' WHERE hold=?", (hold_id,))
         event_rows([again], t0)
     log("hub", f"restarted {name} for {r['by']} from H-{hold_id}: attempt {t['attempt'] + 1}")
@@ -4874,6 +4879,8 @@ def t_answer(agent, a):
                     "SELECT 1 FROM questions WHERE task=? AND id<>? AND answer IS NULL AND assumed IS NULL LIMIT 1",
                     (t["id"], qid)))):
             q("UPDATE tasks SET state='working', waiting_on=NULL WHERE id=?", (t["id"],))
+            with transaction():
+                secret_rewait(t["id"])      # it still waits on the owner's secret (secret_requests)
         activity(qu["task"])
         # Every answer is a message: no ask waits inside its call any more.
         emit(qu["asker"], "say",
@@ -6900,10 +6907,11 @@ def t_request_secret(agent, a):
             f"never its value. Never ask him for it in words in the meantime.")
 
 
-def secret_answer_text(ref, entry, spec, worker=False):
+def secret_answer_text(ref, entry, spec, worker=False, task=False):
     """The words that answer a secret request, read from the catalog and team.json at the moment of the answer: the
     secret's name, its reference and who holds it. Never a value: the hub has none. A worker's or a lead's answer
-    names no grant tool, which only the manager has, and no delivery notice, which only the manager gets."""
+    names no grant tool, which only the manager has, and no delivery notice, which only the manager gets. task: tasks
+    wait on it, and their wake says when their session can use it (secret_wakes)."""
     api = entry.get("kind") == "api_key"
     name = entry.get("env") or entry.get("title") or ref
     held = resource_holders("secret", ref)
@@ -6913,7 +6921,8 @@ def secret_answer_text(ref, entry, spec, worker=False):
         words.append(f"Its variable is {entry.get('env')}, not {spec['env']}.")
     words.append(("Held now by " + ", ".join(
         f"{h['agent']} ({'reads it as $' + name if h['level'] == 'read' else 'uses it through its vault'})"
-        for h in held) + ": each has it in a task session that starts once the vault of its machine has it.")
+        for h in held) + ("." if task else ": each has it in a task session that starts once the vault of its machine "
+                                           "has it."))
                  if held else "No agent holds it yet.")
     words += delivery_words(ref, [h["agent"] for h in held], told=not worker)
     if not worker:
@@ -6929,7 +6938,7 @@ def answer_secret(body, request_id, client):
     agent that asked, in the hub's words, through the same rows as every owner answer (owner_message_rows)."""
     need = q1("SELECT * FROM needs WHERE id=?", (body["need"],))
     if not need:
-        raise Refusal(404, "owner request does not exist")
+        raise Refusal(404, "owner request does not exist: a request whose task ended is gone with it")
     if need["kind"] != "secret":
         raise Refusal(409, "this owner request asks for no secret: answer it in words (POST /ui/needs/<id>)")
     if need["answer"] is not None:
@@ -6937,6 +6946,9 @@ def answer_secret(body, request_id, client):
     if q1("SELECT 1 FROM ui_requests WHERE request_id=?", (request_id,)):
         raise Refusal(409, "request_id was already used for an owner message; send the answer with a new one")
     spec, ref = need_secret(need), body["login"]
+    # the tasks that wait on it, when a task session asked: his answer goes to them, not to a chat
+    waiters = [t for t in spec.get("tasks") or [] if q1(f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (t,))]
+    gave = False
     if ref is not None:
         entry = logins().get(ref)
         if entry is None:
@@ -6944,16 +6956,170 @@ def answer_secret(body, request_id, client):
         if (entry.get("kind") or "login") != spec.get("kind", "api_key"):
             raise Refusal(409, f"this request asks for {secret_asked(spec)}, and {ref} is "
                                f"{'an API key' if entry.get('kind') == 'api_key' else 'a login'}")
-        text = secret_answer_text(ref, entry, spec, worker=role_of(need["by"]) in ("worker", "lead"))
+        text = secret_answer_text(ref, entry, spec, worker=role_of(need["by"]) in ("worker", "lead"),
+                                  task=bool(spec.get("tasks")))
+        gave = any(h["agent"] == need["by"] for h in resource_holders("secret", ref))
     else:
         text = "Not given" + (f": {body['decline']}" if body["decline"] else ".") + \
             " Do not ask for it in words instead."
     t0 = now()
     with transaction():
-        event_id = owner_message_rows(request_id, "answer", need, text, client, need["by"], None, t0)
-        if ref is not None:
-            DB.execute("UPDATE needs SET secret=? WHERE id=?", (json.dumps(dict(spec, saved=ref)), need["id"]))
+        if spec.get("tasks"):
+            # A save that gives the asker the secret wakes its tasks once their machine's vault has it (secret_wakes):
+            # until then one quiet line, which wakes nobody. A decline, or a save that gives it nothing, goes on now.
+            # the next step of a task that goes on without it, in its own events and never in his bubble
+            note = "" if gave else (" Go on without it, or deliver what you can." if ref is None else
+                                    " He does not give it to you: go on without it, or deliver what you can.")
+            event_id = owner_message_rows(request_id, "answer", need, text, client, need["by"], None, t0,
+                                          task=waiters[0] if waiters else None, quiet=gave or not waiters, note=note)
+            if ref is not None:
+                DB.execute("UPDATE needs SET secret=? WHERE id=?",
+                           (json.dumps(dict(spec, saved=ref, **({} if gave else {"woken": t0}))), need["id"]))
+            if not gave:
+                for tid in waiters[1:]:
+                    event_rows([(need["by"], "say", tid, f"[owner] Answer to Needs-you N-{need['id']} "
+                                                         f"({need['title']}): {text}{note}", {})], t0)
+                for tid in waiters:
+                    secret_wait_moved(tid)
+        else:
+            event_id = owner_message_rows(request_id, "answer", need, text, client, need["by"], None, t0)
+            if ref is not None:
+                DB.execute("UPDATE needs SET secret=? WHERE id=?", (json.dumps(dict(spec, saved=ref)), need["id"]))
+    if gave and spec.get("tasks"):
+        secret_wakes(t0)        # a vault that reads his project, or a delivery that finished before this answer
     return {"need": need["id"], "login": ref, "answer": text, "event_id": event_id}
+
+
+# ---------------------------------------------------------------- a task that waits on the owner's secret
+# The owner, 29 October 2026, of an agent in a task: it "can ask me for a secret directly, waits for my answer" and
+# goes on once its machine's vault has it. A request names the tasks that wait on it in its spec ("tasks"), "woken"
+# marks the wake after his save and "told" the one line about a delivery that has not come. A `use` grant reaches the
+# waiting session itself, because sign_in and call_api read the grant when they are called (login_refusal); only a
+# `read` key waits for a new session. No clock ends a wait: his answer, a delivery or the task's end does.
+SECRET_WAITS = ("n.kind='secret' AND (n.answer IS NULL OR (json_extract(n.secret, '$.saved') IS NOT NULL AND "
+                "json_extract(n.secret, '$.woken') IS NULL))")
+
+
+def secret_wait(task_id):
+    """The first secret request that this task waits on: open, or saved and not yet woken (secret_wakes). It reads
+    with DB.execute only, so it commits nothing inside a caller's transaction."""
+    return DB.execute(f"SELECT n.* FROM needs n, json_each(n.secret, '$.tasks') j WHERE {SECRET_WAITS} AND "
+                      f"j.value=? ORDER BY n.id LIMIT 1", (task_id,)).fetchone()
+
+
+def secret_rewait(task_id):
+    """A task that something else just released (its prompt, its question, a restart) waits on the owner's secret
+    again while one of its requests is waited on. DB.execute only."""
+    w = secret_wait(task_id)
+    if w:
+        DB.execute("UPDATE tasks SET state='input-required', waiting_on=? WHERE id=? AND state='working'",
+                   (f"N-{w['id']}", task_id))
+
+
+def secret_wait_moved(task_id):
+    """After one of this task's secret requests settled: its next request holds it, or, with none left, it goes back to
+    working. Only a task whose waiting_on is a secret request, or NULL or its screen with no open question or prompt,
+    is moved, as t_answer's fallback does, so a Q- or P- wait stays. DB.execute only."""
+    t = DB.execute("SELECT state, waiting_on FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if not t or t["state"] != "input-required":
+        return
+    waits = t["waiting_on"]
+    if waits is not None and waits != "its screen" and not waits.startswith("N-"):
+        return
+    if waits in (None, "its screen") and (
+            DB.execute("SELECT 1 FROM questions WHERE task=? AND answer IS NULL AND assumed IS NULL LIMIT 1",
+                       (task_id,)).fetchone() or
+            DB.execute("SELECT 1 FROM prompts WHERE task=? AND decision IS NULL LIMIT 1", (task_id,)).fetchone()):
+        return
+    nxt = secret_wait(task_id)
+    DB.execute("UPDATE tasks SET state=?, waiting_on=? WHERE id=?",
+               ("input-required" if nxt else "working", f"N-{nxt['id']}" if nxt else None, task_id))
+
+
+def secret_woken_words(r, spec):
+    """What a waiting task reads when the secret that the owner saved for it can reach it now."""
+    ref = spec["saved"]
+    entry, level = logins().get(ref) or {}, secret_grants(r["by"]).get(ref)
+    name = entry.get("env") or entry.get("title") or ref
+    head = f"[hub] N-{r['id']}: the owner saved {'the API key' if entry.get('kind') == 'api_key' else 'the login'} " \
+        f"{name} as {ref}"
+    if not level:
+        return head + ", and he does not give it to you: go on without it, or ask your requester."
+    if level == "read":
+        return head + (f", and your machine's vault has it. A session reads ${name} when it starts, so this one does "
+                       f"not have it: ask your requester with ask_my_requester to start this task again.")
+    if entry.get("kind") == "api_key":
+        return head + (", and your machine's vault has it now: call_api uses it in this session. A session that "
+                       "started without call_api needs a new one: ask your requester with ask_my_requester to start "
+                       "this task again.")
+    return head + ", and your machine's vault has it now: sign_in uses it in this session."
+
+
+def secret_wakes(t0=None):
+    """Wake the tasks of each saved request whose secret can reach them now, decided by the asker's vault in team.json
+    now: "file" reads his project, and so does a broker with no store of the fleet's own, so at once; a broker with the
+    fleet's own store when its machine's newest delivery of the secret is done, while one that waits, or a central
+    one that is tried again, keeps the wait; a delivery that failed for good, none on its way, or no vault at all
+    (his grant can give one) is told once, and the task keeps waiting. Run at his answer, after the end of a delivery
+    and from the tick, so that no delivery is missed; each request is read again and written in one transaction."""
+    t0 = t0 or now()
+    with LOCK:
+        due = [r["id"] for r in DB.execute(
+            "SELECT id FROM needs WHERE kind='secret' AND answer IS NOT NULL AND json_extract(secret, '$.saved') IS NOT "
+            "NULL AND json_extract(secret, '$.woken') IS NULL AND json_array_length(secret, '$.tasks') > 0").fetchall()]
+        for need_id in due:
+            with transaction():
+                r = DB.execute("SELECT * FROM needs WHERE id=?", (need_id,)).fetchone()
+                spec = need_secret(r) if r else None
+                if not spec or not spec.get("saved") or spec.get("woken"):
+                    continue
+                a = agents().get(r["by"]) or {}
+                state = "missing"
+                if a.get("vault") == "file" or (a.get("vault") == "broker" and not store_key(TEAM, a.get("machine"))):
+                    state = "delivered"
+                elif a.get("vault") == "broker":
+                    d = DB.execute("SELECT * FROM deposits WHERE login=? AND machine=? ORDER BY id DESC LIMIT 1",
+                                   (spec["saved"], a.get("machine"))).fetchone()
+                    if d and d["finished"] and d["ok"]:
+                        state = "delivered"
+                    elif d and (not d["finished"] or str(d["request_id"]).startswith(CENTRAL_REQUEST)):
+                        state = "waiting"
+                if state == "waiting" or (state == "missing" and spec.get("told")):
+                    continue
+                tasks = [t for t in spec.get("tasks") or []
+                         if DB.execute(f"SELECT 1 FROM tasks WHERE id=? AND {OPEN_TASK}", (t,)).fetchone()]
+                if state == "delivered":
+                    spec["woken"] = t0
+                    words = secret_woken_words(r, spec)
+                else:
+                    spec["told"] = t0
+                    words = (f"[hub] N-{r['id']}: the owner saved it, and your machine's vault does not have it yet. "
+                             f"This task keeps waiting, and goes on once it is there.")
+                DB.execute("UPDATE needs SET secret=? WHERE id=?", (json.dumps(spec), need_id))
+                for tid in tasks:
+                    event_rows([(r["by"], "say", tid, words, {})], t0)
+                    if state == "delivered":
+                        secret_wait_moved(tid)
+
+
+def secret_waits_end(task_id):
+    """A task that ended waits on no secret request any more (end_waits): it leaves each request's tasks, and a request
+    that no task waits on and that has no answer leaves Needs you, as a removed person's open items do, after the id
+    floor is raised, because unused_id would give its N-id again. Nothing of his is written."""
+    with LOCK, transaction():
+        rows = DB.execute("SELECT n.* FROM needs n, json_each(n.secret, '$.tasks') j WHERE n.kind='secret' AND "
+                          "j.value=?", (task_id,)).fetchall()
+        for r in rows:
+            spec = need_secret(r) or {}
+            left = [t for t in spec.get("tasks") or [] if t != task_id]
+            if left or r["answer"] is not None:
+                DB.execute("UPDATE needs SET secret=? WHERE id=?", (json.dumps(dict(spec, tasks=left)), r["id"]))
+                continue
+            DB.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                       ("row_floor:needs", str(unused_id("needs") - 1)))
+            DB.execute("DELETE FROM needs WHERE id=?", (r["id"],))
+            DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)",
+                       (now(), "hub", f"N-{r['id']} left Needs you: {tref(task_id)}, the task that asked, ended"))
 
 
 # ---------------------------------------------------------------- a key into each machine's own vault
@@ -7129,6 +7295,7 @@ def finish_deposit(row, ok, text, t0=None):
                f"delivers it again from the Secrets page of Founderizer."
     emit(manager_name(), "say", said, extra={"quiet": True})
     log(row["agent"], f"delivery {row['id']} of {row['login']} to {row['machine']}: {'done' if ok else 'failed: ' + text}")
+    secret_wakes(t0)        # owner feature secret_requests: a task that waits for this secret on that machine
 
 
 def expire_deposits(t0):
@@ -7890,17 +8057,20 @@ def owner_message_replace(previous, value, request_id, t0):
 
 
 def owner_message_rows(request_id, kind, need, value, client, recipient, replaces, t0, origin=None, files=(),
-                       chosen=None):
+                       chosen=None, task=None, quiet=False, note=""):
     """Inside a transaction: one owner message or answer, from the app (POST /ui/messages, /ui/needs/<id>) or from a
     chat app (origin): the answer of the need, one event and one ui_requests row. The caller checked everything.
-    Returns the event ID."""
+    Returns the event ID. task: the task whose session the answer of a secret request goes to (answer_secret), and
+    quiet: its event wakes nobody and comes with that session's next read; note: hub words for that event only, never
+    in his stored answer."""
     worker_chat = need is None and agents()[recipient].get("role") in ("worker", "lead")
-    # owner feature secret_requests: a worker or a lead asks only in its owner chat, so his answer goes back there,
-    # read once as an agent's message is: it is no message of his that waits for a reply. A removed agent, or one whose
-    # runtime has no chat now, gets the answer as before, which nothing reads.
+    # owner feature secret_requests: a worker or a lead asks in its owner chat, so his answer goes back there, read
+    # once as an agent's message is: it is no message of his that waits for a reply. A request that tasks wait on
+    # answers in those tasks instead (answer_secret). A removed agent, or one whose runtime has no chat now, gets the
+    # answer as before, which nothing reads.
     asker = agents().get(recipient) or {}
-    secret_chat = need is not None and need["kind"] == "secret" and asker.get("role") in ("worker", "lead") and \
-        owner_chat(asker)
+    secret_chat = need is not None and need["kind"] == "secret" and not (need_secret(need) or {}).get("tasks") and \
+        asker.get("role") in ("worker", "lead") and owner_chat(asker)
     if need is None:
         text = owner_message_text(request_id, value, recipient, origin, replaces, files)
     else:
@@ -7916,13 +8086,15 @@ def owner_message_rows(request_id, kind, need, value, client, recipient, replace
             DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, "owner", f"UI {kind} {request_id} "
                        f"accepted as the answer of N-{need['id']} in C-{need['conversation']}"))
             return event_id
-        text = text.rstrip() + attachment_words(files) + (" It needs no reply." if secret_chat else "")
+        text = text.rstrip() + attachment_words(files) + (" It needs no reply." if secret_chat else "") + note
     generation = DB.execute("SELECT v FROM kv WHERE k='db_id'").fetchone()
     generation = generation["v"] if generation else None
     extra = json.dumps({"generation": generation} if worker_chat else
-                       {"generation": generation, "need": need["id"]} if secret_chat else {})
-    event_id = DB.execute("INSERT INTO events(agent,kind,text,created,extra) VALUES(?,?,?,?,?)",
-                          (recipient, "chat" if worker_chat or secret_chat else "say", text, t0, extra)).lastrowid
+                       {"generation": generation, "need": need["id"]} if secret_chat else
+                       {"quiet": True} if quiet else {})
+    event_id = DB.execute("INSERT INTO events(agent,kind,task,text,created,extra) VALUES(?,?,?,?,?,?)",
+                          (recipient, "chat" if worker_chat or secret_chat else "say", task, text, t0,
+                           extra)).lastrowid
     DB.execute("INSERT INTO ui_requests(request_id,kind,need_id,text,event_id,created,client,recipient,"
                "replaces_request_id,origin) VALUES(?,?,?,?,?,?,?,?,?,?)",
                (request_id, kind, need["id"] if need is not None else None, value, event_id, t0, client, recipient,
@@ -8669,6 +8841,7 @@ def end_waits(task_id):
             emit(m["sender"], "say", f"[hub] AM-{m['id']} reached {tref(task_id)}, which ended before it read it.",
                  task=m["sender_task"] if open_ else None)
     conversation_result(task_id)        # AUTONOMY.md P2: a task that a conversation opened tells it its result
+    secret_waits_end(task_id)           # owner feature secret_requests: its waits on the owner's secrets end with it
 
 
 def wait_sweep(t0):
@@ -9640,6 +9813,7 @@ def conversation_waits_end_rows(scope, args, why, t0):
         DB.execute("UPDATE conversation_messages SET waits=NULL WHERE id=?", (w["id"],))
         if DB.execute("UPDATE tasks SET state='working', waiting_on=NULL WHERE id=? AND state='input-required' AND "
                       "waiting_on=?", (w["waits"], cm_ref(w["id"]))).rowcount:
+            secret_rewait(w["waits"])       # the owner's secret holds it still (secret_requests)
             DB.execute(EVENT, (w["owner"], "say", w["waits"], f"[hub] No answer to your {cm_ref(w['id'])} comes from "
                                                               f"{w['name']} now: {why}. Go on without it.", t0, "{}"))
 
@@ -9993,6 +10167,7 @@ def conversation_waiting_rows(conv, person, cm, text, t0):
                (conv["id"], asked["waits"]))
     DB.execute("UPDATE tasks SET state='working', waiting_on=NULL WHERE id=? AND state='input-required' AND "
                "waiting_on=?", (asked["waits"], cm_ref(asked["id"])))
+    secret_rewait(asked["waits"])           # the owner's secret holds it still (secret_requests)
     if asked["source_conversation"] == conv["id"] and asked["source_message"] is not None:
         return None             # this conversation's own task: the message reaches it there as every message does
     DB.execute(EVENT, (conv["agent"], "say", asked["waits"],
@@ -21762,8 +21937,9 @@ def waits_on_parts(task_id):
     A subtask that is input-required waits on the lead itself -- its question or its permission prompt is the lead's
     to answer -- and nothing measures that subtask's silence. So then the lead's own silence counts again, or a lead
     that never answers would reach nobody above it."""
-    parts = q(f"SELECT state FROM tasks WHERE parent=? AND {OPEN_TASK}", (task_id,))
-    return bool(parts) and all(p["state"] != "input-required" for p in parts)
+    parts = q(f"SELECT id, state FROM tasks WHERE parent=? AND {OPEN_TASK}", (task_id,))
+    # a subtask that waits on the owner's secret waits on him, not on its lead (secret_requests)
+    return bool(parts) and all(p["state"] != "input-required" or secret_wait(p["id"]) for p in parts)
 
 
 def unfile_notices(task_id):
@@ -21809,6 +21985,9 @@ def liveness(t0):
         # works on, so a session that then dies has no path of its own and must be restarted like any other -- and
         # without this filter it would never be, because an open question looked like a reason to wait for ever.
         question = q1("SELECT id FROM questions WHERE task=? AND answer IS NULL AND assumed IS NULL ORDER BY id", (tid,))
+        # owner feature secret_requests: so is the owner's secret, until it reaches the task (secret_wakes): a session
+        # lost meanwhile gets its new attempt after that, which then holds the secret
+        secret = secret_wait(tid)
         if hold:
             path = held_word(hold)
         elif lim:
@@ -21829,6 +22008,9 @@ def liveness(t0):
             path = "waiting for its session to start"           # the helper has not started this attempt yet
         elif question:
             path = f"waiting for the answer to Q-{question['id']}"
+        elif secret:
+            path = (f"waiting for the owner's answer to N-{secret['id']}" if secret["answer"] is None else
+                    f"waiting for N-{secret['id']} to reach {owner}'s machine")
         elif release_holds_starts():        # plan P0: also while a release waits for the running turns
             path = "waiting for the Fleet update to finish"         # plan C6: a known cause restarts nothing
         elif online and signed_in_now(owner, (agents().get(owner) or {}).get("runtime")) is False:
@@ -22178,6 +22360,7 @@ def tick():
         # just ended is not a silent task. Run after the silence loop it was nudged at the very tick it came back.
         reminder_sweep(t0)      # what an agent asked to come back to, at the time it named
         wait_sweep(t0)          # plan C8: a waited message to an agent that is no longer active
+        secret_wakes(t0)        # owner feature secret_requests: a saved secret that can reach its waiting task now
         chat_sweep(t0)          # owner feature chat_apps: a message item without a report for 120 seconds
         # plan C9: no clock nudges a task. Each stored turn end decides once, at intake and here after a restart.
         turn_end_sweep(t0)
@@ -32552,10 +32735,13 @@ class Handler(BaseHTTPRequestHandler):
             elif kv_get(f"screen_frozen:{tid}"):
                 return self.json(200, {})           # it still waits on its frozen screen
             if t and t["state"] not in TERMINAL and t["waiting_on"] == "its screen":
-                # what the task waits on again: the question it asked, if one is open, else nothing on its screen
+                # what the task waits on again: the question it asked, if one is open, else the owner's secret that
+                # it waits on (secret_requests), else nothing on its screen
                 asked = q1("SELECT id FROM questions WHERE task=? AND answer IS NULL AND assumed IS NULL ORDER BY id",
                            (tid,))
-                q("UPDATE tasks SET waiting_on=? WHERE id=?", (f"Q-{asked['id']}" if asked else None, tid))
+                secret = None if asked else secret_wait(tid)
+                q("UPDATE tasks SET waiting_on=? WHERE id=?",
+                  (f"Q-{asked['id']}" if asked else f"N-{secret['id']}" if secret else None, tid))
                 if kind == "gone":
                     log("hub", f"{tref(tid)} on {agent}: the question on its screen went")
             return self.json(200, {})
@@ -33553,6 +33739,8 @@ class Handler(BaseHTTPRequestHandler):
                   "reason=COALESCE(NULLIF(reason, ''), ?) WHERE id=?", (now(), PROMPT_REPLACED, pid))
                 q("UPDATE tasks SET state='working', waiting_on=NULL WHERE id=? AND state='input-required' "
                   "AND waiting_on=?", (tid, f"P-{pid}"))
+                with transaction():
+                    secret_rewait(tid)      # the owner's secret holds it still (secret_requests)
                 still = q1("SELECT state FROM tasks WHERE id=?", (tid,))
                 if gone in ("allow", "deny") and still and still["state"] not in TERMINAL:
                     emit(requester, "say", f"[hub] Your {gone} on P-{pid} reached no session: the session of "
@@ -33567,6 +33755,8 @@ class Handler(BaseHTTPRequestHandler):
             if t:
                 q("UPDATE tasks SET state='working', waiting_on=NULL WHERE id=? AND state='input-required' AND waiting_on=?",
                   (tid, f"P-{pid}"))
+                with transaction():
+                    secret_rewait(tid)      # the owner's secret holds it still (secret_requests)
                 activity(tid)
         if not row["decision"]:
             log("hub", f"P-{pid} got no decision in {int(CFG['hook_wait'])}s; {agent} was told no")
@@ -33739,6 +33929,10 @@ def settle_stopped_calls():
     q("UPDATE prompts SET decision='expired', decided=? WHERE decision IS NULL AND IFNULL(polls, 0)=0", (now(),))
     q("UPDATE tasks SET state='working', waiting_on=NULL WHERE state='input-required' AND waiting_on LIKE 'P-%' AND "
       "waiting_on NOT IN (SELECT 'P-' || id FROM prompts WHERE decision IS NULL)")
+    with transaction():         # a task that the owner's secret still holds waits on it again (secret_requests)
+        for r in DB.execute(f"SELECT j.value AS task FROM needs n, json_each(n.secret, '$.tasks') j "
+                            f"WHERE {SECRET_WAITS}").fetchall():
+            secret_rewait(r["task"])
     # A request or a login that the vault had taken can have taken effect while the hub was down. It used to be
     # finished as not done, the vault's own report of it was refused, and the agent was free to send it again with a
     # new request_id -- a payment twice. Its outcome is unknown instead, as when its helper does not answer in time:
