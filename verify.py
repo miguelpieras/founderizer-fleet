@@ -4,7 +4,12 @@
     python3 fleet.py verify           one readable line for each check, then READY
     python3 fleet.py verify --json    the array of 4.1 and nothing else
 
-Each check answers {"check", "state": ok|warn|fail, "says", "fix"}, with the ids of CHECKS and nothing else.
+Each check answers {"check", "state": ok|warn|fail, "says", "fix"}, with the ids of CHECKS and nothing else, and
+"command" when its fix has one. `says` and `fix` are the owner's words, because the app shows them: no file name,
+path, command or internal id, "server" and never "machine", agents by the names both apps give them. The exact
+command is apart, in "command": the readable form prints it in a terminal as (run: ...), and the app shows it nowhere
+but gives it to an agent, in the prompt that Report a problem copies. An answer without one has the four fields alone.
+
 A check that does not apply to this machine is absent from the array: a worker has no hub_answers and no
 owner_claimed. An agent of this machine that a check does not read is named in it and warns - one team.json
 keeps inactive until the owner has signed it in and activated it, and one the hub answers for that this
@@ -39,7 +44,7 @@ import time
 import urllib.error
 import urllib.request
 
-from lifecycle import CONFIG_BRANCH, checkout_branch, exe, signed_in_path
+from lifecycle import CONFIG_BRANCH, checkout_branch, exe, runtime_fact, shown_name, signed_in_path
 
 # PRODUCT.md 4.1: these ids and nothing else. The order is the order of the readable lines.
 CHECKS = ("services", "hub_answers", "owner_claimed", "tailnet", "firewall", "clock", "disk",
@@ -72,6 +77,7 @@ DISK_FAIL, DISK_WARN = 1.0, 5.0         # GiB free for the database and the chec
 UFW_CONF = "/etc/ufw/ufw.conf"          # readable without root, which `ufw status` is not
 TAILNET = ipaddress.ip_network("100.64.0.0/10")     # the private network every machine of a fleet is on
 HUB_SERVICES = ("hub", "git")           # the hub machine's own two, beside the service of each agent on it
+SERVICE_NAMES = {"hub": "the hub", "git": "the git service"}   # those two as the owner reads them
 
 # The OS user of one agent on Linux, which hubsetup.AGENT_USER makes: its home holds that agent's session, its
 # runtime credential and its vault token, at mode 700, so no other agent's user can open it. A Mac keeps one user
@@ -83,7 +89,19 @@ AGENT_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 # then its ~/.local/bin, the two places lifecycle.exe looks in.
 RUNTIME_PATH = 'command -v "$1" || { [ -x "$HOME/.local/bin/$1" ] && printf %s "$HOME/.local/bin/$1"; }'
 LINGER_FILE = "/var/lib/systemd/linger/%s"      # systemd's own record of lingering, readable without root
-BLIND_FIX = "read the whole server: run this check as root, or run it as each agent's own user"
+# The fixes that several answers give, in the owner's words.
+BLIND_FIX = "Run the check again as root, or as each agent's own user."
+SIGN_IN_FIX = "Sign the AI provider in from the app: Settings, Servers, this server, Sign in."
+FETCH_FIX = "Fetch Founderizer on this server again."
+SELFTEST_FIX = "Run the self-test by hand on this server."
+# The runtime's own status command, which signed_in runs: the command that reads a sign-in by hand.
+SIGN_IN_STATUS = {"claude": "claude auth status", "codex": "codex login status"}
+TEAM_PROBLEM = "team.json does not validate: "      # how hub.team_problem starts its line
+# An address the hub keeps for a server is the fleet's team.json, and no command on a server puts it right: on a
+# server `fleet.py addresses` changes that server's copy, which then stops taking the hub's (lifecycle
+# .follow_config_ref), and on the hub it leaves the checkout with local changes, so the hub refuses every save of the
+# app with 409 until somebody commits them (the review of 30 October 2026). So the fix is his one step, with no command.
+ADDRESS_FIX = "Report a problem from the Help menu, so that the hub gets this address right."
 
 
 def _run(argv, timeout=20):
@@ -119,22 +137,44 @@ def _line(text):
     return " ".join(str(text).split())[:300]
 
 
-# The programs a fix may start with. A fix that is a command to paste keeps the command's own spelling: "Sudo
-# timedatectl set-ntp true" is not a command any shell runs (found by the installer test of 22 October 2026).
-COMMANDS = {"git", "loginctl", "python3", "runuser", "sudo", "systemctl", "tailscale", "timedatectl", "ufw"}
-
-
 def _said(text):
-    """One line the owner reads in the app, so it starts with a capital (the owner, 19 October 2026: every message
-    he reads starts with one). A line that starts with a name this machine itself uses keeps that name as it is: a
-    unit (fleet-hub), a file (team.json), a program (`COMMANDS`), an address, a count or a revision. So the rule
-    reaches the words and not the names, and a fix that is a command to paste keeps the command's own spelling."""
+    """One line the owner reads in the app, so it is a sentence: a capital at the start (the owner, 19 October
+    2026: every message he reads starts with one) and a full stop at the end, in at most 300 characters. A line
+    that starts with a name this server itself uses keeps that name as it is: an address, a count or a revision.
+    A command never passes here: it is in the answer's own "command", with its own spelling."""
     line = _line(text)
     head = line.split(" ", 1)[0]
     word = head[:-2] if head.endswith("'s") else head      # an agent's name in the possessive is a word too
-    if word[:1].islower() and word.isalpha() and word not in COMMANDS and not re.fullmatch(r"[0-9a-f]{7,}", word):
-        return line[0].upper() + line[1:]
-    return line
+    if word[:1].islower() and word.isalpha() and not re.fullmatch(r"[0-9a-f]{7,}", word):
+        line = line[0].upper() + line[1:]
+    return line if line.endswith((".", "!", "?")) else line[:299] + "."
+
+
+def _cap(text):
+    """A sentence after the first one of a line starts with a capital too."""
+    return text[:1].upper() + text[1:]
+
+
+def _names(names):
+    """"Manager", "the hub and Manager", "the hub, the git service and Manager": a list as a sentence says it."""
+    names = list(names)
+    return ", ".join(names[:-1]) + " and " + names[-1] if len(names) > 1 else "".join(names)
+
+
+def _sentences(lines):
+    """One sentence for each line, each with its capital and its full stop; "" for none."""
+    return " ".join(_cap(line) + "." for line in lines)
+
+
+def _one(things, one, more):
+    """The word that agrees with how many things a line names: "is" for one service, "are" for two."""
+    return one if len(things) == 1 else more
+
+
+def _label(runtime):
+    """A runtime as the owner knows it, "Claude Code" or "Codex": its label (lifecycle.RUNTIMES), as the hub's own
+    owner lines name it."""
+    return runtime_fact(runtime, "label", runtime)
 
 
 def _passwd(user):
@@ -283,48 +323,51 @@ class Verify:
             return None
         readings = {name: (self.service(name, user) if user and self.as_user(user, ["true"]) is not None else None)
                     for name, user in holders.items()}
-        blind = [self.unit(n) for n, r in readings.items() if r is None]
+        blind = [n for n, r in readings.items() if r is None]
         seen = {n: r for n, r in readings.items() if r is not None}
-        stopped = [self.unit(n) for n, (active, _) in seen.items() if active is not True]
-        off = [self.unit(n) for n, (active, enabled) in seen.items() if active is True and enabled is not True]
+        stopped = [n for n, (active, _) in seen.items() if active is not True]
+        off = [n for n, (active, enabled) in seen.items() if active is True and enabled is not True]
         no_linger = [user for user in sorted({u for u in holders.values() if u}) if self.linger(user) is False]
-        unread = (f"{', '.join(blind)} could not be read: "
-                  + ("it belongs" if len(blind) == 1 else "they belong")
-                  + " to another user of this server") if blind else ""
+        unread = (f"{_cap(self.shown(blind))} could not be read: {_one(blind, 'it belongs', 'they belong')} to "
+                  f"another user of this server.") if blind else ""
         if stopped:
-            says = f"{', '.join(stopped)} is not running" if len(stopped) == 1 else \
-                   f"{', '.join(stopped)} are not running"
-            return self.answer(FAIL, self.and_unread(says, unread), self.start_fix(stopped, holders))
+            return self.answer(FAIL, self.and_unread(f"{self.shown(stopped)} {_one(stopped, 'is', 'are')} not "
+                                                     f"running.", unread),
+                               f"Start {_one(stopped, 'it', 'them')} again on this server.",
+                               self.start_command(stopped, holders))
         if off:
-            return self.answer(WARN, self.and_unread(f"{', '.join(off)} runs but is not enabled, so it does not "
-                                                     f"come back", unread), self.enable_fix(off, holders))
+            return self.answer(WARN, self.and_unread(f"{self.shown(off)} {_one(off, 'is', 'are')} running, but will "
+                                                     f"not start again after a reboot.", unread),
+                               f"Set {_one(off, 'it', 'them')} to start with this server.",
+                               self.enable_command(off, holders))
         if blind:
             return self.answer(WARN, unread, BLIND_FIX)
         if no_linger:
-            return self.answer(WARN, f"{', '.join(self.unit(n) for n in seen)} run, but "
-                                     f"{', '.join(no_linger)} {'has' if len(no_linger) == 1 else 'have'} no "
-                                     f"lingering, so they stop at a reboot",
-                               "let them run without a login: loginctl enable-linger --no-ask-password "
-                               + " ".join(no_linger))
-        return self.answer(OK, f"{', '.join(self.unit(n) for n in seen)} are active and enabled")
+            late = [n for n in seen if holders[n] in no_linger]     # only the services of those users stop
+            return self.answer(WARN, f"{self.shown(late)} {_one(late, 'is', 'are')} running, but will stop when "
+                                     f"nobody is logged in.",
+                               f"Let {_one(late, 'it', 'them')} run when nobody is logged in.",
+                               "loginctl enable-linger --no-ask-password " + " ".join(no_linger))
+        return self.answer(OK, f"{self.shown(seen)} {_one(seen, 'is', 'are')} running.")
 
     def hub_answers(self):
         """The hub answers its own address: the address every machine and the app use, never loopback."""
         if not self.is_hub:
             return None
         if not self.hub:
-            return self.answer(FAIL, "this checkout's team.json gives the hub no address, so no server can reach it",
-                               "run on the hub: python3 fleet.py addresses hub=$(tailscale ip -4)")
+            return self.answer(FAIL, "The hub has no address, so no server can reach it.", ADDRESS_FIX)
         code, body, _ = self.fetch(self.hub + "/health")
         try:
             answer = json.loads(body or "{}")
         except ValueError:
             answer = {}
         if code == 200 and answer.get("ok"):
-            return self.answer(OK, f"the hub answers {self.hub}/health for "
-                                   f"{', '.join(answer.get('agents') or []) or 'no agent'}")
-        return self.answer(FAIL, f"the hub does not answer {self.hub}/health: {_line(body) or code}",
-                           "look at: systemctl --user status fleet-hub")
+            agents = [shown_name(name) for name in answer.get("agents") or []]
+            return self.answer(OK, f"The hub answers at {self.hub}"
+                                   + (f" for {_names(agents)}." if agents else ", with no agent yet."))
+        # What it answered instead is an HTTP code or a body, not his words: the command shows it.
+        return self.answer(FAIL, f"The hub does not answer at {self.hub}.",
+                           "Look at the hub's service on this server.", "systemctl --user status fleet-hub")
 
     def owner_claimed(self):
         """The hub has an owner address, which only the claim writes: without it no Mac reaches this fleet."""
@@ -332,94 +375,96 @@ class Verify:
             return None
         owner = (self.addresses.get("owner") or "").strip()
         if not owner:
-            return self.answer(FAIL, "no Mac has claimed this hub: team.json has no owner address",
-                               "run the installer's claim step again; it shows a code the app takes")
+            return self.answer(FAIL, "No Mac has claimed this hub yet.",
+                               "Run the installer's claim step again, and give its code to the app.")
         if not self.private(owner):
-            return self.answer(WARN, f"the owner's address {owner} is not on the private network",
-                               "check that the app reaches the hub over the private network")
-        return self.answer(OK, f"the owner of this hub is the Mac at {owner}")
+            return self.answer(WARN, f"Your Mac's address {owner} is not on the private network.",
+                               "Check that the app reaches the hub over the private network.")
+        return self.answer(OK, f"Your Mac at {owner} owns this hub.")
 
     def tailnet(self):
         """The private network is up and this machine answers to the address team.json gives it. The hub takes a
         name only from its own machine, so a wrong address here refuses every call this machine makes."""
         if not self.tailscale():
-            return self.answer(FAIL, "Tailscale is not installed, so this server is on no private network",
-                               "install it: curl -fsSL https://tailscale.com/install.sh | sh")
-        state = self.backend_state()
-        if state != "Running":
-            return self.answer(FAIL, f"the private network is not up (Tailscale is {state or 'not answering'})",
-                               "bring it up: tailscale up --accept-dns=false")
+            return self.answer(FAIL, "Tailscale is not installed, so this server is on no private network.",
+                               "Install Tailscale on this server.", "curl -fsSL https://tailscale.com/install.sh | sh")
+        if self.backend_state() != "Running":
+            return self.answer(FAIL, "Tailscale is not up, so this server is on no private network.",
+                               "Start Tailscale on this server.", "tailscale up --accept-dns=false")
         if not self.address:
-            return self.answer(FAIL, "Tailscale gives this server no address", "look at: tailscale status")
+            return self.answer(FAIL, "Tailscale gives this server no address.",
+                               "Look at Tailscale's status on this server.", "tailscale status")
         want = self.addresses.get(self.named) if self.named else None
         if want and want != self.address:
-            return self.answer(FAIL, f"this server answers {self.address}, but team.json gives {self.named} "
-                                     f"{want}, so the hub refuses its calls",
-                               f"run: python3 fleet.py addresses {self.named}={self.address}")
+            return self.answer(FAIL, f"This server is {self.address}, but the hub expects {want} and refuses its "
+                                     f"calls.", ADDRESS_FIX)
         if not self.machine:
-            return self.answer(FAIL, f"this server's address {self.address} is in team.json for no server",
-                               f"run: python3 fleet.py addresses <name>={self.address}")
-        return self.answer(OK, f"{self.address} is up, and team.json gives it to {self.machine}")
+            return self.answer(FAIL, f"The hub has no server at {self.address}, this server's address.", ADDRESS_FIX)
+        return self.answer(OK, f"{self.address} is up, and it is {self.machine}'s address.")
 
     def firewall(self):
         """The firewall is on: only SSH and the private network reach this machine."""
-        state, how = self.firewall_state()
+        state, _how = self.firewall_state()
+        mac = self.platform == "darwin"
         if state is True:
-            return self.answer(OK, f"the firewall is on ({how})")
+            return self.answer(OK, "The firewall is on.")
         if state is False:
-            return self.answer(FAIL, f"the firewall is off ({how})",
-                               "turn it on in System Settings > Network > Firewall" if self.platform == "darwin"
-                               else "turn it on: sudo ufw --force enable")
-        return self.answer(WARN, f"the firewall could not be read ({how})",
-                           "read it by hand: " + ("socketfilterfw --getglobalstate" if self.platform == "darwin"
-                                                  else "ufw status"))
+            if mac:
+                return self.answer(FAIL, "The firewall is off.",
+                                   "Turn the firewall on in System Settings, Network, Firewall.")
+            return self.answer(FAIL, "The firewall is off.", "Turn the firewall on.", "sudo ufw --force enable")
+        return self.answer(WARN, "The firewall could not be read.", "Read the firewall's state by hand on this server.",
+                           "/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate" if mac
+                           else "sudo ufw status")
 
     def clock(self):
         """The clock is within a minute of true: token expiry and signatures depend on it."""
         skew, source = self.hub_skew()
         if skew is not None:
             if abs(skew) <= CLOCK_LIMIT:
-                return self.answer(OK, f"the clock is {_count(abs(skew), 'second')} from {source}")
-            return self.answer(FAIL, f"the clock is {_count(abs(skew), 'second')} from {source}, over the minute "
-                                     f"that tokens and signatures allow", self.time_fix())
+                return self.answer(OK, f"The clock is {_count(abs(skew), 'second')} from {source}.")
+            return self.answer(FAIL, f"The clock is {_count(abs(skew), 'second')} from {source}, over the minute "
+                                     f"allowed.", *self.time_fix())
         synced = self.network_time()
         if synced is True:
-            return self.answer(OK, "the clock follows network time")
+            return self.answer(OK, "The clock follows network time.")
         if synced is False:
-            return self.answer(FAIL, "this server does not follow network time, so its clock drifts", self.time_fix())
-        return self.answer(WARN, "the clock could not be checked: no hub to compare with and no network-time reading",
-                           self.time_fix())
+            return self.answer(FAIL, "This server does not follow network time, so its clock drifts.",
+                               *self.time_fix())
+        return self.answer(WARN, "The clock could not be checked against the hub or network time.", *self.time_fix())
 
     def disk(self):
         """The disk has room for the database and the checkouts."""
         try:
             total, _used, free = self.usage(self.kit)
-        except OSError as e:
-            return self.answer(WARN, f"the disk of {self.kit} could not be read: {_line(e)}",
-                               f"read it by hand: df -h {self.kit}")
+        except OSError:
+            return self.answer(WARN, "The free disk space could not be read.",
+                               "Read the free disk space by hand on this server.", f"df -h {self.kit}")
         gib, whole = free / 2 ** 30, total / 2 ** 30
-        says = f"{gib:.1f} GiB free of {whole:.0f} GiB where the database and the checkouts are"
+        says = f"{gib:.1f} GiB free of {whole:.0f} GiB on the disk Founderizer uses."
         if gib < DISK_FAIL:
-            return self.answer(FAIL, says, "free space: the database, the checkouts and a task output need room")
+            return self.answer(FAIL, says, "Free disk space on this server: Founderizer needs room to work.")
         if gib < DISK_WARN:
-            return self.answer(WARN, says, "free space soon: under 5 GiB leaves little for outputs and updates")
+            return self.answer(WARN, says, "Free disk space soon: under 5 GiB leaves little room for updates.")
         return self.answer(OK, says)
 
     def runtime_installed(self):
         """The runtime binary of each agent on this machine is installed, in the home of that agent's own user."""
         if not self.agents:
             return None
-        found = {name: (self.runtime_of(name), *self.runtime_path(name)) for name in self.agents}
-        missing = [f"{name} has no {rt}" for name, (rt, path, read) in sorted(found.items()) if read and not path]
-        blind = [f"{name}'s {rt} could not be read" for name, (rt, _p, read) in sorted(found.items()) if not read]
+        found = sorted({name: (self.runtime_of(name), *self.runtime_path(name)) for name in self.agents}.items())
+        missing = [(name, rt) for name, (rt, path, read) in found if read and not path]
+        blind = _sentences(f"{shown_name(name)}'s {_label(rt)} could not be read"
+                           for name, (rt, _p, read) in found if not read)
         if missing:
-            return self.answer(FAIL, self.and_unread(", ".join(missing), ", ".join(blind)),
-                               "install it from the vendor's own installer: python3 hubsetup.py runtime "
-                               "--runtime <claude|codex>")
+            return self.answer(FAIL, self.and_unread(_sentences(f"{shown_name(name)} has no {_label(rt)} installed"
+                                                                for name, rt in missing), blind),
+                               "Install the AI provider on this server with its own installer.",
+                               " && ".join(f"python3 hubsetup.py runtime --runtime {rt}"
+                                           for rt in sorted({rt for _name, rt in missing})))
         if blind:
-            return self.answer(WARN, ", ".join(blind), BLIND_FIX)
-        return self.answer(OK, ", ".join(f"{name} runs {rt} ({path})"
-                                         for name, (rt, path, _read) in sorted(found.items())))
+            return self.answer(WARN, blind, BLIND_FIX)
+        return self.answer(OK, _sentences(f"{shown_name(name)} runs {_label(rt)}" for name, (rt, _p, _r) in found))
 
     def runtime_signed_in(self):
         """The runtime of each agent is signed in, read as that agent's own user, because the credential is in that
@@ -434,68 +479,69 @@ class Verify:
             path, read = self.runtime_path(name)
             readings[name] = (runtime, self.signed_in(runtime, path, self.agent_user(name), name) if path else None,
                               read)
-        out = [f"{name} is not signed in to {rt}" for name, (rt, state, read) in sorted(readings.items())
+        rows = sorted(readings.items())
+        out = [f"{shown_name(name)} is not signed in to {_label(rt)}" for name, (rt, state, read) in rows
                if read and state is False]
-        why, by_hand = self.unread_signin()
-        unknown = [f"{name}'s {rt} {why}" for name, (rt, state, read) in sorted(readings.items())
-                   if read and state is None]
-        blind = [f"{name}'s {rt} sign-in could not be read: it belongs to another user of this server"
-                 for name, (rt, _s, read) in sorted(readings.items()) if not read]
+        unknown = [(name, rt) for name, (rt, state, read) in rows if read and state is None]
+        blind = _sentences(f"{shown_name(name)}'s {_label(rt)} sign-in could not be read: it belongs to another user "
+                           f"of this server" for name, (rt, _s, read) in rows if not read)
         if out:
-            return self.answer(FAIL, self.and_unread(", ".join(out), ", ".join(blind)),
-                               "sign this server in from the app: Settings, Servers, this server, Sign in")
+            return self.answer(FAIL, self.and_unread(_sentences(out), blind), SIGN_IN_FIX)
         if unknown:
-            return self.answer(WARN, self.and_unread(", ".join(unknown), ", ".join(blind)), by_hand)
+            why, fix, command = self.unread_signin(rt for _name, rt in unknown)
+            return self.answer(WARN, self.and_unread(_sentences(f"{shown_name(name)}'s {_label(rt)} {why}"
+                                                                for name, rt in unknown), blind), fix, command)
         if blind:
-            return self.answer(WARN, ", ".join(blind), BLIND_FIX)
-        return self.answer(OK, ", ".join(f"{name} is signed in to {rt}"
-                                         for name, (rt, _s, _read) in sorted(readings.items())))
+            return self.answer(WARN, blind, BLIND_FIX)
+        return self.answer(OK, _sentences(f"{shown_name(name)} is signed in to {_label(rt)}"
+                                          for name, (rt, _s, _read) in rows))
 
     def selftest(self):
         """selftest.py passes against its recorded baseline, which is not zero failures (COORDINATION.md rule 5)."""
         path = os.path.join(self.kit, "selftest.py")
         if not os.path.exists(path):
-            return self.answer(FAIL, f"this checkout has no selftest.py in {self.kit}, so it cannot check itself",
-                               "fetch the checkout again")
+            return self.answer(FAIL, "Founderizer on this server has no self-test, so it cannot check itself.",
+                               FETCH_FIX)
         code, out, err = self.run([sys.executable, path], timeout=self.selftest_wait)
         summary = self.summary(out)
+        by_hand = f"cd {self.kit} && python3 selftest.py"
         if not summary:
-            # A run that ended without its summary line crashed; only one that never ended ran out of time. The
-            # last line of its error output is the one that says why (the installer test of 22 October 2026 read
-            # a timeout for a self-test that had stopped on an error after 24 seconds).
-            last = ([line for line in (err or out or "").splitlines() if line.strip()] or ["no output"])[-1]
-            said = (f"the self-test did not answer in {self.selftest_wait} seconds" if "timed out after" in (err or "")
-                    else f"the self-test stopped with an error: {_line(last)}")
-            return self.answer(FAIL, said, f"run it by hand: cd {self.kit} && python3 selftest.py")
+            # A run that ended without its summary line crashed; only one that never ended ran out of time (the
+            # installer test of 22 October 2026 read a timeout for a self-test that had stopped on an error after 24
+            # seconds). The error itself is a traceback's words, so it stays with the command, which prints it.
+            said = (f"The self-test did not answer in {self.selftest_wait} seconds" if "timed out after" in (err or "")
+                    else "The self-test stopped with an error")
+            return self.answer(FAIL, said, SELFTEST_FIX, by_hand)
         passed, total, failed = summary
-        says = f"{passed} of {total} checks passed"
+        says = f"The self-test passed {passed} of {total} checks."
         new = [name for name in failed if name not in SELFTEST_BASELINE]
         if new:
-            return self.answer(FAIL, f"{says}, and {len(new)} of the failures are not expected: {', '.join(new)}",
-                               f"run it by hand: cd {self.kit} && python3 selftest.py -v")
+            # The failing checks' names are the self-test's own words ("... of a machine ..."): the command
+            # that the answer gives prints them.
+            return self.answer(FAIL, says, SELFTEST_FIX, by_hand + " -v")
         if code != 0 and not failed:
-            return self.answer(FAIL, f"the self-test ended with {code}: {says}",
-                               f"run it by hand: cd {self.kit} && python3 selftest.py")
-        return self.answer(OK, says + (f"; the {len(failed)} failures are the recorded baseline" if failed else ""))
+            return self.answer(FAIL, f"The self-test ended in failure, with {passed} of {total} checks passed.",
+                               SELFTEST_FIX, by_hand)
+        return self.answer(OK, says + (f" The {len(failed)} failures are the recorded baseline." if failed else ""))
 
     def version(self):
         """The checkout's revision, so the app and the release channel can compare."""
         code, out, _ = self.run(["git", "-C", self.kit, "rev-parse", "HEAD"])
         revision = (out or "").strip()
         if code != 0 or not re.fullmatch(r"[0-9a-f]{40}", revision):
-            return self.answer(FAIL, f"{self.kit} has no revision: git cannot read it",
-                               "this server needs a git checkout of the fleet: fetch it again")
+            return self.answer(FAIL, "Founderizer on this server has no readable revision.", FETCH_FIX)
         branch = checkout_branch(self.kit, self.run)
         _c, out, _e = self.run(["git", "-C", self.kit, "status", "--porcelain"])
         changed = [line for line in (out or "").split("\n") if line.strip()]
-        where = f"{revision[:12]} on {branch or 'no branch'}"
+        runs = f"This server runs revision {revision[:12]}"
         if branch != CONFIG_BRANCH:
-            return self.answer(WARN, f"{where}, not on {CONFIG_BRANCH}, the ref the fleet runs",
-                               f"put it on the configuration ref: sh {self.kit}/config-ref.sh {self.kit}")
+            return self.answer(WARN, f"{runs}, which does not follow the fleet's updates.",
+                               "Put this server back on the fleet's updates.",
+                               f"sh {self.kit}/config-ref.sh {self.kit}")
         if changed:
-            return self.answer(WARN, f"{where}, with {_count(len(changed), 'changed file')}, so it is not the "
-                                     f"published revision", f"look at: git -C {self.kit} status")
-        return self.answer(OK, where)
+            return self.answer(WARN, f"{runs}, with {_count(len(changed), 'changed file')} of its own.",
+                               "Look at the changed files on this server.", f"git -C {self.kit} status")
+        return self.answer(OK, f"{runs}.")
 
     def team(self):
         """The team.json of this checkout is one the hub can run: the rules of hub.validate_team, which every
@@ -504,22 +550,28 @@ class Verify:
         app and the support duty get for the same file on every machine. It applies to every machine, because
         every machine of a fleet has this checkout."""
         if not self.conf:
-            return self.answer(FAIL, "this checkout has no team.json, so nothing here knows the fleet",
-                               "fetch the checkout again")
+            return self.answer(FAIL, "This server has no team file, so it knows no fleet.", FETCH_FIX)
         try:
             import hub                 # the rules only; nothing of the hub runs, and this reads no machine
-        except Exception as e:
-            return self.answer(WARN, f"this checkout cannot read the rules of team.json: {_line(e)}",
-                               f"look at: cd {self.kit} && python3 -c 'import hub'")
+        except Exception:
+            return self.answer(WARN, "This server cannot read the rules of the team file.",
+                               "Look at the error by hand on this server.", f"cd {self.kit} && python3 -c 'import hub'")
         problem = hub.team_problem(self.conf)
         if problem:
-            return self.answer(FAIL, problem,
-                               f"put the rule right in {os.path.join(self.kit, 'team.json')}: a hub runs this "
-                               f"file as it is, and refuses every owner write of it until the rule is met")
+            # The hub's own line for the rule, in his words: the team file, and a server where the rule says machine.
+            rule = problem[len(TEAM_PROBLEM):] if problem.startswith(TEAM_PROBLEM) else problem
+            rule = re.sub(r"\bmachine(s?)\b", r"server\1", rule).replace("team.json", "the team file")
+            own = rule.startswith("the team file ")     # "the team file needs exactly one manager"
+            # A rule about the file itself is his words. Any other rule names the file's own keys, OS users and
+            # values ("would share the OS user fleet-vps"), so it stays with the command, which prints it.
+            return self.answer(FAIL, "The team file " + (rule[len("the team file "):] if own else
+                                                         "breaks one of its rules."),
+                               "Put the rule right in the team file. Until then, the app cannot change your team.",
+                               None if own else f"cd {self.kit} && python3 -c 'import json, hub; "
+                                                f"print(hub.team_problem(json.load(open(\"team.json\"))))'")
         machines = {a.get("machine") for a in (self.conf.get("agents") or {}).values()}
-        return self.answer(OK, f"this team.json is one a hub can run: "
-                               f"{_count(len(self.conf.get('agents') or {}), 'agent')} on "
-                               f"{_count(len(machines), 'server')}")
+        return self.answer(OK, f"The team file is valid: {_count(len(self.conf.get('agents') or {}), 'agent')} on "
+                               f"{_count(len(machines), 'server')}.")
 
     # ---- the readings each check needs
 
@@ -582,28 +634,31 @@ class Verify:
     def user(self):
         return self.me or "the fleet user"
 
-    def holder_of(self, unit, holders):
-        """The user that holds one unit, by the name the readable line uses."""
-        return next((user for name, user in holders.items() if self.unit(name) == unit), None)
+    def shown(self, names):
+        """Fleet services as the owner knows them, in one phrase: the hub's own two by what they are, and an agent's
+        by the agent's name as both apps write it ("the hub, the git service and Manager")."""
+        return _names(SERVICE_NAMES[n] if n in SERVICE_NAMES and n not in self.agents else shown_name(n)
+                      for n in names)
 
     def as_line(self, user, line):
         """One readable command, said as the user that must run it when that is not the one running this check."""
         return line if not user or user == self.me else f"sudo -u {user} {line}"
 
-    def start_fix(self, units, holders=None):
+    def start_command(self, names, holders):
+        """The command that starts these services again: the ones of the first one's user, as that user."""
         if self.platform == "darwin":
-            return f"start it again: launchctl kickstart gui/{os.getuid()}/{units[0]}"
-        user = self.holder_of(units[0], holders or {})
-        mine = [u for u in units if self.holder_of(u, holders or {}) == user]
-        return "start it again: " + self.as_line(user, "systemctl --user restart " + " ".join(mine))
+            return f"launchctl kickstart gui/{os.getuid()}/{self.unit(names[0])}"
+        user = holders.get(names[0])
+        mine = [self.unit(n) for n in names if holders.get(n) == user]
+        return self.as_line(user, "systemctl --user restart " + " ".join(mine))
 
-    def enable_fix(self, units, holders=None):
+    def enable_command(self, names, holders):
+        """The command that makes these services start again after a reboot, as start_command chooses them."""
         if self.platform == "darwin":
-            return (f"make it come back after a reboot: launchctl bootstrap gui/{os.getuid()} "
-                    f"~/Library/LaunchAgents/{units[0]}.plist")
-        user = self.holder_of(units[0], holders or {})
-        mine = [u for u in units if self.holder_of(u, holders or {}) == user]
-        return "make it come back after a reboot: " + self.as_line(user, "systemctl --user enable " + " ".join(mine))
+            return f"launchctl bootstrap gui/{os.getuid()} ~/Library/LaunchAgents/{self.unit(names[0])}.plist"
+        user = holders.get(names[0])
+        mine = [self.unit(n) for n in names if holders.get(n) == user]
+        return self.as_line(user, "systemctl --user enable " + " ".join(mine))
 
     def backend_state(self):
         ts = self.tailscale()
@@ -653,8 +708,10 @@ class Verify:
         return (before + after) / 2 - theirs, "the hub's clock"
 
     def time_fix(self):
-        return ("turn network time on: System Settings, General, Date & Time" if self.platform == "darwin"
-                else "sudo timedatectl set-ntp true")
+        """(the fix, its command) of a clock that is off or not read."""
+        if self.platform == "darwin":
+            return "Turn network time on: System Settings, General, Date & Time.", None
+        return "Turn network time on for this server.", "sudo timedatectl set-ntp true"
 
     def network_time(self):
         code, out, _ = self.run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"])
@@ -695,16 +752,16 @@ class Verify:
             return None
         return state if isinstance(state, bool) and self.now() - at <= HELPER_READING else None
 
-    def unread_signin(self):
-        """Why a sign-in reading was not taken here, and what takes it, as (the words after the name, the fix). On
-        a Mac outside the login session the reason is the machine's and not the agent's, and the answer is no
-        command the owner can run from where the app runs this check: its helper reads it in that session."""
+    def unread_signin(self, runtimes):
+        """Why a sign-in reading of these runtimes was not taken here, and what takes it, as (the words after the
+        name, the fix, its command). On a Mac outside the login session the reason is the machine's and not the
+        agent's, and the answer is no command the owner can run from where the app runs this check: its helper
+        reads it in that session, the one session that opens the login Keychain."""
         if self.platform == "darwin" and not self.login_session():
-            return ("sign-in is in the login Keychain, which opens for the login session alone, and no agent of "
-                    "this Mac has read it there",
-                    "start this Mac's agents in its login session, which read the sign-in there, and check again")
-        return ("sign-in could not be read",
-                "read it by hand on this server: claude auth status, or codex login status")
+            return ("sign-in is in the login Keychain, out of this check's reach",
+                    "Start this Mac's agents in its login session, then check again.", None)
+        return ("sign-in could not be read", "Read the sign-in by hand on this server.",
+                "; ".join(SIGN_IN_STATUS[rt] for rt in sorted(set(runtimes)) if rt in SIGN_IN_STATUS) or None)
 
     def signed_in(self, runtime, path, user=None, agent=None):
         """True, False or None, from the runtime's own status command: the reading lifecycle.Lifecycle.runtime
@@ -751,27 +808,31 @@ class Verify:
 
     def and_unread(self, says, unread):
         """One line that names what this check found and, after it, what it could not read: a reader of a failing
-        check must not take the rest of the machine for a pass either (PRODUCT.md 4.1)."""
-        return f"{says}, and {unread}" if unread else says
+        check must not take the rest of the machine for a pass either (PRODUCT.md 4.1). Both are sentences."""
+        return f"{says} {unread}" if unread else says
 
-    def answer(self, state, says, fix=None):
-        return {"check": self.asking, "state": state, "says": _said(says), "fix": _said(fix) if fix else None}
+    def answer(self, state, says, fix=None, command=None):
+        """One answer of 4.1: `says` and `fix` in the owner's words, and the exact command of the fix apart, under
+        "command", only when there is one, so a reader of the four fields sees every answer as before."""
+        found = {"check": self.asking, "state": state, "says": _said(says), "fix": _said(fix) if fix else None}
+        if command:
+            found["command"] = _line(command)
+        return found
 
     def unanswered(self):
         """The agents of this machine that a check which reads an agent does not answer for, each as (one line,
-        the fix): the ones team.json keeps inactive, and the ones it does not name at all."""
+        the fix, its command or None): the ones team.json keeps inactive, and the ones it does not name at all."""
         said = []
         if self.inactive:
-            one = len(self.inactive) == 1
-            said.append((f"{', '.join(self.inactive)} {'is' if one else 'are'} not active, so nothing of "
-                         f"{'it' if one else 'them'} is read here",
-                         "open the agent in the app and finish its setup"))
+            said.append((f"{_names(shown_name(a) for a in self.inactive)} {_one(self.inactive, 'is', 'are')} not "
+                         f"active, so {_one(self.inactive, 'it is', 'they are')} not checked here.",
+                         "Open the agent in the app and finish its setup.", None))
         if self.unknown_here():
-            one = len(self.unknown_here()) == 1
-            said.append((f"the hub knows {', '.join(self.unknown_here())}, which this checkout does not name, so "
-                         f"{'that agent' if one else 'those agents'} of this server is not read here",
-                         f"bring this checkout up to date: git -C {self.kit} fetch origin && git merge "
-                         f"--ff-only origin/{CONFIG_BRANCH}"))
+            unknown = self.unknown_here()
+            said.append((f"This server does not know {_names(shown_name(a) for a in unknown)} yet, so "
+                         f"{_one(unknown, 'it is', 'they are')} not checked here.",
+                         "Bring this server up to date with the hub.",
+                         f"git -C {self.kit} fetch origin && git -C {self.kit} merge --ff-only origin/{CONFIG_BRANCH}"))
         return said
 
     def and_agents(self, found):
@@ -782,11 +843,11 @@ class Verify:
         said = self.unanswered()
         if not said:
             return found
-        note = ", and ".join(line for line, _fix in said)
+        note = " ".join(line for line, _fix, _command in said)
         if found is None:
-            return self.answer(WARN, note, said[0][1])
-        return self.answer(FAIL if found["state"] == FAIL else WARN, self.and_unread(found["says"], note),
-                           found["fix"] or said[0][1])
+            return self.answer(WARN, note, *said[0][1:])
+        fix, command = (found["fix"], found.get("command")) if found["fix"] else said[0][1:]
+        return self.answer(FAIL if found["state"] == FAIL else WARN, self.and_unread(found["says"], note), fix, command)
 
     def one(self, name):
         """One check by its id: its answer, or None when it does not apply to this machine. The three checks that
@@ -811,8 +872,9 @@ def failed(results):
 
 
 def report(results):
-    """The readable form: one line for each check, then READY or the failing ids."""
+    """The readable form: one line for each check, then READY or the failing ids. A fix with a command carries it
+    at the end of its line, for whoever reads this in a terminal (INSTALL-PROMPT.md)."""
     lines = [f"  {r['state']:<4}  {r['check']}: {r['says']}" + (f"  (fix: {r['fix']})" if r["fix"] else "")
-             for r in results]
+             + (f"  (run: {r['command']})" if r.get("command") else "") for r in results]
     bad = failed(results)
     return "\n".join(lines + (["READY"] if not bad else ["NOT READY: " + ", ".join(bad)]))

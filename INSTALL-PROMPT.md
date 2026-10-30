@@ -21,7 +21,7 @@ Copy everything between the two markers, paste it as one message, and answer the
 
 You are installing Founderizer for the owner of this machine. Founderizer is a fleet of AI coding
 agents that runs on machines the owner controls: one **hub** on a Linux server that stays on, and
-any number of **machines** that join it. You install the hub, or you join a machine to a hub that
+any number of **servers** that join it. You install the hub, or you join a server to a hub that
 runs already.
 
 Work only with the commands in this prompt. They are the whole install. Do not add steps, do not
@@ -31,7 +31,7 @@ replace a command with one you think is better, and do not go on past a step tha
 
 **You never touch a model provider credential.** Not Anthropic, not OpenAI, not xAI. You do not
 sign in, you do not read, copy, write, move or print a token, and you do not run a command that
-makes one. The owner signs each machine in to their own account afterwards, from the app, with the
+makes one. The owner signs each server in to their own account afterwards, from the app, with the
 provider's own page in their own browser. That is the condition on which this product may host the
 provider's software at all, and it is also the owner's own protection.
 
@@ -62,7 +62,7 @@ about to do, and why you did not.
   not the server's users, not the packages, not a service. The installer does all of it, and it
   checks each step first.
 - **Touch no fleet that is already running.** Do not restart, reload, deploy or update a hub or a
-  machine that is not the one you are installing now.
+  server that is not the one you are installing now.
 - **`--reclaim` only when the owner asks for it in this conversation.** It opens a new owner claim
   on a hub that already has an owner.
 - **Claim no subscription.** The install makes this fleet's own id and stops there. The app is the
@@ -76,8 +76,8 @@ about to do, and why you did not.
 
 Ask the owner for all of it in one message, and wait for the answer. Do not guess any of it.
 
-1. **Which job**: install a new hub, or join a machine to a hub that runs already.
-2. **The machine**: the address or host name you reach it at, and the user you reach it with. That
+1. **Which job**: install a new hub, or join a server to a hub that runs already.
+2. **The server**: the address or host name you reach it at, and the user you reach it with. That
    user must be `root` or must be able to become root. Ubuntu 22.04, Ubuntu 24.04 or Debian 12,
    and a machine that stays on — never a laptop.
 3. **The Tailscale auth key of their fleet**, from their own Tailscale admin console, **written by
@@ -86,7 +86,7 @@ Ask the owner for all of it in one message, and wait for the answer. Do not gues
    instead, tell them it is now in the conversation, ask them to revoke that key in the Tailscale
    console when the install is finished, and go on.
 4. **For a new hub**: the address of the Founderizer repository, which their download page gives
-   them. **For a joining machine**: the whole join line from the app (Settings, Servers,
+   them. **For a joining server**: the whole join line from the app (Settings, Servers,
    Add server), copied without a change.
 5. **This machine must be on the same Tailscale network**, because the hub proves the owner's
    address from a call that comes from here. Check it with `tailscale ip -4`; if there is no
@@ -104,7 +104,7 @@ itself, leave out the `ssh "$SSHUSER@$HOST"` part and run the rest as root.
 
 ## Job A: install a new hub
 
-### A1. Read the machine
+### A1. Read the server
 
     ssh -o BatchMode=yes "$SSHUSER@$HOST" 'id -un; id -u; sed -n "1,2p" /etc/os-release; command -v systemctl'
 
@@ -185,21 +185,21 @@ Give the owner:
 
 - every line `verify` printed, as it is, and whether it ended with `READY`;
 - the hub's address, to paste in the Founderizer window that waits for it;
-- the two things only they can do: sign each machine in to their own provider account
-  (`Settings`, `Servers`, the machine, `Sign in`), and add their agents (the `+` at the top of
+- the two things only they can do: sign each server in to their own provider account
+  (`Settings`, `Servers`, the server, `Sign in`), and add their agents (the `+` at the top of
   the sidebar, `Add agent`).
 
 If the last line is `NOT READY`, each failing check carries its own fix in the same line. Tell the
 owner what failed and what the fix says. Run a fix only when it is one of the commands in this
 prompt; otherwise give it to the owner and stop.
 
-## Job B: join a machine to a hub that runs already
+## Job B: join a server to a hub that runs already
 
-### B1. Read the machine
+### B1. Read the server
 
 The command of A1, with the same checks and the same stops.
 
-### B2. Put the machine on the fleet's private network
+### B2. Put the server on the fleet's private network
 
     ssh "$SSHUSER@$HOST" 'command -v tailscale >/dev/null 2>&1 || curl -fsSL https://tailscale.com/install.sh | sh'
     ssh "$SSHUSER@$HOST" 'umask 077; cat > /root/fleet-authkey' < "$KEYFILE"
@@ -215,9 +215,9 @@ Run the line the owner gave you, unchanged, on the server:
 
     ssh "$SSHUSER@$HOST" '<the whole join line from the app>'
 
-It fetches the join script from their own hub and joins this machine: base packages, the service
+It fetches the join script from their own hub and joins the server: base packages, the service
 user, the checkout, the join itself with the one-time code on standard input, security updates,
-the firewall, one OS user for each agent this machine already has, and `verify` at the end.
+the firewall, one OS user for each agent this server already has, and `verify` at the end.
 
 Check: it prints `this machine is the server <name>`, then `the server service runs`, then the
 lines of `verify`.
@@ -229,13 +229,13 @@ make a code yourself.
 ### B4. Report
 
 Give the owner the lines `verify` printed, whether it ended with `READY`, and the next step in the
-app: the `+` at the top of the sidebar, `Add agent`, and then `Sign in` on that machine's page
+app: the `+` at the top of the sidebar, `Add agent`, and then `Sign in` on that server's page
 (`Settings`, `Servers`).
 
 ## When you are finished
 
-Say, in a few lines: which job you did, which machine, what `verify` answered, and what is left for
-the owner. Then stop. Do not start another machine, do not add an agent, and do not sign anything
+Say, in a few lines: which job you did, which server, what `verify` answered, and what is left for
+the owner. Then stop. Do not start another server, do not add an agent, and do not sign anything
 in.
 
 If anything in this install was not in this prompt, say what it was and what you did about it. If
