@@ -25263,14 +25263,37 @@ def reload_team(revision):
 LEADS_READY = True      # owner API 1.6 "leads": a lead works like a worker, with team tools in its task sessions
 
 
+def forget_removed_agents(names, t0):
+    """Inside a transaction: what the hub holds for an agent that left team.json and that an agent added again under
+    its name must not inherit: its key with its session credentials, and its machine's newest reading and update. An
+    agent moved to another server by removal and Add agent (30 October 2026) could not register the key of its new
+    machine ("only the owner replaces it"), and its install's sign-in read "signed in" from the old machine. Its
+    tasks, messages, memory and other records stay; a rename moves them first (rename_rows). Returns the names of
+    which it deleted anything."""
+    in_transaction("forget_removed_agents")
+    forgot = []
+    for name in names:
+        revoke_sessions(name, t0)
+        if sum(DB.execute(f"DELETE FROM {table} WHERE agent=?", (name,)).rowcount
+               for table in ("agent_keys", "machine_status", "machine_updates")):
+            forgot.append(name)
+    return forgot
+
+
 def apply_team(new):
     was_v2 = contacts_v2()
+    gone = [name for name in agents() if name not in new["agents"]]
     TEAM.update(new)                                 # one key at a time: readers never see an empty team
     for key in [k for k in TEAM if k not in new]:
         del TEAM[key]
     CFG["team_problem"] = team_problem(TEAM)    # a write that validates takes the startup reading off the board
     for name in new["agents"]:
         know(name)
+    if gone:
+        with transaction():
+            forgot = forget_removed_agents(gone, now())
+        if forgot:
+            log("hub", f"forgot the key and the machine reading of {', '.join(forgot)}, which left the team")
     rev = kit_revision(fresh=True)
     # Every machine runs team.json from its own checkout and same_code counts it, so a write about one agent changes
     # what each machine should run: each one that reports is asked to follow, or it stands "behind" (Update available)
