@@ -804,9 +804,10 @@ def which_hub(_args):
 
 
 def add_machine(args):
-    """`POST /ui/servers/join`: the one-time join line for a new machine. With `host` and `ssh_user` this server also
-    runs that line on the machine, over the owner's own SSH, as the app's Add server does."""
-    body = {"name": args.get("name"), "kind": args.get("kind")}
+    """`POST /ui/servers/join`: the one-time join line for a new machine, which joins under its name in Tailscale. With
+    `host` and `ssh_user` this server also runs that line on the machine, over the owner's own SSH, as the app's Add
+    server does."""
+    body = {"kind": args.get("kind")}
     receipt = command("/ui/servers/join", body, "the join line", args.get("request_id"))
     line = receipt.get("line")
     if not args.get("host"):
@@ -913,11 +914,11 @@ def tools():
                           "authority, and it works only from the owner's own Mac.",
              {"address": S["text"], "claim_code": S["text"], "claim_port": S["int"], "port": S["int"]},
              ("address", "claim_code"), claim_hub),
-        tool("add_machine", "Add a machine to the fleet: the hub's one-time join line. With host and ssh_user this "
-                            "server also runs that line on the machine over the owner's own SSH.",
-             {"name": S["text"], "kind": {"type": "string", "enum": ["linux", "mac"]},
-              "host": S["text"], "ssh_user": S["text"], **rid},
-             ("name", "kind"), add_machine),
+        tool("add_machine", "Add a machine to the fleet: the hub's one-time join line. The machine joins under its "
+                            "name in Tailscale. With host and ssh_user this server also runs that line on the machine "
+                            "over the owner's own SSH.",
+             {"kind": {"type": "string", "enum": ["linux", "mac"]}, "host": S["text"], "ssh_user": S["text"], **rid},
+             ("kind",), add_machine),
         tool("add_agent", "Put a new agent on an available server. The hub writes the agent and its profile in one "
                           "commit and makes the install job; read servers to follow its steps.",
              {"server": S["text"], "agent": S["text"], "runtime": {"type": "string", "enum": ["claude", "codex"]},

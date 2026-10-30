@@ -75,7 +75,8 @@ sh /root/fleet-kit/hub.sh --check
 
 Other options: `--port N` (default 8765), `--timezone Z` (default the server's own),
 `--runtime claude|codex` for the manager, `--hostname NAME` for the Tailscale name
-(default `fleet-hub`), `--claim-wait SECONDS` (default 1800) and `--reclaim`.
+(default: the name its provider gave the machine, which becomes its name in Fleet), `--claim-wait SECONDS`
+(default 1800) and `--reclaim`.
 
 ### What the fifteen steps do
 
@@ -89,8 +90,8 @@ Other options: `--port N` (default 8765), `--timezone Z` (default the server's o
 4. **The private network.** Tailscale from its own installer when the server has none
    (`curl -fsSL https://tailscale.com/install.sh | sh`, the vendor's own script, which is what
    `join.sh` uses for a server too),
-   then `tailscale up --auth-key=file:<a root-only file> --hostname=fleet-hub
-   --accept-dns=false`. This hub's address is what `tailscale ip -4` then gives.
+   then `tailscale up --auth-key=file:<a root-only file> --accept-dns=false` (with
+   `--hostname NAME` only when it is given). This hub's address is what `tailscale ip -4` then gives.
 5. **The firewall** (`ufw`): incoming traffic to SSH and to `tailscale0` only, outgoing
    allowed. It comes before the claim, because the owner's Mac must reach port 8765
    while the install still runs. A firewall that is already active keeps its own rules.

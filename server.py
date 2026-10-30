@@ -54,9 +54,10 @@ KEY_FILE = os.path.join(FLEET, "server.key")
 CONF_FILE = os.path.join(FLEET, "server.json")
 LABEL, UNIT = "com.agentfleet.server", "fleet-server.service"
 REPORT_EVERY = 300              # seconds between readings
-# The one feature of this service that the hub reads: it reports its status while a job runs too (beating), so the
+# The features of this service that the hub reads: it reports its status while a job runs too (beating), so the
 # hub tells a long step of a live server from a server that stopped, with no clock of its own (plan C2).
 JOB_HEARTBEAT = "job_heartbeat"
+NAMES_FEATURE = "server_names"  # it takes a new name from the hub (adopt): hub.NAMES_FEATURE
 POLL = 5                        # seconds between looks for a job
 SIGN_IN_WAIT = 900              # seconds a sign-in may take
 HELPER_WAIT = 120               # seconds for a new agent's own helper to reach the hub, before its sign-in can start
@@ -399,7 +400,7 @@ class Service:
         life = self.life
         return {"revision": self.loaded, "os": life.os_info(), "security": life.security(),
                 "runtimes": self.runtimes(),
-                "access": dict(life.access(), user=pwd.getpwuid(os.getuid()).pw_name), "features": [JOB_HEARTBEAT]}
+                "access": dict(life.access(), user=pwd.getpwuid(os.getuid()).pw_name), "features": [JOB_HEARTBEAT, NAMES_FEATURE]}
 
     def runtimes(self):
         """Codex and Claude Code as this server's agent reads them: as its own OS user, in its own home and on its own
@@ -433,7 +434,28 @@ class Service:
         self.last_report = self.clock()
         if status == 200 and re.fullmatch(r"[0-9a-f]{40}", str(answer.get("desired_revision"))):
             self.desired = answer["desired_revision"]
+        if status == 200:
+            self.adopt(answer.get("server"))
         return status
+
+    def adopt(self, name):
+        """The name the hub gives this server in its answer to a reading: its name in Tailscale. A machine renamed there
+        gets its new name in Fleet (hub.rename_machine), which it takes once its own checkout's team.json has it, so
+        that agents_here always reads one name in one file; it keeps it in server.json and calls with it from then on.
+        Until then it calls with the old one, and the hub knows it by its address and key."""
+        if name == self.name or not NAME.fullmatch(str(name)):
+            return
+        try:
+            with open(os.path.join(self.kit, "team.json"), encoding="utf-8") as f:
+                if name not in (json.load(f).get("addresses") or {}):
+                    return
+        except (OSError, ValueError, AttributeError):
+            return
+        conf = load_conf() or {"hub": getattr(self.hub, "url", None), "repo": self.repo}
+        save_conf(dict(conf, name=name))
+        print(f"Founderizer: this machine is the server {name} now, its name in Tailscale (it was {self.name})",
+              flush=True)
+        self.name = name
 
     # ---- the loop
     def loop(self, rounds=None):

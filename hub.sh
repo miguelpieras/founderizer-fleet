@@ -52,7 +52,7 @@ timezone=""
 runtime=claude
 claim_wait=1800
 reclaim=no
-hostname=fleet-hub
+hostname=""             # its name in Tailscale, which is its name in Fleet: the name its provider gave it
 root=""                 # --check only: a folder that stands in for / so the plan can be read on any machine
 step=0
 ready=yes               # what the last step, verify, answered about this machine
@@ -239,7 +239,7 @@ network() {
     if [ "$check" = yes ]; then
         command -v tailscale >/dev/null 2>&1 || plan "install Tailscale from https://tailscale.com/install.sh"
         plan "read the Tailscale auth key on standard input into a file that only root can read, then run: \
-tailscale up --auth-key=file:<that file> --hostname=$hostname --accept-dns=false"
+tailscale up --auth-key=file:<that file>${hostname:+ --hostname=$hostname} --accept-dns=false"
         plan "take this machine's address from: tailscale ip -4"
         address="100.64.0.1"
         say "  check only: the plan below uses $address as this machine's address"
@@ -265,12 +265,12 @@ terminal on this server and paste the key."; }
         ( umask 077; printf '%s\n' "$key" > "$keydir/authkey" )
         key=""
         unset key
-        tailscale up --auth-key="file:$keydir/authkey" --hostname="$hostname" --accept-dns=false \
+        tailscale up --auth-key="file:$keydir/authkey" ${hostname:+--hostname="$hostname"} --accept-dns=false \
             || { rm -rf "$keydir"; stop "Tailscale did not join with that auth key. Make a new key in the fleet's \
 Tailscale admin console, then run the line again."; }
         rm -rf "$keydir"
         trap - EXIT INT TERM
-        say "  this machine joined the private network as $hostname"
+        say "  this machine joined the private network${hostname:+ as $hostname}"
     fi
     address=$(tailscale ip -4 2>/dev/null | head -n 1)
     case "$address" in
@@ -367,7 +367,7 @@ agents() {      # each agent of this machine under its own OS user: its checkout
                 # that its runtime credential and its vault token are in a home no other agent can open
     heading "each agent of this machine, under its own OS user"
     if [ "$check" = yes ]; then
-        plan "read this machine's agents: python3 $kit/hubsetup.py agent-list --team $kit/team.json --machine hub"
+        plan "read this machine's agents: python3 $kit/hubsetup.py agent-list --team $kit/team.json"
         plan "for each agent, as its own user fleet-<agent>: clone git://$address/fleet-pilot.git on the \
 configuration ref into /home/fleet-<agent>/fleet-<agent>, install its runtime into that user's own ~/.local/bin, \
 write its service with fleet.py service <agent>, and enable and start it in that user's own systemd manager"
@@ -377,7 +377,7 @@ write its service with fleet.py service <agent>, and enable and start it in that
     list=$(mktemp) || stop "Could not make a temporary file."
     # shellcheck disable=SC2064
     trap "rm -f $list" EXIT INT TERM
-    python3 "$kit/hubsetup.py" agent-list --team "$kit/team.json" --machine hub > "$list" \
+    python3 "$kit/hubsetup.py" agent-list --team "$kit/team.json" > "$list" \
         || stop "The agents of this machine could not be read from $kit/team.json."
     while read -r agent agent_runtime user; do
         [ -n "$agent" ] || continue
@@ -467,13 +467,13 @@ vault.py reach a vault broker on this machine, which no checkout holds"
 agent_users() {  # one OS user for each agent of this machine, so that no agent's home is readable by another's user
     heading "one OS user for each agent of this machine"
     if [ "$check" = yes ]; then
-        plan "run: python3 $kit/hubsetup.py agent-users --team $kit/team.json --machine hub"
+        plan "run: python3 $kit/hubsetup.py agent-users --team $kit/team.json"
         plan "make the user fleet-<agent> for each agent team.json gives this machine: a locked password, no sudo, \
 lingering on, the group fleet-agents, and the home /home/fleet-<agent> of mode 700 that belongs to it alone"
         plan "run each agent's session as that user, which the next steps install (PRODUCT.md 4.1)"
         return 0
     fi
-    python3 "$kit/hubsetup.py" agent-users --team "$kit/team.json" --machine hub \
+    python3 "$kit/hubsetup.py" agent-users --team "$kit/team.json" \
         || stop "the OS users of this machine's agents could not be made."
 }
 

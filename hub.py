@@ -762,7 +762,8 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "manager_start", "agent_notes", "edit_in_place", "machine_access", "push",
                "attachment_knowledge", "asking_and_waiting", "account_limits", "secret_requests",
                "secret_deliveries", "agent_rename", "agent_memory", "live_changes",
-               "settings", "standing", "history", "costs"]
+               "settings", "standing", "history", "costs",
+               "server_names"]      # the owner, 30 October 2026: a server's name is its name in Tailscale
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -12143,11 +12144,14 @@ def same_code(rev, desired):
             return False            # an unknown commit: not cached, it can arrive later
         if len(_code_diffs) > 512:
             _code_diffs.clear()
-        # A skill's script is no Fleet code either (design v4 D1): no helper runs it, so a checkout without the
-        # skill an agent wrote a minute ago is not behind.
-        _code_diffs[(rev, desired)] = not any(FLEET_FILES.search(p) and not OWNER_ONLY.search(p)
-                                              and not p.startswith(SKILLS + "/") for p in out.split("\n") if p)
+        _code_diffs[(rev, desired)] = not any(fleet_code(p) for p in out.split("\n") if p)
     return _code_diffs[(rev, desired)]
+
+
+def fleet_code(path):
+    """A file whose change a machine must take (same_code). A skill's script is no Fleet code either (design v4 D1): no
+    helper runs it, so a checkout without the skill an agent wrote a minute ago is not behind."""
+    return bool(FLEET_FILES.search(path)) and not OWNER_ONLY.search(path) and not path.startswith(SKILLS + "/")
 
 
 def contains_revision(rev, target):
@@ -23439,6 +23443,7 @@ def tick():
             names_sweep(t0)                 # devops task 1.1: the Tailscale names, when the start found none
             history_sweep(t0)               # AUTONOMY.md P6: what was written since the last pass, into the history
             default_access_sweep(t0)        # the owner, 28 October 2026: every agent's vault, and a Mac's desktop
+            machine_names_sweep(t0)         # the owner, 30 October 2026: a machine's name is its name in Tailscale
         except Exception:
             traceback.print_exc()           # a goal or database check must not stop the timers below
         # close sessions of finished tasks
@@ -23621,6 +23626,11 @@ def address_of_machine(machine):
     return (TEAM.get("addresses") or {}).get(machine) or ""
 
 
+def machine_at(address):
+    """The first machine of team.json at this address, or None."""
+    return next((m for m, ip in (TEAM.get("addresses") or {}).items() if ip == address and m != "owner"), None)
+
+
 def hub_address():
     hub = TEAM.get("hub")
     if isinstance(hub, dict):
@@ -23660,19 +23670,48 @@ REFUSED_HOSTS = set()                       # the (source, Host) pairs logged si
 REFUSED_LOCK = threading.Lock()
 
 
-def tailnet_names():
+TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"    # a hub on a Mac (verify.py `tailscale`)
+
+
+def tailnet_status():
+    """`tailscale status --json` of the hub machine, parsed: None when the command is absent, fails or takes more than 5
+    seconds. Never under LOCK, because of those 5 seconds."""
+    import shutil
+    app = TAILSCALE_APP if os.path.exists(TAILSCALE_APP) else "tailscale"
+    try:
+        done = subprocess.run([shutil.which("tailscale") or app, "status", "--json"], capture_output=True, text=True,
+                              timeout=5, stdin=subprocess.DEVNULL)
+        status = json.loads(done.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return None
+    return status if isinstance(status, dict) else None
+
+
+def tailnet_names(status=None):
     """The hub machine's own names on the private network: Self.DNSName of `tailscale status --json` without its final
     dot, full and short. () when the command is absent, fails or takes more than 5 seconds: the hub starts without
     them, and the next reload_team asks again."""
     try:
-        done = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True, timeout=5,
-                              stdin=subprocess.DEVNULL)
-        name = str((json.loads(done.stdout).get("Self") or {}).get("DNSName") or "").rstrip(".").lower()
-    except (OSError, subprocess.SubprocessError, ValueError, AttributeError, TypeError):
+        name = str(((tailnet_status() if status is None else status).get("Self") or {}).get("DNSName") or "") \
+            .rstrip(".").lower()
+    except (AttributeError, TypeError):
         return ()
     if not HOST_NAME.fullmatch(name):
         return ()
     return tuple(dict.fromkeys((name, name.split(".")[0])))
+
+
+def tailnet_machines(status):
+    """{Tailscale address: name} of every node of a status, the hub machine's own included. The name is the first label
+    of the node's MagicDNS name: the name the machine has in Tailscale, which is its name in Fleet too."""
+    status = status if isinstance(status, dict) else {}
+    peers = status.get("Peer") if isinstance(status.get("Peer"), dict) else {}
+    out = {}
+    for node in [status.get("Self"), *peers.values()]:
+        if isinstance(node, dict) and isinstance(node.get("TailscaleIPs"), list):
+            name = str(node.get("DNSName") or "").rstrip(".").split(".")[0].lower()
+            out.update((ip, name) for ip in node["TailscaleIPs"] if isinstance(ip, str) and name)
+    return out
 
 
 def learn_tailnet_names():
@@ -23691,6 +23730,88 @@ def names_sweep(t0):
     if not TAILNET_NAMES["names"] and t0 - TAILNET_NAMES.get("asked", 0) >= 60:
         TAILNET_NAMES["asked"] = t0
         learn_tailnet_names()
+
+
+MACHINE_NAMES = {"asked": 0.0, "seen": None, "names": {}, "waits": {}, "origin_at": 0.0}    # the newest status read,
+# its names, the waits, and when a rename's note last asked origin
+MACHINE_NAMES_EVERY = 600       # seconds between two reads of the machines' names in Tailscale
+NAMES_FEATURE = "server_names"  # a server service that takes its new name from the hub (server.py `adopt`)
+
+
+def machine_names_sweep(t0):
+    """Inside LOCK: a machine's name in Fleet is its name in Tailscale, so a machine renamed there is renamed here, by
+    itself. Every MACHINE_NAMES_EVERY seconds a thread reads the status outside LOCK (returned, else None); the next
+    tick follows it."""
+    finish_machine_rename(t0)
+    seen, MACHINE_NAMES["seen"] = MACHINE_NAMES["seen"], None
+    if seen:
+        follow_tailnet_names(seen, t0)
+    if t0 - MACHINE_NAMES["asked"] >= MACHINE_NAMES_EVERY:
+        MACHINE_NAMES["asked"] = t0
+        thread = threading.Thread(target=lambda: MACHINE_NAMES.update(seen=tailnet_status()), name="machine-names",
+                                  daemon=True)
+        thread.start()
+        return thread
+
+
+def tailnet_rename_wait(machine, new, t0):
+    """(why, lasting) when the machine cannot take its Tailscale name now, or None. A lasting reason waits for
+    somebody, so the manager hears it; any other passes by itself, and the rename comes at a later read."""
+    if not SERVER_NAME.fullmatch(new) or new == "owner":
+        return f"{new} is no name a server can have in Fleet: 2 to 31 characters a-z 0-9 -, starting with a letter", True
+    if new in (TEAM.get("addresses") or {}) or q1("SELECT 1 FROM server_keys WHERE server=?", (new,)):
+        return f"the fleet has a server named {new}", True
+    if central_ok(t0):
+        return "the central vault pins each server's vault by its name", False
+    if q1("SELECT 1 FROM server_jobs WHERE server=? AND state IN (%s) LIMIT 1" % ",".join("?" * len(JOB_OPEN)),
+          (machine, *JOB_OPEN)):
+        return "its server has a job open", False
+    if q1("SELECT 1 FROM deposits WHERE machine=? AND finished IS NULL UNION ALL "
+          "SELECT 1 FROM withdrawals WHERE machine=? AND finished IS NULL LIMIT 1", (machine, machine)):
+        return "its vault has a delivery or a withdrawal open", False
+    if q1("SELECT 1 FROM server_keys WHERE server=?", (machine,)):
+        st = q1("SELECT data, reported FROM server_status WHERE server=?", (machine,))
+        if not st or t0 - st["reported"] > MACHINE_STALE or \
+                NAMES_FEATURE not in (json.loads(st["data"]).get("features") or []):
+            return "its server service is off, or older than a release that takes a new name", False
+    return None
+
+
+def follow_tailnet_names(status, t0):
+    """Inside LOCK: each machine of team.json whose address has had another name in Tailscale for two reads in a row
+    takes that name (rename_machine), unless it must wait (tailnet_rename_wait): a name that one read catches in the
+    middle of a rename in Tailscale stays out of Fleet. Each wait is logged once; a lasting one also tells the manager,
+    once for each reason, a restart included. The hub's own Host names come from the same status."""
+    TAILNET_NAMES["names"] = tailnet_names(status) or TAILNET_NAMES["names"]
+    names, before, waits = tailnet_machines(status), MACHINE_NAMES["names"], MACHINE_NAMES["waits"]
+    MACHINE_NAMES["names"] = names
+    for machine, ip in list((TEAM.get("addresses") or {}).items()):
+        new = names.get(ip)
+        if machine == "owner" or not new or new == machine:
+            waits.pop(machine, None)
+            if kv_get(f"name_told:{machine}"):
+                kv_set(f"name_told:{machine}", None)
+            continue
+        if before.get(ip) != new:       # the first read of this name, a restart's first read included
+            continue
+        if kv_get("machine_rename"):    # a rename that stopped between its commit and its records goes first
+            break
+        try:
+            wait = tailnet_rename_wait(machine, new, t0)
+            if wait is None:
+                rename_machine(machine, new, t0)
+                waits.pop(machine, None)
+                kv_set(f"name_told:{machine}", None)
+                continue
+        except Exception as e:          # a 409 of the configuration ref, or a team.json it would not run: next read
+            wait = (str(e)[:300] or type(e).__name__, False)
+        if waits.get(machine) != wait[0]:
+            waits[machine] = wait[0]
+            log("hub", f"server {machine} keeps its name for now, not {new}, its name in Tailscale: {wait[0]}")
+        if wait[1] and manager_name() and kv_get(f"name_told:{machine}") != wait[0]:    # once, across restarts
+            kv_set(f"name_told:{machine}", wait[0])
+            emit(manager_name(), "say", f"[hub] The server {machine} is called {new} in Tailscale, and Fleet cannot "
+                                        f"give it that name yet: {wait[0]}.")
 
 
 def host_value(name, port):
@@ -25769,7 +25890,7 @@ def join_view(row, t0):
         return None
     state = "joined" if row["used"] else "canceled" if row["canceled"] else "expired" if row["expires"] <= t0 else "open"
     return {"name": row["name"], "kind": row["kind"], "created": row["created"], "expires_at": row["expires"],
-            "state": state, "server": row["name"] if row["used"] else None}
+            "state": state, "server": (machine_at(row["address"]) or None) if row["used"] else None}
 
 
 def servers_view():
@@ -25803,33 +25924,32 @@ def servers_view():
             "join": join_view(q1("SELECT * FROM join_codes ORDER BY id DESC LIMIT 1"), t0)}
 
 
-def join_line(code, name, kind):
+def join_line(code, kind):
     """The one line that the owner pastes on the new server. A Mac has Tailscale already. A VPS gets it from Tailscale's
-    own installer and joins the private network with the tags of the hub's ports (one sign-in link). Then the line runs
-    this hub's join script, with the code in that script's environment: never in a URL."""
+    own installer and joins the private network with the tags of the hub's ports (one sign-in link), under the name its
+    provider gave it, which becomes its name in Fleet. Then the line runs this hub's join script, with the code in that
+    script's environment: never in a URL."""
     ip, port = hub_address()
     join = f"curl -fsS http://{ip}:{port}/join | FLEET_JOIN={code} sh"
     if kind == "mac":
         return join
     return ("command -v tailscale >/dev/null || curl -fsSL https://tailscale.com/install.sh | sh; tailscale status "
-            f">/dev/null 2>&1 || tailscale up --hostname=fleet-{name} --advertise-tags={JOIN_TAGS} --accept-dns=false; "
-            + join)
+            f">/dev/null 2>&1 || tailscale up --advertise-tags={JOIN_TAGS} --accept-dns=false; " + join)
 
 
-def new_join_code(name, kind):
-    """POST /ui/servers/join: a one-time code for one new server with this name, for 30 minutes. The hub keeps only its
+def new_join_code(kind, label=""):
+    """POST /ui/servers/join: a one-time code for one new server, for 30 minutes. The server gets its name at the join,
+    from Tailscale; the label is the name an older app typed, kept only for that app. The hub keeps only the code's
     SHA-256, and a new code cancels the open one."""
-    if name in (TEAM.get("addresses") or {}):
-        raise Refusal(409, f"Your fleet has a server named {name}. Choose another name.")
     t0 = now()
     raw = "".join(secrets.choice(LINK_ALPHABET) for _ in range(12))
     with transaction():
         DB.execute("UPDATE join_codes SET canceled=? WHERE used IS NULL AND canceled IS NULL", (t0,))
         DB.execute("INSERT INTO join_codes(sha256,name,kind,created,expires) VALUES(?,?,?,?,?)",
-                   (hashlib.sha256(raw.encode()).hexdigest(), name, kind, t0, t0 + JOIN_LIFE))
-    log("owner", f"made a join code for server {name}")
+                   (hashlib.sha256(raw.encode()).hexdigest(), label, kind, t0, t0 + JOIN_LIFE))
+    log("owner", f"made a join code for a {kind} server")
     code = "-".join(raw[i:i + 4] for i in (0, 4, 8))
-    return {"name": name, "kind": kind, "expires_at": t0 + JOIN_LIFE, "code": code, "line": join_line(code, name, kind)}
+    return {"name": label, "kind": kind, "expires_at": t0 + JOIN_LIFE, "code": code, "line": join_line(code, kind)}
 
 
 def join_input(data):
@@ -25875,8 +25995,8 @@ def join_server(src, body):
         raise Refusal(403, "This join code is not valid. Copy the line again from Founderizer: Settings, Servers, "
                            "Add server.")
     if row["used"] is not None:
-        if row["address"] == src and row["key_sha256"] == body["key_sha256"]:
-            return dict(join_answer(row["name"]), replayed=True)
+        if row["address"] == src and row["key_sha256"] == body["key_sha256"] and machine_at(src):
+            return dict(join_answer(machine_at(src)), replayed=True)
         log("hub", f"REFUSED a join from {src}: the code of {row['name']} was used")
         raise Refusal(410, "This join code was already used. Make a new code in Founderizer: Settings, Servers, "
                            "Add server.")
@@ -25884,13 +26004,21 @@ def join_server(src, body):
         raise Refusal(410, "A newer join code replaced this code. Copy the newest line from Founderizer.")
     if row["expires"] <= t0:
         raise Refusal(410, "This join code expired. Make a new code in Founderizer: Settings, Servers, Add server.")
-    name = row["name"]
+    name = body.get("name")
     team, _, _ = team_view(kit_revision(fresh=True))
-    if name in team["addresses"]:
-        raise Refusal(409, f"Your fleet has a server named {name} now. Make a new code with another name.")
     known = next((m for m, ip in team["addresses"].items() if ip == src), None)
     if known:
         raise Refusal(409, f"This server is in your fleet already, as {known}.")
+    if not name:
+        raise Refusal(503, "The hub could not read this server's name in Tailscale. Run the line again in a minute; "
+                           "the code stays valid.")
+    if not SERVER_NAME.fullmatch(name) or name == "owner":
+        raise Refusal(409, f"This server is called {name} in Tailscale, and a server's name in Fleet has 2 to 31 "
+                           f"characters a-z 0-9 -, starting with a letter. Rename this server in Tailscale, then run "
+                           f"the line again.")
+    if name in team["addresses"] or q1("SELECT 1 FROM server_keys WHERE server=?", (name,)):
+        raise Refusal(409, f"Your fleet has a server named {name}. Rename one of the two in Tailscale, then run the "
+                           f"line again.")
     team["addresses"][name] = src
     team.setdefault("servers", {})[name] = {"kind": body["kind"], "user": body["user"]}
     if body["ssh_port"]:                # the join line ran as root: the owner's "Open in Terminal"
@@ -26297,6 +26425,107 @@ def rename_agent(agent, body):
     apply_team(renamed)
     return {"agent": new, "was": agent, "server": server, "job": job, "revision": commit,
             "sha256": hashlib.sha256(data).hexdigest()}
+
+
+# ---- a machine's name is its name in Tailscale
+
+# Every column that holds a machine's name. A rename moves each one in one transaction, so a server keeps its key, its
+# reading, its jobs and its vault's records. test_machine_names names every column of a machine or server name, so a
+# new one is placed here or named as something else. A join code keeps the label it was made with, and finds its
+# server by address.
+MACHINE_COLUMNS = (("server_keys", "server"), ("server_status", "server"), ("server_jobs", "server"),
+                   ("deposits", "machine"), ("withdrawals", "machine"), ("placements", "machine"),
+                   ("place_codes", "machine"), ("place_hosts", "machine"))
+MACHINE_ROWS = (("server_status", "server"), ("place_hosts", "machine"))    # a key of their own: an old row goes
+MACHINE_MAPS = ("addresses", "servers", "access", "vault_stores")      # the team.json maps keyed by a machine
+
+
+def renamed_machine_team(team, old, new):
+    """team.json with the machine `old` named `new`: its key in each map, in its own place, its agents' machine, and
+    the hub's machine when it is the hub."""
+    out = json.loads(json.dumps(team))
+    for key in MACHINE_MAPS:
+        if isinstance(out.get(key), dict) and old in out[key]:
+            out[key] = {(new if m == old else m): v for m, v in out[key].items()}
+    for a in out["agents"].values():
+        if a.get("machine") == old:
+            a["machine"] = new
+    if out["hub"].get("machine") == old:
+        out["hub"]["machine"] = new
+    return out
+
+
+def rename_machine_rows(old, new):
+    """Inside a transaction: every record of the machine under its new name, and the rename's note gone. A row under the
+    new name in a table with one row for each machine is what a server of that name left before it was removed."""
+    in_transaction("rename_machine_rows")
+    for table, column in MACHINE_ROWS:
+        DB.execute(f"DELETE FROM {table} WHERE {column}=?", (new,))
+    for table, column in MACHINE_COLUMNS:
+        DB.execute(f"UPDATE {table} SET {column}=? WHERE {column}=?", (new, old))
+    DB.execute("DELETE FROM kv WHERE k='machine_rename'")
+
+
+def rename_machine(old, new, t0):
+    """Inside LOCK: the machine `old` takes its Tailscale name `new` everywhere. One commit moves it in team.json, one
+    transaction moves every record of it, the manager reads one line, and apply_team asks each machine for its idle
+    update. A note in kv names the rename from before the commit to the end of the transaction, so a hub that stops in
+    between finishes it (finish_machine_rename). Its server service is known by its address and key (server_caller),
+    and takes the new name from the next answer once its checkout has it (server.py `adopt`)."""
+    team, _, _ = team_view(kit_revision(fresh=True))
+    renamed = renamed_machine_team(team, old, new)
+    validate_team(renamed)
+    data = (json.dumps(renamed, indent=2) + "\n").encode()
+    kv_set("machine_rename", json.dumps([old, new]))        # finish_machine_rename reads it, whatever stops below
+    commit = commit_kit_file("team.json", data, f"Server {old} is now {new}, its name in Tailscale")
+    manager = next(n for n, x in renamed["agents"].items() if x.get("role") == "manager")
+    with transaction():
+        rename_machine_rows(old, new)
+        event_rows([(manager, "say", None, f"[hub] The server {old} is now called {new}, its name in Tailscale. "
+                                           f"Use {new} from now on.", None)], t0)
+        log_row("hub", f"server {old} is now {new}, its name in Tailscale, in {commit[:12]}")
+    apply_team(renamed)
+    return commit
+
+
+def finish_machine_rename(t0):
+    """Inside LOCK, at each pass of the sweep: a rename that a stop or an error cut between its commit and its
+    transaction, finished; any other note, forgotten. Origin is asked at most once each MACHINE_NAMES_EVERY seconds,
+    because its fetch runs under LOCK."""
+    note = kv_get("machine_rename")
+    if not note:
+        return
+    old, new = json.loads(note)
+    team, _, _ = team_view(kit_revision(fresh=True))
+    if old in team["addresses"]:        # commit_kit_file pushes before it moves the hub's checkout: ask origin
+        if t0 - MACHINE_NAMES["origin_at"] < MACHINE_NAMES_EVERY:
+            return
+        MACHINE_NAMES["origin_at"], branch = t0, config_ref()
+        if git_kit("fetch", "-q", "origin", timeout=60)[0] != 0:
+            return                      # the next pass asks again
+        code, remote, _ = git_kit("rev-parse", f"origin/{branch}")
+        shown, data, _ = git_kit("show", f"origin/{branch}:team.json")
+        try:
+            there = json.loads(data)["addresses"] if code == 0 and shown == 0 else None
+        except (ValueError, KeyError, TypeError):
+            there = None
+        if there is None:
+            return
+        if new in there and old not in there:
+            rev = kit_revision(fresh=True)          # origin ahead by the rename's team.json, and by no other code
+            code, out, _ = git_kit("diff", "--name-only", rev, remote)
+            if git_kit("merge-base", "--is-ancestor", rev, remote)[0] != 0 or code != 0 or \
+                    any(fleet_code(p) for p in out.split() if p != "team.json") or \
+                    git_kit("merge", "-q", "--ff-only", remote)[0] != 0:
+                return
+            team, _, _ = team_view(kit_revision(fresh=True))
+    if new in team["addresses"] and old not in team["addresses"]:
+        with transaction():
+            rename_machine_rows(old, new)
+        apply_team(team)
+        log("hub", f"finished the rename of server {old} to {new}")
+    else:                               # the commit never landed, or the server left the fleet since
+        kv_set("machine_rename", None)
 
 
 def save_team_entry(body, key, what, entry, busy):
@@ -27702,12 +27931,19 @@ def restored_team(bundle):
             raise ValueError("team.json must be an object")
     except (KeyError, ValueError) as e:
         raise Refusal(422, f"the team.json in this copy cannot be read: {e}") from None
-    team["addresses"] = dict(team.get("addresses") or {}, **(TEAM.get("addresses") or {}))
-    if TEAM.get("hub"):
-        team["hub"] = TEAM["hub"]
+    here, there = (TEAM.get("hub") or {}).get("machine"), (team.get("hub") or {}).get("machine")
     try:
+        # Each hub's machine has its name in Tailscale, so the two can differ: the copy's agents of its hub machine
+        # move to this one first, and a machine of the copy at an address that this hub names otherwise goes
+        if here and there and here != there and here not in (team.get("addresses") or {}):
+            team = renamed_machine_team(team, there, here)
+        ours = TEAM.get("addresses") or {}
+        team["addresses"] = dict({m: ip for m, ip in (team.get("addresses") or {}).items()
+                                  if m in ours or ip not in ours.values()}, **ours)
+        if TEAM.get("hub"):
+            team["hub"] = TEAM["hub"]
         validate_team(team)
-    except ValueError as e:
+    except (ValueError, KeyError, TypeError, AttributeError) as e:
         raise Refusal(422, f"this copy and this server do not make a team.json the hub can run: {e}") from None
     return json.dumps(team, indent=2).encode() + b"\n"
 
@@ -29714,15 +29950,15 @@ class Handler(BaseHTTPRequestHandler):
         return self.json(200, scrub(dict(db=generation, time=now(), **view)), {"Cache-Control": "no-store"})
 
     def ui_servers_join(self):
-        """POST /ui/servers/join: a join code and its line, given once. The hub keeps neither: a repeat gives null."""
+        """POST /ui/servers/join: a join code and its line, given once. The hub keeps neither: a repeat gives null. The
+        server's name is its name in Tailscale, read at the join: a name that an older app sends is only the code's label,
+        which that app finds the code by."""
         def read(data):
-            name, kind = data.get("name"), data.get("kind")
-            if not (isinstance(name, str) and SERVER_NAME.fullmatch(name)):
-                raise ValueError("name must be 2 to 31 characters a-z 0-9 -, starting with a letter")
+            kind, label = data.get("kind"), data.get("name")
             if kind not in SERVER_KINDS:
                 raise ValueError("kind must be linux or mac")
-            return {"name": name, "kind": kind}
-        return self.ui_command("servers/join", read, lambda body: new_join_code(body["name"], body["kind"]),
+            return {"kind": kind, "name": label if isinstance(label, str) and SERVER_NAME.fullmatch(label) else ""}
+        return self.ui_command("servers/join", read, lambda body: new_join_code(body["kind"], body["name"]),
                                keep=lambda result: dict(result, code=None, line=None))
 
     def ui_server_agent(self, server):
@@ -29764,14 +30000,20 @@ class Handler(BaseHTTPRequestHandler):
             return {"server": server, "base_sha256": base}
         return self.ui_command(f"servers/{server}/remove", read, lambda body: remove_server(server, body))
 
-    def server_allowed(self, name):
-        """A call of a server service: from the server's own address, with its server key. Otherwise 403."""
-        src, want = self.client_address[0], address_of_machine(name) if name != "owner" else ""
-        if not want or src != want or not server_key_matches(name, self.bearer()):
+    def server_caller(self, name):
+        """A call of a server service: from a server's own address, with that server's key. The server's name, or None
+        after a 403. The caller is the server at its address, whatever name the path gives, which proves as much as the
+        name did: a machine renamed after its name in Tailscale (rename_machine) calls with its old name until its
+        checkout has the new one."""
+        src, token = self.client_address[0], self.bearer()
+        with LOCK:                      # never between a rename's records and its team.json (rename_machine)
+            server = next((m for m in server_names() if address_of_machine(m) == src and
+                           server_key_matches(m, token)), None)
+        if server is None:
             log("hub", f"REFUSED a server call for {name} from {src}")      # never the key
             self.json(403, {"error": f"{src} is not the server {name}, or this is not its server key"})
-            return False
-        return True
+            return None
+        return server
 
     def join_script(self):
         """GET /join: the join script, with this hub's address in it, and the fleet's id and release channel, from
@@ -29795,16 +30037,27 @@ class Handler(BaseHTTPRequestHandler):
             body = join_input(self.form())
         except ValueError as e:
             return self.json(400, {"error": str(e)})
-        try:
-            with LOCK:
-                result = join_server(self.client_address[0], body)
-        except Refusal as e:
-            return self.json(e.status, {"error": str(e)})
-        return self.json(200, result)
+        # Its name in Tailscale is its name in Fleet: the last read of the machine names first, and a new read only for
+        # a good code that the last read's name did not join, outside LOCK, because the command may take 5 seconds
+        src = self.client_address[0]
+        body["name"] = MACHINE_NAMES["names"].get(src)
+        for fresh in (False, True):
+            try:
+                with LOCK:
+                    result = join_server(src, body)
+                return self.json(200, result)
+            except Refusal as e:
+                if e.status not in (409, 503) or fresh:     # a 409 of the last read's name may be older than Tailscale
+                    return self.json(e.status, {"error": str(e)})
+            status = tailnet_status()
+            body["name"] = tailnet_machines(status).get(src)
+            if status is not None and not body["name"]:
+                return self.json(409, {"error": "This server is not on the hub's private network in Tailscale."})
 
     def server_status(self, name):
         """POST /server/<name>/status: the reading of a server service, as a helper's machine reading without an agent."""
-        if not self.server_allowed(name):
+        name = self.server_caller(name)
+        if name is None:
             return
         if len(self.body()) > 16384:
             return self.json(413, {"error": "status report is too large"})
@@ -29819,12 +30072,13 @@ class Handler(BaseHTTPRequestHandler):
         with area("state" if not old or untimed(json.loads(old["data"])) != untimed(reading) else "activity"):
             q("INSERT INTO server_status(server,data,reported) VALUES(?,?,?) ON CONFLICT(server) DO UPDATE SET "
               "data=excluded.data, reported=excluded.reported", (name, json.dumps(reading), now()))
-        return self.json(200, {"ok": True, "desired_revision": kit_revision()})
+        return self.json(200, {"ok": True, "desired_revision": kit_revision(), "server": name})
 
     def server_jobs(self, name):
         """GET /server/<name>/jobs: the open jobs of this server, oldest first. A rename job also names the agent's
         old name (was), and a job for an agent that keeps the OS user of an earlier name names that user."""
-        if not self.server_allowed(name):
+        name = self.server_caller(name)
+        if name is None:
             return
         rows = q("SELECT id,kind,agent,runtime,state,was FROM server_jobs WHERE server=? AND state IN "
                  "('queued','running','needs_owner') ORDER BY id", (name,))
@@ -29839,7 +30093,8 @@ class Handler(BaseHTTPRequestHandler):
         """POST /server/<name>/signin: this server asks the hub to sign one of its agents in (owner feature
         agent_signin), at the sign-in step of an install or a prepare job. It starts the one sign-in there is,
         machine_signin, so the owner reads the link and pastes the code in the app exactly as on the Machines page."""
-        if not self.server_allowed(name):
+        name = self.server_caller(name)
+        if name is None:
             return
         if len(self.body()) > 4096:
             return self.json(413, {"error": "the request is too large"})
@@ -29853,7 +30108,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def server_job(self, name, job):
         """POST /server/<name>/jobs/<id>: the state of one job of this server."""
-        if not self.server_allowed(name):
+        name = self.server_caller(name)
+        if name is None:
             return
         try:
             update = job_input(self.form())

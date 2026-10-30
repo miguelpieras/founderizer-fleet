@@ -1082,8 +1082,9 @@ def own_team(path, hub_ip, port):
     team = read_team(path)
     if not team:
         return None
-    same = ((team.get("addresses") or {}).get("hub") == hub_ip
-            and int((team.get("hub") or {}).get("port") or 0) == int(port))
+    hub = team.get("hub") or {}         # the hub's machine by its name in team.json: its name in Tailscale since
+    same = ((team.get("addresses") or {}).get(hub.get("machine")) == hub_ip      # the hub follows that (rename_machine)
+            and int(hub.get("port") or 0) == int(port))
     return team if same else None
 
 
@@ -1362,7 +1363,7 @@ def cmd_agent_users(args):
     team = read_team(args.team)
     if team is None:
         raise Stop(f"{args.team} is not a team.json the hub can run, so this machine's agents are not known yet.")
-    agent_users(team, args.machine, check=args.check)
+    agent_users(team, args.machine or (team.get("hub") or {}).get("machine"), check=args.check)
 
 
 def cmd_agent_helper(args):
@@ -1379,7 +1380,7 @@ def cmd_agent_list(args):
     team = read_team(args.team)
     if team is None:
         raise Stop(f"{args.team} is not a team.json the hub can run, so this machine's agents are not known yet.")
-    for agent in agents_of(team, args.machine):
+    for agent in agents_of(team, args.machine or (team.get("hub") or {}).get("machine")):
         conf = team["agents"][agent]
         print(f"{agent} {conf.get('runtime') or 'claude'} {agent_user(agent, conf)}")
 
@@ -1428,7 +1429,8 @@ def main(argv=None):
     rt.set_defaults(fn=cmd_runtime)
     au = sub.add_parser("agent-users")
     au.add_argument("--team", required=True, help="the team.json that names this fleet's agents")
-    au.add_argument("--machine", required=True, help="the machine of team.json whose agents get a user here")
+    au.add_argument("--machine", help="the machine of team.json whose agents get a user here; the hub's own machine "
+                                      "when it is left out")
     au.add_argument("--check", action="store_true", help="say what it would make, change nothing")
     au.set_defaults(fn=cmd_agent_users)
     va = sub.add_parser("vault")
@@ -1444,7 +1446,8 @@ def main(argv=None):
     ah.set_defaults(fn=cmd_agent_helper)
     al = sub.add_parser("agent-list")
     al.add_argument("--team", required=True, help="the team.json that names this fleet's agents")
-    al.add_argument("--machine", required=True, help="the machine of team.json whose agents are listed")
+    al.add_argument("--machine", help="the machine of team.json whose agents are listed; the hub's own machine when "
+                                      "it is left out")
     al.set_defaults(fn=cmd_agent_list)
 
 

@@ -918,8 +918,7 @@ class Onboarding:
             return "skipped", "Joined as %s." % ip
         self.must(TAILSCALE_INSTALL, "Tailscale installation", timeout=900)
         tag = self.state.get("tailscale_tag") or DEFAULT_TAGS
-        up = ("tailscale up --hostname=fleet-%s --advertise-tags=%s --accept-dns=false --ssh=false"
-              % (self.name, shlex.quote(tag)))
+        up = "tailscale up --advertise-tags=%s --accept-dns=false --ssh=false" % shlex.quote(tag)   # its own name
         if self.auth.get("tailscale") == "auth_key":
             key = self.ch.secret("tailscale_auth_key")
             self.must("printf '%%s\\n' \"$FLEET_INPUT\" | install -m 600 /dev/stdin /run/fleet-ts-authkey\n"
