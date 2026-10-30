@@ -12076,9 +12076,20 @@ def parse_profile(text):
     return sections
 
 
+# The manager may update its own profile as routine administration ("including this profile"), so an owner's save
+# keeps the opening that profiles/manager.md ships with instead of the workers' line, which said the opposite.
+MANAGER_OPENING = ("Written by the owner. The manager reads it at every start and may update it as routine Fleet "
+                   "administration, within the owner's choices.\n\nThis file says what the manager is for and what the "
+                   "owner does and does not let it do. How a tool is called is never here: a tool's own description is "
+                   "its current contract, and `RULES.md` says what each tool is for and when to reach for it. Those two "
+                   "travel with the hub and are always the hub's own; this file is the owner's and no update ever "
+                   "touches it, so anything in it that restated a tool would go stale here and nowhere else.")
+
+
 def render_profile(agent, sections):
     """The one form in which the hub writes a profile, so that a read after a save gives the same sections."""
-    out = [f"# Profile: {agent}", "", "Written by the owner. Agents cannot change it.", ""]
+    opening = MANAGER_OPENING if agent == manager_name() else "Written by the owner. Agents cannot change it."
+    out = [f"# Profile: {agent}", "", opening, ""]
     for s in sections:
         if BLOCK_START.match(s["text"]):
             out += [f"**{s['title']}.**", "", s["text"], ""]
@@ -22481,6 +22492,30 @@ def reported_model(agent, screen=False):
     return {"model": d.get("model"), "effort": d.get("effort"), "at": r["created"]}
 
 
+def check_holds(agent, rev, desired):
+    """True when a setup check that the agent's machine made at rev still holds at desired: the two differ in no Fleet
+    file (same_code), or only in other agents' entries of team.json and in other agents' profiles. Each activation
+    writes team.json, which made every other agent's check old; a change of the agent's own entry or profile, of any
+    other part of team.json, or of code still does."""
+    if same_code(rev, desired):
+        return True
+    if not (rev and desired):
+        return False
+    code, out, _ = git_kit("diff", "--name-only", "--no-renames", rev, desired)     # a moved profile is both paths
+    if code != 0:
+        return False
+    paths = [p for p in out.split("\n") if p and fleet_code(p)
+             and not (p.startswith("profiles/") and p != f"profiles/{agent}.md")]
+    if paths != ["team.json"]:
+        return not paths                # only other agents' profiles, or more than team.json
+    blobs = [git_blob(r, "team.json") for r in (rev, desired)]
+    try:
+        old, new = (json.loads(b) for b in blobs)
+    except (TypeError, ValueError):
+        return False
+    return dict(old, agents=old["agents"].get(agent)) == dict(new, agents=new["agents"].get(agent))
+
+
 def activation_missing(agent):
     """([what is missing], the check used): the hub's own conditions for activating an agent in setup."""
     t0, desired = now(), kit_revision(fresh=True)
@@ -22500,7 +22535,7 @@ def activation_missing(agent):
         miss("check", "latest", "There is no completed setup check. Check this server.")
     elif t0 - c["completed"] > ACTIVATION_CHECK_AGE:
         miss("check", "latest", "The latest check is older than 60 minutes. Check this server again.")
-    elif not same_code(c["revision"], desired):
+    elif not check_holds(agent, c["revision"], desired):
         miss("check", "latest", "The latest check saw older settings. Check this server again.")
     else:
         missing += [dict(i, required=True) for i in json.loads(c["verify"])

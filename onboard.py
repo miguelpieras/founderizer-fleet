@@ -1017,7 +1017,12 @@ class Onboarding:
         return CONFIG_BRANCH
 
     def registration(self, data, change, message):
-        """Make the team change in a temporary clone, push it, reload the hub and wait until it lists the agent."""
+        """Make the team change in a temporary clone, push it, reload the hub and wait until it lists the agent.
+
+        A push that fails is followed by a fresh fetch, and the change is made again on the ref's new tip: the hub
+        commits by itself after a registration ("Fleet gave <agent> by default"), and a rebase onto that commit can
+        conflict, which leaves HEAD at the tip without the change, so that the next push sends nothing and the hub
+        reloads a revision without the agent. A tip that holds the change already needs no push."""
         work = Path(tempfile.mkdtemp(prefix="fleet-register-"))
         try:
             code, _, err = self.sys.git(["clone", "-q", self.repo, str(work / "kit")])
@@ -1025,22 +1030,31 @@ class Onboarding:
                 raise StepFailed("Could not clone the fleet repository: %s" % tail(err))
             kit = work / "kit"
             branch = self.config_ref(kit)
-            changed = change(kit)
-            if changed:
+            made = None                                 # the last commit that this run made
+            for attempt in range(3):
+                steps = ([["fetch", "-q", "origin"], ["reset", "-q", "--hard", "origin/" + branch]] if attempt else [])
+                for args in steps:
+                    code, _, err = self.sys.git(args, cwd=str(kit))
+                    if code != 0:
+                        raise StepFailed("git %s failed: %s" % (args[0], tail(err)))
+                if not change(kit):
+                    break
                 for args in (["add", "team.json", "profiles/%s.md" % self.name],
                              ["commit", "-q", "-m", message]):
                     code, _, err = self.sys.git(args, cwd=str(kit))
                     if code != 0:
                         raise StepFailed("git %s failed: %s" % (args[0], tail(err)))
-                for attempt in range(2):
-                    code, _, err = self.sys.git(["push", "-q", "origin", "HEAD:" + branch], cwd=str(kit))
-                    if code == 0:
-                        break
-                    self.sys.git(["pull", "-q", "--rebase", "origin", branch], cwd=str(kit))
-                if code != 0:
-                    raise StepFailed("git push failed: %s" % tail(err))
+                made = self.sys.git(["rev-parse", "HEAD"], cwd=str(kit))[1].strip()
+                code, _, err = self.sys.git(["push", "-q", "origin", "HEAD:" + branch], cwd=str(kit))
+                if code == 0:
+                    break
+            else:
+                raise StepFailed("git push failed: %s" % tail(err))
             code, rev, err = self.sys.git(["rev-parse", "HEAD"], cwd=str(kit))
             revision = rev.strip()
+            if made and self.sys.git(["merge-base", "--is-ancestor", made, revision], cwd=str(kit))[0] != 0:
+                raise StepFailed("The revision %s does not hold the registration commit %s. Nothing was reloaded."
+                                 % (revision[:12], made[:12]))
         finally:
             shutil.rmtree(str(work), ignore_errors=True)
         self.state["registration_commit"] = revision
@@ -1079,6 +1093,13 @@ class Onboarding:
         team, machine = self.team_view(data.get("db")), self.state["machine"]
         machines = team.get("machines") if isinstance(team.get("machines"), dict) else {}
         entry = machines.get(machine)
+        if not isinstance(entry, dict) and self.state.get("host"):
+            # A machine takes its name from Tailscale (release 2026.11.146), so it can be renamed under a saved run.
+            # Its address stays: the run follows the machine that has the address it saved.
+            same = [n for n, m in machines.items() if isinstance(m, dict) and m.get("address") == self.state["host"]]
+            if len(same) == 1:
+                machine = self.state["machine"] = same[0]
+                entry = machines[machine]
         if not isinstance(entry, dict):
             raise StepFailed("The hub has no machine %s. Nothing was changed." % machine)
         ours = self.state.get("registration_commit")
@@ -1135,24 +1156,32 @@ class Onboarding:
             raise StepFailed("%s is not installed for %s. Setup does not install a runtime on an existing machine; "
                              "nothing was changed." % (label, user))
         version = info.get("version") or "version not reported"
-        if info.get("signed_in") == "no":
+        signed = info.get("signed_in")
+        if signed == "no" and info.get("system") == "Darwin":
+            # A Mac keeps the sign-in in the login keychain, which an SSH session cannot read: a signed-in Mac reads
+            # "no" here (lifecycle.remember_signed_in). The setup check reads it in the login session.
+            signed = "unknown"
+        if signed == "no":
             raise NeedsOwner("%s (%s) is installed for %s but not signed in. Setup does not sign in a runtime, so it "
                              "stopped before any change. Resume this run when it is signed in." % (label, version, user))
-        if info.get("signed_in") == "yes":
+        if signed == "yes":
             return "done", "%s (%s) is installed and signed in for %s." % (label, version, user)
         return "done", ("%s (%s) is installed for %s. Its sign-in status is unknown; the agent's setup check confirms "
                         "it before activation." % (label, version, user))
 
     def s_checkout(self):
-        """A separate checkout for the new agent. A folder that this run did not make stops the run."""
+        """A separate checkout for the new agent, on the configuration ref when the origin has it, as join.sh clones
+        one: the code branch of the hub's repository stays at an old release, and its fleet.py could not make the
+        service. A folder that this run did not make stops the run."""
         folder = "fleet-%s" % self.name
         token = self.state.setdefault("checkout_token", uuid.uuid4().hex)
         self.save()                                   # the mark exists before the folder
         mark = '"$HOME/%s/.git/fleet-onboarding"' % folder
         code, out, err = self.worker(
             'if [ -e "$HOME/%(f)s" ]; then echo fleet-checkout=exists; echo mark=$(cat %(m)s 2>/dev/null || true); '
-            'exit 0; fi; git clone -q %(repo)s "$HOME/%(f)s"; echo %(t)s > %(m)s; echo fleet-checkout=cloned'
-            % {"f": folder, "m": mark, "repo": shlex.quote(self.repo), "t": token}, timeout=300)
+            'exit 0; fi; { git clone -q -b %(b)s %(repo)s "$HOME/%(f)s" || git clone -q %(repo)s "$HOME/%(f)s"; } '
+            '&& echo %(t)s > %(m)s && echo fleet-checkout=cloned'
+            % {"f": folder, "m": mark, "b": CONFIG_BRANCH, "repo": shlex.quote(self.repo), "t": token}, timeout=300)
         info = kv(out)
         if code != 0 or info.get("fleet-checkout") not in ("exists", "cloned"):
             raise StepFailed("The checkout could not be cloned: %s" % tail(err, 160))
