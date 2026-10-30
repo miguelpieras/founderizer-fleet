@@ -221,6 +221,8 @@ RUNTIMES = {
                               "read-only": "the runtime allows reads only"},
                     "otherwise": "see the Codex settings"},
         "screen_counter": False,
+        # a browser task runs in the app-server runner, whose native UI tools work the machine's own screen
+        "browser_tabs": False,
         # OpenAI keeps a prompt's cache for some minutes of inactivity, and Codex keys it by its own thread
         # (prompt_cache_key), so a new Codex session reads little of another's
         "cache_seconds": 300,
@@ -279,6 +281,9 @@ RUNTIMES = {
                     "otherwise": "the session settings allow and deny tools; they are not an OS boundary"},
         # read on 2.1.285, 2.1.308 and 2.1.311 while a foreground `sleep 300` ran, 27 October 2026
         "screen_counter": True,
+        # with --chrome each session works in a tab group of its own of Claude in Chrome: two sessions read, scrolled
+        # and typed in their own tabs at the same time on one Mac, 30 October 2026
+        "browser_tabs": True,
         "cache_seconds": 3600,          # an hour; its own records say when it is five minutes (fleet.claude_context)
         "compact_tokens": 200000,       # fleet.STANDING_COMPACT, the window that Fleet starts its standing sessions with
         "routine": {"model": "sonnet", "effort": "low"},
@@ -333,6 +338,7 @@ RUNTIMES = {
                        "Sign in to Grok yourself on {where} machine."),
         "sandbox": None,
         "screen_counter": False,
+        "browser_tabs": False,
         "cache_seconds": None,
         "compact_tokens": None,
         "routine": None,
@@ -348,9 +354,9 @@ RUNTIMES = {
 RUNTIME_FACTS = ("label", "driver", "acp_command", "can", "full_access", "manager_access", "first_worker", "manager",
                  "owner_chat", "agent_messages", "conversation", "conversation_why", "closed_versions", "mcp_servers",
                  "app_server", "switch", "session_settings", "token_in_env", "model_flags", "local_model", "sign_in",
-                 "sign_out", "no_sign_in", "sandbox", "screen_counter", "cache_seconds", "compact_tokens", "routine",
-                 "task_denied", "task_allowed", "conversation_denied", "manager_denied", "task_opening",
-                 "token_weights")
+                 "sign_out", "no_sign_in", "sandbox", "screen_counter", "browser_tabs", "cache_seconds",
+                 "compact_tokens", "routine", "task_denied", "task_allowed", "conversation_denied", "manager_denied",
+                 "task_opening", "token_weights")
 
 
 # The session reuse rule (AUTONOMY.md P9.10) and its setting (section 4), one object in team.json "settings":

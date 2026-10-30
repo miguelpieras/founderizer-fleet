@@ -1186,8 +1186,17 @@ def mobile_chat(agent, since):
     return items[:MOBILE_CHAT] if since else items[-MOBILE_CHAT:]
 
 
-def desktop_busy(name):
-    """The browser or screen task that holds the desktop of this agent's machine (owner API 1.12), or None. An open
+def browser_tabs(agent):
+    """True when this agent's browser tasks work in tabs of their own (lifecycle.RUNTIMES "browser_tabs")."""
+    return bool(runtime_fact((agents().get(agent) or {}).get("runtime"), "browser_tabs"))
+
+
+def desktop_busy(name, needs="screen"):
+    """The browser or screen task that keeps a new task with these needs off the desktop of this agent's machine
+    (owner API 1.12), or None. A screen task works the machine's own screen, so every open browser or screen task
+    holds the desktop for it. A browser task whose runtime works in tabs of its own (browser_tabs) runs beside the
+    others of that kind, so for it only a screen task or a browser task of another runtime holds the desktop: two
+    such sessions read, scrolled and typed in their own tabs at the same time on one Mac (30 October 2026). An open
     task holds it, also a paused or held one and one that waits to start. A task that ended holds it until its session
     is confirmed closed: its helper (1.12 or later) acknowledged the task's stop event, which it does only after it
     closed the window and ended what is left of the task, and then reported its windows without this one. A window
@@ -1195,10 +1204,13 @@ def desktop_busy(name):
     here = machine_agents(name)
     if not here:
         return None
+    beside = needs == "browser" and browser_tabs(name)
     marks, quiet = ",".join("?" * len(here)), {}
-    for t in q(f"SELECT t.id, t.owner, t.state, a.alive, a.alive_ts, (SELECT MAX(e.helper_ack) FROM events e "
+    for t in q(f"SELECT t.id, t.owner, t.state, t.needs, a.alive, a.alive_ts, (SELECT MAX(e.helper_ack) FROM events e "
                f"WHERE e.task=t.id AND e.kind='stop') AS closed FROM tasks t LEFT JOIN agents a ON a.name=t.owner "
                f"WHERE t.needs IN ('browser','screen') AND t.owner IN ({marks}) ORDER BY t.id", here):
+        if beside and t["needs"] == "browser" and browser_tabs(t["owner"]):
+            continue
         if t["owner"] not in quiet:     # a helper from before 1.12 acknowledges a stop after it closes the window only
             quiet[t["owner"]] = "agent_key" in helper_features(t["owner"])
         if t["state"] not in TERMINAL or not t["closed"] or not quiet[t["owner"]] or not t["alive_ts"] or \
@@ -1208,11 +1220,12 @@ def desktop_busy(name):
 
 
 def desktop_refusal(owner, needs, caller):
-    """Why a new browser or screen task for `owner` must wait (owner API 1.12: one at a time on each machine), or
-    None. Only the fleet manager sees the other task's ID."""
+    """Why a new browser or screen task for `owner` must wait (owner API 1.12: a screen task alone on each machine,
+    and browser tasks side by side in tabs of their own; desktop_busy), or None. Only the fleet manager sees the
+    other task's ID."""
     if needs not in ("browser", "screen"):
         return None
-    busy = desktop_busy(owner)
+    busy = desktop_busy(owner, needs)
     if busy is None:
         return None
     which = tref(busy["id"]) if caller == manager_name() else "another browser or screen task"
@@ -6044,7 +6057,10 @@ def capacity_text(view, filters, needs, restricted=False, parent=None, caller=No
         if a["desktop_busy"]:
             busy = a["desktop_busy"]["task"]
             out.append("    DESKTOP BUSY: its machine runs " + (f"T-{busy}" if visible(busy) else
-                       "another browser or screen task") + "; a new browser or screen task waits until it ends.")
+                       "another browser or screen task") +
+                       ("; a new screen task waits until it ends, and a new browser task runs beside it."
+                        if not desktop_busy(a["agent"], "browser") else
+                        "; a new browser or screen task waits until it ends."))
         step = presence_of(a["agent"], t0)      # plan C2: data for this text, never in a /ui route
         if step:
             out.append(f"    HELPER BUSY: inside one step ({step['step']}) since {clock(step['since'])}; new work "
