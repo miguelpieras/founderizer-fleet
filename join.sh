@@ -73,7 +73,7 @@ linux() {
     agent_users "/home/$WORKER/fleet-server"
     vault_broker "/home/$WORKER/fleet-server"
     verify_step "/home/$WORKER/fleet-server" as_worker
-    say "done. Add an agent to this server in Founderizer: Agents, Add agent."
+    say "done. Add an agent to this server in Founderizer: Settings, Servers, this server, Add agent."
 }
 
 as_worker() {    # the command as the user of the service, from its home folder, with its user services reachable
@@ -280,11 +280,11 @@ mac() {
     # (PRODUCT.md P2), and its agents share that user's runtime credential.
     mac_vault
     verify_step "$HOME/fleet-server" as_self
-    say "done. Add an agent to this Mac in Founderizer: Agents, Add agent. Its agents run while this user is logged in."
+    say "done. Add an agent to this Mac in Founderizer: Settings, Servers, this Mac, Add agent. Its agents run while this user is logged in."
 }
 
 main() {
-    [ -n "${FLEET_JOIN:-}" ] || stop "No join code. Copy the whole line from Founderizer: Servers, Add server."
+    [ -n "${FLEET_JOIN:-}" ] || stop "No join code. Copy the whole line from Founderizer: Settings, Servers, Add server."
     code=$FLEET_JOIN
     unset FLEET_JOIN
     case "$(uname -s)" in

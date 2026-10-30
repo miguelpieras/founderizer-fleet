@@ -39,7 +39,7 @@ INTENTS = 1 << 12                                   # DIRECT_MESSAGES only
 FATAL_CLOSE = {4004, 4010, 4011, 4012, 4013, 4014}  # the account stops with state error
 NEW_SESSION_CLOSE = {4007, 4009}                    # the session cannot resume
 DISCORD_LIMIT, WHATSAPP_LIMIT, MOST_PARTS = 2000, 4000, 4
-REST_NOTE = "The rest is in Fleet."
+REST_NOTE = "The rest is in Founderizer."
 
 # Timings in seconds. The tests make them short.
 OUT_WAIT = 25               # the /bridge/out long poll
@@ -106,7 +106,7 @@ def break_at(text, limit):
 
 def split_parts(text, limit, most=MOST_PARTS):
     """At most `most` parts of at most `limit` characters (CHAT-APPS.md 8.4). When the text needs more, the last part
-    ends with "The rest is in Fleet."."""
+    ends with "The rest is in Founderizer."."""
     parts, rest = [], text
     while len(rest) > limit and len(parts) < most:
         end, start = break_at(rest, limit)

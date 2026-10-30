@@ -59,7 +59,7 @@ ready=yes               # what the last step, verify, answered about this machin
 
 say() { printf 'Founderizer: %s\n' "$*"; }
 stop() { printf 'Founderizer install stopped: %s\n' "$*" >&2; exit 1; }
-heading() { step=$((step + 1)); printf '\nFleet step %d: %s\n' "$step" "$*"; }
+heading() { step=$((step + 1)); printf '\nFounderizer step %d: %s\n' "$step" "$*"; }
 act() {                 # one changing command: in check mode it is only named
     if [ "$check" = yes ]; then
         printf 'Founderizer:   would run: %s\n' "$*"
@@ -414,7 +414,7 @@ checks() {
     heading "the checks the owner can act on"
     if [ "$check" = yes ]; then
         plan "run: python3 $kit/hubsetup.py check --address $address --port $port (selftest.py and GET /health)"
-        plan "print the hub's address as the line to paste in the app, Settings"
+        plan "print the hub's address as the line to paste in Founderizer"
         return 0
     fi
     as_user python3 "$kit/hubsetup.py" check --address "$address" --port "$port" --kit "$kit" \
@@ -509,20 +509,21 @@ verify_step() {  # the last step: the one health check of the whole product (PRO
 done_text() {
     printf '\n'
     if [ "$check" = yes ]; then
-        say "then the hub would be installed, and its address would be the line to paste in the Mac app, Settings:"
+        say "then the hub would be installed, and its address would be the line to paste in Founderizer:"
     elif [ "$ready" = no ]; then
-        say "the hub is installed, and verify says it is not healthy yet. Its address, for the Mac app, Settings:"
+        say "the hub is installed, and verify says it is not healthy yet. Its address, to paste in Founderizer:"
     else
-        say "the hub is installed and verify says READY. Paste this address in the Mac app, Settings:"
+        say "the hub is installed and verify says READY. Paste this address in Founderizer:"
     fi
     printf '\n    http://%s:%s\n\n' "$address" "$port"
-    say "what is left, and only the owner can do it, all of it in the app:"
+    say "what is left, and only you can do it, all of it in Founderizer:"
     printf '%s\n' \
-        "  1. Sign in to your own $runtime account: Machines, this machine, Sign in." \
+        "  1. Sign in to your own $runtime account: Settings, Servers, this server, Sign in." \
         "     The app gives you a link, you authenticate in your own browser, and you paste the code it gives you" \
         "     back into the app. The sign-in happens on this server, and nothing of it is stored by Founderizer." \
         "     Nobody can do this for you, and the same button signs you in again when the login expires." \
-        "  2. Add your agents: Agents, Add agent. Each one is signed in the same way, on its own machine." \
+        "  2. Add your agents: the + at the top of the sidebar, Add agent. Each one is signed in the same way," \
+        "     on its own server." \
         ""
 }
 

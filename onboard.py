@@ -537,6 +537,23 @@ def runtime_install(rt, ver):
     return "curl -fsSL https://claude.ai/install.sh | bash -s %s" % shlex.quote(ver)
 
 
+# What a vendor installer prints when the machine could not reach the internet: the system's codes, as npm gives them,
+# and curl's and wget's own words. Such a failure usually passes, so an install tries the step again by itself
+# (NETWORK_RETRIES) before it says that it failed (T-35).
+NETWORK_ERROR = re.compile(r"\bE(?:TIMEDOUT|CONNRESET|CONNREFUSED|AI_AGAIN|NOTFOUND|NETUNREACH|HOSTUNREACH)\b|"
+                           r"\bcurl: \((?:6|7|28|35|52|56)\)|could not resolve host|unable to resolve host|"
+                           r"temporary failure in name resolution|failed to connect|connection timed out|"
+                           r"operation timed out|connection reset|network is unreachable|no route to host",
+                           re.IGNORECASE)
+NETWORK_RETRIES = 3     # tries again of an install step that failed on a network error, before it fails
+NETWORK_WAIT = 20       # seconds before each of those tries
+
+
+def network_failure(text):
+    """True when an installer's output says that the machine could not reach the internet."""
+    return bool(NETWORK_ERROR.search(text or ""))
+
+
 def runtime_update(rt):
     """The vendor's own update of one runtime of the worker user in ~/.local/bin, to the newest version that the vendor
     gives: Claude Code's `update` command, which follows the channel and the floor that CLAUDE_CHANNEL set and does

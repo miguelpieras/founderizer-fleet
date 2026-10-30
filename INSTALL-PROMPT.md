@@ -3,7 +3,7 @@
 Founderizer installs on a Linux machine without a console. There are two ways, and the customer
 picks one:
 
-- **From the Mac app** (the usual way): `Add server`, the address, the user and the SSH key they
+- **From the Mac app** (the usual way): Settings, Servers, Add server, the address, the user and the SSH key they
   already have. The app installs over their own connection and shows what `verify` answered.
 - **From the agent they already run** (this file): they paste the prompt below into Claude Code,
   or into any agent with a shell, and it does the same install for them.
@@ -86,8 +86,8 @@ Ask the owner for all of it in one message, and wait for the answer. Do not gues
    instead, tell them it is now in the conversation, ask them to revoke that key in the Tailscale
    console when the install is finished, and go on.
 4. **For a new hub**: the address of the Founderizer repository, which their download page gives
-   them. **For a joining machine**: the whole join line from the app (`Servers`, then
-   `Add server`), copied without a change.
+   them. **For a joining machine**: the whole join line from the app (Settings, Servers,
+   Add server), copied without a change.
 5. **This machine must be on the same Tailscale network**, because the hub proves the owner's
    address from a call that comes from here. Check it with `tailscale ip -4`; if there is no
    address, stop and ask the owner to connect this machine first.
@@ -184,9 +184,10 @@ security updates and `verify`, and together they take some minutes.
 Give the owner:
 
 - every line `verify` printed, as it is, and whether it ended with `READY`;
-- the hub's address, to paste in the Mac app under Settings;
+- the hub's address, to paste in the Founderizer window that waits for it;
 - the two things only they can do: sign each machine in to their own provider account
-  (`Machines`, the machine, `Sign in`), and add their agents (`Agents`, `Add agent`).
+  (`Settings`, `Servers`, the machine, `Sign in`), and add their agents (the `+` at the top of
+  the sidebar, `Add agent`).
 
 If the last line is `NOT READY`, each failing check carries its own fix in the same line. Tell the
 owner what failed and what the fix says. Run a fix only when it is one of the commands in this
@@ -228,7 +229,8 @@ make a code yourself.
 ### B4. Report
 
 Give the owner the lines `verify` printed, whether it ended with `READY`, and the next step in the
-app: `Agents`, `Add agent`, and then `Sign in` on that machine.
+app: the `+` at the top of the sidebar, `Add agent`, and then `Sign in` on that machine's page
+(`Settings`, `Servers`).
 
 ## When you are finished
 

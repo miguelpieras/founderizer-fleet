@@ -228,7 +228,8 @@ is nearly always those rules.
   hub runs.
 - **`GET /ui/state`** from the owner's Mac, which the claim line makes on that Mac. 200
   there is the real proof: that route answers the owner's address and no other.
-- **The address line**, printed last. Paste it into the Mac app, Settings.
+- **The address line**, printed last. Paste it into the Founderizer window that waits for it: the app
+  connects to the hub at once.
 
 ### This fleet's own id
 
@@ -257,7 +258,7 @@ and the installer prints every line it answers:
   ok    hub_answers: The hub answers http://100.80.1.2:8765/health for manager
   ok    owner_claimed: The owner of this hub is the Mac at 100.80.1.3
   ...
-  fail  runtime_signed_in: Manager is not signed in to claude  (fix: Sign this machine in from the app: Machines, then Sign in)
+  fail  runtime_signed_in: Manager is not signed in to claude  (fix: Sign this server in from the app: Settings, Servers, this server, Sign in)
 NOT READY: runtime_signed_in
 ```
 
@@ -272,7 +273,7 @@ same array as the owner's checklist.
 ## The sign-in, and renewing it
 
 One thing is left after the install, and it is done in the app: **sign in to your own
-Claude account.** Machines → this machine → **Sign in**.
+Claude account.** Settings → Servers → this server → **Sign in**.
 
 What happens, in order (UI-API.md, "Sign a machine in"):
 
@@ -301,8 +302,8 @@ through the app. **Grok has no sign-in path at all**, in the app or anywhere els
 Founderizer: xAI's terms do not let a third party run it this way, and Founderizer refuses it in
 code rather than leaving it to a rule nobody reads.
 
-Then add your agents in the app (Agents → Add agent). Each one is signed in the same
-way, on the machine it runs on.
+Then add your agents in the app: the + at the top of the sidebar, Add agent. Each one is
+signed in the same way, on the server it runs on.
 
 ## Run it again, update, remove
 

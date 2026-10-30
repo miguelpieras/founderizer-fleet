@@ -8,9 +8,9 @@ login settings, or enable public access. For a Codex worker, it adds one table t
 (`[projects."<checkout>"]`, `trust_level = "trusted"`); other settings and an
 existing entry for this checkout stay as they are.
 
-For a new VPS (Ubuntu or Debian) or a Mac, the usual way is Founderizer → Servers → Add
-server: one line on the new machine joins it (UI-API.md, "Servers"), and Founderizer →
-Agents → Add agent then installs an agent on it. This page is the manual way.
+For a new VPS (Ubuntu or Debian) or a Mac, the usual way is Founderizer → Settings → Servers →
+Add server: one line on the new machine joins it (UI-API.md, "Servers"), and Add agent on that
+server's page then installs an agent on it. This page is the manual way.
 
 ## Register the machine first
 
@@ -318,9 +318,11 @@ warning for each machine whose broker differs from the hub's own `vault.py`. A
 warning that stays is one of four things: the machine has a broker and no server
 service, its installers are older than that root command, it cannot reach the hub's
 configuration ref, or the broker did not come up on the new program and kept the one
-that was serving. The `fix` names the command above and, after it, the `agent-helper`
-step for a machine that does not have it; `journalctl -u fleet-vault -n 30` says
-which of the four it is.
+that was serving. The warning says it in the owner's words, with no command ("The
+vault on vps-2 has not taken the last update." and "It updates itself within ten
+minutes; tell us if it does not."): the command above, and the `agent-helper` step for
+a machine that does not have it, are this page's, for whoever he asks.
+`journalctl -u fleet-vault -n 30` says which of the four it is.
 
 The checksum is read once, when the broker starts, so a copy installed under a
 broker that was not restarted does not clear the warning — the running code is

@@ -83,7 +83,7 @@ AGENT_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 # then its ~/.local/bin, the two places lifecycle.exe looks in.
 RUNTIME_PATH = 'command -v "$1" || { [ -x "$HOME/.local/bin/$1" ] && printf %s "$HOME/.local/bin/$1"; }'
 LINGER_FILE = "/var/lib/systemd/linger/%s"      # systemd's own record of lingering, readable without root
-BLIND_FIX = "read the whole machine: run this check as root, or run it as each agent's own user"
+BLIND_FIX = "read the whole server: run this check as root, or run it as each agent's own user"
 
 
 def _run(argv, timeout=20):
@@ -290,7 +290,7 @@ class Verify:
         no_linger = [user for user in sorted({u for u in holders.values() if u}) if self.linger(user) is False]
         unread = (f"{', '.join(blind)} could not be read: "
                   + ("it belongs" if len(blind) == 1 else "they belong")
-                  + " to another user of this machine") if blind else ""
+                  + " to another user of this server") if blind else ""
         if stopped:
             says = f"{', '.join(stopped)} is not running" if len(stopped) == 1 else \
                    f"{', '.join(stopped)} are not running"
@@ -313,7 +313,7 @@ class Verify:
         if not self.is_hub:
             return None
         if not self.hub:
-            return self.answer(FAIL, "this checkout's team.json gives the hub no address, so no machine can reach it",
+            return self.answer(FAIL, "this checkout's team.json gives the hub no address, so no server can reach it",
                                "run on the hub: python3 fleet.py addresses hub=$(tailscale ip -4)")
         code, body, _ = self.fetch(self.hub + "/health")
         try:
@@ -343,21 +343,21 @@ class Verify:
         """The private network is up and this machine answers to the address team.json gives it. The hub takes a
         name only from its own machine, so a wrong address here refuses every call this machine makes."""
         if not self.tailscale():
-            return self.answer(FAIL, "Tailscale is not installed, so this machine is on no private network",
+            return self.answer(FAIL, "Tailscale is not installed, so this server is on no private network",
                                "install it: curl -fsSL https://tailscale.com/install.sh | sh")
         state = self.backend_state()
         if state != "Running":
             return self.answer(FAIL, f"the private network is not up (Tailscale is {state or 'not answering'})",
                                "bring it up: tailscale up --accept-dns=false")
         if not self.address:
-            return self.answer(FAIL, "Tailscale gives this machine no address", "look at: tailscale status")
+            return self.answer(FAIL, "Tailscale gives this server no address", "look at: tailscale status")
         want = self.addresses.get(self.named) if self.named else None
         if want and want != self.address:
-            return self.answer(FAIL, f"this machine answers {self.address}, but team.json gives {self.named} "
+            return self.answer(FAIL, f"this server answers {self.address}, but team.json gives {self.named} "
                                      f"{want}, so the hub refuses its calls",
                                f"run: python3 fleet.py addresses {self.named}={self.address}")
         if not self.machine:
-            return self.answer(FAIL, f"this machine's address {self.address} is in team.json for no machine",
+            return self.answer(FAIL, f"this server's address {self.address} is in team.json for no server",
                                f"run: python3 fleet.py addresses <name>={self.address}")
         return self.answer(OK, f"{self.address} is up, and team.json gives it to {self.machine}")
 
@@ -386,7 +386,7 @@ class Verify:
         if synced is True:
             return self.answer(OK, "the clock follows network time")
         if synced is False:
-            return self.answer(FAIL, "this machine does not follow network time, so its clock drifts", self.time_fix())
+            return self.answer(FAIL, "this server does not follow network time, so its clock drifts", self.time_fix())
         return self.answer(WARN, "the clock could not be checked: no hub to compare with and no network-time reading",
                            self.time_fix())
 
@@ -439,11 +439,11 @@ class Verify:
         why, by_hand = self.unread_signin()
         unknown = [f"{name}'s {rt} {why}" for name, (rt, state, read) in sorted(readings.items())
                    if read and state is None]
-        blind = [f"{name}'s {rt} sign-in could not be read: it belongs to another user of this machine"
+        blind = [f"{name}'s {rt} sign-in could not be read: it belongs to another user of this server"
                  for name, (rt, _s, read) in sorted(readings.items()) if not read]
         if out:
             return self.answer(FAIL, self.and_unread(", ".join(out), ", ".join(blind)),
-                               "sign this machine in from the app: Machines, then Sign in")
+                               "sign this server in from the app: Settings, Servers, this server, Sign in")
         if unknown:
             return self.answer(WARN, self.and_unread(", ".join(unknown), ", ".join(blind)), by_hand)
         if blind:
@@ -484,7 +484,7 @@ class Verify:
         revision = (out or "").strip()
         if code != 0 or not re.fullmatch(r"[0-9a-f]{40}", revision):
             return self.answer(FAIL, f"{self.kit} has no revision: git cannot read it",
-                               "this machine needs a git checkout of the fleet: fetch it again")
+                               "this server needs a git checkout of the fleet: fetch it again")
         branch = checkout_branch(self.kit, self.run)
         _c, out, _e = self.run(["git", "-C", self.kit, "status", "--porcelain"])
         changed = [line for line in (out or "").split("\n") if line.strip()]
@@ -519,7 +519,7 @@ class Verify:
         machines = {a.get("machine") for a in (self.conf.get("agents") or {}).values()}
         return self.answer(OK, f"this team.json is one a hub can run: "
                                f"{_count(len(self.conf.get('agents') or {}), 'agent')} on "
-                               f"{_count(len(machines), 'machine')}")
+                               f"{_count(len(machines), 'server')}")
 
     # ---- the readings each check needs
 
@@ -700,11 +700,11 @@ class Verify:
         a Mac outside the login session the reason is the machine's and not the agent's, and the answer is no
         command the owner can run from where the app runs this check: its helper reads it in that session."""
         if self.platform == "darwin" and not self.login_session():
-            return ("sign-in is in the login Keychain, which opens for the login session alone, and this machine's "
-                    "helper has left no reading of it",
-                    "start this machine's helper, which reads the sign-in in that session, and check again")
+            return ("sign-in is in the login Keychain, which opens for the login session alone, and no agent of "
+                    "this Mac has read it there",
+                    "start this Mac's agents in its login session, which read the sign-in there, and check again")
         return ("sign-in could not be read",
-                "read it by hand on this machine: claude auth status, or codex login status")
+                "read it by hand on this server: claude auth status, or codex login status")
 
     def signed_in(self, runtime, path, user=None, agent=None):
         """True, False or None, from the runtime's own status command: the reading lifecycle.Lifecycle.runtime
@@ -765,11 +765,11 @@ class Verify:
             one = len(self.inactive) == 1
             said.append((f"{', '.join(self.inactive)} {'is' if one else 'are'} not active, so nothing of "
                          f"{'it' if one else 'them'} is read here",
-                         "finish the agent in the app: Machines, then Sign in, and then activate it"))
+                         "open the agent in the app and finish its setup"))
         if self.unknown_here():
             one = len(self.unknown_here()) == 1
             said.append((f"the hub knows {', '.join(self.unknown_here())}, which this checkout does not name, so "
-                         f"{'that agent' if one else 'those agents'} of this machine is not read here",
+                         f"{'that agent' if one else 'those agents'} of this server is not read here",
                          f"bring this checkout up to date: git -C {self.kit} fetch origin && git merge "
                          f"--ff-only origin/{CONFIG_BRANCH}"))
         return said

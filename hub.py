@@ -58,7 +58,7 @@ import releases
 from lifecycle import (APP_SERVER, APP_SERVER_RUNTIME, DEPLOY_APP_NOTE, GITHUB_TOKEN, MCP_LIMIT, MCP_NAME,
                        REPO_ACCESS, REPO_NAME, REUSE_SETTINGS, RUNTIMES, RUNTIME_RESULTS, SWITCH_RUNTIMES, TOOL_CATALOG,
                        app_server_task, mcp_server, mcp_variable, no_sign_in, reuse_value, runtime_fact,
-                       runtimes_with, switch_target, tool_catalog, tool_needs)
+                       runtimes_with, shown_name, switch_target, tool_catalog, tool_needs)
 from lifecycle import SKILL_FILE, SKILL_NAME, SKILLS, skill_front, skill_rows, skills_text   # design v4 D: agents' skills
 
 DESKTOP = Frames()
@@ -776,7 +776,10 @@ MOBILE_TASKS = 20               # task heads that the phone reads beside the ope
 MOBILE_CHAT = 30                # chat items in one page for the phone
 MOBILE_PREVIEW = 120            # characters of a chat preview in the phone's agent list
 MOBILE_HEAD = ("id", "title", "state", "owner", "requester", "goal", "needs", "attempt", "accepted", "created",
-               "started", "last_activity", "delivered", "checked_at", "waiting_on", "follows")
+               "started", "last_activity", "delivered", "checked_at", "waiting_on", "follows",
+               # what the Mac's own state word reads, so that the phone's Tasks row says "Stalled" as its page does
+               "stalled_since", "nudge_level", "missing_since")
+MOBILE_ANSWERED = 50            # answered Needs-you items that the phone reads, for the folded cards of its chats
 MOBILE_SEEN = 60                # seconds: a helper seen this recently is online in both apps (helperIsRecent)
 DEVICE_PATHS = (("/ui/mobile", ("GET",)), ("/ui/state", ("GET",)), ("/ui/knowledge", ("GET",)),
                 ("/ui/owner/devices", ("GET",)), ("/ui/messages", ("POST",)), ("/ui/needs", ("POST",)),
@@ -966,11 +969,15 @@ def ping_need(nid):
 def ping_payload(need, generation):
     """What Apple carries to the phone for one Needs-you item: its number, its title and its options, and nothing
     else of it. The options go only when each one fits a button whole, because a label that is cut can be pressed
-    for the wrong answer: an item without them opens the app. The text passes the screening of /ui/state."""
+    for the wrong answer: an item without them opens the app. The text passes the screening of /ui/state.
+
+    **The banner's title is the agent that asks** (T-39): "Atlas", as the apps name it, over its question, so he
+    sees who asks before he opens anything. "Needs you" only for an item that names no agent."""
     title = scrub(need["title"] or "")
     if len(title) > PUSH_TEXT:
         title = title[:PUSH_TEXT - 1].rstrip() + "…"
-    aps = {"alert": {"title": "Needs you", "body": title}, "sound": "default", "thread-id": "needs"}
+    asker = shown_name(need["by"]) or "Needs you"
+    aps = {"alert": {"title": asker, "body": title}, "sound": "default", "thread-id": "needs"}
     payload = {"need": need["id"], "db": generation}
     options = need_options(need)
     if 2 <= len(options) <= NEED_OPTIONS_MAX and all(len(o) <= PUSH_BUTTON for o in options) \
@@ -1097,7 +1104,8 @@ def check_need_options(given):
 
 
 def mobile_agent(name, config):
-    """One agent for the phone: what its row and its chat header show, without the whole usage record."""
+    """One agent for the phone: what its row, its chat header and its page show, without the whole usage record.
+    `machine` is the server it runs on (its team.json `machine`), which its page names under Runs on."""
     row = q1("SELECT last_seen,alive,alive_ts FROM agents WHERE name=?", (name,))
     usage = q1("SELECT data FROM agent_usage WHERE name=?", (name,))
     lim = active_limit(name)
@@ -1107,7 +1115,7 @@ def mobile_agent(name, config):
               "UNION ALL SELECT created, text, 'agent' AS side FROM owner_reports WHERE agent=? "
               "ORDER BY created DESC LIMIT 1", (name, name))
     return {"name": name, "role": config["role"], "runtime": config["runtime"], "active": agent_active(name),
-            "can": config.get("can", []), "direct_chat": owner_chat(config),
+            "can": config.get("can", []), "direct_chat": owner_chat(config), "machine": config.get("machine"),
             "last_seen": row["last_seen"] if row else None, "alive": row["alive"] if row else None,
             "alive_ts": row["alive_ts"] if row else None,
             "open_tasks": q1("SELECT COUNT(*) n FROM tasks WHERE owner=? AND state NOT IN "
@@ -1126,10 +1134,15 @@ def mobile_state(generation):
     recent = [{k: r[k] for k in MOBILE_HEAD} for r in q(f"SELECT * FROM tasks WHERE state IN {ended} "
                                                         f"ORDER BY id DESC LIMIT {MOBILE_TASKS}")]
     needs = [need_view(r) for r in q("SELECT * FROM needs WHERE answer IS NULL ORDER BY id")]
+    # D-7 item 2: an answered request card stays in its chat, folded to two lines, so the phone reads the newest
+    # answered items too, oldest first. `needs` stays the open ones, which every phone already reads.
+    answered = [need_view(r) for r in q("SELECT * FROM needs WHERE answer IS NOT NULL ORDER BY id DESC LIMIT ?",
+                                        (MOBILE_ANSWERED,))]
     return {"schema_version": 1, "db": generation, "time": now(), "manager_flag": kv_get("mgr_flag"),
             "manager_warning": manager_warning(), "ui_features": ui_features(),
             "agents": [mobile_agent(name, config) for name, config in agents().items()],
-            "needs": needs, "tasks": tasks, "recent": list(reversed(recent)),
+            "needs": needs, "answered_needs": list(reversed(answered)), "tasks": tasks,
+            "recent": list(reversed(recent)),
             "holds": [dict(r) for r in q("SELECT * FROM holds WHERE released IS NULL ORDER BY id")],
             "outcomes": [dict(r) for r in q("SELECT * FROM outcomes WHERE resolved IS NULL ORDER BY id")],
             "chat_apps": {"paused": chat_paused()},
@@ -1159,9 +1172,11 @@ def mobile_chat(agent, since):
         marks = ",".join("?" * len(said))
         for f in q(f"SELECT * FROM attachments WHERE message IN ({marks}) ORDER BY id", [r["request_id"] for r in said]):
             files.setdefault(f["message"], []).append(attachment_view(f))
+    # answer_to: the Needs-you item that a message answers, as the Mac's chat links it (its kind and need_id)
     items = [{"kind": "message", "ts": r["created"], "id": r["request_id"], "text": r["text"], "client": r["client"],
               "read_at": r["read_at"], "replaces": r["replaces_request_id"], "edited": message_edited(r),
-              "attachments": files.get(r["request_id"], [])}
+              "attachments": files.get(r["request_id"], []),
+              "answer_to": r["need_id"] if r["kind"] == "answer" else None}
              for r in said]
     items += [{"kind": "report", "ts": r["created"], "id": r["id"], "text": r["text"], "about": r["about"],
                "in_reply_to": r["in_reply_to"], "pushed": bool(r["pushed"])}
@@ -2406,6 +2421,26 @@ def until_clock(ts, t0=None):
     left = max(0, ts - (t0 if t0 is not None else now()))
     return (f"in {int(left // 3600)} hours, at {clock(ts)}" if left >= 5400 else
             f"in {int(left // 60)} minutes, at {clock(ts)}")
+
+
+def owner_clock(ts, t0=None):
+    """A time as the owner reads it on his screen: in the fleet's own time zone (team.json goals.timezone), with no
+    zone name (T-37: his screen said "UTC" and he lives in another zone). A clock alone reads as the nearest such
+    time, so it carries the day when it is 20 hours or more away, and only the date from six days on."""
+    import datetime
+    if not ts:
+        return "an unknown time"
+    at = datetime.datetime.fromtimestamp(ts, goal_settings()[2])
+    off = abs(ts - (t0 if t0 is not None else now()))
+    return (at.strftime("%H:%M") if off < 20 * 3600 else at.strftime("%A %H:%M") if off < 6 * 86400 else
+            f"{at.day} {at.strftime('%B')}")
+
+
+def silent_words(agent, last_seen, t0=None):
+    """Why an open task of an agent that does not answer has no live path, as the owner reads it in its task: the
+    agent by the name he knows ("Mini") and how long it has been silent, never "helper" or "UTC"."""
+    name = shown_name(agent)
+    return f"{name} has been silent since {owner_clock(last_seen, t0)}" if last_seen else f"{name} has never answered"
 
 
 def active_hold(task_id):
@@ -7809,7 +7844,7 @@ def deliver_secret(body, copies):
              for c in body["copies"] if c["machine"] not in machines or not machines[c["machine"]]["carrier"]
              or machines[c["machine"]]["recipient"] != c["recipient"]}
     if wrong:
-        raise Conflict("these machines cannot take a copy now: " + ", ".join(sorted(wrong)), machines=wrong)
+        raise Conflict("these servers cannot take a copy now: " + ", ".join(sorted(wrong)), machines=wrong)
     out, rows, events = [], [], []
     for c in body["copies"]:
         old = done.get(c["machine"])
@@ -7866,9 +7901,9 @@ def expire_deposits(t0):
     """A copy that its machine did not take in DEPOSIT_WAIT is dropped, and so is one whose carrier lost its broker
     access or whose machine's pinned key changed: no broker could take it any more."""
     for r in q("SELECT * FROM deposits WHERE finished IS NULL"):
-        why = ("Its machine did not take it in a week." if t0 - r["created"] > DEPOSIT_WAIT else
+        why = ("Its server did not take it in a week." if t0 - r["created"] > DEPOSIT_WAIT else
                f"{r['agent']} has no broker access any more." if agents().get(r["agent"], {}).get("vault") != "broker"
-               else "Its machine's vault key changed since the copy was sealed."
+               else "Its server's vault key changed since the copy was sealed."
                if store_key(TEAM, r["machine"]) != r["recipient"] else None)
         if why:
             finish_deposit(r, False, why, t0)
@@ -8309,7 +8344,7 @@ def expire_withdrawals(t0):
     """A withdrawal that its machine did not take in WITHDRAW_WAIT is dropped, and so is one whose carrier lost its
     broker access: no broker could take it any more."""
     for r in q("SELECT * FROM withdrawals WHERE finished IS NULL"):
-        why = ("Its machine did not take it in a week." if t0 - r["created"] > WITHDRAW_WAIT else
+        why = ("Its server did not take it in a week." if t0 - r["created"] > WITHDRAW_WAIT else
                f"{r['agent']} has no broker access any more." if agents().get(r["agent"], {}).get("vault") != "broker"
                else None)
         if why:
@@ -8764,7 +8799,7 @@ def chat_command(m, person=None):
             return f"You are {person['name']}. The owner added you to this fleet as a {person['role']}."
         return "You are the owner."
     if word == "/help":
-        return "Commands:\n/whoami: who you are in Fleet\n/help: this list"
+        return "Commands:\n/whoami: who you are in Founderizer\n/help: this list"
     return None
 
 
@@ -8789,7 +8824,7 @@ def chat_link_attempt(account, acc, m, code, t0):
                (app, sender, m["sender_alt"], m["sender_name"], t0))
     DB.execute("INSERT INTO log(ts,agent,what) VALUES(?,?,?)", (t0, "owner", f"linked a {CHAT_APP_NAMES[app]} handle "
                                                                             f"through {account}"))
-    chat_reply(account, m["chat"], "Linked. You are the owner in Fleet.", t0)
+    chat_reply(account, m["chat"], "Linked. You are the owner in Founderizer.", t0)
     return "stored"
 
 
@@ -13570,7 +13605,7 @@ def duty_watch_target(body, want, t0):
             raise Refusal(400, "this time has passed")
         if w["check"]:
             if "trigger_check" not in helper_features(body["agent"]):
-                raise Refusal(409, f"{body['agent']}'s helper cannot run checks yet; update Fleet on that machine "
+                raise Refusal(409, f"{body['agent']}'s helper cannot run checks yet; update Fleet on that server "
                                    f"first")
             pin_check(w["check"])
         if w["trigger"] is not None:
@@ -20776,7 +20811,7 @@ def agent_rule_problem(f, old=None):
     if check and (old is None or check != old["check"] or agent != old["agent"]):
         need = check_feature_of(check)
         if need not in helper_features(agent):
-            return f"{agent}'s helper cannot run these checks yet; update Fleet on that machine first"
+            return f"{agent}'s helper cannot run these checks yet; update Fleet on that server first"
         if check.get("code") != "saved":
             pin_check(check)
     return None
@@ -21848,14 +21883,13 @@ def send_check(r, t0):
         return
     runner = runner_of(t)
     lines = wakeups.is_lines(json.loads(t["check_spec"]))
+    who = shown_name(runner)           # in his words: the name he knows, its server, and Founderizer
     if not helper_online(runner, t0):
-        why = f"{runner} is offline."
-    elif lines and LINES_FEATURE not in helper_features(runner):
-        why = f"{runner}'s helper cannot run checks that print lines yet. Update Fleet on that machine."
-    elif check_feature(t) not in helper_features(runner):
-        why = f"{runner}'s helper cannot run {'saved ' if check_feature(t) == 'trigger_code' else ''}checks yet. Update Fleet on that machine."
+        why = f"{who} is not answering."
+    elif lines and LINES_FEATURE not in helper_features(runner) or check_feature(t) not in helper_features(runner):
+        why = f"{who} cannot run this check yet. Update Founderizer on its server."
     elif checks_in_flight(runner) >= CHECK_SLOTS:       # plan C12: busy is no error, and the run waits its turn
-        why = f"busy: {CHECK_SLOTS} checks run on {runner}'s machine now."
+        why = f"busy: {CHECK_SLOTS} checks run on {who}'s server now."
     else:
         with transaction():
             dispatch_check(t, r["id"], t0)
@@ -21885,9 +21919,9 @@ def check_now(t, t0, command=None):
             raise Refusal(409, why)
     runner = runner_of(t)
     if runner not in agents() or not helper_online(runner, t0):
-        raise Refusal(409, f"{runner} is offline; Check now needs its helper online")
+        raise Refusal(409, f"{shown_name(runner)} is not answering. Check again when it does.")
     if check_feature(t) not in helper_features(runner):
-        raise Refusal(409, f"{runner}'s helper cannot run these checks yet; update Fleet on that machine first")
+        raise Refusal(409, f"{shown_name(runner)} cannot run this check yet. Update Founderizer on its server first.")
     with transaction():
         run = DB.execute("INSERT INTO trigger_runs(trigger_id,revision,due,manual,check_now,state,created) "
                          "VALUES(?,?,?,1,1,'waiting',?)", (t["id"], t["revision"], t0, t0)).lastrowid
@@ -21931,7 +21965,7 @@ def check_result(t, r, body, t0, stored=None, held=None):
         state, reason, pause = "quiet", NEWER_CHECK, None
     elif not body["ok"] and body["error"] == "busy":
         failures, error, detail = t["failures"], None, None
-        state, reason, pause = "waiting", f"busy: {body.get('detail') or 'its machine runs four checks now'}.", None
+        state, reason, pause = "waiting", f"busy: {body.get('detail') or 'its server runs four checks now'}.", None
         retry = t0 + CHECK_BUSY_RETRY
     elif body["ok"] and agent_rule(t):     # plan P4: an agent's check wakes in one way, by its lines
         failures, error, detail, pause = 0, None, None, None
@@ -22224,12 +22258,13 @@ def lost_checks(runner, running, t0):
             continue
         t = trigger_row(r["trigger_id"])
         if kv_get(f"check_lost:{r['id']}") or r["check_now"]:
-            check_result(t, r, {"ok": False, "error": "lost", "detail": f"{runner}'s helper lost it twice."}, t0)
+            lost = f"{shown_name(runner)} lost this check twice."
+            check_result(t, r, {"ok": False, "error": "lost", "detail": lost}, t0)
             kv_set(f"check_lost:{r['id']}", None)
         else:
             kv_set(f"check_lost:{r['id']}", t0)
             q("UPDATE trigger_runs SET state='waiting', retry_at=?, reason=? WHERE id=?",
-              (t0, f"{runner}'s helper lost it; it is sent once more.", r["id"]))
+              (t0, f"{shown_name(runner)} lost this check; it is sent once more.", r["id"]))
         log("hub", f"check run {r['id']} of trigger {t['id']} was lost on {runner}")
 
 
@@ -22414,18 +22449,18 @@ def activation_missing(agent):
         missing.append({"kind": kind, "ref": ref, "state": "failed", "detail": detail, "required": True})
     row = next((m for m in machine_rows()[1] if m["agent"] == agent), None)
     if not row or row["stale"]:
-        miss("machine", "status", "The helper has sent no status in the last ten minutes.")
+        miss("machine", "status", "Its server has sent no status for ten minutes.")
     elif (row["update"] or {}).get("state") != "current":
-        miss("machine", "update", "The helper does not run the hub's revision. Update Fleet on this machine.")
+        miss("machine", "update", "Its server runs an older version. Update Founderizer on it.")
     if settings_pending(agent):
-        miss("machine", "settings", "The helper has not loaded the current settings yet.")
+        miss("machine", "settings", "Its server has not loaded the new settings yet.")
     c = q1("SELECT * FROM machine_checks WHERE agent=? ORDER BY id DESC LIMIT 1", (agent,))
     if not c or c["state"] != "completed" or c["verify"] is None:
-        miss("check", "latest", "There is no completed setup check. Check this machine.")
+        miss("check", "latest", "There is no completed setup check. Check this server.")
     elif t0 - c["completed"] > ACTIVATION_CHECK_AGE:
-        miss("check", "latest", "The latest check is older than 60 minutes. Check this machine again.")
+        miss("check", "latest", "The latest check is older than 60 minutes. Check this server again.")
     elif not same_code(c["revision"], desired):
-        miss("check", "latest", "The latest check saw an older team.json or profile. Check this machine again.")
+        miss("check", "latest", "The latest check saw older settings. Check this server again.")
     else:
         missing += [dict(i, required=True) for i in json.loads(c["verify"])
                     if item_required(agent, i) and i["state"] != "ok"]
@@ -22437,16 +22472,16 @@ def offered(agent, model, effort, reading="models"):
     "screen_models": the screen runtime's own list (owner API 1.11)."""
     st = q1("SELECT data FROM machine_status WHERE agent=?", (agent,))
     r = (json.loads(st["data"]).get(reading) if st else None) or {}
-    when = f" (reading at {clock(r['read_at'])})" if r.get("read_at") else ""
+    when = f" (read at {owner_clock(r['read_at'])})" if r.get("read_at") else ""
     screen = reading == "screen_models"
     if not r.get("ok") or not r.get("read_at") or now() - r["read_at"] > MODELS_MAX_AGE or \
             (screen and not runtime_fact(r.get("runtime"), "app_server")):      # never a terminal CLI's list
-        raise Refusal(409, f"{agent} has no current {'Codex screen ' if screen else ''}model list{when}. "
-                           f"Check this machine first.")
+        raise Refusal(409, f"{shown_name(agent)} has no current {'Codex screen ' if screen else ''}model list{when}. "
+                           f"Check this server first.")
     runtime = (agents().get(agent) or {}).get("runtime")
     if not screen and r.get("runtime") not in (None, runtime):     # a runtime switch that its helper has not loaded
-        raise Refusal(409, f"{agent}'s model list{when} is of {r.get('runtime')}, and it runs {runtime} now: its "
-                           f"helper has not loaded that change yet. Wait for it, then check this machine.")
+        raise Refusal(409, f"{shown_name(agent)} has not loaded its switch to {runtime_label(runtime)} yet. Wait "
+                           f"for it, then check this server.")
     options = {o["model"]: o for o in r["options"]}
     full_name = not screen and model is not None and r.get("other_names") and re.fullmatch(r"claude-[a-z0-9.-]+", model)
     if model is not None and model not in options and not full_name:
@@ -22484,21 +22519,22 @@ def save_agent_settings(agent, body):
         offered(agent, model, effort)
     if "screen" in new:                     # owner API 1.11: the screen runtime's own model and effort
         if old["screen"] is None:
-            raise Refusal(400, f"{agent} has no screen runtime")
+            raise Refusal(400, f"{shown_name(agent)} has no screen runtime.")
         if new["screen"] != old["screen"]:
             if "screen_model" not in helper_features(agent):
-                raise Refusal(409, f"{agent}'s helper cannot use screen settings yet; update Fleet on that machine first")
+                raise Refusal(409, f"{shown_name(agent)} cannot use screen settings yet. Update Founderizer on its "
+                                   f"server first.")
             if new["screen"]["model"] or new["screen"]["effort"]:
                 offered(agent, new["screen"]["model"], new["screen"]["effort"], reading="screen_models")
     if new.get("active") is False and old["active"]:
         busy = [r["id"] for r in q(f"SELECT id FROM tasks WHERE owner=? AND {OPEN_TASK} ORDER BY id", (agent,))]
         if busy:
-            raise Conflict(f"{agent} has open tasks; finish or cancel them first", open_tasks=busy)
+            raise Conflict(f"{shown_name(agent)} has open tasks; finish or cancel them first.", open_tasks=busy)
     check = None
     if activating:
         missing, check = activation_missing(agent)
         if missing:
-            raise Conflict(f"{agent} cannot be activated yet", missing=missing)
+            raise Conflict(f"{shown_name(agent)} cannot be activated yet.", missing=missing)
     changed = [{"field": k, "before": old[k], "after": v} for k, v in new.items() if v != old[k]]
     if not changed:
         return {"agent": agent, "revision": rev, "sha256": current, "changed": [], "updates_requested": [],
@@ -22823,8 +22859,8 @@ def save_runtime(agent, body):
                 "settings_pending": settings_pending(agent), "activation": None}
     view = runtime_switch(agent, team)
     if view["missing"]:
-        raise Conflict(f"{agent} cannot switch to {to} yet", missing=view["missing"], busy=view["busy"],
-                       rules=view["rules"])
+        raise Conflict(f"{shown_name(agent)} cannot switch to {runtime_label(to)} yet.", missing=view["missing"],
+                       busy=view["busy"], rules=view["rules"])
     stored = dict(a.get("runtime_policies") or {})
     stored[old] = runtime_policy(a)
     policy = json.loads(json.dumps(switch_policy(a, to)))
@@ -23033,9 +23069,7 @@ def liveness(t0):
             if alive and t["missing_since"]:
                 q("UPDATE tasks SET missing_since=NULL WHERE id=?", (tid,))
             continue
-        reason = ("its session is not running" if online else
-                  f"{owner}'s helper has not checked in since {clock(row['last_seen'])}" if row and row["last_seen"]
-                  else f"{owner}'s helper has never checked in")
+        reason = "its session is not running" if online else silent_words(owner, row["last_seen"] if row else None, t0)
         q("UPDATE tasks SET live_path=NULL, stalled_since=COALESCE(stalled_since,?), stalled_reason=? WHERE id=? AND "
           "(live_path IS NOT NULL OR stalled_since IS NULL OR stalled_reason IS NOT ?)", (t0, reason, tid, reason))
         if once:
@@ -23271,28 +23305,23 @@ def manager_flag_update(t0):
             step = presence_of(mgr, t0)
             if untaken >= pending and untaken > max(read, limit_ended(mgr), switch_ended(mgr)):
                 kind = "silent"
-                flag = "The manager did not take a message that its helper told it twice. Open its session."
+                flag = "The manager did not take a message it was given twice."
             elif online and step and step.get("blocked"):
-                kind = "silent"
-                flag = (f"The manager's helper is inside one step ({step['step']}) since {clock(step['since'])}, and "
-                        f"a message waits behind it. Look at its machine.")
+                kind = "silent"         # the step's own name is the log's (presence_ping), not his
+                flag = f"The manager has been stuck since {owner_clock(step['since'], t0)}, and a message waits."
         frozen = kv_get("mgr_screen_frozen")
         if frozen:          # plan C2: a frozen runtime takes nothing, whether or not a message waits for it now
             kind = "silent"
-            flag = (f"The manager's session is in the middle of a turn, and its screen stopped moving at "
-                    f"{clock(float(frozen))}. Look at its machine.")
+            flag = f"The manager's session has not moved since {owner_clock(float(frozen), t0)}."
         lim = active_limit(mgr)
-        if lim:
+        if lim:             # its way on (a limit menu on its screen, which Founderizer never answers) is health_view's
             kind = "limited"
-            flag = (f"The manager reached its usage limit. Its messages wait until {clock(lim['until'])}"
-                    + ("." if lim["reset_known"] else ", one hour after the limit was seen, because no reset time was given.")
-                    # runtime gaps C1: a helper with stuck_screens starts a session that still shows the menu again
-                    + ("" if STUCK_SCREENS in helper_features(mgr) else " If its session shows the rate-limit menu, "
-                       "answer it on that machine. The helper never answers it."))
+            flag = (f"The manager reached its usage limit. Its messages wait until "
+                    f"{'' if lim['reset_known'] else 'about '}{owner_clock(lim['until'], t0)}.")
         asks, shown = kv_get("mgr_screen"), kv_get("mgr_screen_shown")
         if shown or asks:           # it stays until the question goes or the manager reads (plan C10: no 90 s life)
             kind = "screen"
-            flag = "The manager's session shows a question on its own screen. Open its session and answer it."
+            flag = "The manager's session shows a question on its own screen."
         # A window list from before the end of a switch can still lack the new session's window (switch_ended).
         if listed(row) and online and "manager" not in (row["alive"] or "").split(",") and \
                 row["alive_ts"] > switch_ended(mgr):
@@ -23300,8 +23329,7 @@ def manager_flag_update(t0):
             flag = "The manager session is not running. Start it again."
         elif row and row["last_seen"] and not online and pending:
             kind = "down"
-            flag = (f"The manager's machine stopped checking in at {clock(row['last_seen'])}, and a message waits for "
-                    f"it. Look at that machine.")
+            flag = f"The manager's server has been silent since {owner_clock(row['last_seen'], t0)}; a message waits."
         # Signed out, it can do nothing, so its silence, a question on its screen, a stopped session or an old limit
         # only show what that looks like, and the sign-in is the step (the owner, 25 October 2026). A switch keeps
         # its own words below.
@@ -23313,18 +23341,17 @@ def manager_flag_update(t0):
         # the new session still shows. A switch stalls on a fact (plan C10): a question on the old session's screen,
         # a failed update of its machine, or a sign-out; otherwise it is the quiet switching, however long it takes.
         if manager_held(mgr) and kind in (None, "silent", "down", "signed_out", "screen"):
-            runtime = agents()[mgr].get("runtime")
+            runtime = runtime_label(agents()[mgr].get("runtime"))
             up = q1("SELECT state FROM machine_updates WHERE agent=?", (mgr,))
-            why = ("its previous session shows a question on its screen" if shown or asks else
-                   "the Fleet update of its machine failed" if up and up["state"] == "failed" else
-                   f"it is not signed in to {runtime}" if signed_out else None)
+            why = ("waits on a question" if shown or asks else
+                   "stopped: its update failed" if up and up["state"] == "failed" else
+                   "waits for its sign-in" if signed_out else None)
             if why:
                 kind = "switch_stalled"
-                flag = (f"The manager's switch to {runtime} cannot finish: {why}. Its messages wait. Open its session "
-                        f"on its machine, answer what it shows, sign it in, or update its machine in Fleet.")
+                flag = f"The manager's switch to {runtime} {why}."
             else:
                 kind = "switching"
-                flag = f"The manager switches to {runtime}. Its messages wait until its new session runs."
+                flag = f"The manager switches to {runtime}. Its messages wait until it runs."
         if kind != kv_get("mgr_flag_kind"):
             kv_set("mgr_flag_kind", kind)
             kv_set("mgr_flag", flag)
@@ -25007,7 +25034,7 @@ def reload_team(revision):
         groups.setdefault(new["addresses"][a["machine"]], []).append(name)
     missing = [code for names in groups.values() if len(names) > 1 for code in placement_missing(names, new)]
     if missing:
-        raise Conflict("these agents cannot share a machine yet", missing=missing)
+        raise Conflict("these agents cannot share a server yet", missing=missing)
     code, head, _ = git_kit("rev-parse", "HEAD")
     if code != 0 or git_kit("merge-base", "--is-ancestor", head, full)[0] != 0:
         raise Refusal(409, "that revision is not a fast-forward of the hub checkout")
@@ -25101,7 +25128,7 @@ def save_lines(base, lines):
     except ValueError as e:
         raise Refusal(400, str(e)) from None
     if not LEADS_READY and any(l["role"] == "lead" for l in new.values()):
-        raise Refusal(409, "leads are not available yet: the helper cannot run a lead session")
+        raise Refusal(409, "Leads are not available yet; keep it a worker.")
     moved = [n for n in new if new[n]["role"] != old[n]["role"]]
     busy = {n: q1(f"SELECT COUNT(*) c FROM tasks WHERE owner=? AND {OPEN_TASK}", (n,))["c"] for n in moved}
     busy = {n: c for n, c in busy.items() if c}
@@ -25281,7 +25308,7 @@ def save_vault(agent, body):
         raise Refusal(400, "the fleet manager's vault is set at installation")
     old, new = a.get("vault", "none"), body["vault"]
     if old == "file":
-        raise Conflict(f"{agent} uses the vault files of its machine; Fleet does not change file mode")
+        raise Conflict(f"{shown_name(agent)} uses the vault files of its server; Founderizer does not change that.")
     open_tasks = [r["id"] for r in q(f"SELECT id FROM tasks WHERE owner=? AND {OPEN_TASK} ORDER BY id", (agent,))]
     receipt = {"agent": agent, "revision": rev, "sha256": current, "changed": [], "updates_requested": [],
                "settings_pending": settings_pending(agent), "activation": None, "open_tasks": open_tasks}
@@ -25292,7 +25319,7 @@ def save_vault(agent, body):
     if new == "broker":
         grant = vault_grant(agent, team)
         if not grant["ready"]:
-            raise Conflict(f"{agent} cannot get broker access yet", missing=grant["missing"])
+            raise Conflict(f"{shown_name(agent)} cannot get broker access yet.", missing=grant["missing"])
         a["vault"], a["vault_recipient"] = "broker", key
     else:
         a["vault"] = "none"
@@ -25416,7 +25443,7 @@ def save_vault_create(agent, body):
             raise Refusal(400, "only a worker or a lead can make logins")
         missing = create_missing(agent, team)
         if missing:
-            raise Conflict(f"{agent} cannot create logins yet", missing=missing)
+            raise Conflict(f"{shown_name(agent)} cannot create logins yet.", missing=missing)
         a["vault_create"] = True
     else:
         a.pop("vault_create", None)
@@ -25530,9 +25557,9 @@ def save_access(body):
     addresses = team.get("addresses") or {}
     if machine not in addresses:
         known = ", ".join(sorted(m for m in addresses if m != "owner"))
-        raise Refusal(404, f"this fleet has no machine {machine}" + (f" (it has {known})" if known else ""))
+        raise Refusal(404, f"this fleet has no server {machine}" + (f" (it has {known})" if known else ""))
     if machine == "owner":
-        raise Refusal(409, "the owner's own computer is the one that connects; the fleet does not reach it")
+        raise Refusal(409, "Your Mac connects to the fleet; the fleet does not reach it.")
     ways = dict(team.get("access") or {})
     old = ways.get(machine)
     entry = None if deleting else {"ssh_user": body["ssh_user"], "ssh_port": body["ssh_port"],
@@ -25772,7 +25799,7 @@ def new_join_code(name, kind):
     """POST /ui/servers/join: a one-time code for one new server with this name, for 30 minutes. The hub keeps only its
     SHA-256, and a new code cancels the open one."""
     if name in (TEAM.get("addresses") or {}):
-        raise Refusal(409, f"Fleet has a machine named {name}. Choose another name.")
+        raise Refusal(409, f"Your fleet has a server named {name}. Choose another name.")
     t0 = now()
     raw = "".join(secrets.choice(LINK_ALPHABET) for _ in range(12))
     with transaction():
@@ -25824,23 +25851,25 @@ def join_server(src, body):
     if row is None:
         ins("INSERT INTO join_failures(address,ts) VALUES(?,?)", (src, t0))
         log("hub", f"REFUSED a join from {src}: not a join code")
-        raise Refusal(403, "This join code is not valid. Copy the line again from Fleet: Servers, Add server.")
+        raise Refusal(403, "This join code is not valid. Copy the line again from Founderizer: Settings, Servers, "
+                           "Add server.")
     if row["used"] is not None:
         if row["address"] == src and row["key_sha256"] == body["key_sha256"]:
             return dict(join_answer(row["name"]), replayed=True)
         log("hub", f"REFUSED a join from {src}: the code of {row['name']} was used")
-        raise Refusal(410, "This join code was already used. Make a new code in Fleet: Servers, Add server.")
+        raise Refusal(410, "This join code was already used. Make a new code in Founderizer: Settings, Servers, "
+                           "Add server.")
     if row["canceled"] is not None:
-        raise Refusal(410, "A newer join code replaced this code. Copy the newest line from Fleet.")
+        raise Refusal(410, "A newer join code replaced this code. Copy the newest line from Founderizer.")
     if row["expires"] <= t0:
-        raise Refusal(410, "This join code expired. Make a new code in Fleet: Servers, Add server.")
+        raise Refusal(410, "This join code expired. Make a new code in Founderizer: Settings, Servers, Add server.")
     name = row["name"]
     team, _, _ = team_view(kit_revision(fresh=True))
     if name in team["addresses"]:
-        raise Refusal(409, f"Fleet has a machine named {name} now. Make a new code with another name.")
+        raise Refusal(409, f"Your fleet has a server named {name} now. Make a new code with another name.")
     known = next((m for m, ip in team["addresses"].items() if ip == src), None)
     if known:
-        raise Refusal(409, f"This machine is in Fleet already, as {known}.")
+        raise Refusal(409, f"This server is in your fleet already, as {known}.")
     team["addresses"][name] = src
     team.setdefault("servers", {})[name] = {"kind": body["kind"], "user": body["user"]}
     if body["ssh_port"]:                # the join line ran as root: the owner's "Open in Terminal"
@@ -25854,8 +25883,8 @@ def join_server(src, body):
     except Refusal as e:                # the code stays unused: the same line can run again
         if e.status != 409:
             raise
-        raise Refusal(409, "The hub cannot save the new server now: the Fleet repository has newer commits than the "
-                           "hub runs. Run the line again in a few minutes; the code stays valid.") from None
+        raise Refusal(409, "The hub cannot save the new server now. Run the line again in a few minutes; the code "
+                           "stays valid.") from None      # its configuration ref has commits newer than the hub runs
     apply_team(team)
     with transaction():
         DB.execute("UPDATE join_codes SET used=?, address=?, key_sha256=? WHERE id=?",
@@ -25915,16 +25944,16 @@ def start_server_login(server, agent, runtime):
     sign-in of another runtime that the owner has open on the Machines page is refused rather than handed back,
     because the job waits for its own runtime and would otherwise wait out its 15 minutes for nothing."""
     if not isinstance(agent, str) or agent not in server_agents(server):
-        raise Refusal(404, f"{agent} is not an agent of {server}")
+        raise Refusal(404, f"{shown_name(agent)} is not an agent of {server}.")
     if not isinstance(runtime, str):
         raise Refusal(400, "runtime must be claude or codex")
     open_one = open_login(agent)
     if open_one and open_one["runtime"] != runtime:
-        raise Refusal(409, f"{agent} has an open {runtime_label(open_one['runtime'])} sign-in. Finish that one or let "
-                           f"it run out, then try again.")
+        raise Refusal(409, f"{shown_name(agent)} has an open {runtime_label(open_one['runtime'])} sign-in. Finish that "
+                           f"one or let it run out, then try again.")
     if not open_one and runtime in LOGIN_RUNTIMES and not q1(
             "SELECT last_seen FROM agents WHERE name=? AND last_seen>?", (agent, now() - MACHINE_STALE)):
-        raise Refusal(503, f"{agent}'s helper has not reached the hub yet; ask again in a minute")
+        raise Refusal(503, f"{shown_name(agent)} has not reached the hub yet. Try again in a minute.")
     return start_machine_login(agent, runtime)
 
 
@@ -25952,7 +25981,8 @@ def server_agent_entry(team, agent, server, runtime, role, parent):
         import hubsetup
         start = hubsetup.WORKER_STARTS.get(runtime)
         if not start:
-            raise Refusal(409, f"no worker runs {runtime} yet, so Fleet has no start settings to copy for {agent}")
+            raise Refusal(409, f"No worker runs {runtime_label(runtime)} yet, so Founderizer has no settings to copy "
+                               f"for {shown_name(agent)}.")
         entry = {"start": start}
         if (FULL_ACCESS.get(runtime) or {}).get("allow"):
             entry["allow"] = list(FULL_ACCESS[runtime]["allow"])
@@ -26040,11 +26070,11 @@ def prepare_server_agent(server, body):
     if a is None:
         raise Refusal(404, "no such agent")
     if a.get("machine") != server:
-        raise Refusal(409, f"{agent} is not on {server}")
+        raise Refusal(409, f"{shown_name(agent)} is not on {server}.")
     if a.get("runtime") == runtime:
-        raise Refusal(409, f"{agent} runs {runtime} already")
+        raise Refusal(409, f"{shown_name(agent)} runs {runtime_label(runtime)} already.")
     if switch_target(a.get("runtime")) != runtime:
-        raise Refusal(409, f"{agent} cannot switch to {runtime}")
+        raise Refusal(409, f"{shown_name(agent)} cannot switch to {runtime_label(runtime)}.")
     expire_server_jobs(t0)
     last = q1("SELECT * FROM server_jobs WHERE server=? ORDER BY id DESC LIMIT 1", (server,))
     if last and last["state"] in JOB_OPEN:
@@ -26068,7 +26098,7 @@ def remove_server(server, body):
     if server not in server_names(team):
         raise Refusal(404, "no such server")
     if server == (team.get("hub") or {}).get("machine"):
-        raise Refusal(409, "the hub's machine stays in Fleet")
+        raise Refusal(409, "The hub's server stays in your fleet.")
     here = server_agents(server, team)
     if here:
         raise Conflict(f"{server} has agents; it stays while they are on it", agents=here)
@@ -26193,7 +26223,7 @@ def rename_agent(agent, body):
     if a.get("role") == "manager":
         raise Refusal(409, "The manager keeps its name.")
     if new == agent:
-        raise Refusal(409, f"{agent} has this name already.")
+        raise Refusal(409, f"{shown_name(agent)} has this name already.")
     if new in team["agents"]:
         raise Refusal(409, f"An agent named {new} exists.")
     if q1("SELECT 1 FROM agents WHERE name=?", (new,)):
@@ -26201,10 +26231,11 @@ def rename_agent(agent, body):
                            f"another name.")
     if q1("SELECT 1 FROM tasks WHERE (owner=? OR requester=?) AND state NOT IN ('completed','failed','rejected',"
           "'canceled') LIMIT 1", (agent, agent)):
-        raise Refusal(409, f"{agent} has open tasks. Rename it when they are done.")
+        raise Refusal(409, f"{shown_name(agent)} has open tasks. Rename it when they are done.")
     server = a.get("machine")
     if server not in server_names(team) or not q1("SELECT 1 FROM server_keys WHERE server=?", (server,)):
-        raise Refusal(409, f"{server} has no server service, so Fleet cannot move {agent} to its new name there.")
+        raise Refusal(409, f"{server} runs no Founderizer service, so {shown_name(agent)} cannot take its new name "
+                           f"there.")
     expire_server_jobs(t0)
     last = q1("SELECT * FROM server_jobs WHERE server=? ORDER BY id DESC LIMIT 1", (server,))
     if last and last["state"] in JOB_OPEN:
@@ -26215,7 +26246,7 @@ def rename_agent(agent, body):
     if reading is None or reading["stale"]:
         raise Refusal(409, f"{server} sent no reading in the last 10 minutes: check that it is on")
     if open_login(agent):
-        raise Refusal(409, f"{agent} has an open sign-in. Finish it or let it run out, then try again.")
+        raise Refusal(409, f"{shown_name(agent)} has an open sign-in. Finish it or let it run out, then try again.")
     profile = git_blob(rev, f"profiles/{agent}.md")
     if git_blob(rev, f"profiles/{new}.md") is not None:
         raise Refusal(409, f"A profile for {new} is in the fleet already. Choose another name.")
@@ -26787,9 +26818,9 @@ def mcp_probe(names, command):
 
     for agent in names[:MCP_PROBE_MAX]:
         if not helper_online(agent, t0):
-            row(agent, "not_asked", "not asked, this machine has not checked in.")
+            row(agent, "not_asked", "not asked, this server has not checked in.")
         elif MCP_PROBE_FEATURE not in helper_features(agent):
-            row(agent, "not_asked", "not asked, this machine's Fleet is older than this check.")
+            row(agent, "not_asked", "not asked, this server's Founderizer is older than this check.")
         else:
             token = secrets.token_urlsafe(16)
             with MCP_LOCK:
@@ -26798,7 +26829,7 @@ def mcp_probe(names, command):
                  extra={"probe": token, "command": command})
             waiting[token] = row(agent, "asked", "asked.")
     for agent in names[MCP_PROBE_MAX:]:
-        row(agent, "not_asked", f"not asked, one check asks at most {MCP_PROBE_MAX} machines.")
+        row(agent, "not_asked", f"not asked, one check asks at most {MCP_PROBE_MAX} servers.")
     asked = list(waiting)
     deadline = t0 + MCP_PROBE_WAIT
     while waiting and now() < deadline:
@@ -26847,14 +26878,14 @@ def check_mcp_server(name, entry, agent=None):
         said = " ".join(w["says"] for w in where)
         if not answered:
             result.update(needs="machine", says=(
-                f"{made['command']} is a program of the agent's own machine, so the hub never runs it, and no "
-                f"machine answered this check. " + (said or f"No agent has {name} yet, so there was no machine to "
-                f"ask: give the server to an agent, or name one.") +
+                f"{made['command']} is a program of the agent's own server, so the hub never runs it, and no "
+                f"server answered this check. " + (said or f"No agent has {name} yet, so there was no server to "
+                f"ask: give {name} to an agent, or name one.") +
                 " The session's start text says it when the program is not installed."))
             return result
         missing = any(w["state"] == "missing" for w in answered)
         result.update(checked=True, answers=not missing, needs="machine" if missing or open_ones else None,
-                      says=f"{made['command']} is a program of the agent's own machine: each machine resolved the "
+                      says=f"{made['command']} is a program of the agent's own server: each server resolved the "
                            f"name itself and nobody ran it. {said}")
         return result
     access, url = None, made["url"]
@@ -26863,7 +26894,7 @@ def check_mcp_server(name, entry, agent=None):
         if not bad and mcp_connection(saved, name):
             with contextlib.suppress(Refusal):
                 access = mcp_access(name)[0]
-    local = (" The address is a loopback address, so the hub asked its own machine, which is the agent's machine "
+    local = (" The address is a loopback address, so the hub asked its own server, which is the agent's server "
              "only when the agent works there." if urllib.parse.urlsplit(url).hostname in ("127.0.0.1", "localhost")
              else "")
     try:
@@ -27062,10 +27093,11 @@ def settle_checks(t0):
     for c in q("SELECT * FROM machine_checks WHERE state='requested' AND requested < ?", (t0 - CHECK_WAIT,)):
         seen = (q1("SELECT last_seen FROM agents WHERE name=?", (c["agent"],)) or {"last_seen": None})["last_seen"]
         offline = not seen or seen < c["requested"]
+        name = shown_name(c["agent"])          # the server check's line, which he reads
         q("UPDATE machine_checks SET state=?, completed=?, detail=? WHERE id=?",
           ("offline" if offline else "failed", t0,
-           f"{c['agent']}'s helper has not checked in since the check was asked" if offline else
-           f"{c['agent']}'s helper did not send a report in {CHECK_WAIT} seconds", c["id"]))
+           f"{name} has been silent since the check was asked." if offline else
+           f"{name} sent no report in {CHECK_WAIT} seconds.", c["id"]))
 
 
 def record_status(agent, data):
@@ -27358,7 +27390,7 @@ def hub_only_notes(found):
             holds = f"the {n} Google accounts you connected{client}." + lost
         said.append("**Your Google sign-in.** `~/.fleet/google.json` on the hub machine holds " + holds)
         steps.append(
-            "**Connect Google again**, one account at a time, in the app under Settings > Apps. You need the "
+            "**Connect Google again**, one account at a time, in the app under Settings › Apps. You need the "
             "client file of the Desktop client from your Google Cloud project — Credentials, download the JSON "
             "again — "
             "and to be signed in to each account in the browser that opens. `config/team.json` in this copy "
@@ -27373,8 +27405,8 @@ def hub_only_notes(found):
             f"**Your MCP sign-ins.** `~/.fleet/mcp.json` on the hub machine holds {many}. Without it the agents "
             "that had those tools are told the server is not connected, and the tools do not load.")
         steps.append(
-            "**Connect each MCP server again**, in the app under Settings > MCPs. A server that signs you in "
-            "through your browser needs nothing but that; one with a key of its own needs that key, from "
+            "**Connect each MCP server again**, in the app under Settings › Apps, MCP servers. A server that signs "
+            "you in through your browser needs nothing but that; one with a key of its own needs that key, from "
             "wherever you keep it. `config/team.json` in this copy names the servers and their addresses.")
     else:
         had_none.append("MCP server connected")
@@ -27487,9 +27519,9 @@ Two kinds of thing: what no copy can carry, and what this one leaves out on purp
 are about **your** hub as it stood when this copy was made, not a list of what a fleet might have.
 
 **The vault store keys.** Each machine that holds logins has its own key, in a folder only that machine's vault
-user can open. Fleet cannot read it and cannot copy it, and a new key would leave every saved value unreadable.
-So the logins a broker made are lost with that machine — including the passwords of accounts your agents opened,
-which nobody ever saw. The machines that hold one:
+user can open. Founderizer cannot read it and cannot copy it, and a new key would leave every saved value
+unreadable. So the logins a broker made are lost with that machine — including the passwords of accounts your
+agents opened, which nobody ever saw. The machines that hold one:
 
 {holders}
 Keep anything you cannot afford to lose in your own password manager as well.
@@ -27514,9 +27546,9 @@ here: the day somebody reads it is the day nothing else is left.
    on port 8765; a €5 VPS is enough. You type nothing in its console: the app either installs over your own SSH
    connection, or hands you one block to paste into the agent you already run. It claims the hub at the end,
    which is what makes your Mac its owner, and you now have an empty fleet.
-3. **Restore from a copy**, in the app, and give it this file. The app offers it the moment it has claimed the
-   new hub, beside Start a new fleet; afterwards it is in Settings > System status, under Details and beside
-   Save a copy. The app reads this file first and tells you what is in it before it sends anything.
+3. **Restore copy**, in the app, and give it this file. The app offers it the moment it has claimed the
+   new hub, beside New fleet; afterwards it is in Settings › Backup. The app reads this file first and
+   tells you what is in it before it sends anything.
 4. The hub checks the copy, writes your configuration back onto its configuration ref, puts the records in place
    and restarts itself. It keeps the new machine's own addresses, so the app stays connected, and it takes back
    the fleet id your subscription is tied to, so your plan is the same fleet and you buy nothing again.
@@ -27655,7 +27687,7 @@ def restored_team(bundle):
     try:
         validate_team(team)
     except ValueError as e:
-        raise Refusal(422, f"this copy and this machine do not make a team.json the hub can run: {e}") from None
+        raise Refusal(422, f"this copy and this server do not make a team.json the hub can run: {e}") from None
     return json.dumps(team, indent=2).encode() + b"\n"
 
 
@@ -27790,12 +27822,18 @@ def health_view():
     """Everything the owner needs to see that the hub, its database, its backup and every machine are in order.
 
     **Every warning carries the way out.** A screen that says something is wrong and offers nothing leaves the
-    owner where he was (his words, 19 October 2026), so each warning has `fix` — one line, the one thing that
-    settles it — and `agent`, the agent it is about when it is about one. That is the same rule `verify` follows
-    for a machine, and it is what lets the app draw a button beside the line instead of inventing one."""
+    owner where he was (his words, 19 October 2026), so each warning has `agent`, the agent it is about when it is
+    about one, and the app draws the one button that settles it from `kind` and `agent`. `fix` is the one line that
+    button does not say itself, the same rule `verify` follows for a machine, and `None` where the button says it
+    all ("Save a copy", "Open Mini").
+
+    **In his voice and in few words** (T-37, 28 October 2026): the app's title names who and what, so `detail` says
+    the one fact behind it ("Silent since 14:53."), with times in the fleet's own zone, and never "UTC" or "the
+    owner"."""
     t0 = now()
     desired, machines = machine_rows()
     warnings = []
+    manager = shown_name(manager_name())       # the manager as he reads it, in the lines below
     # The agent on the hub's own machine: the disk that runs low is that machine's disk, so its page is where that
     # warning leads. None on a hub whose machine carries no agent, and then the warning carries no agent either.
     hub_machine = (TEAM.get("hub") or {}).get("machine")
@@ -27809,9 +27847,7 @@ def health_view():
         backup = {"at": float(kv_get("backup_at")), "bytes": int(kv_get("backup_bytes")), "sha256": kv_get("backup_sha256")}
         backup["age"] = t0 - backup["at"]
     if backups_enabled() and not backup:
-        warn("backup_missing", "The owner has no confirmed backup of the hub database.",
-             "Save a copy on your own Mac. This hub keeps none, and one dead disk takes the records and the "
-             "configuration together.")
+        warn("backup_missing", "None saved yet.", None)      # the title: No copy of your fleet; the button: Save a copy
     elif backups_enabled() and backup["age"] > BACKUP_WARN:
         warn("backup_old", f"The last confirmed backup is {span(backup['age'])} old.",
              "Save a new copy on your own Mac.")
@@ -27834,93 +27870,67 @@ def health_view():
     except (TypeError, ValueError):
         beat = None
     if beat and t0 - beat > TICK_WARN:
-        warn("timers_stalled",
-             f"The hub's timers last completed a full pass {ago(beat)} ago, at {clock(beat)}. They run every "
-             f"{CFG.get('tick', 5):g} seconds: while they are stopped, no silent task is nudged, no lost session is "
-             f"started again, no work held by a usage limit is resumed, and no goal, duty or report is swept.",
-             "Tell us. The hub's own log holds the error that stopped the pass (on the hub machine: journalctl "
-             "--user -u fleet-hub -n 200). Restarting fleet-hub frees a pass that is stuck; a pass that fails on a "
-             "record fails again after the restart.", agent=on_the_hub)
+        # In his words (T-37): since when, and what it costs him. A restart of the hub's server frees a pass that is
+        # stuck (its page, which the button opens, has Restart); a pass that fails on a record fails again after it,
+        # and the hub's own log (journalctl --user -u fleet-hub) holds the error for whoever he tells.
+        warn("timers_stalled", f"Since {owner_clock(beat, t0)}, no stuck task or session is restarted.",
+             "Restart the hub's server, and tell us if this comes back.", agent=on_the_hub)
     helpers = []
     for name in agents():
         row = q1("SELECT last_seen FROM agents WHERE name=?", (name,))
         seen = row["last_seen"] if row else None
         offline = not seen or quiet_for(seen, t0) > CFG.get("offline_after", 90)
         helpers.append({"agent": name, "last_seen": seen, "offline": offline})
-        if offline:
-            warn("helper_offline", f"{name.capitalize()}'s helper has not checked in since "
-                                   f"{clock(seen) if seen else 'the hub started'}.",
-                 f"Open {name.capitalize()} and check that its machine is on and reaches your private network.",
+        if offline:         # the app's title names the agent, and its button opens it
+            warn("helper_offline", f"Silent since {owner_clock(seen, t0) if seen else 'the hub started'}.", None,
                  agent=name)
     for m in machines:
         if m["stale"]:
-            warn("machine_stale", f"{m['agent'].capitalize()} has sent no machine status for ten minutes.",
-                 f"Open {m['agent'].capitalize()} and check it from its own page.", agent=m["agent"])
-        elif m["update"]["state"] in ("behind", "failed"):
+            warn("machine_stale", "No status for ten minutes.", None, agent=m["agent"])
+        elif m["update"]["state"] in ("behind", "failed"):      # the app's button: Update <Agent>
             warn("machine_" + m["update"]["state"],
-                 f"{m['agent'].capitalize()} does not run the hub revision {(desired or '')[:12]}.",
-                 f"Update {m['agent'].capitalize()}." + (" Its machine kept the revision it had."
-                                                         if m["update"]["state"] == "failed" else ""),
-                 agent=m["agent"])
+                 "It still runs the version it had." if m["update"]["state"] == "failed" else
+                 "It runs an older version than the hub.", None, agent=m["agent"])
     # The vault broker is the one piece of the fleet that a release does not reach by itself: it runs a root-owned
     # copy of vault.py outside every checkout a helper updates, and `lifecycle.OWNER_ONLY` lets a commit that
     # changes only that file count as taken, so a machine reports "current" whatever its broker runs. The broker
     # says what its own program hashes to and the hub compares it with its own vault.py, because nothing else can.
     #
-    # Each machine now catches its own broker up: its server service reads the installed program, which is
+    # Each machine catches its own broker up: its server service reads the installed program, which is
     # world-readable, and where it differs from the vault.py of its checkout it asks the one root command the
     # installers put in place for it (`hubsetup.vault_program_script`), which fetches the program from the
-    # configuration ref itself and restarts the broker. So this warning is no longer the fleet's way of telling
-    # the owner to paste a command per release: it is what says that the catch-up could not happen, which is why
-    # the fix line is to run that same command by hand and read what it says -- and, where the command is not
-    # there at all, the installer step that puts it there. The cases it covers: a machine with a broker and no
-    # server service, a machine whose installers are older than that root command, no route to the ref, and a new
-    # program the broker did not come up on, which keeps the one that was serving.
+    # configuration ref itself and restarts the broker, and it tries again every ten minutes (server.VAULT_EVERY).
+    # So a warning that stays says that the catch-up could not happen: a machine with a broker and no server
+    # service, a machine whose installers are older than that root command, no route to the ref, or a new program
+    # the broker did not come up on, which keeps the one that was serving.
+    #
+    # **In his words** (T-37): the server and what did not happen, and the one way on, with no revision, path or
+    # command. The steps by hand -- that root command, and `hubsetup.py agent-helper` where it is not there -- are
+    # WORKER-INSTALL.md's "When a release changes vault.py", for whoever he tells; `journalctl -u fleet-vault` on
+    # that server says which cause it is. Never the join line: `new_join_code` refuses a name the fleet has.
     #
     # A machine that is stale or behind is left out: it has not taken the release at all, its own warning already
     # carries that, and two lines for one cause say less than one.
     want = vault_source(desired)
     held = {m["machine"] for m in machines if m["stale"] or m["update"]["state"] != "current"}
-    hub_ip = hub_address()[0]
-    # This hub's own configuration ref, which the step below fetches the broker's program from. A hub with no
-    # address of its own in team.json can name none, and says so rather than printing a broken git URL.
-    config_ref = f"git://{hub_ip}/fleet-pilot.git" if hub_ip else "<this hub's configuration ref>"
     for machine, broker in (broker_programs(t0).items() if want else ()):
         if machine in held or broker["source"] == want:
             continue
-        # The second step, and why it is here. On exactly the machines whose installers are older than that root
-        # command, the command is not there -- which is *why* their broker is behind -- so a fix line that names
-        # only the command sends the owner to a missing file and says nothing about the one cause that never
-        # clears by itself. `hubsetup.py agent-helper` is the step both installers already run for it: it puts the
-        # command in place, it writes nothing when the three files are the ones this version writes, and the
-        # machine's own server service brings the broker across within ten minutes of it. The join line cannot
-        # stand here: `new_join_code` refuses a name the fleet already has, so a machine already in the fleet gets
-        # no fresh one, and the script would redo apt, the firewall and POST /join with `set -eu` stopping it
-        # before this step. Only the two arguments the hub knows are named -- the machine's service user from
-        # `servers` and this hub's own configuration ref -- and never the checkout, whose path is not the same on
-        # every machine of a fleet.
-        user = ((TEAM.get("servers") or {}).get(machine) or {}).get("user")
-        step = (f"python3 hubsetup.py agent-helper --repo {config_ref}"
-                + (f" --user {user}" if user else "") + ", in that machine's checkout")
-        warn("vault_behind",
-             f"The vault broker on {machine} does not run the vault.py of revision {desired[:12]}, which is the "
-             f"revision that machine reports. That machine brings its own broker onto a release within ten "
-             f"minutes of taking it, so a broker still behind means it could not: it has no server service, it "
-             f"cannot reach this hub's configuration ref, or the broker did not come up on the new program and "
-             f"kept the one that was serving. A machine whose installers are older than that root command has it "
-             f"nowhere yet, and that is the one cause that does not clear by itself. "
-             f"`journalctl -u fleet-vault -n 30` on that machine says which cause it is.",
-             f"On {machine}, as root: /usr/local/sbin/fleet-vault-program. If it is not there, {step}.",
-             agent=broker["agent"])
+        warn("vault_behind", f"The vault on {machine} has not taken the last update.",
+             "It updates itself within ten minutes; tell us if it does not.", agent=broker["agent"])
     flag = manager_warning()
     if flag:
         # A session that is not running is the one manager warning that a button settles: the app asks that
         # machine's helper to start it (owner feature manager_start). The others — a usage limit, a question on its
         # own screen, a silence, a switch that has not finished — are put right where its session is.
         warn("manager_" + flag["kind"], kv_get("mgr_flag"),
-             f"Start the session of {manager_name().capitalize()} again." if flag["kind"] == "down" else
-             f"Open {manager_name().capitalize()} and sign it in." if flag["kind"] == "signed_out" else
-             f"Open {manager_name().capitalize()}, where its session and its machine are.", agent=manager_name())
+             f"Start the session of {manager} again." if flag["kind"] == "down" else
+             f"Open {manager} and sign it in." if flag["kind"] == "signed_out" else
+             "Open its session and answer the question." if flag["kind"] == "screen" else
+             # runtime gaps C1: a helper with stuck_screens starts a session that shows the limit menu again itself
+             ("If its session shows a limit menu, answer it there."
+              if STUCK_SCREENS not in helper_features(manager_name()) else None) if flag["kind"] == "limited" else
+             f"Open {manager}, where its session and its server are.", agent=manager_name())
     # An allowance that is gone, or will be gone before it resets. One line per provider account and not per agent,
     # because the allowance belongs to the account and several agents can share one.
     #
@@ -27938,75 +27948,62 @@ def health_view():
         found = allowance_worth_saying(g["reading"], t0)
         if not found:
             continue
-        w, pace, why = found
+        w, _pace, why = found
         stops, spent = manager_name() in g["agents"], why == "spent"
-        # Spent says what is true and what it costs: the window is gone, and the reason no other line here says so
-        # is that nothing has failed yet. It carries no projection -- there is nothing left to project. Its reset
-        # says how far off it is, because here the reset is the decision: waiting out seven hours and waiting out
-        # thirty-one are not the same answer, and the clock alone does not tell them apart.
-        said = ((f"has used all of its \"{clip(w['label'], 40)}\" window"
-                 + (f", which resets {until_clock(w['resets_at'], t0)}" if w["resets_at"]
-                    else ", for which it gave no reset time")
-                 + ". No session has been refused yet, so nothing holds it and no other line here says so: the next "
-                   "session on this account is the one that stops.") if spent else
-                (f"has used {w['used_percent']:g}% of its \"{clip(w['label'], 40)}\" window"
-                 + (f", which resets at {clock(w['resets_at'])}" if w["resets_at"]
-                    else ", for which it gave no reset time")
-                 + (f". At the pace of the window so far it is gone before then ({pace:.0f}% of it by the reset)."
-                    if why == "pace" else ". Almost nothing is left of it.")))
-        # The manager's fix keeps the words it already had, minus the one that no longer helps: keeping sessions off
-        # the login saves what is left of a window, and a spent one has nothing left to save.
-        if stops and spent:
-            fix = (f"Sign {manager_name().capitalize()} in to an account with allowance left. While the manager is "
-                   f"held, nothing on this fleet is answered, checked or decided.")
-        elif stops:
-            fix = (f"Keep your own sessions off this login until the reset, or sign "
-                   f"{manager_name().capitalize()} in to an account with allowance left. While the manager is held, "
-                   f"nothing on this fleet is answered, checked or decided.")
-        else:
-            fix = (f"Open {g['agents'][0].capitalize()} and tell {manager_name().capitalize()} what must not wait "
-                   f"for the reset. Fleet buys no allowance.")
-        warn("allowance_spent" if spent else "allowance_pace",
-             f"The {g['runtime']} account of {', '.join(a.capitalize() for a in g['agents'])} " + said, fix,
+        # In his voice and in few words (T-37): the app's title names the agent ("Nova nears its usage limit"), so
+        # the line says how much of which limit is used and when that matters, and never a provider's own name of
+        # its window. An account that several agents share names them first. Spent carries no projection -- there
+        # is nothing left to project -- and its reset says how far off it is, because there the reset is the
+        # decision: waiting out seven hours and waiting out thirty-one are not the same answer.
+        names = [shown_name(a) for a in g["agents"]]
+        minutes = w.get("window_minutes") or 0
+        length = (f"{minutes // 1440}-day " if minutes % 1440 == 0 else f"{minutes // 60}-hour "
+                  if minutes % 60 == 0 else "usage ") if minutes else "usage "
+        limit = ("its " if len(names) == 1 else "their ") + length + "limit"
+        left = max(0, (w["resets_at"] or 0) - t0)
+        hours, mins = int(left // 3600), max(1, int(left // 60))       # "1 hour", never "1 hours" (review A11)
+        resets = (f"; it resets in {hours} hour{'' if hours == 1 else 's'}." if left >= 5400 else
+                  f"; it resets in {mins} minute{'' if mins == 1 else 's'}.") if w["resets_at"] else "."
+        said = (f"All of {limit} is used" + resets if spent else
+                f"{w['used_percent']:g}% of {limit} is used; it runs out before "
+                f"{owner_clock(w['resets_at'], t0)}." if why == "pace" else
+                f"{w['used_percent']:g}% of {limit} is used" + resets)
+        if len(names) > 1:
+            said = f"{', '.join(names[:-1])} and {names[-1]}: {said}"
+        # The manager's way out: keeping his own sessions off the account saves what is left of a window, and a spent
+        # one has nothing left to save. A worker's is the manager, who decides what waits.
+        fix = (f"Sign {manager} in to another account." if stops and spent else
+               "Keep your own sessions off this account until it resets." if stops else
+               f"Tell {manager} what must not wait.")
+        warn("allowance_spent" if spent else "allowance_pace", said, fix,
              agent=manager_name() if stops else (g["agents"][0] if len(g["agents"]) == 1 else None))
     # The findings of the fleet's own sweeps, on the owner's screen (his rule, 19 October 2026: a screen that reports
     # something wrong must carry the way to put it right). He is told only what the manager has already had and is
     # not acting on: it had a turn after the notice and left the notice unread (plan C10). A circle the hub noticed a
     # minute ago is the manager's to decide, and interrupting the owner with it is the drowning this work set out to
     # stop. The hub still changes nothing about either.
+    #
+    # In his words (T-37): how many, and that nobody acts on them, with the one way on. The items themselves are the
+    # manager's to read (and a stuck task has the board's Stalled mark); the line names no tool and no number of a
+    # record. The hub changes nothing about either by itself: the third attempt is sometimes the right one, and
+    # cancelling work is a decision.
     stuck = circles_waiting(t0)
     if stuck:
-        warn("circles_stuck",
-             f"{len(stuck)} thing(s) look like running in circles, and {manager_name().capitalize()} had a turn "
-             f"after it was told and did not read it: " + " | ".join(line for _, line in stuck[:2])
-             + (f" | and {len(stuck) - 2} more." if len(stuck) > 2 else ""),
-             f"Open {manager_name().capitalize()} and tell it what to do about them. The hub reports a circle and "
-             f"changes nothing by itself, because the third attempt is sometimes the right one.",
-             agent=manager_name())
+        one = len(stuck) == 1
+        warn("circles_stuck", f"{manager} has not acted on {len(stuck)} {'loop' if one else 'loops'} it was told of.",
+             f"Tell {manager} what to do about {'it' if one else 'them'}.", agent=manager_name())
     wedged = tasks_stuck(t0)
     if wedged:
-        warn("tasks_stuck",
-             f"{len(wedged)} open task(s) are stuck and nothing is moving them. Their requester was told about each, "
-             f"had a turn since and did not read it (for a lead's, {manager_name().capitalize()} too): "
-             + " | ".join(line for _, line in wedged[:2])
-             + (f" | and {len(wedged) - 2} more." if len(wedged) > 2 else ""),
-             f"Open {manager_name().capitalize()} and tell it what to do about them: wait, cancel each and give the "
-             f"work to another worker, or raise a Needs-you item. The hub starts a lost session again until two in a "
-             f"row left nothing and then changes nothing by itself, because cancelling work is a decision.",
-             agent=manager_name())
+        one = len(wedged) == 1
+        warn("tasks_stuck", f"{len(wedged)} {'task is' if one else 'tasks are'} stuck, and nobody is acting on "
+                            f"{'it' if one else 'them'}.",
+             f"Tell {manager} what to do with {'it' if one else 'them'}.", agent=manager_name())
     waiting = reports_waiting(t0)
     if waiting:
-        oldest, leads = waiting[0], {r["to_agent"] for r in waiting if r["to_agent"] != manager_name()
-                                     and not report_for_manager(r)}
-        warn("reports_undecided",
-             f"{len(waiting)} report(s) from your agents wait for a decision, and the agent that decides each had a "
-             f"turn after it was named to it and did not read it. The oldest is {upref(oldest['id'])} from "
-             f"{oldest['from_agent']} to {oldest['to_agent']}, {ago(oldest['created'])} ago: "
-             + clip(oldest["text"], 160),
-             f"Open {manager_name().capitalize()} and have it decide them with decide_report"
-             + (f"; {', '.join(sorted(leads))} owe(s) one, which it can ask for." if leads else ".")
-             + " An agent that reports something and hears nothing back stops reporting.",
-             agent=manager_name())
+        one = len(waiting) == 1
+        warn("reports_undecided", f"{len(waiting)} {'report' if one else 'reports'} from your agents "
+                                  f"{'waits' if one else 'wait'} for a decision.",
+             f"Ask {manager} to decide {'it' if one else 'them'}.", agent=manager_name())
     free = None
     try:
         st = os.statvfs(os.path.dirname(CFG.get("db_path") or ".") or ".")
@@ -28015,8 +28012,8 @@ def health_view():
         pass
     if free is not None and free < DISK_LOW:
         warn("disk_low", f"The hub disk has {free // 1024 ** 2} MiB free.",
-             (f"Open {on_the_hub.capitalize()} and free space on the hub's own machine." if on_the_hub
-              else "Free space on the hub's own machine."), agent=on_the_hub)
+             (f"Open {shown_name(on_the_hub)} and free space on the hub's own server." if on_the_hub
+              else "Free space on the hub's own server."), agent=on_the_hub)
     pages = q1("PRAGMA page_count")[0] * q1("PRAGMA page_size")[0]
     return {"ok": not warnings, "time": t0, "revision": desired, "backups_enabled": backups_enabled(),
             "hub": {"started_at": STARTED, "python": platform.python_version(), "sqlite": sqlite3.sqlite_version,
@@ -28095,7 +28092,7 @@ def expire_logins(t0=None):
     # hour while a window nobody reads waits on that machine.
     for row in q("SELECT * FROM signin_jobs WHERE state='starting' AND updated<?", (t0 - LOGIN_START_LIFE,)):
         q("UPDATE signin_jobs SET state='failed', detail=?, updated=? WHERE id=?",
-          ("Its machine did not get as far as the provider's page. Start the sign-in again.", t0, row["id"]))
+          ("Its server did not get as far as the provider's page. Start the sign-in again.", t0, row["id"]))
         LIVE_LOGINS.pop(row["id"], None)
     for one, live in list(LIVE_LOGINS.items()):
         if live.get("code") and t0 - live.get("code_at", t0) > LOGIN_CODE_LIFE:
@@ -28275,16 +28272,16 @@ def start_machine_login(agent, runtime, replace=False):
         return {"agent": agent, "login": login_view(open_one, live=False), "changed": False}
     signed_in = signed_in_now(agent, runtime) is True
     if signed_in and not replace:
-        raise Refusal(409, f"{runtime_label(runtime)} is signed in on this machine. Use another account signs it "
+        raise Refusal(409, f"{runtime_label(runtime)} is signed in on this server. Use another account signs it "
                            f"out first.")
     if signed_in and runtime not in LOGIN_OUT_RUNTIMES:
         raise Refusal(409, f"Founderizer drives no {runtime_label(runtime)} sign-out, so it cannot change the "
-                           f"account on this machine. Sign out there yourself, then sign in.")
+                           f"account on this server. Sign out there yourself, then sign in.")
     if not q1("SELECT last_seen FROM agents WHERE name=? AND last_seen>?", (agent, now() - MACHINE_STALE)):
-        raise Refusal(409, f"{agent}'s helper is not reporting, so nothing can start the sign-in on that machine.")
+        raise Refusal(409, f"{shown_name(agent)} is not answering. Check that its server is on.")
     busy = switch_busy(agent) if signed_in else None
     if busy:
-        raise Refusal(409, f"{agent.capitalize()} has {busy_words(busy)}. A sign-out stops it, so finish or stop "
+        raise Refusal(409, f"{shown_name(agent)} has {busy_words(busy)}. A sign-out stops it, so finish or stop "
                            f"that first.")
     t0, state = now(), "signing_out" if signed_in else "starting"
     lid = ins("INSERT INTO signin_jobs(agent,runtime,state,created,updated) VALUES(?,?,?,?,?)",
@@ -28302,7 +28299,7 @@ def give_login_code(agent, code):
     It is held in memory for one reader and is never written down."""
     row = open_login(agent)
     if row is None:
-        raise Refusal(409, "this machine has no sign-in waiting. Start one in the app.")
+        raise Refusal(409, "this server has no sign-in waiting. Start one in the app.")
     live = LIVE_LOGINS.get(row["id"]) or {}
     if row["state"] != "needs_owner" or not live.get("wants_code"):
         raise Refusal(409, f"this sign-in is {row['state']} and is not waiting for a code.")
@@ -28311,7 +28308,7 @@ def give_login_code(agent, code):
     live["code"], live["code_at"] = code, now()
     LIVE_LOGINS[row["id"]] = live
     q("UPDATE signin_jobs SET state='signing_in', detail=?, updated=? WHERE id=?",
-      ("The code went to the machine.", now(), row["id"]))
+      ("The code went to the server.", now(), row["id"]))
     log("owner", f"gave {agent} the sign-in code for L-{row['id']}")        # the code itself is never written
     return {"agent": agent, "login": login_view(q1("SELECT * FROM signin_jobs WHERE id=?", (row["id"],)),
                                                live=False)}
@@ -29020,6 +29017,13 @@ def release_sweep(t0):
         start_release_work(True, automatic=True)
     except Refusal:
         pass            # a run is going, or the fleet is working: the next sweep asks again
+
+
+class HubServer(ThreadingHTTPServer):
+    """The hub's HTTP server, with a listen backlog of 64 and not socketserver's 5. An app that opens a page reads a
+    dozen routes or more at once, and a connection that finds the backlog full is refused: the app reads that as a
+    failed read and shows its reading as old ("Last reading") while the hub is well (29 October 2026)."""
+    request_queue_size = 64
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -30084,7 +30088,7 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             data, manifest = backup_bundle(central)
         if len(data) > BACKUP_MAX:
-            return self.json(413, {"error": "the copy is larger than 256 MiB; take it on the hub machine"})
+            return self.json(413, {"error": "the copy is larger than 256 MiB; take it on the hub's server"})
         digest, t0 = hashlib.sha256(data).hexdigest(), now()
         with LOCK:
             kv_set("backup_served", json.dumps({"sha256": digest, "bytes": len(data), "at": t0}))
@@ -30133,8 +30137,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json(409, {"error": "request_id was already used for a different command"})
                 return self.json(200, dict(json.loads(old["result"]), replayed=True))
             if fleet_has_records() and not replace:
-                return self.json(409, {"error": "this hub already holds a fleet's work. A restore is for a new "
-                                                "machine; send replace=yes to put this copy over what is here"})
+                return self.json(409, {"error": "This hub already holds a fleet's work. A restore is for a new "
+                                                "server."})      # the app's button replaces it (replace=yes)
             try:
                 staged = stage_restore(data, CFG["db_path"], commit_kit_file, replace=replace)
             except Refusal as e:
@@ -30424,14 +30428,14 @@ class Handler(BaseHTTPRequestHandler):
             base = self.integration_base(data, ("machine", "ssh_user", "ssh_port", "screen_sharing", "delete"))
             machine = data.get("machine")
             if not isinstance(machine, str) or not SERVER_NAME.fullmatch(machine):
-                raise ValueError("machine must be the name of a machine of this fleet")
+                raise ValueError("machine must be the name of a server of this fleet")
             if data.get("delete") is not None:
                 if data["delete"] is not True or set(data) & {"ssh_user", "ssh_port", "screen_sharing"}:
                     raise ValueError("delete must be true, without ssh_user, ssh_port or screen_sharing")
                 return {"base_sha256": base, "machine": machine, "delete": True}
             user = data.get("ssh_user")
             if not isinstance(user, str) or not SSH_USER.fullmatch(user.strip()):
-                raise ValueError("ssh_user must be the user this machine is reached as: 1 to 32 characters, a "
+                raise ValueError("ssh_user must be the user this server is reached as: 1 to 32 characters, a "
                                  "letter or _ first, then letters, digits, . _ or -")
             port = data.get("ssh_port", 22)
             if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
@@ -35138,7 +35142,7 @@ def main():
     # AUTONOMY.md P6: the records written before this start, into the history, a short step at a time (the backfill)
     threading.Thread(target=history_indexer, name="history-index", daemon=True).start()
     TAILNET_NAMES["names"] = tailnet_names()        # devops task 1.1: the names that a client may call this hub by
-    server = ThreadingHTTPServer((host, port), Handler)
+    server = HubServer((host, port), Handler)
     server.daemon_threads = True
     print(f"Founderizer hub on http://{host}:{port}  board: http://{host}:{port}/board")
     print(f"It answers the Host values: {', '.join(sorted(allowed_hosts(server.server_address)))}.", flush=True)

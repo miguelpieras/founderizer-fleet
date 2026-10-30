@@ -427,6 +427,18 @@ def session_reuse(runtime, context, started, now_runs, settings=None, at=None, f
     return True, ""
 
 
+def shown_name(name):
+    """A name as both apps show it, which is Swift's `capitalized`: a capital for every letter that starts the name or
+    follows a character that is not a letter, and small letters for the rest ("hgr-dev" is "Hgr-Dev", "mini-2b"
+    "Mini-2B"). Python's capitalize() gave "Hgr-dev", so one agent read two ways on one screen (review A9, 29 October
+    2026). For the words the owner reads, from the hub and from a server's jobs."""
+    out, before = [], ""
+    for c in str(name or ""):
+        out.append(c.upper() if c.isalpha() and not before.isalpha() else c.lower())
+        before = c
+    return "".join(out)
+
+
 def runtime_fact(runtime, fact, otherwise=None):
     """One fact of one runtime's entry, and the only way to ask for it. `otherwise` is the answer for a name that is
     no runtime of this fleet, so that a check reads as the question it asks: such a name has no owner chat and holds

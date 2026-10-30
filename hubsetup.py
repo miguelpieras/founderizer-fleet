@@ -37,7 +37,7 @@ way round: this machine makes the code, the owner's Mac sends it back, and the a
 The claim listener holds the hub's own address and port, so the Tailscale access rules for port 8765 are proved
 before the hub exists. It keeps only the code's SHA-256, never writes the code anywhere, takes one code once, and
 stops as soon as it has the address. The script it serves at GET /claim then waits for the hub itself on the same
-port and prints the line for the app's Settings, so the final check is made from the owner's own machine.
+port and prints the address to paste in Founderizer, so the final check is made from the owner's own machine.
 
 This program never signs in to Claude, Codex or Grok, never reads or writes a provider credential, and never makes
 a vault entry. The customer signs in to their own account in their own session; `"vault": "none"` in the template
@@ -196,13 +196,24 @@ def install_runtime(runtime):
     if here:
         say(f"{runtime} is installed on this machine ({here}).")
         return here
-    pin = onboard.RUNTIME_PINS[runtime]
-    say(f"installing {runtime} {pin} from its own installer, into ~/.local/bin.")
-    done = subprocess.run(["sh", "-c", 'mkdir -p "$HOME/.local/bin" && ' + onboard.runtime_install(runtime, pin)],
-                          capture_output=True, text=True, timeout=900, stdin=subprocess.DEVNULL)
-    here = lifecycle.exe(runtime)
-    if done.returncode != 0 or not here:
-        raise Stop(f"{runtime} did not install: {(done.stderr or done.stdout or '').strip()[-300:]}")
+    pin, label = onboard.RUNTIME_PINS[runtime], lifecycle.RUNTIMES[runtime]["label"]
+    # An installer that could not reach the internet runs again by itself (onboard.NETWORK_RETRIES). Its own words
+    # go to this install's log, and the line that stops the install says what failed in plain words (T-35).
+    for again in range(onboard.NETWORK_RETRIES + 1):
+        say(f"installing {runtime} {pin} from its own installer, into ~/.local/bin"
+            + (f" (again: {again} of {onboard.NETWORK_RETRIES})." if again else "."))
+        done = subprocess.run(["sh", "-c", 'mkdir -p "$HOME/.local/bin" && ' + onboard.runtime_install(runtime, pin)],
+                              capture_output=True, text=True, timeout=900, stdin=subprocess.DEVNULL)
+        here = lifecycle.exe(runtime)
+        if done.returncode == 0 and here:
+            break
+        offline = onboard.network_failure(f"{done.stderr}\n{done.stdout}")
+        say(f"{runtime} did not install{', a network error' if offline else ''}: "
+            f"{(done.stderr or done.stdout or '').strip()[-300:]}")
+        if not offline or again == onboard.NETWORK_RETRIES:
+            raise Stop(f"{label} did not install: this server could not reach the internet." if offline else
+                       f"{label} did not install.")
+        time.sleep(onboard.NETWORK_WAIT)
     if runtime == "claude":         # its updates follow the stable channel, as on every other Founderizer machine
         subprocess.run([sys.executable, "-c", onboard.CLAUDE_CHANNEL, here], capture_output=True, text=True, timeout=120)
     say(f"{runtime} is installed ({here}). Nobody is signed in to it: that is the owner's own step, in the app.")
@@ -1176,8 +1187,9 @@ def normalise(text):
 
 def claim_script(hub_ip, port):
     """The script that GET /claim serves and the owner's Mac runs: it sends the code on standard input, then waits for
-    the hub itself on the same port and prints the line for the app's Settings. The code is in the environment of that
-    line and goes to curl's standard input, never in an argument and never in a URL."""
+    the hub itself on the same port and prints the address to paste in Founderizer, whose first-run window connects
+    to it at once. The code is in the environment of that line and goes to curl's standard input, never in an
+    argument and never in a URL."""
     base = f"http://{hub_ip}:{port}"
     return f"""#!/bin/sh
 # Claim a new Founderizer hub for this Mac. The hub printed the line that runs this script; FLEET_CLAIM holds the one-time
@@ -1194,14 +1206,14 @@ unset code
 i=0
 while [ "$i" -lt 60 ]; do
     if curl -fsS -m 5 -o /dev/null "{base}/ui/state"; then
-        echo "Founderizer: this Mac reads the hub. Paste this address in the app, Settings: {base}"
+        echo "Founderizer: this Mac reads the hub. Paste this address in Founderizer: {base}"
         exit 0
     fi
     sleep 5
     i=$((i + 1))
 done
-echo "Founderizer: the hub took this Mac as its owner, but it does not answer /ui/state yet. Look at the installer's \
-output on the server, then paste {base} in the app, Settings." >&2
+echo "Founderizer: the hub does not answer yet. When its install is done, paste this address in Founderizer: \
+{base}" >&2
 exit 1
 """
 

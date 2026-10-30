@@ -45,6 +45,7 @@ import urllib.request
 
 import lifecycle
 import onboard
+from lifecycle import shown_name      # a name as the apps show it
 
 KIT = os.path.dirname(os.path.abspath(__file__))
 HOME = os.path.expanduser("~")
@@ -84,6 +85,14 @@ class StepFailed(Exception):
     def __init__(self, step, detail):
         super().__init__(detail)
         self.step = step
+
+
+def failed(step, words, raw=None):
+    """A step that failed, in the words he reads on the server's page. The system's own text (a command's error, a
+    status number) goes to this service's log, never to his screen (UX fix round 3)."""
+    if raw:
+        print(f"{step or 'job'}: {ANSI.sub('', str(raw).strip())[-2000:]}", file=sys.stderr, flush=True)
+    return StepFailed(step, words)
 
 
 class Gone(Exception):
@@ -132,7 +141,7 @@ def account(user):
 
 
 def die(text):
-    print("Fleet join stopped: " + text, file=sys.stderr)
+    print("Founderizer join stopped: " + text, file=sys.stderr)
     sys.exit(1)
 
 
@@ -192,7 +201,7 @@ def cmd_join(args):
     server again (the line once more after a failed step) is a repeat for the hub."""
     code = sys.stdin.readline().strip()
     if not code:
-        die("No join code. Copy the whole line from Fleet: Servers, Add server.")
+        die("No join code. Copy the whole line from Founderizer: Settings, Servers, Add server.")
     key = server_key(make=True)
     status, answer = Hub(args.hub).call("POST", "/join", {
         "code": code, "key_sha256": hashlib.sha256(key.encode()).hexdigest(), "kind": args.kind,
@@ -202,12 +211,12 @@ def cmd_join(args):
                                    f"again.")
     name = answer.get("server")
     if not NAME.fullmatch(str(name)) or not re.fullmatch(r"http://[0-9.:\[\]a-f]+", str(answer.get("hub"))):
-        die("The hub gave an answer that Fleet cannot use.")
+        die("The hub gave an answer that Founderizer cannot use.")
     save_conf({"name": name, "hub": answer["hub"], "repo": answer.get("repo")})
-    print(f"Fleet: this machine is the server {name}" + (" (it had joined already)" if answer.get("replayed") else ""),
-          flush=True)
+    again = " (it had joined already)" if answer.get("replayed") else ""
+    print(f"Founderizer: this machine is the server {name}{again}", flush=True)
     install_service()
-    print("Fleet: the server service runs", flush=True)
+    print("Founderizer: the server service runs", flush=True)
 
 
 def install_service(run=subprocess.run, platform=sys.platform):
@@ -251,14 +260,15 @@ def install_service(run=subprocess.run, platform=sys.platform):
 
 def cmd_service(args):
     if not load_conf():
-        die("This machine has not joined Fleet. Run the join line from Fleet: Servers, Add server.")
-    print("Fleet: wrote and started " + install_service())
+        die("This machine has not joined your fleet. Run the join line from Founderizer: Settings, Servers, Add "
+            "server.")
+    print("Founderizer: wrote and started " + install_service())
 
 
 def cmd_run(args):
     conf, key = load_conf(), server_key()
     if not conf or not key:
-        print("This machine has not joined Fleet; the server service waits.", flush=True)
+        print("This server has not joined your fleet; its Founderizer service waits.", flush=True)
         while True:
             time.sleep(600)
     Service(conf, Hub(conf["hub"], key)).loop()
@@ -373,12 +383,11 @@ class Service:
         if self.platform == "darwin":
             return None
         user = self.os_user(agent, job.get("user"))
-        self.post(job, "running", "user", f"The OS user {user} of {agent}.")
+        self.post(job, "running", "user", f"The OS user {user} of {shown_name(agent)}.")
         code, out, err = self.run(["sudo", "-n", AGENT_HELPER, user], timeout=120)
         if code != 0 or not self.users(user):
-            raise StepFailed("user", f"The OS user {user} of {agent} could not be made: {tail(err or out)}. The "
-                                     f"server needs {AGENT_HELPER} from the Fleet installer; run the join line "
-                                     f"again on {self.name}.")
+            raise failed("user", f"The OS user {user} of {shown_name(agent)} could not be made. Run the join line "
+                                 f"again on {self.name}.", err or out)
         return user
 
     def revision(self):
@@ -470,7 +479,8 @@ class Service:
         try:
             kind = {"install": self.install, "prepare": self.prepare, "rename": self.rename}.get(job.get("kind"))
             if kind is None:
-                raise StepFailed(None, f"This server service does not know the job {job.get('kind')}. Update Fleet.")
+                raise StepFailed(None, f"This server service does not know the job {job.get('kind')}. Update "
+                                       f"Founderizer.")
             kind(job)
         except StepFailed as e:
             self.post(job, "failed", e.step, str(e)[:500], quiet=True)
@@ -478,7 +488,7 @@ class Service:
             pass
         except Exception as e:          # one bad job never stops the service
             print(f"job {job.get('id')}: {e!r}", file=sys.stderr, flush=True)
-            self.post(job, "failed", None, f"The server service failed: {str(e)[:300]}", quiet=True)
+            self.post(job, "failed", None, "The server service failed. Try again.", quiet=True)
 
     def post(self, job, state, step, detail, prompt=None, quiet=False):
         status, answer = self.hub.call("POST", f"/server/{self.name}/jobs/{job['id']}",
@@ -491,13 +501,13 @@ class Service:
     def install(self, job):
         agent, runtime = job.get("agent"), job.get("runtime")
         if not NAME.fullmatch(str(agent)) or runtime not in LABELS:
-            raise StepFailed(None, "The job names no agent or runtime that Fleet knows.")
+            raise StepFailed(None, "The job names no agent or AI provider that Founderizer knows.")
         user = self.user_step(job, agent)
         exe = self.runtime_step(job, runtime, user)
         folder = self.checkout_step(job, agent, user)
         self.service_step(job, agent, runtime, folder, user)
         self.sign_in_step(job, agent, runtime, exe, user)
-        self.post(job, "done", "sign_in", f"{agent} runs on {self.name}. Check it and activate it in its Settings.")
+        self.post(job, "done", "sign_in", f"{shown_name(agent)} runs on {self.name}. Open it to finish its setup.")
 
     # ---- prepare the other runtime of an agent (owner feature runtime_switch)
     def prepare(self, job):
@@ -506,18 +516,18 @@ class Service:
         checkout when the server is not signed in. The agent keeps its runtime until the owner switches it."""
         agent, runtime = job.get("agent"), job.get("runtime")
         if not NAME.fullmatch(str(agent)) or runtime not in LABELS:
-            raise StepFailed(None, "The job names no agent or runtime that Fleet knows.")
+            raise StepFailed(None, "The job names no agent or AI provider that Founderizer knows.")
         user = self.agent_user(agent, job.get("user"))
         folder = os.path.join(self.home_of(user), f"fleet-{agent}")
         if not self.ours(folder, agent, user):
-            raise StepFailed(None, f"{agent} has no checkout {self.short_of(agent, user)} from Fleet on "
-                                   f"{self.name}.")
+            raise StepFailed(None, f"{shown_name(agent)} has no checkout {self.short_of(agent, user)} from "
+                                   f"Founderizer on {self.name}.")
         exe = self.runtime_step(job, runtime, user)
         if runtime == "codex":
             self.codex_trust(folder, "runtime", user)
         self.sign_in_step(job, agent, runtime, exe, user)
-        self.post(job, "done", "sign_in", f"{LABELS[runtime]} is installed and signed in on {self.name}. Now switch {agent} "
-                                          f"to it.")
+        self.post(job, "done", "sign_in", f"{LABELS[runtime]} is installed and signed in on {self.name}. Now switch "
+                                          f"{shown_name(agent)} to it.")
 
     # ---- a new name for an agent (owner feature agent_rename)
     def rename(self, job):
@@ -528,21 +538,22 @@ class Service:
         is missing."""
         agent, was, runtime = job.get("agent"), job.get("was"), job.get("runtime")
         if not NAME.fullmatch(str(agent)) or not NAME.fullmatch(str(was)) or agent == was or runtime not in LABELS:
-            raise StepFailed(None, "The job names no agent or runtime that Fleet knows.")
+            raise StepFailed(None, "The job names no agent or AI provider that Founderizer knows.")
         user = self.agent_user(agent, job.get("user"))
         old, folder = (os.path.join(self.home_of(user), f"fleet-{name}") for name in (was, agent))
         if not self.there(folder, user) and self.ours(old, was, user):
             self.post(job, "running", "checkout", f"The checkout {self.short_of(agent, user)}.")
             code, out, err = self.run(self.as_agent(user, ["mv", old, folder]))
             if code != 0:
-                raise StepFailed("checkout", f"{self.short_of(was, user)} could not become "
-                                             f"{self.short_of(agent, user)}: {tail(err or out)}")
+                raise failed("checkout", f"{self.short_of(was, user)} could not become "
+                                         f"{self.short_of(agent, user)}. Try again.", err or out)
             self.mark(folder, agent, user)
         folder = self.checkout_step(job, agent, user)
-        self.post(job, "running", "service", f"The service of {was} ends, and the service of {agent} starts.")
+        self.post(job, "running", "service", f"The service of {shown_name(was)} ends, and the service of "
+                                             f"{shown_name(agent)} starts.")
         self.retire(job, was, user)
         self.service_step(job, agent, runtime, folder, user)
-        self.post(job, "done", "service", f"{agent} runs on {self.name}.")
+        self.post(job, "done", "service", f"{shown_name(agent)} runs on {self.name}.")
 
     def retire(self, job, was, user=None):
         """The old name of a renamed agent ends on this server: its service stops and never starts again, its tmux
@@ -553,13 +564,15 @@ class Service:
             self.run(["launchctl", "bootout", job_name])
             self.run(["rm", "-f", os.path.join(self.home, "Library", "LaunchAgents", f"com.agentfleet.{was}.plist")])
             if self.run(["launchctl", "print", job_name])[0] == 0:
-                raise StepFailed("service", f"The service of {was} did not stop. Restart {self.name}, then try again.")
+                raise StepFailed("service", f"The service of {shown_name(was)} did not stop. Restart "
+                                            f"{self.name}, then try again.")
         else:
             unit = f"fleet-{was}.service"
             self.run(self.as_agent(user, ["systemctl", "--user", "disable", "--now", unit]))
             code, out, _err = self.run(self.as_agent(user, ["systemctl", "--user", "is-active", unit]))
             if out.strip() == "active":
-                raise StepFailed("service", f"The service of {was} did not stop. Restart {self.name}, then try again.")
+                raise StepFailed("service", f"The service of {shown_name(was)} did not stop. Restart "
+                                            f"{self.name}, then try again.")
             self.run(self.as_agent(user, ["rm", "-f", os.path.join(self.home_of(user), ".config", "systemd", "user",
                                                                    unit)]))
             self.run(self.as_agent(user, ["systemctl", "--user", "daemon-reload"]))
@@ -569,19 +582,36 @@ class Service:
     def runtime_step(self, job, runtime, user=None):
         """The runtime of this agent, in the home of its own user: the credential the vendor's client writes lives
         beside it, and a home of mode 700 cannot be shared, so a machine with several agents carries one copy for
-        each."""
+        each.
+
+        A vendor installer that could not reach the internet is run again by itself, up to onboard.NETWORK_RETRIES
+        times, while the owner's page stays on its moving words and the job's line stays "Installing Codex.". Its own
+        words go to this service's log, one line for each try with the job's id, and the job's line says what failed
+        in plain words: the owner can act on "could not reach the internet", and on no installer's error text
+        (T-35)."""
         label = LABELS[runtime]
         self.post(job, "running", "runtime", f"Looking for {label}.")
         exe = self.agent_exe(runtime, user)
         if exe:
             return exe
         pin = onboard.RUNTIME_PINS[runtime]
-        self.post(job, "running", "runtime", f"Installing {label} {pin}.")
         script = 'mkdir -p "$HOME/.local/bin" && ' + onboard.runtime_install(runtime, pin)
-        code, out, err = self.agent_sh(user, script, timeout=900)
-        exe = self.agent_exe(runtime, user)
-        if code != 0 or not exe:
-            raise StepFailed("runtime", f"{label} did not install: {tail(err or out)}")
+        for again in range(onboard.NETWORK_RETRIES + 1):
+            # One line for every try, without the version: the tries are the log's (T-35). Each try still posts it,
+            # so a job cancelled between two tries stops here (Gone).
+            self.post(job, "running", "runtime", f"Installing {label}.")
+            code, out, err = self.agent_sh(user, script, timeout=900)
+            exe = self.agent_exe(runtime, user)
+            if code == 0 and exe:
+                break
+            offline = onboard.network_failure(f"{err}\n{out}")
+            print(f"job {job.get('id')}: {label} {pin} did not install (try {again + 1} of "
+                  f"{onboard.NETWORK_RETRIES + 1}{', a network error' if offline else ''}): "
+                  f"{' '.join(tail(err or out, 500).split())}", flush=True)
+            if not offline or again == onboard.NETWORK_RETRIES:
+                raise StepFailed("runtime", f"{label} did not install: {self.name} could not reach the internet."
+                                 if offline else f"{label} did not install.")
+            self.sleep(onboard.NETWORK_WAIT)
         if runtime == "claude":         # its updates follow the stable channel, as after the SSH setup
             self.run(self.as_agent(user, [sys.executable, "-c", onboard.CLAUDE_CHANNEL, exe]), timeout=120)
         return exe
@@ -612,18 +642,22 @@ class Service:
         self.post(job, "running", "checkout", f"The checkout {short}.")
         if self.there(folder, user):
             if not self.ours(folder, agent, user):
-                raise StepFailed("checkout", f"{short} exists, and Fleet did not make it. It stays as it is.")
+                raise StepFailed("checkout", f"{short} exists, and Founderizer did not make it. It stays as it is.")
         else:
             if not self.repo:
                 raise StepFailed("checkout", "This server has no repository address. Run the join line again.")
             code, out, err = self.run(self.as_agent(user, ["git", "clone", "-q", self.repo, folder]), timeout=300)
             if code != 0:
-                raise StepFailed("checkout", f"git could not get the Fleet repository: {tail(err or out)}")
+                raise failed("checkout", f"{self.name} could not get the Founderizer repository. Try again.",
+                             err or out)
             self.mark(folder, agent, user)
         # an origin from before the split stays as it was
         problem = lifecycle.follow_config_ref(folder, self.agent_run(user))
         if problem:
-            raise StepFailed("checkout", f"git could not bring {short} up to date: {problem}")
+            # His words only: the one plain reason stays, git's own text goes to the log.
+            own = problem.startswith("the checkout has its own changes")
+            raise failed("checkout", f"{short} could not be brought up to date: {problem}." if own
+                         else f"{short} could not be brought up to date. Try again.", None if own else problem)
         code, out, _err = self.run(self.as_agent(user, ["cat", os.path.join(folder, "team.json")]))
         try:
             listed = code == 0 and agent in (json.loads(out or "{}").get("agents") or {})
@@ -631,7 +665,7 @@ class Service:
             listed = False
         if not listed:
             branch = lifecycle.checkout_branch(folder, self.agent_run(user))
-            raise StepFailed("checkout", f"The repository does not list {agent} yet on "
+            raise StepFailed("checkout", f"The repository does not list {shown_name(agent)} yet on "
                                          f"{branch or 'this checkout'}. Try again in a minute.")
         return folder
 
@@ -642,8 +676,8 @@ class Service:
         code, out, err = self.run(self.as_agent(user, ["/bin/sh", "-c", 'printf "%s\\n" "$2" > "$1"', "sh", mark,
                                                        agent]))
         if code != 0:
-            raise StepFailed("checkout", f"{self.short_of(agent, user)} could not be marked as Fleet's: "
-                                         f"{tail(err or out)}")
+            raise failed("checkout", f"{self.short_of(agent, user)} could not be marked as Founderizer's. Try "
+                                     f"again.", err or out)
 
     def there(self, folder, user=None):
         """Whether this folder is there, read as the agent's own user: its home is of mode 700, so this service
@@ -669,13 +703,13 @@ class Service:
         happen as the agent's own OS user, so the unit is in that user's own systemd manager and its session runs
         as it. A Codex agent's checkout is trusted first, as the worker installer does it; an owner's own setting
         that does not trust it stays."""
-        self.post(job, "running", "service", f"The service of {agent}.")
+        self.post(job, "running", "service", f"The service of {shown_name(agent)}.")
         if runtime == "codex":
             self.codex_trust(folder, "service", user)
         argv, cwd = self.in_folder(user, folder, [sys.executable, "fleet.py", "service", agent])
         code, out, err = self.run(argv, cwd=cwd)
         if code != 0:
-            raise StepFailed("service", f"The service of {agent} could not be written: {tail(err or out)}")
+            raise failed("service", f"The service of {shown_name(agent)} could not be written. Try again.", err or out)
         if self.platform == "darwin":
             job_name = f"gui/{os.getuid()}/com.agentfleet.{agent}"
             if self.run(["launchctl", "print", job_name])[0] == 0:
@@ -687,7 +721,7 @@ class Service:
             code, out, err = self.run(self.as_agent(user, ["systemctl", "--user", "enable", "--now",
                                                            f"fleet-{agent}.service"]))
         if code != 0:
-            raise StepFailed("service", f"The service of {agent} did not start: {tail(err or out)}")
+            raise failed("service", f"The service of {shown_name(agent)} did not start. Try again.", err or out)
 
     def codex_trust(self, folder, step, user=None):
         """Codex's trust of the agent's checkout, with the worker installer's function, so that a Codex session there
@@ -697,10 +731,10 @@ class Service:
                                                   "print(worker_install.trust_codex_checkout())"])
         code, out, err = self.run(argv, cwd=cwd)
         if code != 0:
-            raise StepFailed(step, f"Codex's trust of {folder} could not be set: {tail(err or out)}")
+            raise failed(step, f"Codex's trust of {folder} could not be set. Try again.", err or out)
         if out.strip() == "kept":
-            raise StepFailed(step, f"Codex has its own setting for {folder} that does not trust it. Fleet leaves it as "
-                                   f"it is. Change it, then try again.")
+            raise StepFailed(step, f"Codex has its own setting for {folder} that does not trust it. Founderizer "
+                                   f"leaves it as it is. Change it, then try again.")
 
     def sign_in_step(self, job, agent, runtime, exe, user=None):
         """The sign-in of this agent's own runtime. The credential is in that agent's user's home, so the sign-in
@@ -728,11 +762,14 @@ class Service:
             if status == 200:
                 break
             if status != 503 or self.clock() >= deadline:
-                raise StepFailed("sign_in", f"The hub could not start the sign-in of {LABELS[runtime]} for {agent}: "
-                                            f"{answer.get('error') or status}")
-            self.post(job, "running", "sign_in", f"Waiting for the helper of {agent} to reach Fleet.")
+                # The hub's own refusal is words for him; a status number alone is not, so it goes to the log.
+                if answer.get("error"):
+                    raise StepFailed("sign_in", f"The sign-in did not start: {answer['error']}")
+                raise failed("sign_in", "The sign-in did not start, because the hub did not answer. Try again.",
+                             f"POST /server/{self.name}/signin answered {status}")
+            self.post(job, "running", "sign_in", f"Waiting for {shown_name(agent)} to reach the hub.")
             self.sleep(10)
-        self.post(job, "needs_owner", "sign_in", f"Sign {agent} in to {LABELS[runtime]} in Fleet.",
+        self.post(job, "needs_owner", "sign_in", f"Sign {shown_name(agent)} in to {LABELS[runtime]} in Founderizer.",
                   prompt={"kind": "signin", "purpose": "claude_login", "agent": agent, "login": answer["login"]["id"]})
         self.wait_signed_in(runtime, user)
 
@@ -782,7 +819,7 @@ class Service:
             if life.runtime(runtime)["signed_in"] is True:
                 return
             self.sleep(2)           # the owner's sign-in shows as soon as it is made (live_changes)
-        raise StepFailed("sign_in", f"{LABELS[runtime]} did not sign in within 15 minutes. Try again in Fleet.")
+        raise StepFailed("sign_in", f"{LABELS[runtime]} did not sign in within 15 minutes. Try again in Founderizer.")
 
     # ---- updates
     def update(self):
