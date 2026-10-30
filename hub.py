@@ -2303,7 +2303,7 @@ def task_start_text(agent, task_id, resume=False, note="", row=None, opening=Non
     said = (f'Call read_messages with task_id "{tref(task_id)}" whenever signalled. ' if opening else
             f'You are agent "{agent}" in Founderizer. Read {", ".join(rules_files(rules_parts(agent)))} and '
             f'profiles/{agent}.md in this folder first, but RULES.md only if your context does not hold it yet: '
-            f'Claude Code loads it through CLAUDE.md. Your helper brought this folder up to date just before this '
+            f'your helper gives it with your start. Your helper brought this folder up to date just before this '
             f'session; do not pull at the start. Call read_messages with task_id \"{tref(task_id)}\" now and whenever '
             f'signalled. ')
     said += (f'You are RESUMING task {tref(task_id)} after your earlier session stopped. '

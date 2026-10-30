@@ -67,6 +67,7 @@ from lifecycle import (GITHUB_TOKEN, MCP_PROGRAM, REPO_ACCESS, REPO_NAME, RUNTIM
                        reuse_settings, runtime_fact, runtimes_with, session_reuse, skills_text, tool_catalog,
                        tool_needs)
 from desktop import Publisher
+from onboard import CLAUDE_UPDATES_OFF
 
 KIT = os.path.dirname(os.path.abspath(__file__))
 HOME = os.path.expanduser("~/.fleet")
@@ -586,6 +587,60 @@ CHROME_TOOLS = "mcp__claude-in-chrome__*"      # the tools that Claude Code's --
 # The files of this checkout that no worker session edits: Fleet's code, the rules, the owner's files, and the agents'
 # skills, which an agent changes with write_skill only (design v4 D1).
 PROTECTED = ("fleet.py", "lifecycle.py", "onboard.py", "vault.py", "acp_runner.py", "screen_runner.py", "desktop.py", "FleetWorker.swift", "worker_install.py", "install-worker.sh", "Install Fleet Worker.command", "hub.py", "wakeups.py", "usage.py", "threads.py", "selftest.py", "test_logins.py", "verify.py", "verify_case.py", "pilot.py", "publish.py", "publish/**", "team.json", "bws.toml", "RULES.md", "rules/**", "CLAUDE.md", "AGENTS.md", "profiles/**", "skills/**")
+# No Claude session that a helper starts loads a setting source of its machine (--setting-sources ''). A Mac keeps one
+# desktop user for its agents (PRODUCT.md P2), so that person's own CLAUDE.md, rules, skills, agents, plugins and hooks
+# would steer every agent there unseen, and an agent could write them to steer its own later sessions; and the
+# folder's source is no way around it, because Claude Code reads the CLAUDE.md and the rules of every folder above the
+# checkout, the home folder's ~/.claude among them. What a session still needs of the user's file comes with its own
+# --settings (kept_user_settings), and the rules that a start without its stable text read from the folder's CLAUDE.md
+# come from the checkout's RULES.md (rules_file).
+CLAUDE_USER_SETTINGS = None     # that file; None: settings.json of CLAUDE_CONFIG_DIR, else of ~/.claude, as Claude Code
+                                # finds it
+CLAUDE_CHANNELS = ("latest", "stable", "rc")    # the update channels that Claude Code 2.1.301 and later take
+CLAUDE_CLEANUP_DAYS = 30                        # Claude Code's own cleanupPeriodDays when a settings file names none
+
+
+def kept_user_settings():
+    """What a Claude session keeps of its user's own settings file, which it does not load: the update channel and
+    its floor, which Fleet's installer writes there (onboard.CLAUDE_CHANNEL), and the owner's switch that turns the
+    updates off (CLAUDE_UPDATES_OFF in env), so that the session's own updater keeps to them; and how many days of
+    transcripts Claude Code keeps, because without a source that names it Claude Code 2.1.308 and later clean none,
+    and the agents' transcripts would grow without end. A value that Claude Code would refuse stays out, so that it
+    never refuses the session's settings for it. {} for a file that Claude Code could not read either, and for one
+    that is no regular file, which it does not read and which could keep the helper waiting."""
+    path = CLAUDE_USER_SETTINGS or os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"),
+                                                "settings.json")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)     # a FIFO too opens at once
+    except FileNotFoundError:
+        own = {}
+    except OSError:
+        return {}
+    else:
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return {}
+            with os.fdopen(os.dup(fd), encoding="utf-8") as f:
+                own = json.load(f)
+        except (OSError, ValueError, RecursionError):      # a nesting deeper than the decoder goes
+            return {}
+        finally:
+            os.close(fd)
+    if not isinstance(own, dict):
+        return {}
+    kept = {}
+    if own.get("autoUpdatesChannel") in CLAUDE_CHANNELS:
+        kept["autoUpdatesChannel"] = own["autoUpdatesChannel"]
+    floor = own.get("minimumVersion")
+    if isinstance(floor, str) and RUNTIME_VERSION.fullmatch(floor):
+        kept["minimumVersion"] = floor
+    days = own.get("cleanupPeriodDays", CLAUDE_CLEANUP_DAYS)
+    if isinstance(days, int) and not isinstance(days, bool) and days >= 1:
+        kept["cleanupPeriodDays"] = days
+    env = own.get("env") if isinstance(own.get("env"), dict) else {}
+    off = {name: value if isinstance(value, str) else json.dumps(value) for name, value in env.items()
+           if name in CLAUDE_UPDATES_OFF and isinstance(value, (str, int))}
+    return dict(kept, env=off) if off else kept
 
 
 def settings_arg(agent, conf, task, tools=(), needs="none"):
@@ -619,6 +674,10 @@ def settings_arg(agent, conf, task, tools=(), needs="none"):
         if needs == "browser" and CHROME_TOOLS not in allow:
             allow.append(CHROME_TOOLS)
         settings = {"permissions": {"allow": allow, "deny": deny}}
+    if conf.get("role") == "manager" or (task and task != "conversation"):
+        # Workflow for every agent (decision 41), also where its account's plan has it off until a setting turns it
+        # on, as on Pro: that setting was the user's, which no session loads (kept_user_settings)
+        settings["enableWorkflows"] = True
     settings["prefersReducedMotion"] = False        # the screen watch reads its counters (MOTION)
     # AUTONOMY.md decision 41: what an agent learns is the fleet's (its notes and its memory, which the owner reads),
     # never a memory folder of Claude Code's own that a later session would load unseen
@@ -634,6 +693,7 @@ def settings_arg(agent, conf, task, tools=(), needs="none"):
             "PostToolUse": [{"hooks": [{"type": "command", "async": True, "timeout": 10,
                                         "command": f"{hook} activity {agent} {task}"}]}],
         }
+    settings.update(kept_user_settings())
     return "--settings " + shlex.quote(json.dumps(settings))
 
 
@@ -830,7 +890,7 @@ def codex_server(name, catalog=None):
 # the same agent, so that the provider's cache holds it from one session to the next, and with its task last. That
 # text is the fleet's rules (RULES.md, and the parts of rules/ that hub.rules_parts names for this agent) and the
 # agent's profile, all from this checkout, which the helper brought up to date just before the start. Claude reads it
-# as its appended system prompt, from a file, and takes no CLAUDE.md of the folder (--setting-sources user); its task
+# as its appended system prompt, from a file, and takes no CLAUDE.md of the folder (--setting-sources ''); its task
 # is the first answer of read_messages. Codex reads RULES.md as the folder's AGENTS.md, which the published tree
 # carries as RULES.md itself (publish.COPIED), and the parts, its profile and then its task as its first prompt.
 RULES_PARTS = ("lead", "manager", "conversations", "logins", "github")     # hub.RULES_PARTS, in that order
@@ -869,6 +929,15 @@ def stable_text(agent, opening, parts, head=None, skills=True):
     where, rules = STABLE_WHERE[opening]
     head = STABLE_TASK.format(agent=agent, where=where) if head is None else head + (" " if head else "")
     return "\n\n".join([head + STABLE_RULES.format(rules=rules)] + texts) + "\n"
+
+
+def rules_file():
+    """The file that gives a Claude start without its stable text (an older hub's event, a hub that could not be
+    reached, a missing file, a standing session that continues its conversation) the rules that it read from the
+    folder's CLAUDE.md before --setting-sources '': this checkout's RULES.md, which a release leaves as that CLAUDE.md's
+    AGENTS.md. Claude Code joins it with what --append-system-prompt gives. None when this checkout has no RULES.md."""
+    path = os.path.join(KIT, "RULES.md")
+    return path if os.path.isfile(path) else None
 
 
 def standing_opening(conf, rules):
@@ -966,8 +1035,7 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
         stable += github_text(values, tools) if task else ""
         window = task or "manager"
         if opening == "read":
-            first = "--setting-sources user --append-system-prompt-file " + \
-                shlex.quote(session_file(agent, window, "md", stable)) + \
+            first = "--append-system-prompt-file " + shlex.quote(session_file(agent, window, "md", stable)) + \
                 ("" if task or resume else " " + shlex.quote(prompt))
         elif resume:
             first = f"-c project_doc_max_bytes={codex_rules_limit()} " + shlex.quote(session)   # its thread
@@ -976,6 +1044,9 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
             # it removes before Codex starts. Codex reads all of RULES.md as this folder's AGENTS.md.
             path = shlex.quote(session_file(agent, window, "md", stable + "\n" + prompt))
             first = f'-c project_doc_max_bytes={codex_rules_limit()} "$(cat {path}; rm -f {path})"'
+    elif conf.get("runtime") == "claude":
+        core = rules_file()                                 # the folder's CLAUDE.md loads no more
+        first = " ".join(x for x in ("--append-system-prompt-file " + shlex.quote(core) if core else "", first) if x)
     cmd = conf["start"].format(prompt=" ".join(x for x in (flags, first) if x),
                                chrome="--chrome" if needs == "browser" else "",
                                settings=settings_arg(agent, conf, task, tools, needs))
@@ -1002,6 +1073,8 @@ def session_command(agent, conf, prompt, task=None, needs="none", attempt=1, gen
             cmd = cmd.replace("claude ", "claude --strict-mcp-config --mcp-config " + shlex.quote(config) + " ", 1)
     if session and conf.get("runtime") == "claude":
         cmd = cmd.replace("claude ", f"claude {'--resume' if resume else '--session-id'} {session} ", 1)
+    if conf.get("runtime") == "claude":
+        cmd = cmd.replace("claude ", "claude --setting-sources '' ", 1)     # no source of this machine (rules_file)
     if resume and conf.get("runtime") == "codex":
         cmd = cmd.replace("codex ", "codex resume ", 1)     # last, so that it comes first: codex resume [options] <thread>
     env = f"FLEET_ATTEMPT={attempt} FLEET_GENERATION={shlex.quote(generation)} FLEET_HUB={shlex.quote(HUB)} FLEET_AGENT={shlex.quote(agent)} FLEET_TASK={shlex.quote(task or '')}"
@@ -1139,12 +1212,12 @@ def account_now(agent, runtime):
     return key if isinstance(key, str) and ACCOUNT_KEY.fullmatch(key) else None
 
 
-# Claude Code puts RULES.md in the context through CLAUDE.md, so a session that also read it was given its
-# 17,000 tokens twice; a Codex session reads it. The first 60 characters find a session from before session ids
+# A Claude session's start puts RULES.md in its context (stable_text, rules_file), so a session that also read it was
+# given its 17,000 tokens twice; a Codex session reads it. The first 60 characters find a session from before session ids
 # (manager_windows), so they stay as they were.
 MANAGER_START = ('You are the manager in Founderizer. Read RULES.md and profiles/{agent}.md in this folder '
-                 'first, but RULES.md only if your context does not hold it yet: Claude Code loads it through '
-                 'CLAUDE.md. {resume}On every new-message signal call read_messages; its read is the receipt. Messages that start with [hub] come from the hub and '
+                 'first, but RULES.md only if your context does not hold it yet: your helper gives it with your '
+                 'start. {resume}On every new-message signal call read_messages; its read is the receipt. Messages that start with [hub] come from the hub and '
                  'messages that start with [owner] come from the owner: act on each one. Before you give work, choose by suitability, '
                  'then availability, with see_capacity. Then wait for the first message.')
 # The tail that this prompt had before the hub sent a brief: a cold start, and see_team is over a hundred lines of
@@ -1322,16 +1395,21 @@ def chat_command(agent, conf, generation, token=None, marker=None, resume=None, 
     elif conf.get("runtime") == "claude":
         if resume is not None and not THREAD_ID.fullmatch(str(resume)):
             raise Refused("a Claude chat resumes only a session id")
-        # no memory folder of Claude Code's own either (AUTONOMY.md decision 41, settings_arg)
-        settings = {"autoMemoryEnabled": False,
-                    "permissions": {"allow": [f"mcp__fleet__{t}" for t in CHAT_TOOLS], "deny": DENY}}
+        # no memory folder of Claude Code's own either (AUTONOMY.md decision 41, settings_arg), and none of this
+        # machine user's settings (kept_user_settings)
+        settings = dict({"autoMemoryEnabled": False,
+                         "permissions": {"allow": [f"mcp__fleet__{t}" for t in CHAT_TOOLS], "deny": DENY}},
+                        **kept_user_settings())
         args = ["claude"] + (["--resume", resume] if resume else ["--session-id", marker] if marker else []) + \
             ["--permission-mode", "dontAsk", "--tools", "", "--strict-mcp-config",
              "--mcp-config", mcp_config_file(agent, "owner-chat", url, token) if token else
              json.dumps({"mcpServers": {"fleet": {"type": "http", "url": url}}}),
              "--settings", json.dumps(settings)] + \
-            (["--setting-sources", "user", "--append-system-prompt-file", session_file(agent, "owner-chat", "md", prompt)]
-             if stable is not None else ["--append-system-prompt", prompt]) + shlex.split(model_flags(conf))
+            ["--setting-sources", ""] + \
+            (["--append-system-prompt-file", session_file(agent, "owner-chat", "md", prompt)] if stable is not None else
+             # the folder's CLAUDE.md loads no more: its rules come from the checkout's RULES.md
+             (["--append-system-prompt-file", core] if (core := rules_file()) else []) +
+             ["--append-system-prompt", prompt]) + shlex.split(model_flags(conf))
     else:
         raise Refused("direct chat is not configured for this runtime")
     values = dict(env or {}, **({"FLEET_SESSION_TOKEN": token}
@@ -1521,8 +1599,11 @@ def conversation_command(agent, conf, generation, conversation, url, token, prom
     if not token or not prompt:
         raise Refused("a conversation session needs its credential and its prompt")
     folder, window = conversation_folder(conversation), f"C-{conversation}"
-    settings = {"autoMemoryEnabled": False,
-                "permissions": {"allow": [f"mcp__fleet__{t}" for t in CONVERSATION_TOOLS], "deny": DENY}}
+    # what it keeps of the user's settings (kept_user_settings); a pinned version keeps its updater off whatever their
+    # env says, because --settings env would win over CLOSED_NO_UPDATES
+    kept = {key: value for key, value in kept_user_settings().items() if runtime is None or key != "env"}
+    settings = dict({"autoMemoryEnabled": False,
+                     "permissions": {"allow": [f"mcp__fleet__{t}" for t in CONVERSATION_TOOLS], "deny": DENY}}, **kept)
     # --setting-sources "": no user, project or local settings, so no CLAUDE.md, hook or plugin of this machine, and
     # --settings still applies. --safe-mode would also drop the --mcp-config server, so the session had no tools.
     own = runtime is None or runtime == conf.get("runtime")
