@@ -25265,17 +25265,21 @@ LEADS_READY = True      # owner API 1.6 "leads": a lead works like a worker, wit
 
 def forget_removed_agents(names, t0):
     """Inside a transaction: what the hub holds for an agent that left team.json and that an agent added again under
-    its name must not inherit: its key with its session credentials, and its machine's newest reading and update. An
-    agent moved to another server by removal and Add agent (30 October 2026) could not register the key of its new
-    machine ("only the owner replaces it"), and its install's sign-in read "signed in" from the old machine. Its
-    tasks, messages, memory and other records stay; a rename moves them first (rename_rows). Returns the names of
-    which it deleted anything."""
+    its name must not inherit: its key with its session credentials, its machine's newest reading and update, and the
+    marks that its default access ended (default_access_sweep). An agent moved to another server by removal and Add
+    agent (30 October 2026) could not register the key of its new machine ("only the owner replaces it"), its
+    install's sign-in read "signed in" from the old machine, and it never got its new machine's vault. Its tasks,
+    messages, memory and other records stay; a rename moves them first (rename_rows). Returns the names of which it
+    deleted anything."""
     in_transaction("forget_removed_agents")
     forgot = []
     for name in names:
         revoke_sessions(name, t0)
-        if sum(DB.execute(f"DELETE FROM {table} WHERE agent=?", (name,)).rowcount
-               for table in ("agent_keys", "machine_status", "machine_updates")):
+        deleted = sum(DB.execute(f"DELETE FROM {table} WHERE agent=?", (name,)).rowcount
+                      for table in ("agent_keys", "machine_status", "machine_updates"))
+        deleted += DB.execute("DELETE FROM kv WHERE k IN (?,?)",
+                              (f"default_vault:{name}", f"default_desktop:{name}")).rowcount
+        if deleted:
             forgot.append(name)
     return forgot
 
@@ -25293,7 +25297,8 @@ def apply_team(new):
         with transaction():
             forgot = forget_removed_agents(gone, now())
         if forgot:
-            log("hub", f"forgot the key and the machine reading of {', '.join(forgot)}, which left the team")
+            log("hub", f"forgot the key, the machine reading and the default-access marks of {', '.join(forgot)}, which "
+                       f"left the team")
     rev = kit_revision(fresh=True)
     # Every machine runs team.json from its own checkout and same_code counts it, so a write about one agent changes
     # what each machine should run: each one that reports is asked to follow, or it stands "behind" (Update available)
@@ -25562,9 +25567,9 @@ def save_vault(agent, body):
 # should come by default with computer and browser use". So every worker and lead gets its machine's vault, and an
 # agent on a Mac the desktop of its Mac (with_desktop), with no click of his. The hub gives each once, and then it is
 # his: his own vault command, or a change of his to the agent's capabilities, ends that default for the agent
-# (default_vault:<agent>, default_desktop:<agent>, which a rename moves), so a "none" or a capability that he took
-# away stays. A vault is given when vault_grant says it can be, the rule of his own command: on a new machine that is
-# after its broker first reports, and until then the agent holds none.
+# (default_vault:<agent>, default_desktop:<agent>, which a rename moves and an agent that leaves team.json loses), so
+# a "none" or a capability that he took away stays. A vault is given when vault_grant says it can be, the rule of his
+# own command: on a new machine that is after its broker first reports, and until then the agent holds none.
 DEFAULT_ACCESS_EVERY = 60       # seconds between two passes of default_access_sweep
 DEFAULT_ACCESS = {"at": 0.0, "retry": {}}       # the last pass, and when an agent whose commit failed is tried again
 
@@ -26380,6 +26385,7 @@ AGENT_ROWS = {"agents": "name", "agent_usage": "name", "machine_status": "agent"
 # The hub's own notes about one agent in kv, each kept under a prefix and the agent's name.
 AGENT_KV = ("tools:", "offline_told:", "runtime_since:", "switched:", "switching:", "history_agent:", "default_vault:",
             "default_desktop:")
+KEY_FEATURE = "rename_key"      # a server service whose rename job moves the agent's key file (server.py `carry_key`)
 
 
 def renamed_team(team, old, new):
@@ -26413,15 +26419,21 @@ def renamed_profile(data, old, new):
     return (first + sep + rest).encode("utf-8")
 
 
-def rename_rows(old, new, t0):
+def rename_rows(old, new, t0, key_moves=False):
     """Inside a transaction: every record of the agent under its new name (AGENT_COLUMNS, AGENT_KV). Its session
-    credentials stop, and its key goes, so the helper that starts under the new name enrolls its own: the hub takes
-    a first key from the agent's own machine only, and a second key only from the owner."""
+    credentials stop. key_moves: its server's job moves its key file (KEY_FEATURE), so its key takes the new name here
+    too and its helper is known from its first call; on a shared machine a helper cannot register a key. Else that
+    job deletes the file, so the key goes and the helper of the new name enrolls its own: the hub takes a first key
+    from the agent's own machine only, and a second key only from the owner."""
     in_transaction("rename_rows")
     for table, column in AGENT_ROWS.items():
         DB.execute(f"DELETE FROM {table} WHERE {column}=?", (new,))
     revoke_sessions(old, t0)
-    DB.execute("DELETE FROM agent_keys WHERE agent IN (?,?)", (old, new))
+    DB.execute("DELETE FROM agent_keys WHERE agent=?", (new,))
+    if key_moves:
+        DB.execute("UPDATE agent_keys SET agent=? WHERE agent=?", (new, old))
+    else:
+        DB.execute("DELETE FROM agent_keys WHERE agent=?", (old,))
     for table, column in AGENT_COLUMNS:
         DB.execute(f"UPDATE {table} SET {column}=? WHERE {column}=?", (new, old))
     for prefix in AGENT_KV:
@@ -26432,9 +26444,9 @@ def rename_rows(old, new, t0):
 def rename_agent(agent, body):
     """POST /ui/team/agents/<agent>/rename: the agent's new name, everywhere. One commit moves its team.json entry,
     every reference to it, its profile and its skills; one transaction moves every record of it; and its server's
-    service gets the job to move its checkout and its service to the new name, under the OS user it already has, so it
-    keeps its runtime and its sign-in. Not the manager, and not while the agent has an open task: a task session
-    carries the name it started with."""
+    service gets the job to move its checkout, its key file and its service to the new name, under the OS user it
+    already has, so it keeps its runtime and its sign-in. Not the manager, and not while the agent has an open task: a
+    task session carries the name it started with."""
     new, t0 = body["name"], now()
     rev = kit_revision(fresh=True)
     team, current, _ = team_view(rev)
@@ -26470,6 +26482,8 @@ def rename_agent(agent, body):
         raise Refusal(409, f"{server} sent no reading in the last 10 minutes: check that it is on")
     if open_login(agent):
         raise Refusal(409, f"{shown_name(agent)} has an open sign-in. Finish it or let it run out, then try again.")
+    st = q1("SELECT data FROM server_status WHERE server=?", (server,))
+    key_moves = KEY_FEATURE in (json.loads(st["data"]).get("features") or [])
     profile = git_blob(rev, f"profiles/{agent}.md")
     if git_blob(rev, f"profiles/{new}.md") is not None:
         raise Refusal(409, f"A profile for {new} is in the fleet already. Choose another name.")
@@ -26489,7 +26503,7 @@ def rename_agent(agent, body):
     commit = commit_kit_file("team.json", data, f"Owner renamed agent {agent} to {new}", more=more)
     manager = next(n for n, x in renamed["agents"].items() if x.get("role") == "manager")
     with transaction():
-        rename_rows(agent, new, t0)
+        rename_rows(agent, new, t0, key_moves)
         job = DB.execute("INSERT INTO server_jobs(server,kind,agent,runtime,state,created,updated,was) "
                          "VALUES(?,?,?,?,?,?,?,?)", (server, "rename", new, renamed["agents"][new]["runtime"],
                                                      "queued", t0, t0, agent)).lastrowid
@@ -29448,6 +29462,11 @@ class Handler(BaseHTTPRequestHandler):
         if who == "owner" or who not in agents():
             return True
         token, keyed, shared = self.bearer(), agent_key(who) is not None, shared_machine(who)
+        # A rename holds the lock for its whole commit, so this call may have waited in agent_key while its name left.
+        # It must not read `no_key`: its helper would delete the key file that the rename's job moves.
+        if who not in agents():
+            self.json(404, {"error": "unknown agent"})
+            return False
         if token is not None:
             if key_matches(who, token):
                 return True

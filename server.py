@@ -22,9 +22,9 @@ installers put in place (/usr/local/sbin/fleet-agent-user, hubsetup.agent_helper
 through the one sudoers line beside it. A Mac keeps one user for its agents (PRODUCT.md P2), and so does an agent
 from before the move: there every step is this service's own user, as it was. prepare: the other runtime of an agent
 on this server, before the owner switches it, with the same runtime and sign-in steps, under that agent's own user;
-it changes no agent, checkout or service. rename: an agent the owner gave a new name (agent_rename): its checkout
-and its service move to the new name under the OS user it already has, so it keeps its runtime and its sign-in. The
-service runs no AI session and reads no secret. Its key is
+it changes no agent, checkout or service. rename: an agent the owner gave a new name (agent_rename): its checkout, its
+agent key and its service move to the new name under the OS user it already has, so it keeps its runtime and its
+sign-in. The service runs no AI session and reads no secret. Its key is
 ~/.fleet/server.key (mode 600); the hub keeps only its SHA-256, and it opens only this server's routes.
 """
 import argparse
@@ -58,6 +58,7 @@ REPORT_EVERY = 300              # seconds between readings
 # hub tells a long step of a live server from a server that stopped, with no clock of its own (plan C2).
 JOB_HEARTBEAT = "job_heartbeat"
 NAMES_FEATURE = "server_names"  # it takes a new name from the hub (adopt): hub.NAMES_FEATURE
+KEY_FEATURE = "rename_key"      # its rename job moves the agent's key file (carry_key): hub.KEY_FEATURE
 POLL = 5                        # seconds between looks for a job
 SIGN_IN_WAIT = 900              # seconds a sign-in may take
 HELPER_WAIT = 120               # seconds for a new agent's own helper to reach the hub, before its sign-in can start
@@ -400,7 +401,8 @@ class Service:
         life = self.life
         return {"revision": self.loaded, "os": life.os_info(), "security": life.security(),
                 "runtimes": self.runtimes(),
-                "access": dict(life.access(), user=pwd.getpwuid(os.getuid()).pw_name), "features": [JOB_HEARTBEAT, NAMES_FEATURE]}
+                "access": dict(life.access(), user=pwd.getpwuid(os.getuid()).pw_name),
+                "features": [JOB_HEARTBEAT, NAMES_FEATURE, KEY_FEATURE]}
 
     def runtimes(self):
         """Codex and Claude Code as this server's agent reads them: as its own OS user, in its own home and on its own
@@ -554,10 +556,10 @@ class Service:
     # ---- a new name for an agent (owner feature agent_rename)
     def rename(self, job):
         """The agent under the new name the hub gave it: its checkout moves to fleet-<new> and is marked as the new
-        name's, the service of the old name ends and the service of the new name starts. It stays in the home of the
-        OS user it has (the job names that user once the agent keeps an earlier name's), so its runtime and its
-        sign-in stay where they are and nobody signs in again. Each step reads first, so Try again repeats only what
-        is missing."""
+        name's, the service of the old name ends, its agent key takes the new name and the service of the new name
+        starts. It stays in the home of the OS user it has (the job names that user once the agent keeps an earlier
+        name's), so its runtime and its sign-in stay where they are and nobody signs in again. Each step reads first,
+        so Try again repeats only what is missing."""
         agent, was, runtime = job.get("agent"), job.get("was"), job.get("runtime")
         if not NAME.fullmatch(str(agent)) or not NAME.fullmatch(str(was)) or agent == was or runtime not in LABELS:
             raise StepFailed(None, "The job names no agent or AI provider that Founderizer knows.")
@@ -574,13 +576,24 @@ class Service:
         self.post(job, "running", "service", f"The service of {shown_name(was)} ends, and the service of "
                                              f"{shown_name(agent)} starts.")
         self.retire(job, was, user)
+        self.carry_key(was, agent, user)
         self.service_step(job, agent, runtime, folder, user)
         self.post(job, "done", "service", f"{shown_name(agent)} runs on {self.name}.")
 
+    def carry_key(self, was, agent, user=None):
+        """The agent's key file under its new name, as the hub's record of that key is (hub.rename_rows): after the
+        old name's helper stopped, and before the new name's starts. On a machine with several agents a helper cannot
+        register a key, so without this file the agent would stay out of the hub until the owner registers one."""
+        old, new = (os.path.join(self.home_of(user), ".fleet", f"agent-{name}.key") for name in (was, agent))
+        if self.there(old, user):
+            code, out, err = self.run(self.as_agent(user, ["mv", "-f", old, new]))
+            if code != 0:
+                raise failed("service", f"The key of {shown_name(agent)} could not take its new name. Try again.",
+                             err or out)
+
     def retire(self, job, was, user=None):
-        """The old name of a renamed agent ends on this server: its service stops and never starts again, its tmux
-        session ends, and its agent key goes, because the hub took that name's key back and the helper of the new
-        name enrolls its own. What is not there is no failure; a service that still runs is."""
+        """The old name of a renamed agent ends on this server: its service stops and never starts again, and its tmux
+        session ends. What is not there is no failure; a service that still runs is."""
         if self.platform == "darwin":
             job_name = f"gui/{os.getuid()}/com.agentfleet.{was}"
             self.run(["launchctl", "bootout", job_name])
@@ -599,7 +612,6 @@ class Service:
                                                                    unit)]))
             self.run(self.as_agent(user, ["systemctl", "--user", "daemon-reload"]))
         self.run(self.as_agent(user, ["tmux", "kill-session", "-t", f"fleet-{was}"]))
-        self.run(self.as_agent(user, ["rm", "-f", os.path.join(self.home_of(user), ".fleet", f"agent-{was}.key")]))
 
     def runtime_step(self, job, runtime, user=None):
         """The runtime of this agent, in the home of its own user: the credential the vendor's client writes lives
@@ -701,12 +713,12 @@ class Service:
             raise failed("checkout", f"{self.short_of(agent, user)} could not be marked as Founderizer's. Try "
                                      f"again.", err or out)
 
-    def there(self, folder, user=None):
-        """Whether this folder is there, read as the agent's own user: its home is of mode 700, so this service
-        cannot even look inside it."""
+    def there(self, path, user=None):
+        """Whether this folder or file is there, read as the agent's own user: its home is of mode 700, so this
+        service cannot even look inside it."""
         if not user:
-            return os.path.exists(folder)
-        return self.run(self.as_agent(user, ["test", "-d", folder]))[0] == 0
+            return os.path.exists(path)
+        return self.run(self.as_agent(user, ["test", "-e", path]))[0] == 0
 
     def ours(self, folder, agent, user=None):
         """True for the agent's checkout that this service made: its .git/fleet-server mark names the agent, read
