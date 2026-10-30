@@ -543,7 +543,8 @@ def run(argv, data, env=None):
         return None
 
 
-PROVIDER_SITES = ("claude.ai", "chatgpt.com", "auth.openai.com", "x.ai")   # the providers' own sign-in sites
+PROVIDER_SITES = ("claude.ai", "claude.com", "chatgpt.com", "auth.openai.com", "x.ai")   # the providers' sign-in sites
+PROVIDER_KEY_SITES = ("platform.claude.com",)   # an API console under one of them: a key read there stays allowed
 
 
 def provider_site(host):
@@ -551,10 +552,13 @@ def provider_site(host):
     owner signs in to their own account in their own session, through the provider's own flow, and that is the
     condition on which Anthropic permits an operator to host the unmodified Claude Code at all. So no login of
     Fleet's may be one, and sign_in, create_login and save_key refuse these sites. An API key of a provider's paid
-    API (console.anthropic.com, platform.openai.com) is another thing and stays allowed: it is a key the owner pays
-    per call, not the subscription credential of a session. That is why OpenAI's entry is auth.openai.com, where a
-    ChatGPT account signs in, and not all of openai.com."""
+    API (console.anthropic.com, platform.claude.com, platform.openai.com) is another thing and stays allowed: it is
+    a key the owner pays per call, not the subscription credential of a session. That is why OpenAI's entry is
+    auth.openai.com, where a ChatGPT account signs in, and not all of openai.com, and why PROVIDER_KEY_SITES keeps
+    the console platform.claude.com apart from claude.com."""
     host = str(host or "").lower().rstrip(".")
+    if any(host == site or host.endswith("." + site) for site in PROVIDER_KEY_SITES):
+        return False
     return any(host == site or host.endswith("." + site) for site in PROVIDER_SITES)
 
 
