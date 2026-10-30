@@ -1,7 +1,8 @@
 """Read numeric CLI usage only. No prompts, provider credentials, or inference.
 
 The helper runs this collector on a separate thread. Provider reads are limited
-to one attempt per five minutes; transcript scans have size and time bounds.
+to one attempt per five minutes; transcript scans have size and time bounds, and
+each scan reads only what the transcripts gained since the last one.
 """
 import datetime
 import hashlib
@@ -20,8 +21,11 @@ import lifecycle
 
 POLL_SECONDS = 300
 SCAN_SECONDS = 30
-MAX_BYTES = 256 * 1024 * 1024
+SCAN_TIME = 10                      # seconds that one scan reads, and MAX_BYTES its bytes: a scan that needs more
+MAX_BYTES = 256 * 1024 * 1024       # goes on at the next one (Scan), and none gives a partial total
 MAX_LINE = 4 * 1024 * 1024
+MAX_ROW = 32 * 1024 * 1024          # a longer transcript line is passed over: no token record is that long
+TAIL = 64                           # the bytes before where a file's reading stopped, to see that they are still there
 TOKEN_KEYS = ("input", "output", "cache_read", "cache_write")
 BY_SESSION = 500                    # per-session totals in one report: the newest sessions
 SESSION_ID = re.compile(r"[A-Za-z0-9._:-]{1,80}")
@@ -30,6 +34,13 @@ SESSION_FIELDS = ("session_id", "total", "last_activity")
 # of its newest call and the share of its first call that came from the cache. They go only to a hub whose last
 # answer said that it takes them, so that the release before it never refuses a report (Collector.send).
 SESSION_KINDS = ("input", "cache_read", "cache_write", "output", "calls", "model", "first_cache_share")
+# Helper feature session_models (AUTONOMY.md P8 and decision 41): each session's tokens by model, its sub-agents' and
+# workflow agents' with them, as "models": [[model, input, cache_read, cache_write, output, calls], ...], the largest
+# first. A workflow agent often runs another model than its session, and the hub prices each model at its own weights.
+# They too go only to a hub whose last answer said that it takes them (Collector.send).
+MODEL_FIELDS = ("input", "cache_read", "cache_write", "output", "calls")
+MODELS_MAX = 8                      # a session's models in one report: past it, the smallest fold into one of no model
+REPORT_MAX = 512 * 1024             # hub.USAGE_REPORT_MAX: a report with the models past it goes with the kinds only
 MODEL = re.compile(r"[A-Za-z0-9._:/\[\]-]{1,120}")      # threads.Translator.model_record takes the same names
 SCOPE = "Retained Fleet workspace sessions"
 SOURCES = {"claude": "Claude Code transcripts", "codex": "Codex session records"}
@@ -89,118 +100,373 @@ def account_key(provider, identity):
     return provider + ":" + hashlib.sha256((provider + ":" + identity).encode()).hexdigest()[:32] if identity else None
 
 
-def transcript_tokens(runtime, kit, home=None):
+class ScanPending(ValueError):
+    """A scan reached SCAN_TIME or MAX_BYTES before the end of the transcripts. Its Scan keeps what it read and the
+    next scan goes on from there, so no scan gives a partial total."""
+
+
+class Scan:
+    """What one runtime's transcripts gave, file by file, from one scan to the next. A scan of every file every 30
+    seconds failed as a whole at 5,000 files, 256 MiB or 10 seconds (the review of 29 October 2026), and every
+    workflow agent writes a file of its own. So a file with the same identity, size and change time is not read again,
+    one that grew is read on from where the last scan stopped, and one that changed before that point from its start.
+    A scan reads at least one line, so the scans after it always reach the end."""
+
+    def __init__(self):
+        self.files = {}         # path -> its File
+        self.read = 0           # the bytes of the lines that the last scan read
+        self.made, self.stale = None, True      # the reading of the files as they are, unless one changed since
+
+
+class File:
+    """Where the reading of one transcript file stands, and what its complete lines gave (its records)."""
+    __slots__ = ("mark", "done", "offset", "tail", "index", "records")
+
+    def __init__(self, records):
+        self.mark, self.done, self.offset, self.tail, self.index, self.records = None, False, 0, b"", 0, records
+
+
+def in_checkout(cwd, kit):
+    """A folder that is the checkout or inside it, where a sub-agent's worktree of the checkout lies too."""
+    return isinstance(cwd, str) and (cwd == kit or cwd.startswith(kit.rstrip("/") + "/"))
+
+
+def model_name(value):
+    return value if isinstance(value, str) and MODEL.fullmatch(value) else None
+
+
+def earliest(a, b):
+    return b if a is None else a if b is None else min(a, b)
+
+
+def latest(a, b):
+    return b if a is None else a if b is None else max(a, b)
+
+
+def spend(models, model, values):
+    """One call of `model` into {model: MODEL_FIELDS}: its input, cache reads, cache writes and output, and one call
+    when it read or wrote any token."""
+    bucket = models.setdefault(model, [0] * len(MODEL_FIELDS))
+    bucket[:] = [a + b for a, b in zip(bucket, [*values, int(any(values))])]
+
+
+class ClaudeRecords:
+    """One Claude transcript: each API message once, with the largest kinds that its blocks gave (several blocks of
+    one message are one call), and for each session that its rows name whether the session ran in the checkout, its
+    time span, its own first call and the model of its own newest. A sub-agent's and a workflow agent's rows carry the
+    root session's id and their own model (AUTONOMY.md decision 41)."""
+    __slots__ = ("calls", "sessions")
+
+    def __init__(self):
+        self.calls = {}         # message id -> [session, model, own, input, output, cache_read, cache_write]
+        self.sessions = {}      # session -> [ran in the checkout, since, last, (time, message) of its own first call,
+                                #             (time, model) of its own newest call]
+
+    @staticmethod
+    def wants(index, line):
+        return b'"assistant"' in line           # a line without it holds no token record
+
+    @staticmethod
+    def reads_on():
+        return True
+
+    def take(self, index, row, kit):
+        if row.get("type") != "assistant":
+            return
+        message = row.get("message") or {}
+        usage, key, sid = message.get("usage"), message.get("id"), row.get("sessionId")
+        if not usage or not isinstance(key, str) or not isinstance(sid, str):
+            return
+        values = [number(usage.get(k, 0), True) for k in
+                  ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")]
+        model, own, ts = model_name(message.get("model")), not row.get("isSidechain"), timestamp(row.get("timestamp"))
+        call = self.calls.get(key)
+        if call is None:
+            self.calls[key] = [sid, model, own, *values]
+        else:
+            call[3:] = [max(a, b) for a, b in zip(call[3:], values)]
+        # A session is the checkout's when any of its rows ran there: a row's folder is the session's folder at that
+        # moment, which a change of folder or a sub-agent's worktree moves away from the checkout
+        s = self.sessions.setdefault(sid, [False, None, None, None, None])
+        s[0], s[1], s[2] = s[0] or in_checkout(row.get("cwd"), kit), earliest(s[1], ts), latest(s[2], ts)
+        if own:
+            s[3] = s[3] or (ts, key)
+            s[4] = (ts, model) if model else s[4]
+
+
+def claude_sessions(files):
+    """{session: what it spent} for the sessions that ran in the checkout, with their sub-agents' and workflow
+    agents' calls, and how many there are. Each message counts once over every file: a resumed or forked session's
+    file can copy another's."""
+    calls, sessions = {}, {}
+    for path in sorted(files):
+        records = files[path].records
+        for key, call in records.calls.items():
+            known = calls.get(key)
+            if known is None:
+                calls[key] = list(call)
+            else:
+                known[3:] = [max(a, b) for a, b in zip(known[3:], call[3:])]
+        for sid, s in records.sessions.items():
+            t = sessions.setdefault(sid, [False, None, None, None, None])
+            t[0], t[1], t[2] = t[0] or s[0], earliest(t[1], s[1]), latest(t[2], s[2])
+            if s[3] and (t[3] is None or (s[3][0] or math.inf) < (t[3][0] or math.inf)):
+                t[3] = s[3]
+            if s[4] and (t[4] is None or (s[4][0] or 0) >= (t[4][0] or 0)):
+                t[4] = s[4]
+    per = {}
+    for sid, model, own, i, o, r, w in calls.values():
+        if sessions[sid][0]:
+            spend(per.setdefault(sid, {"models": {}})["models"], model, [i, r, w, o])
+    for sid, s in per.items():
+        t = sessions[sid]
+        s.update(since=t[1], last=t[2], model=t[4][1] if t[4] else None, first=calls[t[3][1]][3:] if t[3] else None)
+    return per, len(per)
+
+
+CODEX_KEYS = ("input_tokens", "output_tokens", "cached_input_tokens", "cache_write_input_tokens")
+
+
+class CodexRecords:
+    """One Codex rollout: its thread, the session that it is part of, whether it ran in the checkout, and its own
+    calls by model. A forked sub-agent's rollout starts with a copy of its parent's history (threads.codex_own_start),
+    whose calls are the parent's: its own rows start at the ordinal that its first line gives (Codex 0.163 and later),
+    or else at its first turn that started at the fork. A call counts once, with its own usage: a running total is
+    given again, and an older Codex that resumes a session in the same file starts it again from nothing."""
+    __slots__ = ("thread", "root", "parent", "ours", "start", "fork", "model", "newest", "total", "models", "first",
+                 "since", "last")
+
+    def __init__(self):
+        self.thread = self.root = self.parent = self.start = self.fork = self.model = self.newest = None
+        self.total = self.first = self.since = self.last = None
+        self.ours, self.models = False, {}
+
+    @staticmethod
+    def wants(index, line):
+        return index == 0 or b'"token_count"' in line or b'"turn_context"' in line or b'"task_started"' in line
+
+    def reads_on(self):
+        return self.ours        # another folder's rollout: its first line says all that it is to this checkout
+
+    def take(self, index, row, kit):
+        kind = row.get("type")
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        if index == 0:
+            if kind == "session_meta" and isinstance(payload.get("id"), str):
+                self.identify(payload, timestamp(row.get("timestamp")), kit)
+            return
+        event = payload.get("type") if kind == "event_msg" else None
+        if self.start is None and event == "task_started":
+            began = payload.get("started_at")       # whole seconds: up to a second before the file's first line
+            if self.fork is None or not isinstance(began, (int, float)) or began >= self.fork - 2:
+                self.start = index
+        if self.start is None or index < self.start:
+            if event == "token_count":              # the copied running total, which a fork can go on from
+                self.total = self.running(payload) or self.total
+        elif kind == "turn_context":                # the model of the calls that follow
+            self.model = model_name(payload.get("model"))
+            self.newest = self.model or self.newest
+        elif event == "token_count":
+            self.count(payload, timestamp(row.get("timestamp")))
+
+    def identify(self, meta, at, kit):
+        """Its first line: the thread, its root session (Codex 0.163 and later name it; an older one names only the
+        parent, as the fork's or as the spawn's), whether it ran in the checkout, and where its own rows start."""
+        source = meta.get("source")
+        spawn = (source.get("subagent") or {}) if isinstance(source, dict) else {}
+        spawn = spawn.get("thread_spawn") if isinstance(spawn, dict) else None
+        parent = meta.get("forked_from_id") or meta.get("parent_thread_id") or \
+            (spawn.get("parent_thread_id") if isinstance(spawn, dict) else None)
+        self.thread, self.ours, self.fork = meta["id"], in_checkout(meta.get("cwd"), kit), at
+        self.root = meta["session_id"] if isinstance(meta.get("session_id"), str) else None
+        self.parent = parent if isinstance(parent, str) else None
+        ordinal = meta.get("subagent_history_start_ordinal")
+        if isinstance(ordinal, int) and not isinstance(ordinal, bool) and ordinal >= 1:
+            self.start = ordinal
+        elif not meta.get("forked_from_id"):
+            self.start = 1                          # no copied history: every row after this one is its own
+
+    @staticmethod
+    def running(payload):
+        usage = (payload.get("info") or {}).get("total_token_usage")
+        return tuple(number(usage.get(k, 0), True) for k in CODEX_KEYS) if usage else None
+
+    def count(self, payload, ts):
+        total = self.running(payload)
+        if total is None or total == self.total:
+            return                                  # no usage yet, or the same running total again: no new call
+        last = (payload.get("info") or {}).get("last_token_usage")
+        if last:                                    # the call's own usage (Codex 0.159 and later)
+            call = tuple(number(last.get(k, 0), True) for k in CODEX_KEYS)
+        elif self.total and all(a >= b for a, b in zip(total, self.total)):
+            call = tuple(a - b for a, b in zip(total, self.total))
+        else:
+            call = total                            # the running total started again
+        raw, out, read, write = call
+        values = [number(raw - read - write, True), read, write, out]
+        self.total = total
+        spend(self.models, self.model, values)
+        if self.first is None and raw:
+            self.first = [values[0], out, read, write]
+        self.since, self.last = earliest(self.since, ts), latest(self.last, ts)
+
+
+def codex_sessions(files):
+    """{session: what it spent} for the sessions that ran in the checkout, each sub-agent's calls in its root session,
+    and how many threads spent: a sub-agent's thread counts as one of them, as before."""
+    threads = {}
+    for path in sorted(files):
+        r = files[path].records
+        if r.thread is not None and (r.thread not in threads or held(r) > held(threads[r.thread])):
+            threads[r.thread] = r                   # two files of one thread: the one that holds more
+
+    def root_of(r, depth=0):
+        up = r.root if r.root and r.root != r.thread else r.parent
+        if not up or up == r.thread or depth > 32:
+            return r.thread
+        return root_of(threads[up], depth + 1) if up in threads else up
+    per, spent = {}, 0
+    for r in threads.values():
+        root = root_of(r) if r.models else None
+        top = threads.get(root)
+        if root is None or not (top.ours if top else r.ours):
+            continue
+        s = per.setdefault(root, {"models": {}, "since": None, "last": None, "first": None, "model": None})
+        for model, values in r.models.items():
+            bucket = s["models"].setdefault(model, [0] * len(MODEL_FIELDS))
+            bucket[:] = [a + b for a, b in zip(bucket, values)]
+        s["since"], s["last"], spent = earliest(s["since"], r.since), latest(s["last"], r.last), spent + 1
+    for root, s in per.items():
+        if root in threads:                         # the session's own first call and newest model, not an agent's
+            s["first"], s["model"] = threads[root].first, threads[root].newest
+    return per, spent
+
+
+def held(records):
+    """What a Codex rollout holds: its tokens, then its calls."""
+    return (sum(sum(v[:4]) for v in records.models.values()), sum(v[4] for v in records.models.values()))
+
+
+def model_rows(models):
+    """A session's {model: MODEL_FIELDS} as report rows, the largest first and none that spent nothing; past
+    MODELS_MAX the smallest fold into one row of no model, which the hub prices at its runtime's default."""
+    rows = sorted(([model, *values] for model, values in models.items() if any(values[:4])),
+                  key=lambda row: (-sum(row[1:5]), row[0] is None, row[0] or ""))
+    if len(rows) > MODELS_MAX:
+        keep = [row for row in rows if row[0] is not None][:MODELS_MAX - 1]
+        rows = keep + [[None, *map(sum, zip(*(row[1:] for row in rows if row not in keep)))]]
+    return rows
+
+
+def token_reading(runtime, per, spent):
+    """The tokens of every counted session in total, and the newest BY_SESSION sessions each with its own."""
+    if not per:
+        return None
+    for s in per.values():
+        s["kinds"] = [sum(column) for column in zip(*s["models"].values())] or [0] * len(MODEL_FIELDS)
+    input_, cache_read, cache_write, output, _ = (sum(column) for column in zip(*(s["kinds"] for s in per.values())))
+    newest = sorted(per, key=lambda sid: per[sid]["last"] or 0, reverse=True)[:BY_SESSION]
+    since = [s["since"] for s in per.values() if s["since"] is not None]
+    last = [s["last"] for s in per.values() if s["last"] is not None]
+    return dict(input=input_, output=output, cache_read=cache_read, cache_write=cache_write,
+                total=input_ + output + cache_read + cache_write, sessions=spent, since=min(since, default=None),
+                last_activity=max(last, default=None), collected_at=time.time(), source=SOURCES[runtime], scope=SCOPE,
+                error=None, by_session=[session_row(sid, per[sid]) for sid in newest])
+
+
+def session_row(sid, s):
+    input_, cache_read, cache_write, output, calls = s["kinds"]
+    return {"session_id": sid, "total": input_ + cache_read + cache_write + output, "last_activity": s["last"],
+            "input": input_, "output": output, "cache_read": cache_read, "cache_write": cache_write, "calls": calls,
+            "model": s["model"], "first_cache_share": cache_share(s["first"]) if s["first"] else None,
+            "models": model_rows(s["models"])}
+
+
+def holds(stream, f):
+    """The bytes before where the reading of `f` stopped are still there: the file has only grown since."""
+    if not f.offset:
+        return True
+    stream.seek(f.offset - len(f.tail))
+    return stream.read(len(f.tail)) == f.tail
+
+
+def read_on(scan, f, stream, size, kit, deadline):
+    """Read the complete lines of `stream` after f.offset, up to the size that the file had when it was listed. A line
+    that can hold a token record is parsed whole, and one longer than MAX_ROW is passed over. A scan past its bounds
+    stops between two lines (ScanPending), and a line that a writer is still finishing is read at a later scan."""
+    while f.offset < size:
+        if scan.read and (scan.read >= MAX_BYTES or time.monotonic() > deadline):
+            raise ScanPending("scan limit")
+        if f.index and not f.records.reads_on():
+            break
+        line = stream.readline(MAX_ROW + 1)
+        length, tail, whole = len(line), (f.tail + line)[-TAIL:], line.endswith(b"\n")
+        if length > MAX_ROW:                        # no token record is that long: passed over to its end
+            chunk = line
+            while chunk and not chunk.endswith(b"\n"):
+                chunk = stream.readline(MAX_ROW + 1)
+                length, tail = length + len(chunk), (tail + chunk)[-TAIL:]
+            line, whole = None, chunk.endswith(b"\n")
+        scan.read += length
+        if not whole:
+            break                                   # a writer can still be finishing the last record
+        if line is not None and f.records.wants(f.index, line):
+            try:
+                row = json.loads(line)
+            except ValueError:
+                raise ValueError("invalid transcript") from None
+            if isinstance(row, dict):
+                f.records.take(f.index, row, kit)
+        f.offset, f.tail, f.index = f.offset + length, tail, f.index + 1
+    f.done = True
+
+
+def read_files(scan, root, kit, records):
+    """Bring `scan` up to date with the transcript files below `root`, within one scan's bounds."""
+    deadline, scan.read, listed = time.monotonic() + SCAN_TIME, 0, set()
+    for path in sorted(root.glob("**/*.jsonl")):
+        try:
+            if path.is_symlink():
+                continue
+            info = path.stat()
+            mark = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+            known = scan.files.get(path)
+            listed.add(path)
+            if known and known.mark == mark and known.done:
+                continue
+            scan.stale = True
+            with path.open("rb") as stream:
+                if not (known and known.mark and known.mark[:2] == mark[:2] and
+                        (info.st_size > known.offset or known.mark == mark) and holds(stream, known)):
+                    known = scan.files[path] = File(records())
+                known.mark, known.done = mark, False
+                stream.seek(known.offset)
+                read_on(scan, known, stream, info.st_size, kit, deadline)
+        except FileNotFoundError:
+            listed.discard(path)                    # gone since it was listed
+    for path in set(scan.files) - listed:
+        del scan.files[path]
+        scan.stale = True
+
+
+def transcript_tokens(runtime, kit, home=None, scan=None):
+    """The tokens of the retained sessions that ran in the checkout `kit`: in total, and each of the newest sessions
+    its own, with its sub-agents' and workflow agents' calls and each model apart (helper feature session_models).
+    `scan` keeps what earlier scans read (Scan). A scan that reaches its bounds raises ScanPending, so a reading that
+    needs more than one scan and has no Scan to go on with fails, as a scan of every file did before."""
     home, kit = Path(home or Path.home()), str(Path(kit).resolve())
+    scan = Scan() if scan is None else scan
     if runtime == "claude":
         # Every level below the project folder: a subagent's transcript is <session>/subagents/agent-<id>.jsonl, and
         # a workflow agent's <session>/subagents/workflows/<run>/agent-<id>.jsonl (AUTONOMY.md decision 41), whose
-        # rows carry the root session's id and their own usage, so they count in that session's totals
-        root = home / ".claude/projects" / re.sub(r"[^A-Za-z0-9-]", "-", kit)
-        paths = root.glob("**/*.jsonl")
+        # rows carry the root session's id and their own usage and model, so they count in that session's totals
+        read_files(scan, home / ".claude/projects" / re.sub(r"[^A-Za-z0-9-]", "-", kit), kit, ClaudeRecords)
     else:
-        root = home / ".codex/sessions"
-        paths = root.glob("**/*.jsonl")
-    deadline, size, messages, sessions = time.monotonic() + 10, 0, {}, set()
-    owner, recent = {}, {}            # message key -> session; session -> newest record time
-    since, last = None, None
-    # session_kinds: Codex key -> its distinct cumulative totals, one for each call; session -> (order, the values of
-    # its own first call); session -> the model of its newest call, in its file's own order. A subagent's calls count
-    # for its root session, but the first call and the model are the session's own.
-    totals_seen, first, models = {}, {}, {}
-    for count, path in enumerate(paths):
-        if count >= 5000 or time.monotonic() > deadline:
-            raise ValueError("scan limit")
-        if path.is_symlink():
-            continue
-        size += path.stat().st_size
-        if size > MAX_BYTES:
-            raise ValueError("scan limit")
-        sid, root, included = None, None, runtime == "claude"
-        with path.open("rb") as stream:
-            while True:
-                line = stream.readline(MAX_LINE + 1)
-                if not line:
-                    break
-                if len(line) > MAX_LINE or time.monotonic() > deadline:
-                    raise ValueError("scan limit")
-                if not line.endswith(b"\n"):
-                    break  # a writer can still be finishing the last record
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    raise ValueError("invalid transcript") from None
-                kind = row.get("type")
-                if runtime == "codex" and kind == "session_meta":
-                    meta = row.get("payload") or {}
-                    included = meta.get("cwd") == kit
-                    sid = meta.get("id")
-                    root = meta.get("session_id") or sid    # a subagent's rollout names its root session
-                    if not included:
-                        break
-                if not included:
-                    continue
-                if runtime == "claude":
-                    if kind != "assistant" or row.get("cwd") != kit:
-                        continue
-                    message = row.get("message") or {}
-                    usage = message.get("usage")
-                    key, sid = message.get("id"), row.get("sessionId")
-                    root = sid                              # subagent transcripts keep the root sessionId
-                    if not usage or not key or not sid:
-                        continue
-                    values = [number(usage.get(k, 0), True) for k in
-                              ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")]
-                    own, model, order = not row.get("isSidechain"), message.get("model"), 0     # its first row
-                else:
-                    payload = row.get("payload") or {}
-                    if kind == "turn_context" and sid and sid == root:      # the model of the calls that follow
-                        if isinstance(payload.get("model"), str) and MODEL.fullmatch(payload["model"]):
-                            models[root] = payload["model"]
-                        continue
-                    if kind != "event_msg" or payload.get("type") != "token_count" or not sid:
-                        continue
-                    usage = (payload.get("info") or {}).get("total_token_usage")
-                    if not usage:
-                        continue
-                    raw, out, read, write = [number(usage.get(k, 0), True) for k in
-                                            ("input_tokens", "output_tokens", "cached_input_tokens", "cache_write_input_tokens")]
-                    values, key = [number(raw - read - write, True), out, read, write], sid
-                    if raw + out:
-                        totals_seen.setdefault(key, set()).add((raw, out))     # each call raises the running total
-                    # The running total after a session's first call is that call's own: the smallest one with input.
-                    own, model, order = sid == root and raw > 0, None, raw
-                # Claude can emit several blocks for one API message. Codex
-                # records cumulative totals repeatedly. Neither is additive.
-                previous = messages.get(key, [0, 0, 0, 0])
-                messages[key] = [max(a, b) for a, b in zip(previous, values)]
-                sessions.add(sid)
-                owner[key] = root                       # per-session totals roll subagents up to their root
-                if own:
-                    if root not in first or order < first[root][0]:
-                        first[root] = (order, values)
-                    if isinstance(model, str) and MODEL.fullmatch(model):
-                        models[root] = model
-                ts = timestamp(row.get("timestamp"))
-                if ts is not None:
-                    since = min(since, ts) if since is not None else ts
-                    last = max(last, ts) if last is not None else ts
-                    recent[root] = max(recent.get(root) or ts, ts)
-    if not messages:
-        return None
-    totals = dict(zip(TOKEN_KEYS, map(sum, zip(*messages.values()))))
-    per, calls = {}, {}
-    for key, values in messages.items():
-        per[owner[key]] = [a + b for a, b in zip(per.get(owner[key], (0, 0, 0, 0)), values)]
-        calls[owner[key]] = calls.get(owner[key], 0) + (len(totals_seen.get(key, ())) if runtime == "codex"
-                                                        else int(sum(values) > 0))
-    newest = sorted(per, key=lambda sid: recent.get(sid) or 0, reverse=True)[:BY_SESSION]
-    return dict(totals, total=sum(totals.values()), sessions=len(sessions), since=since,
-                last_activity=last, collected_at=time.time(), source=SOURCES[runtime], scope=SCOPE, error=None,
-                by_session=[dict({"session_id": sid, "total": sum(per[sid]), "last_activity": recent.get(sid)},
-                                 **dict(zip(TOKEN_KEYS, per[sid])), calls=calls[sid],
-                                 model=models.get(sid),
-                                 first_cache_share=cache_share(first[sid][1]) if sid in first else None)
-                            for sid in newest])
+        read_files(scan, home / ".codex/sessions", kit, CodexRecords)
+    if scan.stale:
+        scan.made = token_reading(runtime, *(claude_sessions if runtime == "claude" else codex_sessions)(scan.files))
+        scan.stale = False
+    return dict(scan.made, collected_at=time.time()) if scan.made else None
 
 
 def cache_share(values):
@@ -470,7 +736,8 @@ def validate_usage(data, runtime, screen=False):
             if not isinstance(rows, list) or len(rows) > BY_SESSION:
                 raise ValueError("invalid sessions")
             for row in rows:
-                if not isinstance(row, dict) or set(row) not in ({*SESSION_FIELDS}, {*SESSION_FIELDS, *SESSION_KINDS}) \
+                if not isinstance(row, dict) or set(row) not in ({*SESSION_FIELDS}, {*SESSION_FIELDS, *SESSION_KINDS},
+                                                                {*SESSION_FIELDS, *SESSION_KINDS, "models"}) \
                         or not isinstance(row["session_id"], str) or not SESSION_ID.fullmatch(row["session_id"]):
                     raise ValueError("invalid session")
                 number(row["total"], True)
@@ -484,6 +751,8 @@ def validate_usage(data, runtime, screen=False):
                             not (model is None or isinstance(model, str) and MODEL.fullmatch(model)) or \
                             not (share is None or number(share) <= 1):
                         raise ValueError("invalid session")
+                if "models" in row:             # helper feature session_models
+                    validate_models(row)
         if value["error"] is not None and value["error"] not in ERRORS:
             raise ValueError("invalid error")
         if value["collected_at"] is not None and number(value["collected_at"]) > time.time() + 60:
@@ -523,6 +792,22 @@ def validate_usage(data, runtime, screen=False):
                 if window["window_minutes"] is not None:
                     number(window["window_minutes"], True)
     return data
+
+
+def validate_models(row):
+    """A session's models (helper feature session_models): each model once, and their tokens and calls add up to the
+    session's own."""
+    models, names, sums = row["models"], set(), [0] * len(MODEL_FIELDS)
+    if not isinstance(models, list) or len(models) > MODELS_MAX:
+        raise ValueError("invalid models")
+    for entry in models:
+        if not isinstance(entry, list) or len(entry) != 1 + len(MODEL_FIELDS) or \
+                not (entry[0] is None or isinstance(entry[0], str) and MODEL.fullmatch(entry[0])) or entry[0] in names:
+            raise ValueError("invalid models")
+        names.add(entry[0])
+        sums = [total + number(value, True) for total, value in zip(sums, entry[1:])]
+    if sums != [row[key] for key in MODEL_FIELDS]:
+        raise ValueError("invalid models")
 
 
 def screen_database(home=None):
@@ -574,13 +859,23 @@ def local_model(conf):
 
 def plain_sessions(data):
     """A report without each session's four kinds: its shape before helper feature session_kinds."""
-    def plain(tokens):
+    return sessions_as(data, SESSION_FIELDS)
+
+
+def kinds_sessions(data):
+    """A report without each session's models: its shape before helper feature session_models."""
+    return sessions_as(data, SESSION_FIELDS + SESSION_KINDS)
+
+
+def sessions_as(data, fields):
+    """A report whose sessions, and the runtime's before a switch, keep these fields only."""
+    def keep(tokens):
         if not tokens or "by_session" not in tokens:
             return tokens
-        return dict(tokens, by_session=[{k: row[k] for k in SESSION_FIELDS} for row in tokens["by_session"]])
-    out = dict(data, tokens=plain(data.get("tokens")))
+        return dict(tokens, by_session=[{k: row[k] for k in fields if k in row} for row in tokens["by_session"]])
+    out = dict(data, tokens=keep(data.get("tokens")))
     if out.get("previous"):
-        out["previous"] = dict(out["previous"], tokens=plain(out["previous"].get("tokens")))
+        out["previous"] = dict(out["previous"], tokens=keep(out["previous"].get("tokens")))
     return out
 
 
@@ -597,7 +892,8 @@ class Collector:
         self.path = self.home / ".fleet" / ("usage-" + agent + ".json")
         self.data, self.last_poll = {"tokens": None, "limits": None}, 0
         self.wake = threading.Event()   # account_again: scan now, not at the end of this wait
-        self.kinds = False              # the hub's last answer took each session's four kinds (send)
+        self.takes = 0                  # the hub's last answer took each session's four kinds (1), and its models (2)
+        self.scans = {}                 # runtime -> its Scan: each scan reads only what its transcripts gained
         try:
             cache = read_json(self.path)
             if cache["runtime"] != runtime:     # another runtime's numbers and poll time never stand for this one
@@ -635,13 +931,16 @@ class Collector:
         if self.previous and time.time() - self.previous_poll >= POLL_SECONDS:
             self.previous_poll = time.time()
             try:
-                self.data["previous"] = {"runtime": self.previous,
-                                         "tokens": transcript_tokens(self.previous, self.kit, self.home)}
+                self.data["previous"] = {"runtime": self.previous, "tokens": self.tokens(self.previous)}
+            except ScanPending:
+                self.previous_poll = 0          # it goes on at the next scan, and the last reading stands till then
             except (OSError, ValueError, KeyError, TypeError):
                 if (self.data.get("previous") or {}).get("tokens"):
                     self.data["previous"]["tokens"]["error"] = "Token records could not be read."
         try:
-            self.data["tokens"] = transcript_tokens(self.runtime, self.kit, self.home)
+            self.data["tokens"] = self.tokens(self.runtime)
+        except ScanPending:
+            pass                                # it goes on at the next scan, and the last reading stands till then
         except (OSError, ValueError, KeyError, TypeError):
             if self.data["tokens"]:
                 self.data["tokens"]["error"] = "Token records could not be read."
@@ -676,16 +975,25 @@ class Collector:
             json.dump({"runtime": self.runtime, "data": self.data, "last_poll": self.last_poll}, stream)
         self.send(self.data)
 
+    def tokens(self, runtime):
+        return transcript_tokens(runtime, self.kit, self.home, self.scans.setdefault(runtime, Scan()))
+
     def send(self, data):
         """Publish one report. Each session's four kinds go only to a hub whose last answer said that it takes them
-        (helper feature session_kinds); a hub that refuses them, a release from before them, gets the same report
-        without them at once."""
-        answer = self.publish(data if self.kinds else plain_sessions(data))
-        if self.kinds and isinstance(answer, tuple) and answer[0] in (400, 413):
-            self.kinds = False
-            answer = self.publish(plain_sessions(data))
+        (helper feature session_kinds), and its models only to one that said it takes those too (session_models),
+        while they keep the report within the hub's size limit; a hub that refuses a report, a release from before
+        what it carries, gets the plainer one at once."""
+        level = self.takes
+        if level == 2 and len(json.dumps(data)) > REPORT_MAX:
+            level = 1
+        shapes = (plain_sessions, kinds_sessions, lambda report: report)
+        answer = self.publish(shapes[level](data))
+        while level and isinstance(answer, tuple) and answer[0] in (400, 413):
+            level -= 1
+            answer = self.publish(shapes[level](data))
         if isinstance(answer, tuple) and answer[0] == 200:
-            self.kinds = isinstance(answer[1], dict) and answer[1].get("session_kinds") is True
+            said = answer[1] if isinstance(answer[1], dict) else {}
+            self.takes = 1 + (said.get("session_models") is True) if said.get("session_kinds") is True else 0
 
     def run(self):
         while True:

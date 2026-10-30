@@ -78,7 +78,10 @@ FEATURES = ["trigger_check", "agent_setup", "trigger_code", "screen_model", "age
             # AUTONOMY.md decision 41: a task session runs Workflow, and its records keep a workflow open until its own
             # end notice; no session of it offers a tool that asks a person on its screen
             "workflow_tasks",
-            "stable_skills"]    # a session's stable text lists the agent's own skills (skills_text, design v4 D3)
+            "stable_skills",    # a session's stable text lists the agent's own skills (skills_text, design v4 D3)
+            # its usage report gives each session's tokens by model, its sub-agents' and workflow agents' with them,
+            # and each scan reads only what the transcripts gained (plan P8, decision 41)
+            "session_models"]
 # ---------------------------------------------------------------- the runtimes
 #
 # What the fleet knows about a runtime is here, in one entry for each provider, and nowhere else. hub.py, fleet.py and

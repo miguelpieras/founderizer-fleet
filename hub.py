@@ -1684,7 +1684,10 @@ def migrate():
         # account, and its percentage points of that account's main usage window
         "session_tokens": {"input": "INTEGER", "cache_read": "INTEGER", "cache_write": "INTEGER", "output": "INTEGER",
                            "calls": "INTEGER", "kind": "TEXT", "task_kind": "TEXT", "model": "TEXT", "runtime": "TEXT",
-                           "account": "TEXT", "first_cache_share": "REAL", "window_share": "REAL"},
+                           "account": "TEXT", "first_cache_share": "REAL", "window_share": "REAL",
+                           # helper feature session_models: the session's tokens by model, its agents' with them, as
+                           # JSON [[model, input, cache_read, cache_write, output, calls], ...] (usage.MODEL_FIELDS)
+                           "models": "TEXT"},
         "trigger_runs": {"check_now": "INTEGER NOT NULL DEFAULT 0", "attempts": "INTEGER NOT NULL DEFAULT 0",
                          "retry_at": "REAL", "closes": "REAL", "token": "TEXT", "sent": "REAL", "expires": "REAL",
                          "value": "REAL", "summary": "TEXT", "error": "TEXT", "detail": "TEXT", "finished": "REAL",
@@ -11330,11 +11333,11 @@ def record_session_tokens(agent, rows, runtime=None, reading=None):
     """Per-session totals from a helper's usage report, in one transaction. The hub sums them per goal.
 
     AUTONOMY.md P8: a row of a helper with session_kinds also carries the session's four kinds of tokens, its model
-    calls, its model and the share of its first call that came from the cache, and an older row leaves them as they
-    are. The hub adds the session's runtime (the report's), its account (the report's reading, while the session
-    spends), its kind and task kind (session_kind), and its points of that account's main usage window. A task's
-    thread records can arrive after a usage report, so a standing session that spent within KIND_AGAIN is matched
-    again."""
+    calls, its model and the share of its first call that came from the cache, and a row of one with session_models
+    its tokens by model; an older row leaves them as they are. The hub adds the session's runtime (the report's), its
+    account (the report's reading, while the session spends), its kind and task kind (session_kind), and its points of
+    that account's main usage window. A task's thread records can arrive after a usage report, so a standing session
+    that spent within KIND_AGAIN is matched again."""
     if not rows:
         return
     t0 = now()
@@ -11353,17 +11356,19 @@ def record_session_tokens(agent, rows, runtime=None, reading=None):
                 kind, task_kind = session_kind(agent, r["session_id"])
             values.append((agent, r["session_id"], r["total"], r["last_activity"], t0,
                            *(r.get(k) for k in ("input", "cache_read", "cache_write", "output", "calls", "model",
-                                                "first_cache_share")), runtime, account, kind, task_kind))
+                                                "first_cache_share")),
+                           json.dumps(r["models"]) if "models" in r else None, runtime, account, kind, task_kind))
         DB.executemany(
             "INSERT INTO session_tokens(agent,session_id,total,last_activity,reported,input,cache_read,cache_write,"
-            "output,calls,model,first_cache_share,runtime,account,kind,task_kind) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "output,calls,model,first_cache_share,models,runtime,account,kind,task_kind) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(agent,session_id) DO UPDATE SET total=excluded.total, "
             "last_activity=excluded.last_activity, reported=excluded.reported, "
             "input=COALESCE(excluded.input,input), cache_read=COALESCE(excluded.cache_read,cache_read), "
             "cache_write=COALESCE(excluded.cache_write,cache_write), output=COALESCE(excluded.output,output), "
             "calls=COALESCE(excluded.calls,calls), model=COALESCE(excluded.model,model), "
             "first_cache_share=COALESCE(excluded.first_cache_share,first_cache_share), "
+            "models=COALESCE(excluded.models,models), "
             "runtime=COALESCE(runtime,excluded.runtime), "
             # the account it spent from: the reading of the report in which it last spent
             "account=CASE WHEN excluded.total<>total OR account IS NULL THEN COALESCE(excluded.account,account) "
@@ -11428,7 +11433,7 @@ def window_shares(agent, account, reading, t0):
     w = main_window(reading, t0)
     if not w:
         return
-    rows = read_rows("SELECT agent, session_id, runtime, model, input, cache_read, cache_write, output FROM "
+    rows = read_rows("SELECT agent, session_id, runtime, model, models, input, cache_read, cache_write, output FROM "
                      "session_tokens WHERE account=? AND last_activity>=?",
                      (account, w["resets_at"] - w["window_minutes"] * 60))
     book = price_book()
@@ -11446,13 +11451,29 @@ def price_book():
 
 
 def session_cost(r, book):
-    """List dollars of one session's tokens at the prices of its runtime and model now (AUTONOMY.md P8, P10), so one
-    period compares with another at the same prices. None for a session whose four kinds are not known, or whose
+    """List dollars of one session's tokens at the prices of its runtime now (AUTONOMY.md P8, P10), so one period
+    compares with another at the same prices: each model of the session at its own, because its sub-agents and
+    workflow agents often run another one (decision 41). None for a session whose four kinds are not known, or whose
     runtime has no prices."""
     if r["input"] is None:
         return None
-    price = token_price(book.get(r["runtime"]), r["model"])
-    return sum(r[k] * price[k] for k in TOKEN_KINDS) / 1e6 if price else None
+    prices = [(token_price(book.get(r["runtime"]), model), tokens) for model, tokens in session_models(r)]
+    return sum(tokens[k] * price[k] for price, tokens in prices for k in TOKEN_KINDS) / 1e6 \
+        if all(price for price, _ in prices) else None
+
+
+def session_models(r):
+    """[(model, {kind: tokens})] of one session: its models as its helper reported them (helper feature
+    session_models), while they add up to the session's four kinds; else all of it at the session's own model, as an
+    older helper reports it, and as a session that spent since its last report with them is."""
+    try:
+        models = json.loads(r["models"]) if "models" in r.keys() and r["models"] else None
+        models = [(m[0], dict(zip(TOKEN_KINDS, m[1:5]))) for m in models] if models else None
+    except (ValueError, TypeError, IndexError):
+        models = None
+    if models and all(sum(tokens[k] for _, tokens in models) == r[k] for k in TOKEN_KINDS):
+        return models
+    return [(r["model"], {k: r[k] for k in TOKEN_KINDS})]
 
 
 def goal_tokens(goal_id):
@@ -33277,8 +33298,9 @@ class Handler(BaseHTTPRequestHandler):
                     q("INSERT INTO agent_usage(name,data) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET data=excluded.data",
                       (agent, json.dumps(data)))
                 limit_reading(agent, data.get("limits"), now())
-            # helper feature session_kinds: this hub takes each session's four kinds (usage.Collector.send)
-            return self.json(200, {"ok": True, "session_kinds": True})
+            # helper features session_kinds and session_models: this hub takes each session's four kinds, and its
+            # tokens by model (usage.Collector.send)
+            return self.json(200, {"ok": True, "session_kinds": True, "session_models": True})
         if parts == ["ui", "messages"]:
             return self.ui_submit()
         if parts == ["ui", "attachments"]:
