@@ -624,6 +624,19 @@ MCP_RESERVED = re.compile(r"(?:FLEET|BWS|LD|DYLD|ANTHROPIC|CLAUDE|CODEX)_[A-Z0-9
 MCP_FIELDS = {"title", "url", "command", "args", "env", "auth", "key", "runtimes"}
 
 
+def desktop_path(home):
+    """Where a Mac's server service leaves its reading of Chrome (Lifecycle.remember_browser)."""
+    return os.path.join(home, ".fleet", "desktop.json")
+
+
+def write_json(path, value):
+    """One small file, whole or not at all: a check reads it while a helper writes it."""
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    with open(path + ".new", "w") as f:
+        json.dump(value, f)
+    os.replace(path + ".new", path)
+
+
 def signed_in_path(home, agent):
     """The file where that agent's helper leaves its sign-in reading."""
     return os.path.join(home, FLEET_DIR, SIGNED_IN_FILE % agent)
@@ -740,6 +753,193 @@ def app_server_task(conf, needs):
     return needs == "screen" or bool(runtime_fact(conf.get("runtime"), "app_server")
                                      and conf.get("start") == APP_SERVER
                                      and conf.get("role") in ("worker", "lead"))
+
+
+def chrome_extension(home):
+    """Claude's extension, from each Chrome profile's own record: True when a profile has it on, False when it is
+    there and off, None when no profile has it. A newer Chrome keeps only the reasons it is off."""
+    chrome, found = os.path.join(home, "Library", "Application Support", "Google", "Chrome"), None
+    for profile in os.listdir(chrome) if os.path.isdir(chrome) else ():
+        try:
+            with open(os.path.join(chrome, profile, "Secure Preferences"), encoding="utf-8") as f:
+                entry = json.load(f)["extensions"]["settings"][CLAUDE_EXTENSION]
+            if entry.get("state") != 0 and not entry.get("disable_reasons"):
+                return True
+            found = False
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return found
+
+
+def mcp_call(argv, tool, timeout=20, popen=subprocess.Popen):
+    """The text answer of one tool of a local MCP server, from one exchange over its standard input and output, or
+    None when it gave none. No model runs."""
+    try:
+        proc = popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                     start_new_session=True)
+    except (OSError, TypeError):
+        return None
+    lines, end, reply = queue.Queue(), time.monotonic() + timeout, None
+
+    def pump():
+        # This thread closes the pipe: a close from the caller waits for this read, which a child of the server can
+        # hold open after the kill below, and the timeout would be no limit.
+        with proc.stdout:
+            for line in proc.stdout:
+                lines.put(line)
+        lines.put(None)
+
+    def answer(number):
+        while time.monotonic() < end:
+            try:
+                line = lines.get(timeout=max(0.05, end - time.monotonic()))
+            except queue.Empty:
+                return None
+            if line is None:
+                return None
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(message, dict) and message.get("id") == number:
+                return message
+        return None
+
+    threading.Thread(target=pump, daemon=True).start()
+    try:
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "founderizer", "version": "1"}}}) + "\n")
+        proc.stdin.flush()
+        if answer(1):
+            proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+            proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                                         "params": {"name": tool, "arguments": {}}}) + "\n")
+            proc.stdin.flush()
+            reply = answer(2)
+    except (OSError, ValueError):
+        reply = None
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        proc.wait()
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+    try:
+        return reply["result"]["content"][0]["text"]
+    except (TypeError, KeyError, IndexError):
+        return None
+
+
+def browser_connected(exe):
+    """Whether the Chrome of this Mac answers Claude Code's account: True or False, or None when nothing says. It is
+    the runtime's own list of the browsers connected to its account, from its own Chrome server: no model runs, so a
+    status report can read it. Only the login session opens the runtime's credential, so a run outside it reads False
+    for a Mac that is signed in: it is read by the helper and the server service alone."""
+    said = mcp_call([exe, "--claude-in-chrome-mcp"], "list_connected_browsers")
+    if said is None:
+        return None
+    if said.startswith("Browser extension is not connected"):
+        return False                    # its own words for no browser on this account (31 October 2026, a bare Mac)
+    try:
+        browsers = json.loads(said)
+    except ValueError:
+        return None
+    if not isinstance(browsers, list):
+        return None
+    # Another Chrome on the same account does not answer for this Mac: the field says where each one is, when it knows.
+    return any(not isinstance(b, dict) or b.get("onThisComputer", b.get("isLocal", True)) is not False
+               for b in browsers)
+
+
+def console_session(run):
+    """(who is at this Mac's console, whether its screen is locked), each None when it could not be read, and None
+    for the whole reading when the console did not answer."""
+    code, out, _ = run(["ioreg", "-n", "Root", "-d1", "-a"])
+    try:
+        root = plistlib.loads(out.encode()) if code == 0 else None
+    except Exception:
+        root = None
+    if not isinstance(root, dict):
+        return None
+    return (next((u.get("kCGSSessionUserNameKey") for u in root.get("IOConsoleUsers") or []
+                  if isinstance(u, dict) and u.get("kCGSSessionOnConsoleKey")), None), root.get("IOConsoleLocked"))
+
+
+def session_item(run, user):
+    """macOS: who is at the console, and whether its screen is locked. A heartbeat cannot show this."""
+    reading = console_session(run)
+    if reading is None:
+        return ("mac", "session", "not_verified", "The console session could not be read.")
+    console, locked = reading
+    if not console:
+        return ("mac", "session", "failed", "No one is logged in at the console.")
+    if console != user:
+        return ("mac", "session", "failed", f"{console} is at the console, not {user}.")
+    if locked is True:
+        return ("mac", "session", "failed", f"{user} is at the console, and the screen is locked.")
+    if locked is False:
+        return ("mac", "session", "ok", f"{user} is at the console, and the screen is unlocked.")
+    return ("mac", "session", "not_verified", f"{user} is at the console; its lock state could not be read.")
+
+
+def autologin_item(run, user):
+    code, out, _ = run(["fdesetup", "status"])
+    if code == 0 and "FileVault is On" in out:      # macOS offers no automatic login then: no fault of this machine's
+        return ("mac", "automatic_login", "not_verified",
+                "FileVault is on, so a person must unlock this Mac after each restart.")
+    code, out, _ = run(["defaults", "read", "/Library/Preferences/com.apple.loginwindow", "autoLoginUser"])
+    auto = out.strip() if code == 0 else ""
+    if not auto:
+        return ("mac", "automatic_login", "failed", "Automatic login is off.")
+    if auto != user:
+        return ("mac", "automatic_login", "failed", f"Automatic login is on for {auto}, not {user}.")
+    return ("mac", "automatic_login", "ok", f"Automatic login is on for {user}.")
+
+
+def awake_item(run):
+    code, out, _ = run(["pmset", "-g"])
+    if code != 0:
+        return ("mac", "awake", "not_verified", "The power settings could not be read.")
+
+    def minutes(key):
+        m = re.search(r"^\s*" + key + r"\s+(\d+)", out, re.M)
+        value = int(m.group(1)) if m else None
+        return "unknown" if value is None else "never" if value == 0 else f"after {value} minutes"
+    restart = re.search(r"^\s*autorestart\s+(\d+)", out, re.M)
+    system = minutes("sleep")
+    words = (f"System sleep {system}; display sleep {minutes('displaysleep')}; restart after a power failure "
+             f"{'unknown' if not restart else 'on' if restart.group(1) == '1' else 'off'}.")
+    return ("mac", "awake", "ok" if system == "never" else "not_verified" if system == "unknown" else "failed", words)
+
+
+def desktop_items(run, home, user, tabs, connected=None):
+    """What a Mac's desktop can do now, as setup check items: the one reading of it, which the helper's setup check and
+    `fleet.py verify` both give. tabs: the runtime works in tabs of Chrome through Claude's extension. connected: what
+    browser_connected read in the login session, None where nobody read it."""
+    session = session_item(run, user)
+    ready = session[2] == "ok"
+    chrome = any(os.path.isdir(p) for p in ("/Applications/Google Chrome.app",
+                                             os.path.join(home, "Applications", "Google Chrome.app")))
+    extension = chrome_extension(home) if tabs else True
+    usable = chrome and ready and extension and (not tabs or connected is not False)
+    return [("capability", "browser", "ok" if usable else "failed",
+             "Google Chrome is installed, and the session is ready." if usable else
+             "Google Chrome is not installed." if not chrome else
+             f"The browser needs {user} at the console with the screen unlocked." if not ready else
+             "Claude's extension is off: press Enable Extension in Chrome on this Mac." if extension is False else
+             "Claude's extension is not in Chrome on this Mac: restart Chrome, then press Enable Extension."
+             if extension is None else
+             "Claude's extension is not signed in: sign in to Claude in Chrome on this Mac, with this Mac's account."),
+            ("capability", "screen", "not_verified" if ready else "failed",
+             "The session is ready, but Fleet cannot check the macOS screen recording and accessibility "
+             "permissions that screen control needs." if ready else
+             f"Screen control needs {user} at the console with the screen unlocked."),
+            autologin_item(run, user), awake_item(run), session]
 
 
 def exe(name, home=None):
@@ -1100,7 +1300,7 @@ class Lifecycle:
             except OSError:
                 pass
         code, out, _ = self.run(["uname", "-r"])
-        return {"name": name, "kernel": out.strip() if code == 0 and out.strip() else None}
+        return {"name": name, "kernel": out.strip() if code == 0 and out.strip() else None, "boot": self.boot()}
 
     def security(self):
         s = {"unattended_upgrades": None, "pending_security": None, "reboot_required": None,
@@ -1109,6 +1309,9 @@ class Lifecycle:
             code, out, _ = self.run(["/usr/libexec/ApplicationFirewall/socketfilterfw", "--getglobalstate"])
             if code == 0 and out.strip():
                 s["firewall"] = "active" if "enabled" in out.lower() else "inactive"
+            if self.agent is None:      # one reading for each Mac: the server service's, and no agent's
+                s["desktop"] = self.desktop()
+                self.remember_browser(s["desktop"]["browser"])
         else:
             code, out, _ = self.run(["systemctl", "is-enabled", "unattended-upgrades"])
             if out.strip():
@@ -1129,6 +1332,24 @@ class Lifecycle:
         except Exception:
             s["vault"] = None
         return s
+
+    def desktop(self):
+        """What only hands at this Mac can put right: its lock, Chrome and Claude's extension, with no AI."""
+        console = console_session(self.run)
+        code, _, _ = self.run(["pgrep", "-x", "Google Chrome"])
+        extension = chrome_extension(self.home)
+        # Its answer means something only for a runtime that is signed in: a signed-out one reads no browser at all.
+        claude = self.exe("claude") if extension and self.runtime("claude")["signed_in"] else None
+        return {"locked": console[1] if console else None, "chrome": code == 0, "extension": extension,
+                "browser": browser_connected(claude) if claude else None}
+
+    def remember_browser(self, connected):
+        """Leave the reading of Chrome where `fleet.py verify` reads it: over SSH it cannot read it, as a sign-in
+        (remember_signed_in)."""
+        try:
+            write_json(desktop_path(self.home), {"at": self.clock(), "browser": connected})
+        except OSError:
+            pass                # the next reading writes it again
 
     def private_network(self):
         """Whether Tailscale says that it is up, or None when nothing says: no command, one that failed or hung, or a
@@ -1381,24 +1602,10 @@ class Lifecycle:
         add("capability", "shell", "ok", f"Commands run as {user}.")
         add("capability", "web", "not_verified", "Web access is a runtime tool; Fleet cannot check it without a model turn.")
         if self.platform == "darwin":
-            session = self.session_item(user)
-            ready = session[2] == "ok"
-            chrome = any(os.path.isdir(p) for p in ("/Applications/Google Chrome.app",
-                                                     os.path.join(self.home, "Applications", "Google Chrome.app")))
-            extension = self.chrome_extension() if RUNTIMES.get(name, {}).get("browser_tabs") else True
-            add("capability", "browser", "ok" if chrome and ready and extension else "failed",
-                "Google Chrome is installed, and the session is ready." if chrome and ready and extension else
-                "Google Chrome is not installed." if not chrome else
-                f"The browser needs {user} at the console with the screen unlocked." if not ready else
-                "Claude's extension is off: press Enable Extension in Chrome on this Mac." if extension is False else
-                "Claude's extension is not in Chrome on this Mac: restart Chrome, then press Enable Extension.")
-            add("capability", "screen", "not_verified" if ready else "failed",
-                "The session is ready, but Fleet cannot check the macOS screen recording and accessibility "
-                "permissions that screen control needs." if ready else
-                f"Screen control needs {user} at the console with the screen unlocked.")
-            add(*self.autologin_item(user))
-            add(*self.awake_item())
-            add(*session)
+            tabs = RUNTIMES.get(name, {}).get("browser_tabs")
+            exe = self.exe(name) if tabs else None
+            for item in desktop_items(self.run, self.home, user, tabs, browser_connected(exe) if exe else None):
+                add(*item)
         else:
             add("capability", "browser", "failed", "A Linux worker has no desktop session for a browser.")
             add("capability", "screen", "failed", "A Linux worker has no desktop session.")
@@ -1429,67 +1636,6 @@ class Lifecycle:
             return ("model", ref, "failed", f"{effort} is not an effort of {model or 'the default model'} here.")
         return ("model", ref, "ok", ("Offered" if model else "The default model") +
                 (" with the efforts " + ", ".join(efforts) + "." if efforts else "."))
-
-    def chrome_extension(self):
-        """Claude's extension, from each Chrome profile's own record: True when a profile has it on, False when it is
-        there and off, None when no profile has it. A newer Chrome keeps only the reasons it is off."""
-        chrome, found = os.path.join(self.home, "Library", "Application Support", "Google", "Chrome"), None
-        for profile in os.listdir(chrome) if os.path.isdir(chrome) else ():
-            try:
-                with open(os.path.join(chrome, profile, "Secure Preferences"), encoding="utf-8") as f:
-                    entry = json.load(f)["extensions"]["settings"][CLAUDE_EXTENSION]
-                if entry.get("state") != 0 and not entry.get("disable_reasons"):
-                    return True
-                found = False
-            except (OSError, ValueError, KeyError, TypeError, AttributeError):
-                continue
-        return found
-
-    def session_item(self, user):
-        """macOS: who is at the console, and whether its screen is locked. A heartbeat cannot show this."""
-        code, out, _ = self.run(["ioreg", "-n", "Root", "-d1", "-a"])
-        try:
-            root = plistlib.loads(out.encode()) if code == 0 else None
-        except Exception:
-            root = None
-        if not isinstance(root, dict):
-            return ("mac", "session", "not_verified", "The console session could not be read.")
-        console = next((u.get("kCGSSessionUserNameKey") for u in root.get("IOConsoleUsers") or []
-                        if isinstance(u, dict) and u.get("kCGSSessionOnConsoleKey")), None)
-        locked = root.get("IOConsoleLocked")
-        if not console:
-            return ("mac", "session", "failed", "No one is logged in at the console.")
-        if console != user:
-            return ("mac", "session", "failed", f"{console} is at the console, not {user}.")
-        if locked is True:
-            return ("mac", "session", "failed", f"{user} is at the console, and the screen is locked.")
-        if locked is False:
-            return ("mac", "session", "ok", f"{user} is at the console, and the screen is unlocked.")
-        return ("mac", "session", "not_verified", f"{user} is at the console; its lock state could not be read.")
-
-    def autologin_item(self, user):
-        code, out, _ = self.run(["defaults", "read", "/Library/Preferences/com.apple.loginwindow", "autoLoginUser"])
-        auto = out.strip() if code == 0 else ""
-        if not auto:
-            return ("mac", "automatic_login", "failed", "Automatic login is off.")
-        if auto != user:
-            return ("mac", "automatic_login", "failed", f"Automatic login is on for {auto}, not {user}.")
-        return ("mac", "automatic_login", "ok", f"Automatic login is on for {user}.")
-
-    def awake_item(self):
-        code, out, _ = self.run(["pmset", "-g"])
-        if code != 0:
-            return ("mac", "awake", "not_verified", "The power settings could not be read.")
-
-        def minutes(key):
-            m = re.search(r"^\s*" + key + r"\s+(\d+)", out, re.M)
-            value = int(m.group(1)) if m else None
-            return "unknown" if value is None else "never" if value == 0 else f"after {value} minutes"
-        restart = re.search(r"^\s*autorestart\s+(\d+)", out, re.M)
-        system = minutes("sleep")
-        words = (f"System sleep {system}; display sleep {minutes('displaysleep')}; restart after a power failure "
-                 f"{'unknown' if not restart else 'on' if restart.group(1) == '1' else 'off'}.")
-        return ("mac", "awake", "ok" if system == "never" else "not_verified" if system == "unknown" else "failed", words)
 
     def admin_item(self):
         sudo = shutil.which("sudo")

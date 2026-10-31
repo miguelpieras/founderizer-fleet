@@ -6,7 +6,8 @@
 #   updates and the firewall. The line has joined the private network (Tailscale) before this script.
 #   A Mac (macOS 14 or later, with Tailscale and Homebrew), as the user that will run the agents: tmux and Python
 #   with Homebrew, then the join, then this Mac's vault, the one step that asks for that user's password, then
-#   Claude's extension for Chrome.
+#   Claude's extension for Chrome. The Founderizer installer runs the same line as root behind macOS's own password
+#   dialog, with that user in FLEET_MAC_USER: each step of that user still runs as that user, and the vault asks nothing.
 #
 # The join itself is server.py in a new checkout of the Founderizer repository: the server key, POST /join with the code, and
 # the server service. The code goes to server.py on standard input, never in a command argument or a URL. The script
@@ -28,6 +29,8 @@ CHANNEL="__FLEET_CHANNEL__"
 CLAUDE_EXTENSION=fcoeoabgfenejglbffodgkkbkcdhcgfn       # Claude's extension in the Chrome Web Store
 WORKER=fleet
 PACKAGES="git tmux python3 curl ca-certificates ufw unattended-upgrades sudo"
+MAC_USER=""     # the user that will run a Mac's agents
+USER_PATH=""    # that user's PATH
 ready=yes       # what the last step, verify, answered about this machine
 
 say() { printf 'Founderizer: %s\n' "$*"; }
@@ -85,6 +88,11 @@ as_worker() {    # the command as the user of the service, from its home folder,
 }
 
 as_self() { "$@"; }
+
+as_mac_user() { # The command as that Mac user, when the installer runs this script as root. Root's own PATH stays the
+                # system's: that user can change what stands in its folders and in Homebrew's.
+    sudo -u "$MAC_USER" -H env PATH="$USER_PATH" "$@"
+}
 
 reach() {
     curl -fsS -m 10 "$HUB/health" >/dev/null 2>&1 || stop "This machine cannot reach the Founderizer hub at $HUB. Check that \
@@ -187,8 +195,8 @@ mac_vault() {   # This Mac's vault, which every agent of it reaches (the owner, 
         ready=no
         say "this Mac's vault was not installed: $CHANNEL gave no signed vault. Run the line again."
     else
-        say "this Mac's vault: macOS asks once for the password of $(id -un), because only root installs it"
-        if sudo /bin/sh -c "$VAULT_ROOT_STEP" sh "$work/$VAULT_APP" "$(id -un)" "$name" "$HUB" "$FLEET" "$CHANNEL" \
+        say "this Mac's vault: macOS asks once for the password of $MAC_USER, because only root installs it"
+        if sudo /bin/sh -c "$VAULT_ROOT_STEP" sh "$work/$VAULT_APP" "$MAC_USER" "$name" "$HUB" "$FLEET" "$CHANNEL" \
                 "$VAULT_REQUIREMENT" </dev/null; then
             say "this Mac's vault: installed, with the fleet's own store; it updates itself every hour"
         else
@@ -204,9 +212,9 @@ mac_chrome() {  # The browser of a Mac agent on Claude (the owner, 28 October 20
                 # Web Store: Chrome fetches it at its next start and asks once, on this Mac's screen, to enable it.
                 # It stays in place, so a Chrome profile that is removed gets the extension back at the next start.
     folder="$HOME/Library/Application Support/Google/Chrome/External Extensions"
-    mkdir -p "$folder"
-    printf '{"external_update_url": "https://clients2.google.com/service/update2/crx"}\n' \
-        > "$folder/$CLAUDE_EXTENSION.json"
+    "$1" mkdir -p "$folder"
+    "$1" /bin/sh -c 'printf "{\"external_update_url\": \"https://clients2.google.com/service/update2/crx\"}\n" > "$1"' \
+        sh "$folder/$CLAUDE_EXTENSION.json"
     say "Claude's extension: Chrome fetches it at its next start and asks once to enable it"
 }
 
@@ -266,34 +274,50 @@ firewall() {    # $1: the SSH ports. Incoming traffic only to SSH and on the pri
 }
 
 mac() {
-    [ "$(id -u)" != 0 ] || stop "Run the line in Terminal as the Mac user that will run the agents, not as root."
+    runner=as_self
+    MAC_USER=$(id -un)
+    if [ "$(id -u)" = 0 ]; then
+        [ -n "${FLEET_MAC_USER:-}" ] || stop "Run the line in Terminal as the Mac user that will run the agents, not as root."
+        runner=as_mac_user
+        MAC_USER=$FLEET_MAC_USER
+        HOME=$(dscl . -read "/Users/$MAC_USER" NFSHomeDirectory | awk '{print $2}')
+        export HOME
+    fi
     version=$(sw_vers -productVersion)
     [ "${version%%.*}" -ge 14 ] 2>/dev/null || stop "macOS $version is too old. Use macOS 14 or later."
     reach
     brew=""
     for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do [ -x "$b" ] && { brew=$b; break; }; done
     [ -n "$brew" ] || stop "Homebrew is not installed. Install it from https://brew.sh, then run the line again."
-    prefix=$("$brew" --prefix)
-    PATH="$HOME/.local/bin:$prefix/bin:$PATH"
-    export PATH
+    USER_PATH="$HOME/.local/bin:$(dirname "$brew"):$PATH"
+    prefix=$("$runner" "$brew" --prefix)
+    USER_PATH="$HOME/.local/bin:$prefix/bin:$PATH"
+    if [ "$runner" = as_self ]; then
+        PATH=$USER_PATH
+        export PATH
+    fi
     need=""
-    command -v tmux >/dev/null 2>&1 || need="$need tmux"
-    "$prefix/bin/python3" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null || need="$need python"
+    "$runner" sh -c 'command -v tmux' >/dev/null 2>&1 || need="$need tmux"
+    "$runner" "$prefix/bin/python3" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null || need="$need python"
     [ -x "$prefix/bin/git" ] || git --version >/dev/null 2>&1 || need="$need git"
     if [ -n "$need" ]; then
         say "installing with Homebrew:$need"
         # shellcheck disable=SC2086
-        "$brew" install $need </dev/null || stop "Homebrew could not install$need."
+        "$runner" "$brew" install $need </dev/null || stop "Homebrew could not install$need."
     fi
-    checkout "$HOME/fleet-server" as_self
-    printf '%s\n' "$code" | "$prefix/bin/python3" "$HOME/fleet-server/server.py" join --hub "$HUB" --kind mac
-    current "$HOME/fleet-server" as_self
+    checkout "$HOME/fleet-server" "$runner"
+    printf '%s\n' "$code" | "$runner" "$prefix/bin/python3" "$HOME/fleet-server/server.py" join --hub "$HUB" --kind mac
+    current "$HOME/fleet-server" "$runner"
     # No OS user for each agent on a Mac, and no root helper: a Mac agent's service is a LaunchAgent of a desktop
     # session, so a second user would have to be logged in at the screen. A Mac keeps one user for its agents
     # (PRODUCT.md P2), and its agents share that user's runtime credential.
     mac_vault
-    mac_chrome
-    verify_step "$HOME/fleet-server" as_self
+    mac_chrome "$runner"
+    if [ "$runner" = as_mac_user ]; then
+        say "the installer goes on from here, and it runs the checks itself"    # a minute saved for the owner
+        return 0
+    fi
+    verify_step "$HOME/fleet-server" "$runner"
     say "done. Add an agent to this Mac in Founderizer: Settings, Servers, this Mac, Add agent. Its agents run while this user is logged in."
 }
 

@@ -62,10 +62,34 @@ the lock screen. Leave a dedicated screen worker unlocked while it works.
 
 A Mac's join line also leaves the file that makes Chrome take Claude's extension from
 its Web Store (`join.sh` `mac_chrome`). Chrome fetches it at its next start and asks
-once, on that Mac's screen, to enable it. Then sign the extension in, in that Chrome,
-to the Claude account of the Mac's agents. Until a Chrome profile has it on, the setup
-check fails the `browser` item of an agent on Claude. A Chrome profile that is removed
-takes the extension with it, and the next start of Chrome fetches it again.
+once, on that Mac's screen, to enable it. It asks on the page only on a profile that has
+started before the file arrived; on a newer one the question waits in no menu at all.
+Then sign the extension in, in that Chrome, to the Claude account of the Mac's agents.
+Until a Chrome profile has it on and Chrome answers that account, the setup check fails
+the `browser` item of an agent on Claude. A Chrome profile that is removed takes the
+extension with it, and the next start of Chrome fetches it again.
+
+## A new Mac: one sitting
+
+A bare Mac needs no Terminal. Open the Founderizer installer on it, and type the address
+and the link code it shows in Founderizer on your own Mac: Add server, A Mac that stays
+on. In Apple's own setup, say no to FileVault: with FileVault on, macOS offers no
+automatic login, and a person must unlock the Mac after each power cut.
+
+macOS's own dialog asks for the password once, and the installer's one root step
+(`Installer/setup.sh` in the app's repository) then installs Apple's developer tools,
+Homebrew, Tailscale, Chrome and the ChatGPT app, turns on the firewall, Remote Login,
+Screen Sharing, no sleep and the restart after a power cut, and runs the hub's join line.
+The password never reaches Founderizer. The rest is one page at a time: automatic login,
+the Lock Screen, Claude's extension and the sign-in in Chrome, one Chrome menu item, and
+for computer use the ChatGPT sign-in and two macOS pages. A power cut does not lose the
+page. Finish restarts the Mac, and the hub then proves the browser with a real task, with
+nobody at the Mac. The manager tells you in one line.
+
+Keep that Mac behind a locked door: it stays signed in, and anyone who touches it acts
+as your agents. Sign accounts in that Chrome that are made for the agents, and never
+sign that Mac's Claude account in on your own Chrome: the extension's link is
+account-wide, so an agent could reach your own browser.
 
 ## Linux VPS or a new checkout
 

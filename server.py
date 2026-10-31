@@ -36,6 +36,7 @@ import plistlib
 import pwd
 import re
 import secrets
+import socket
 import subprocess
 import sys
 import threading
@@ -60,6 +61,7 @@ JOB_HEARTBEAT = "job_heartbeat"
 NAMES_FEATURE = "server_names"  # it takes a new name from the hub (adopt): hub.NAMES_FEATURE
 KEY_FEATURE = "rename_key"      # its rename job moves the agent's key file (carry_key): hub.KEY_FEATURE
 POLL = 5                        # seconds between looks for a job
+CHROME_SETTLES = 30             # seconds from Chrome's start to the reading that says whether it answers
 SIGN_IN_WAIT = 900              # seconds a sign-in may take
 HELPER_WAIT = 120               # seconds for a new agent's own helper to reach the hub, before its sign-in can start
 PATH_ENV = os.pathsep.join([os.path.join(HOME, ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
@@ -260,6 +262,40 @@ def install_service(run=subprocess.run, platform=sys.platform):
     return path
 
 
+def cmd_finish(args):
+    """The installer's last press on a new Mac: the hub goes on with this Mac's setup, now or after its restart."""
+    conf, key = load_conf(), server_key()
+    if not conf or not key:
+        die("This machine has not joined your fleet.")
+    code, out, _ = lifecycle.Lifecycle(KIT, None, {}, None, lambda: False).run(["sysctl", "-n", "kern.bootsessionuuid"])
+    status, answer = Hub(conf["hub"], key).call("POST", f"/server/{conf['name']}/setup", {
+        "boot": out.strip() if code == 0 else None, "restarts": not args.no_restart})
+    if status not in (200, 404):        # 404: a Mac of the fleet from before, whose sitting the hub does not carry
+        die(answer.get("error") or f"The hub did not answer ({status}).")
+
+
+def cmd_desktop(args):
+    """What this Mac's desktop is now, as one line of JSON: the reading of its status report, for the installer."""
+    print(json.dumps(lifecycle.Lifecycle(KIT, None, {}, None, lambda: False).desktop()))
+
+
+def cmd_chrome_script(args):
+    """One harmless script through this Mac's vault, so that macOS asks its one question while a person is here."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(280)
+        s.connect(os.path.join(HOME, "Library", "Application Support", "AgentFleet", "vault.sock"))
+        s.sendall(b'{"v": 2, "op": "chrome"}\n')
+        print(s.makefile().readline().strip())
+
+
+def cmd_computer_use(args):
+    """One harmless call of Computer Use, so that it asks macOS for its two permissions while a person is here: macOS
+    lists an app on those pages only once the app has asked. No model runs."""
+    client = os.path.join(HOME, ".codex", "computer-use", "Codex Computer Use.app", "Contents", "SharedSupport",
+                          "SkyComputerUseClient.app", "Contents", "MacOS", "SkyComputerUseClient")
+    print(lifecycle.mcp_call([client, "mcp"], "list_apps", timeout=60))
+
+
 def cmd_service(args):
     if not load_conf():
         die("This machine has not joined your fleet. Run the join line from Founderizer: Settings, Servers, Add "
@@ -295,6 +331,7 @@ class Service:
         self.life = life or lifecycle.Lifecycle(kit, None, {}, None, lambda: False, platform_name=platform, home=home)
         self.loaded = self.revision()
         self.desired = self.last_report = None
+        self.chrome_opened = self.report_at = None      # keep_chrome: when it last opened Chrome, and the reading due
         self.stuck = None               # a revision that did not fast-forward: no new try for it
         self.vault_tried = None         # when the vault broker was last asked to catch up (vault_program)
 
@@ -462,10 +499,25 @@ class Service:
         self.name = name
 
     # ---- the loop
+    def keep_chrome(self):
+        """Chrome stays open on a Mac whose extension is on, so browser tasks work after a restart with no hands. A
+        Chrome that opens gets a reading of its own soon: it answers the runtime's account some seconds later. It is
+        opened once in REPORT_EVERY, so a Chrome that does not start stops no reading, and a person can quit it."""
+        if self.platform != "darwin" or lifecycle.chrome_extension(self.home) is not True or \
+                (self.chrome_opened is not None and self.clock() - self.chrome_opened < REPORT_EVERY) or \
+                self.run(["pgrep", "-x", "Google Chrome"])[0] == 0:
+            return
+        self.run(["open", "-g", "-a", "Google Chrome"])
+        self.chrome_opened = self.clock()
+        self.report_at = self.clock() + CHROME_SETTLES
+
     def loop(self, rounds=None):
         while rounds is None or rounds > 0:
             rounds = None if rounds is None else rounds - 1
-            if self.last_report is None or self.clock() - self.last_report >= REPORT_EVERY:
+            self.keep_chrome()
+            if self.last_report is None or self.clock() - self.last_report >= REPORT_EVERY or \
+                    (self.report_at is not None and self.clock() >= self.report_at):
+                self.report_at = None
                 self.report()
             status, answer = self.hub.call("GET", f"/server/{self.name}/jobs")
             if status == 403:
@@ -534,7 +586,8 @@ class Service:
         exe = self.runtime_step(job, runtime, user)
         folder = self.checkout_step(job, agent, user)
         self.service_step(job, agent, runtime, folder, user)
-        self.sign_in_step(job, agent, runtime, exe, user)
+        if job.get("sign_in") != "at_the_mac":      # the installer leads this sign-in, at this Mac's own screen
+            self.sign_in_step(job, agent, runtime, exe, user)
         self.post(job, "done", "sign_in", f"{shown_name(agent)} runs on {self.name}. Open it to finish its setup.")
 
     # ---- prepare the other runtime of an agent (owner feature runtime_switch)
@@ -945,8 +998,14 @@ def main():
     join.add_argument("--ssh-port", type=int)
     sub.add_parser("service")
     sub.add_parser("run")
+    finish = sub.add_parser("finish")
+    finish.add_argument("--no-restart", action="store_true")
+    sub.add_parser("desktop")
+    sub.add_parser("chrome-script")
+    sub.add_parser("computer-use")
     args = parser.parse_args()
-    {"join": cmd_join, "service": cmd_service, "run": cmd_run}[args.cmd](args)
+    {"join": cmd_join, "service": cmd_service, "run": cmd_run, "finish": cmd_finish, "desktop": cmd_desktop,
+     "chrome-script": cmd_chrome_script, "computer-use": cmd_computer_use}[args.cmd](args)
 
 
 if __name__ == "__main__":

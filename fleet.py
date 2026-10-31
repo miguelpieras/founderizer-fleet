@@ -6365,9 +6365,11 @@ def ready_runtime_config(home=None, kit=None):
     if not isinstance(projects, dict):
         projects = {}
     mine = {folder: projects[folder] if isinstance(projects.get(folder), dict) else {} for folder in folders}
-    if kept.get("hasCompletedOnboarding") and all(m.get("hasTrustDialogAccepted") for m in mine.values()):
+    if kept.get("hasCompletedOnboarding") and kept.get("hasCompletedClaudeInChromeOnboarding") and \
+            all(m.get("hasTrustDialogAccepted") for m in mine.values()):
         return False
     kept["hasCompletedOnboarding"] = True
+    kept["hasCompletedClaudeInChromeOnboarding"] = True     # one notice before the first `--chrome` session: same wait
     kept.setdefault("theme", "dark")
     # Its offer of the new renderer comes back until it has been shown three times, and it blocks the window while
     # it stands there. Nobody is at this terminal to take it, so it is counted out before it is ever drawn.

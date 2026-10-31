@@ -298,6 +298,9 @@ CREATE TABLE IF NOT EXISTS join_codes(id INTEGER PRIMARY KEY, sha256 TEXT NOT NU
   kind TEXT NOT NULL, created REAL NOT NULL, expires REAL NOT NULL, used REAL, canceled REAL, address TEXT,
   key_sha256 TEXT);
 CREATE TABLE IF NOT EXISTS join_failures(id INTEGER PRIMARY KEY, address TEXT NOT NULL, ts REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS mac_setups(server TEXT PRIMARY KEY, agent TEXT NOT NULL, runtime TEXT NOT NULL,
+  state TEXT NOT NULL, boot TEXT, restarts INTEGER NOT NULL DEFAULT 1, reported REAL, tries INTEGER NOT NULL DEFAULT 0,
+  checks INTEGER NOT NULL DEFAULT 0, token TEXT, task INTEGER, seen REAL, created REAL NOT NULL, updated REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS server_keys(server TEXT PRIMARY KEY, sha256 TEXT NOT NULL, created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS server_status(server TEXT PRIMARY KEY, data TEXT NOT NULL, reported REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS server_jobs(id INTEGER PRIMARY KEY, server TEXT NOT NULL, kind TEXT NOT NULL, agent TEXT,
@@ -763,7 +766,8 @@ UI_FEATURES = ["direct_chat", "corrections", "thread_events", "task_controls", "
                "attachment_knowledge", "asking_and_waiting", "account_limits", "secret_requests",
                "secret_deliveries", "agent_rename", "agent_memory", "live_changes",
                "settings", "standing", "history", "costs",
-               "server_names"]      # the owner, 30 October 2026: a server's name is its name in Tailscale
+               "server_names",      # the owner, 30 October 2026: a server's name is its name in Tailscale
+               "mac_setup"]         # the owner, 31 October 2026: one sitting at a new Mac
 # The junction: each lane adds its own feature name here, and /ui/state and /ui/mobile both answer with this one list.
 # Two names are not here because they are not always true: central_vault, which ui_features() adds only while the
 # central vault answers (central_ok), and contact_roles, only while the fleet setting contacts.v2 is on: the app
@@ -1692,6 +1696,7 @@ def migrate():
                      "kind": "TEXT NOT NULL DEFAULT 'lesson'", "cost_minutes": "INTEGER", "recheck": "TEXT"},
         "machine_checks": {"verify": "TEXT", "revision": "TEXT"},
         "server_jobs": {"was": "TEXT"},             # owner feature agent_rename: the name a rename job moves from
+        "join_codes": {"agent": "TEXT", "runtime": "TEXT"},     # the first agent of a Mac (mac_setups)
         "session_credentials": {"ready": "REAL"},   # owner feature chat_warm: when its owner chat listed its tools
         # AUTONOMY.md P8: each session's four kinds of tokens apart, its model calls, the share of its first call that
         # came from the cache (helper feature session_kinds); and what the hub adds: its runtime, kind and task kind,
@@ -22468,6 +22473,8 @@ def item_required(agent, item):
         return bool(a.get("model") or a.get("effort")) and item["state"] != "not_verified"
     if item["kind"] == "capability":
         return item["ref"] in (a.get("can") or []) and item["state"] != "not_verified"
+    if item["kind"] == "mac":           # a Mac that sleeps, or that nobody logs in to, serves no agent; its screen
+        return item["state"] == "failed" and item["ref"] != "session"       # counts through what needs it (capability)
     return False
 
 
@@ -22514,6 +22521,18 @@ def check_holds(agent, rev, desired):
     except (TypeError, ValueError):
         return False
     return dict(old, agents=old["agents"].get(agent)) == dict(new, agents=new["agents"].get(agent))
+
+
+def start_machine_check(agent):
+    """Check this machine now: the helper runs its usual status collection at once (no AI turn, no change)."""
+    pending = q1("SELECT * FROM machine_checks WHERE agent=? AND state='requested' ORDER BY id DESC LIMIT 1", (agent,))
+    if pending:
+        return {"agent": agent, "check": check_view(pending), "changed": False}
+    cid = ins("INSERT INTO machine_checks(agent,requested,state) VALUES(?,?,'requested')", (agent, now()))
+    probe = ins("INSERT INTO jobs(agent,task,kind,login,created) VALUES(?,NULL,'probe',NULL,?)",
+                (agent, now())) if granted_logins(agent) else None
+    emit(agent, "check", "Check this machine now", extra=dict({"check": cid}, **({"probe_job": probe} if probe else {})))
+    return {"agent": agent, "check": check_view(q1("SELECT * FROM machine_checks WHERE id=?", (cid,))), "changed": True}
 
 
 def activation_missing(agent):
@@ -23495,6 +23514,8 @@ def tick():
             history_sweep(t0)               # AUTONOMY.md P6: what was written since the last pass, into the history
             default_access_sweep(t0)        # the owner, 28 October 2026: every agent's vault, and a Mac's desktop
             machine_names_sweep(t0)         # the owner, 30 October 2026: a machine's name is its name in Tailscale
+            mac_setup_sweep(t0)             # the owner, 31 October 2026: one sitting at a new Mac
+            mac_desktop_sweep()             # what only hands at a Mac can put right
         except Exception:
             traceback.print_exc()           # a goal or database check must not stop the timers below
         # close sessions of finished tasks
@@ -24592,6 +24613,15 @@ def reading_age_of(value):
     return float(min(max(value, 0.0), READING_AGE_MAX))
 
 
+def desktop_status(value):
+    """A Mac's own reading of what only hands there can put right (lifecycle.Lifecycle.desktop), or None."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("desktop must be an object or null")
+    return {k: _optional(value.get(k), bool) for k in ("locked", "chrome", "extension", "browser")}
+
+
 def validate_status(data):
     """A helper's machine status report. Unknown fields are dropped; missing fields are null."""
     if not isinstance(data, dict):
@@ -24689,11 +24719,13 @@ def validate_status(data):
             "legacy_windows": legacy, "runtimes": runtimes, "other_runtime_windows": other,
             "owner_chat_bound": _optional(data.get("owner_chat_bound"), bool),
             "manager_bound": _optional(data.get("manager_bound"), bool), "manager_handover": handover,
-            "os": {"name": _optional(system.get("name"), str), "kernel": _optional(system.get("kernel"), str)},
+            "os": {"name": _optional(system.get("name"), str), "kernel": _optional(system.get("kernel"), str),
+                   "boot": _optional(system.get("boot"), str, 80)},
             "security": {"unattended_upgrades": _optional(sec.get("unattended_upgrades"), bool),
                          "pending_security": _optional(sec.get("pending_security"), int),
                          "reboot_required": _optional(sec.get("reboot_required"), bool),
-                         "firewall": firewall, "tailscale": _optional(sec.get("tailscale"), bool), "vault": vault},
+                         "firewall": firewall, "tailscale": _optional(sec.get("tailscale"), bool), "vault": vault,
+                         "desktop": desktop_status(sec.get("desktop"))},
             "runtime": {"name": _optional(rt.get("name"), str, 40), "version": _optional(rt.get("version"), str, 120),
                         "signed_in": _optional(rt.get("signed_in"), bool)},
             "update": {"state": state, "detail": _optional(up.get("detail"), str, 500)},
@@ -25834,6 +25866,7 @@ def save_access(body):
 SERVER_NAME = re.compile(r"[a-z][a-z0-9-]{1,30}")
 SERVER_KINDS = ("linux", "mac")
 JOIN_LIFE = 1800                # seconds a join code works
+MAC_JOIN_LIFE = 7200            # a bare Mac installs its tools before the join, so its code works for longer
 JOIN_TRIES = 5                  # wrong join codes from one address in JOIN_WINDOW seconds; then the address waits
 JOIN_WINDOW = 600
 JOIN_CODE = re.compile(r"[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{12}")       # LINK_ALPHABET: 12 characters, 60 bits
@@ -25892,6 +25925,223 @@ def with_desktop(entry, team):
         if "browser" not in added:
             added.append("Chrome")
     return added
+
+
+# ---- one sitting at a new Mac (the owner, 31 October 2026: "it has to be truly smooth!")
+#
+# The app names the first agent with the join code, and from there the hub carries the setup by itself, so the owner's
+# Mac need not stay awake or in reach. The row of mac_setups moves through these states:
+#
+#   add        the Mac joined; its first reading adds the agent, with its install job (mac_setup_add)
+#   waiting    the job runs, and the installer leads the owner through the sitting at the Mac
+#   finished   the owner pressed Finish, and the Mac restarts: its new boot and a connected Chrome end this state
+#   checking   a setup check of the agent; it activates the agent
+#   proving    a browser task opens a page that only a real browser can answer
+#   done       the manager tells the owner; stopped: the manager is told what stopped it
+MAC_SETUP_READINGS = 3          # readings of a Mac whose Chrome does not connect before the manager is told
+MAC_SETUP_PAGE = ("<!doctype html><html><head><meta charset='utf-8'><title>Mac setup</title></head>"
+                  "<body style='font:16px sans-serif;margin:40px'><h1 id='w'>Wait</h1><script>fetch(location.pathname,"
+                  "{method:'POST'}).then(r=>{document.getElementById('w').textContent=r.ok?'Done':'Try again'})"
+                  "</script></body></html>")
+
+
+def mac_setup_set(server, **fields):
+    q(f"UPDATE mac_setups SET {', '.join(k + '=?' for k in fields)}, updated=? WHERE server=?",
+      (*fields.values(), now(), server))
+
+
+def mac_setup_stop(row, why, hands=False):
+    """The setup stopped. The manager is told in words that it can pass on, and the owner's app still has the agent's
+    own setup page, which needs no sitting. The state comes last: a restart here repeats the message, and loses nothing."""
+    log("hub", f"the setup of {row['server']} stopped: {why}")
+    emit(manager_name(), "say", f"[hub] The setup of the new Mac {row['server']} stopped: {why} Tell the owner in one "
+                                f"line." + (" Only hands at that Mac, or the app's Screen Sharing button, can put this "
+                                            "right." if hands else ""))
+    mac_setup_set(row["server"], state="stopped")
+
+
+def mac_setup_add(row, t0):
+    """The Mac has joined, and its first reading says that its service runs: the owner's first agent is added as the
+    app adds an agent, with the owner's word from the join code. A refusal can pass (a release, a fetch that failed),
+    so it goes again at the next reading."""
+    reading = server_reading(row["server"], [])
+    if reading is None or reading["stale"]:
+        return
+    if row["agent"] in server_agents(row["server"]):        # a restart of the hub came between the two writes below
+        return mac_setup_set(row["server"], state="waiting", tries=0)
+    seen = q1("SELECT reported FROM server_status WHERE server=?", (row["server"],))["reported"]
+    if seen == row["reported"]:
+        return
+    _, current, _ = team_view(kit_revision(fresh=True))
+    try:
+        add_server_agent(row["server"], {"agent": row["agent"], "runtime": row["runtime"], "role": "worker",
+                                         "reports_to": None, "base_sha256": current})
+    except Conflict:
+        return                          # team.json moved between the two reads: the next pass reads it again
+    except Refusal as e:
+        if row["tries"] + 1 >= MAC_SETUP_READINGS:
+            return mac_setup_stop(row, f"{shown_name(row['agent'])} could not be added: {e}.")
+        return mac_setup_set(row["server"], reported=seen, tries=row["tries"] + 1)
+    mac_setup_set(row["server"], state="waiting", tries=0)
+
+
+def mac_setup_installing(row):
+    """The agent's install runs while the owner sits at the Mac. If it fails, the installer waits for a runtime that
+    does not come, so the manager is told. The app's own page gives the install again."""
+    job = q1("SELECT state, detail FROM server_jobs WHERE server=? AND agent=? ORDER BY id DESC LIMIT 1",
+             (row["server"], row["agent"]))
+    if job and job["state"] == "failed":
+        mac_setup_stop(row, f"{shown_name(row['agent'])} could not be installed: {job['detail']}")
+
+
+def mac_setup_finish(server, boot, restarts):
+    """(status, answer) of the installer's last press. Pressing it again changes nothing."""
+    row = q1("SELECT * FROM mac_setups WHERE server=?", (server,))
+    if row is None:
+        return 404, {"error": f"{server} has no setup"}
+    if row["state"] == "add":
+        return 409, {"error": "Your hub has not added this Mac's agent yet. Try again in a minute."}
+    if row["state"] == "waiting":
+        if not (isinstance(boot, str) and boot) or not isinstance(restarts, bool):
+            return 400, {"error": "boot is this boot of the Mac, and restarts is true or false"}
+        mac_setup_set(server, state="finished", boot=boot, restarts=int(restarts))
+    return 200, {"ok": True}
+
+
+def mac_setup_returned(row):
+    """True once the Mac has done what its setup waits for: a new boot, where it restarts, and Chrome connected. The
+    manager is told when Chrome does not connect in MAC_SETUP_READINGS new readings."""
+    st = q1("SELECT data, reported FROM server_status WHERE server=?", (row["server"],))
+    if not st or st["reported"] == row["reported"]:
+        return False
+    data = json.loads(st["data"])
+    if row["restarts"] and (data.get("os") or {}).get("boot") in (None, row["boot"]):
+        return False
+    if ((data.get("security") or {}).get("desktop") or {}).get("browser") is not False:
+        mac_setup_set(row["server"], reported=st["reported"])
+        return True                     # a reading that says nothing goes on to the real task, which is the proof
+    if row["tries"] + 1 >= MAC_SETUP_READINGS:
+        mac_setup_stop(row, f"Chrome on that Mac does not answer {shown_name(row['agent'])}'s account.", hands=True)
+    else:
+        mac_setup_set(row["server"], reported=st["reported"], tries=row["tries"] + 1)
+    return False
+
+
+def mac_setup_check(row):
+    """The agent's setup check, on the Mac as it stands now."""
+    start_machine_check(row["agent"])
+    mac_setup_set(row["server"], state="checking")
+
+
+def mac_setup_activate(row):
+    """The check is back: the agent goes active as the owner's own Activate would, on the same conditions."""
+    check = q1("SELECT state FROM machine_checks WHERE agent=? ORDER BY id DESC LIMIT 1", (row["agent"],))
+    if not check or check["state"] == "requested":
+        return
+    agent = agents().get(row["agent"])
+    if agent is None:
+        return mac_setup_stop(row, f"{shown_name(row['agent'])} is no longer in your fleet.")
+    if agent.get("active", True) is False:
+        missing, _ = activation_missing(row["agent"])
+        if missing:
+            # What is missing can pass by itself: an update on its way to this Mac, a check that came too late. So the
+            # next reading of the Mac checks again, and only a count ends it.
+            if row["checks"] + 1 >= MAC_SETUP_READINGS:
+                return mac_setup_stop(row, f"{shown_name(row['agent'])} cannot start: "
+                                           + " ".join(str(m["detail"]) for m in missing)[:300])
+            return mac_setup_set(row["server"], state="finished", checks=row["checks"] + 1)
+        _, current, _ = team_view(kit_revision(fresh=True))
+        try:
+            save_agent_settings(row["agent"], {"active": True, "base_sha256": current})
+        except Conflict:
+            return                      # it moved between the reads: the next pass reads it again
+    mac_setup_prove(row)
+
+
+def mac_setup_prove(row):
+    """One real task of the agent: it opens a page of this hub in Chrome. The page's script answers the hub, so a task
+    that never reached a real browser proves nothing, whatever its result says."""
+    token, ip_port = secrets.token_urlsafe(18), hub_address()
+    url = f"http://{ip_port[0]}:{ip_port[1]}/mac-setup/{token}"
+    task = check_task(manager_name(), {
+        "owner": row["agent"], "needs": "browser", "title": "Open the last page of this Mac's setup",
+        "details": f"Open {url} in Chrome with your browser tools, and wait until the page says Done. Use no other tool.",
+        "done_when": "The page says Done."})
+    with transaction():
+        tid = admit_task(manager_name(), task)
+        DB.execute("UPDATE mac_setups SET state='proving', token=?, task=?, updated=? WHERE server=?",
+                   (token, tid, now(), row["server"]))
+
+
+def mac_setup_proved(row):
+    """The page answered: the manager tells the owner, in one line. The owner's next message goes to a Mac that works."""
+    if row["seen"] is None:
+        t = q1("SELECT state FROM tasks WHERE id=?", (row["task"],))
+        if t and t["state"] in ("completed", "failed", "rejected", "canceled"):
+            mac_setup_stop(row, f"{shown_name(row['agent'])}'s task ended, and the page never opened in Chrome.")
+        return
+    mac_setup_set(row["server"], state="done")
+    line = f"{shown_name(row['agent'])} is ready on {row['server']}."
+    if not row["restarts"]:
+        line += " The restart was not proved: with FileVault on, a person must unlock this Mac after a power cut."
+    log("hub", f"the setup of {row['server']} is proved")
+    emit(manager_name(), "say", f"[hub] The new Mac {row['server']} passed its last proof. Tell the owner these words "
+                                f"with message_owner, and nothing more: {line}")
+
+
+def mac_setup_sweep(t0):
+    """Each pass moves each open setup one step, from what the hub reads. Nothing here waits on a clock."""
+    for row in q("SELECT * FROM mac_setups WHERE state IN ('add','waiting','finished','checking','proving')"):
+        try:
+            if row["state"] == "add":
+                mac_setup_add(row, t0)
+            elif row["state"] == "waiting":
+                mac_setup_installing(row)
+            elif row["state"] == "finished":
+                if mac_setup_returned(row):
+                    mac_setup_check(row)
+            elif row["state"] == "checking":
+                mac_setup_activate(row)
+            else:
+                mac_setup_proved(row)
+        except (ToolError, Refusal) as e:
+            mac_setup_stop(row, f"{e}.")
+        except Exception:
+            traceback.print_exc()       # one setup must not stop the others: the next pass tries it again
+
+
+def mac_desktop_sweep():
+    """What only hands at a Mac can put right reaches the manager once, in the second reading that shows it: a Mac that
+    is reopening Chrome is no news. A Mac whose owner sits at it, and a Mac with no agent that works in its Chrome, are
+    none either."""
+    for name in server_names():
+        st = q1("SELECT data, reported FROM server_status WHERE server=?", (name,))
+        desktop = ((json.loads(st["data"]).get("security") or {}).get("desktop") or {}) if st else {}
+        setup = q1("SELECT state FROM mac_setups WHERE server=?", (name,))
+        working = [a for a in server_agents(name) if agents()[a].get("active", True) is not False
+                   and "browser" in (agents()[a].get("can") or []) and browser_tabs(a)]
+        if not desktop or not working or (setup and setup["state"] in ("add", "waiting")):
+            continue
+        words = ("its screen is locked" if desktop.get("locked") else
+                 "Claude's extension is off in Chrome" if desktop.get("extension") is False else
+                 "Chrome does not run" if desktop.get("extension") and desktop.get("chrome") is False else
+                 "Claude's extension in Chrome is signed out" if desktop.get("browser") is False else None)
+        seen, told = kv_get(f"desktop_seen:{name}"), kv_get(f"desktop_told:{name}")
+        if not words:
+            if seen or told:
+                kv_set(f"desktop_seen:{name}", None)
+                kv_set(f"desktop_told:{name}", None)
+            continue
+        if told == words:
+            continue
+        said = json.dumps([words, st["reported"]])
+        if not seen or json.loads(seen)[0] != words:
+            kv_set(f"desktop_seen:{name}", said)
+        elif json.loads(seen)[1] != st["reported"]:
+            kv_set(f"desktop_told:{name}", words)
+            emit(manager_name(), "say", f"[hub] On the Mac {name}, {words}. Browser tasks there wait. Only hands at that "
+                                        f"Mac, or the app's Screen Sharing button, can put this right: raise it for the "
+                                        f"owner with raise_needs_you.")
 
 
 def server_names(team=None):
@@ -26016,19 +26266,21 @@ def join_line(code, kind):
             f">/dev/null 2>&1 || tailscale up --advertise-tags={JOIN_TAGS} --accept-dns=false; " + join)
 
 
-def new_join_code(kind, label=""):
-    """POST /ui/servers/join: a one-time code for one new server, for 30 minutes. The server gets its name at the join,
-    from Tailscale; the label is the name an older app typed, kept only for that app. The hub keeps only the code's
-    SHA-256, and a new code cancels the open one."""
+def new_join_code(kind, label="", agent=None, runtime=None):
+    """POST /ui/servers/join: a one-time code for one new server, for 30 minutes, and for a Mac two hours. The server
+    gets its name at the join, from Tailscale; the label is the name an older app typed, kept only for that app. The hub
+    keeps only the code's SHA-256, and a new code cancels the open one. agent and runtime: the first agent of a new Mac,
+    which the hub adds by itself once that Mac reports (mac_setup_add)."""
     t0 = now()
     raw = "".join(secrets.choice(LINK_ALPHABET) for _ in range(12))
+    life = MAC_JOIN_LIFE if kind == "mac" else JOIN_LIFE
     with transaction():
         DB.execute("UPDATE join_codes SET canceled=? WHERE used IS NULL AND canceled IS NULL", (t0,))
-        DB.execute("INSERT INTO join_codes(sha256,name,kind,created,expires) VALUES(?,?,?,?,?)",
-                   (hashlib.sha256(raw.encode()).hexdigest(), label, kind, t0, t0 + JOIN_LIFE))
+        DB.execute("INSERT INTO join_codes(sha256,name,kind,created,expires,agent,runtime) VALUES(?,?,?,?,?,?,?)",
+                   (hashlib.sha256(raw.encode()).hexdigest(), label, kind, t0, t0 + life, agent, runtime))
     log("owner", f"made a join code for a {kind} server")
     code = "-".join(raw[i:i + 4] for i in (0, 4, 8))
-    return {"name": label, "kind": kind, "expires_at": t0 + JOIN_LIFE, "code": code, "line": join_line(code, kind)}
+    return {"name": label, "kind": kind, "expires_at": t0 + life, "code": code, "line": join_line(code, kind)}
 
 
 def join_input(data):
@@ -26119,6 +26371,9 @@ def join_server(src, body):
                    (t0, src, body["key_sha256"], row["id"]))
         DB.execute("INSERT INTO server_keys(server,sha256,created) VALUES(?,?,?) ON CONFLICT(server) DO UPDATE SET "
                    "sha256=excluded.sha256, created=excluded.created", (name, body["key_sha256"], t0))
+        if row["agent"]:
+            DB.execute("INSERT INTO mac_setups(server,agent,runtime,state,created,updated) VALUES(?,?,?,'add',?,?)",
+                       (name, row["agent"], row["runtime"], t0, t0))
     log("hub", f"server {name} joined from {src} in {commit[:12]}")
     return dict(join_answer(name), revision=commit, replayed=False)
 
@@ -26345,6 +26600,7 @@ def remove_server(server, body):
     with transaction():
         DB.execute("DELETE FROM server_keys WHERE server=?", (server,))
         DB.execute("DELETE FROM server_status WHERE server=?", (server,))
+        DB.execute("DELETE FROM mac_setups WHERE server=?", (server,))
         DB.execute("UPDATE server_jobs SET state='canceled', prompt=NULL, updated=? WHERE server=? AND state IN "
                    "('queued','running','needs_owner')", (t0, server))
     log("owner", f"removed server {server} in {commit[:12]}")
@@ -26358,7 +26614,7 @@ def remove_server(server, body):
 # a person, a chat handle, a file, a tool or a machine is not here (test_rename names each one, so a new column of a
 # name like these is placed on one side or the other). Words an agent or the owner wrote stay as they were written.
 AGENT_COLUMNS = (
-    ("tasks", "owner"), ("tasks", "requester"), ("notes", "agent"), ("questions", "asker"), ("questions", "requester"),
+    ("mac_setups", "agent"), ("tasks", "owner"), ("tasks", "requester"), ("notes", "agent"), ("questions", "asker"), ("questions", "requester"),
     ("reports", "from_agent"), ("reports", "to_agent"), ("reports", "decided_by"), ("prompts", "agent"),
     ("prompts", "by"), ("rules", "agent"), ("rules", "by"), ("needs", "by"), ("events", "agent"), ("reminders", "agent"),
     ("sealed", "sender"), ("sealed", "recipient"), ("jobs", "agent"), ("log", "agent"), ("agents", "name"),
@@ -26523,7 +26779,7 @@ def rename_agent(agent, body):
 # server by address.
 MACHINE_COLUMNS = (("server_keys", "server"), ("server_status", "server"), ("server_jobs", "server"),
                    ("deposits", "machine"), ("withdrawals", "machine"), ("placements", "machine"),
-                   ("place_codes", "machine"), ("place_hosts", "machine"))
+                   ("place_codes", "machine"), ("place_hosts", "machine"), ("mac_setups", "server"))
 MACHINE_ROWS = (("server_status", "server"), ("place_hosts", "machine"))    # a key of their own: an old row goes
 MACHINE_MAPS = ("addresses", "servers", "access", "vault_stores")      # the team.json maps keyed by a machine
 
@@ -29881,16 +30137,7 @@ class Handler(BaseHTTPRequestHandler):
         def act(body):
             if agent not in agents():
                 raise Refusal(404, "no such agent")
-            pending = q1("SELECT * FROM machine_checks WHERE agent=? AND state='requested' ORDER BY id DESC LIMIT 1", (agent,))
-            if pending:
-                return {"agent": agent, "check": check_view(pending), "changed": False}
-            cid = ins("INSERT INTO machine_checks(agent,requested,state) VALUES(?,?,'requested')", (agent, now()))
-            probe = ins("INSERT INTO jobs(agent,task,kind,login,created) VALUES(?,NULL,'probe',NULL,?)",
-                        (agent, now())) if granted_logins(agent) else None
-            emit(agent, "check", "Check this machine now",
-                 extra=dict({"check": cid}, **({"probe_job": probe} if probe else {})))
-            return {"agent": agent, "check": check_view(q1("SELECT * FROM machine_checks WHERE id=?", (cid,))),
-                    "changed": True}
+            return start_machine_check(agent)
         return self.ui_command(f"machines/{agent}/check", lambda data: {"agent": agent}, act)
 
     def ui_machine_signin(self, agent):
@@ -30047,11 +30294,17 @@ class Handler(BaseHTTPRequestHandler):
         server's name is its name in Tailscale, read at the join: a name that an older app sends is only the code's label,
         which that app finds the code by."""
         def read(data):
-            kind, label = data.get("kind"), data.get("name")
+            kind, label, agent, runtime = (data.get(k) for k in ("kind", "name", "agent", "runtime"))
             if kind not in SERVER_KINDS:
                 raise ValueError("kind must be linux or mac")
-            return {"kind": kind, "name": label if isinstance(label, str) and SERVER_NAME.fullmatch(label) else ""}
-        return self.ui_command("servers/join", read, lambda body: new_join_code(body["kind"], body["name"]),
+            if agent is not None and (kind != "mac" or not isinstance(agent, str) or not AGENT_NAME.match(agent)
+                                      or agent == "owner" or agent in agents() or not isinstance(runtime, str)
+                                      or not runtime_fact(runtime, "browser_tabs")):
+                raise ValueError("agent is a new first agent of a Mac, with a runtime that works in Chrome")
+            return {"kind": kind, "name": label if isinstance(label, str) and SERVER_NAME.fullmatch(label) else "",
+                    "agent": agent, "runtime": runtime if agent else None}
+        return self.ui_command("servers/join", read,
+                               lambda body: new_join_code(body["kind"], body["name"], body["agent"], body["runtime"]),
                                keep=lambda result: dict(result, code=None, line=None))
 
     def ui_server_agent(self, server):
@@ -30167,6 +30420,36 @@ class Handler(BaseHTTPRequestHandler):
               "data=excluded.data, reported=excluded.reported", (name, json.dumps(reading), now()))
         return self.json(200, {"ok": True, "desired_revision": kit_revision(), "server": name})
 
+    def server_setup(self, name):
+        """POST /server/<name>/setup: the installer's last press on a new Mac. `boot` is this boot of the Mac, and
+        `restarts` is false on a Mac with FileVault on, which no automatic login brings back after a restart."""
+        name = self.server_caller(name)
+        if name is None:
+            return
+        if len(self.body()) > 4096:
+            return self.json(413, {"error": "the request is too large"})
+        data = self.form()
+        with LOCK:
+            return self.json(*mac_setup_finish(name, data.get("boot"), data.get("restarts")))
+
+    def mac_setup_page(self, token):
+        """GET /mac-setup/<token>: the page of a new Mac's last proof. Only a real browser runs its script."""
+        with LOCK:
+            row = q1("SELECT 1 FROM mac_setups WHERE token=? AND state='proving'", (token,))
+        if not row:
+            return self.send(404, "No such page.\n", "text/plain; charset=utf-8")
+        return self.send(200, MAC_SETUP_PAGE, "text/html; charset=utf-8")
+
+    def mac_setup_seen(self, token):
+        """POST /mac-setup/<token>: that page's script ran in a real browser (mac_setup_prove)."""
+        with LOCK:
+            row = q1("SELECT server FROM mac_setups WHERE token=? AND state='proving'", (token,))
+            # From that Mac's own address: another Chrome on the same account proves nothing about this Mac.
+            if not row or self.client_address[0] != address_of_machine(row["server"]):
+                return self.json(404, {"error": "no such page"})
+            q("UPDATE mac_setups SET seen=COALESCE(seen,?), updated=? WHERE server=?", (now(), now(), row["server"]))
+        return self.json(200, {"ok": True})
+
     def server_jobs(self, name):
         """GET /server/<name>/jobs: the open jobs of this server, oldest first. A rename job also names the agent's
         old name (was), and a job for an agent that keeps the OS user of an earlier name names that user."""
@@ -30179,7 +30462,9 @@ class Handler(BaseHTTPRequestHandler):
         for r in rows:
             job = {k: r[k] for k in ("id", "kind", "agent", "runtime", "state")}
             user = (agents().get(r["agent"]) or {}).get("user")
-            jobs.append(dict(job, **({"was": r["was"]} if r["was"] else {}), **({"user": user} if user else {})))
+            here = q1("SELECT 1 FROM mac_setups WHERE server=? AND agent=? AND state='waiting'", (name, r["agent"]))
+            jobs.append(dict(job, **({"was": r["was"]} if r["was"] else {}), **({"user": user} if user else {}),
+                             **({"sign_in": "at_the_mac"} if here else {})))
         return self.json(200, {"jobs": jobs})
 
     def server_signin(self, name):
@@ -33198,6 +33483,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_servers(query)
         if parts == ["join"]:
             return self.join_script()
+        if len(parts) == 2 and parts[0] == "mac-setup":
+            return self.mac_setup_page(parts[1])
         if len(parts) == 3 and parts[0] == "server" and parts[2] == "jobs":
             return self.server_jobs(parts[1])
         if parts == ["ui", "profiles"]:
@@ -33803,6 +34090,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui_server_prepare(parts[2])
         if parts == ["join"]:
             return self.join()
+        if len(parts) == 2 and parts[0] == "mac-setup":
+            return self.mac_setup_seen(parts[1])
+        if len(parts) == 3 and parts[0] == "server" and parts[2] == "setup":
+            return self.server_setup(parts[1])
         if len(parts) == 3 and parts[0] == "server" and parts[2] == "status":
             return self.server_status(parts[1])
         if len(parts) == 3 and parts[0] == "server" and parts[2] == "signin":       # owner feature agent_signin

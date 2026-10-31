@@ -44,11 +44,12 @@ import time
 import urllib.error
 import urllib.request
 
-from lifecycle import CONFIG_BRANCH, checkout_branch, exe, runtime_fact, shown_name, signed_in_path
+from lifecycle import (CONFIG_BRANCH, checkout_branch, desktop_items, desktop_path, exe, runtime_fact, shown_name,
+                       signed_in_path)
 
 # PRODUCT.md 4.1: these ids and nothing else. The order is the order of the readable lines.
 CHECKS = ("services", "hub_answers", "owner_claimed", "tailnet", "firewall", "clock", "disk",
-          "runtime_installed", "runtime_signed_in", "selftest", "version", "team")
+          "runtime_installed", "runtime_signed_in", "desktop", "selftest", "version", "team")
 OK, WARN, FAIL = "ok", "warn", "fail"
 
 # The three checks that read an agent of this machine: its service, its runtime binary and that runtime's
@@ -66,8 +67,9 @@ SELFTEST_BASELINE = ()
 # The checks a release cannot be judged by, because no release can pass them for the owner: signing a machine in to
 # its provider is the owner's own step, in the app, and a fleet whose owner has not taken it yet is not an unhealthy
 # fleet — it is a new one. releases.Update reads this, so the release gate and `fleet.py verify` agree about which
-# failures are the code's. Everything else a release can break stays in the gate.
-OWNER_STEPS = ("runtime_signed_in",)
+# failures are the code's. Everything else a release can break stays in the gate. A Mac's desktop is the same: its
+# sign-ins, its lock and its Chrome need hands at that Mac, and no release can pass them.
+OWNER_STEPS = ("runtime_signed_in", "desktop")
 SELFTEST_WAIT = 300         # it waits for the hub's own timers, so about a minute on a quiet machine
 # How old a helper's own sign-in reading may be and still answer for this machine: three of its reports
 # (lifecycle.REPORT_EVERY), so one missed report is not an unread check. Only a Mac answers from it (signed_in).
@@ -500,6 +502,25 @@ class Verify:
         return self.answer(OK, _sentences(f"{shown_name(name)} is signed in to {_label(rt)}"
                                           for name, (rt, _s, _read) in rows))
 
+    def desktop(self):
+        """A Mac's desktop can serve its agents: the items of the helper's own setup check (lifecycle.desktop_items), so
+        the two never disagree. Whether Chrome answers the runtime's account can be read in the login session alone, so
+        that part is the server service's reading, and a run with no such reading says nothing about it. Each line is
+        what a person does at that Mac, so a failure carries no command."""
+        if self.platform != "darwin" or not self.agents:
+            return None
+        tabs = any(runtime_fact(self.runtime_of(name), "browser_tabs") for name in self.agents)
+        items = desktop_items(self.run, self.home, self.me, tabs, self.helper_browser())
+        wanted = {c for name in self.agents for c in (self.conf["agents"][name].get("can") or [])}
+        failed = [detail for kind, ref, state, detail in items
+                  if state == "failed" and (kind != "capability" or ref in wanted)]      # as the hub's activation counts
+        open_ = [detail for kind, _ref, state, detail in items if state == "not_verified" and kind == "mac"]
+        if failed:
+            return self.answer(FAIL, " ".join(failed)[:300], "Put this right at this Mac's own screen.")
+        if open_:
+            return self.answer(WARN, " ".join(open_)[:300], "Look at this at this Mac's own screen.")
+        return self.answer(OK, "This Mac stays awake, logs in by itself, and Chrome is ready for its agents.")
+
     def selftest(self):
         """selftest.py passes against its recorded baseline, which is not zero failures (COORDINATION.md rule 5)."""
         path = os.path.join(self.kit, "selftest.py")
@@ -755,6 +776,17 @@ class Verify:
         except (OSError, ValueError, TypeError, KeyError):
             return None
         return state if isinstance(state, bool) and self.now() - at <= HELPER_READING else None
+
+    def helper_browser(self):
+        """What this Mac's server service last read about Chrome and the runtime's account (lifecycle.browser_connected),
+        or None when it has no reading of the last HELPER_READING seconds."""
+        try:
+            with open(desktop_path(self.home)) as f:
+                said = json.load(f)
+            state = said.get("browser")
+            return state if isinstance(state, bool) and self.now() - float(said["at"]) <= HELPER_READING else None
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            return None
 
     def unread_signin(self, runtimes):
         """Why a sign-in reading of these runtimes was not taken here, and what takes it, as (the words after the
