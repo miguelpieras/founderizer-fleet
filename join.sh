@@ -5,7 +5,8 @@
 #   A VPS (Ubuntu 22.04 or 24.04, or Debian 12), as root: base packages, the user fleet, then the join, security
 #   updates and the firewall. The line has joined the private network (Tailscale) before this script.
 #   A Mac (macOS 14 or later, with Tailscale and Homebrew), as the user that will run the agents: tmux and Python
-#   with Homebrew, then the join, then this Mac's vault, the one step that asks for that user's password.
+#   with Homebrew, then the join, then this Mac's vault, the one step that asks for that user's password, then
+#   Claude's extension for Chrome.
 #
 # The join itself is server.py in a new checkout of the Founderizer repository: the server key, POST /join with the code, and
 # the server service. The code goes to server.py on standard input, never in a command argument or a URL. The script
@@ -24,6 +25,7 @@ HUB="__FLEET_HUB__"
 REPO="__FLEET_REPO__"
 FLEET="__FLEET_ID__"            # the fleet's id at its release channel, where a Mac takes its signed vault
 CHANNEL="__FLEET_CHANNEL__"
+CLAUDE_EXTENSION=fcoeoabgfenejglbffodgkkbkcdhcgfn       # Claude's extension in the Chrome Web Store
 WORKER=fleet
 PACKAGES="git tmux python3 curl ca-certificates ufw unattended-upgrades sudo"
 ready=yes       # what the last step, verify, answered about this machine
@@ -197,6 +199,17 @@ mac_vault() {   # This Mac's vault, which every agent of it reaches (the owner, 
     rm -rf "$work"
 }
 
+mac_chrome() {  # The browser of a Mac agent on Claude (the owner, 28 October 2026: "a mac studio server should come by
+                # default with computer and browser use"). This file is Chrome's own way to take an extension from its
+                # Web Store: Chrome fetches it at its next start and asks once, on this Mac's screen, to enable it.
+                # It stays in place, so a Chrome profile that is removed gets the extension back at the next start.
+    folder="$HOME/Library/Application Support/Google/Chrome/External Extensions"
+    mkdir -p "$folder"
+    printf '{"external_update_url": "https://clients2.google.com/service/update2/crx"}\n' \
+        > "$folder/$CLAUDE_EXTENSION.json"
+    say "Claude's extension: Chrome fetches it at its next start and asks once to enable it"
+}
+
 vault_build() { # $1: an empty folder. The release channel's newest Mac build, as the vault's own updater takes it: this
                 # fleet's manifest, then the zip that it names on the channel's own host, by its SHA-256, unpacked.
     curl -fsS --proto '=https' --max-time 60 -H "Founderizer-Fleet: $FLEET" -o "$1/manifest.json" \
@@ -279,6 +292,7 @@ mac() {
     # session, so a second user would have to be logged in at the screen. A Mac keeps one user for its agents
     # (PRODUCT.md P2), and its agents share that user's runtime credential.
     mac_vault
+    mac_chrome
     verify_step "$HOME/fleet-server" as_self
     say "done. Add an agent to this Mac in Founderizer: Settings, Servers, this Mac, Add agent. Its agents run while this user is logged in."
 }

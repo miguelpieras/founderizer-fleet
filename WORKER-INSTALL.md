@@ -60,6 +60,13 @@ python3 worker_install.py --agent studio --start --authorize-screen
 The Mac service starts after the user signs in. It does not bypass FileVault or
 the lock screen. Leave a dedicated screen worker unlocked while it works.
 
+A Mac's join line also leaves the file that makes Chrome take Claude's extension from
+its Web Store (`join.sh` `mac_chrome`). Chrome fetches it at its next start and asks
+once, on that Mac's screen, to enable it. Then sign the extension in, in that Chrome,
+to the Claude account of the Mac's agents. Until a Chrome profile has it on, the setup
+check fails the `browser` item of an agent on Claude. A Chrome profile that is removed
+takes the extension with it, and the next start of Chrome fetches it again.
+
 ## Linux VPS or a new checkout
 
 Copy `install-worker.sh` to the machine, then run:

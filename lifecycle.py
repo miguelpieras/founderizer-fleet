@@ -350,6 +350,8 @@ RUNTIMES = {
         "token_weights": None,
     },
 }
+# Claude's extension in the Chrome Web Store, the browser of a runtime with browser_tabs (join.sh mac_chrome).
+CLAUDE_EXTENSION = "fcoeoabgfenejglbffodgkkbkcdhcgfn"
 # Every fact above in one list, so that a new entry cannot quietly leave one out (test_runtime_table).
 RUNTIME_FACTS = ("label", "driver", "acp_command", "can", "full_access", "manager_access", "first_worker", "manager",
                  "owner_chat", "agent_messages", "conversation", "conversation_why", "closed_versions", "mcp_servers",
@@ -1375,10 +1377,13 @@ class Lifecycle:
             ready = session[2] == "ok"
             chrome = any(os.path.isdir(p) for p in ("/Applications/Google Chrome.app",
                                                      os.path.join(self.home, "Applications", "Google Chrome.app")))
-            add("capability", "browser", "ok" if chrome and ready else "failed",
-                "Google Chrome is installed, and the session is ready." if chrome and ready else
+            extension = self.chrome_extension() if RUNTIMES.get(name, {}).get("browser_tabs") else True
+            add("capability", "browser", "ok" if chrome and ready and extension else "failed",
+                "Google Chrome is installed, and the session is ready." if chrome and ready and extension else
                 "Google Chrome is not installed." if not chrome else
-                f"The browser needs {user} at the console with the screen unlocked.")
+                f"The browser needs {user} at the console with the screen unlocked." if not ready else
+                "Claude's extension is off: press Enable Extension in Chrome on this Mac." if extension is False else
+                "Claude's extension is not in Chrome on this Mac: restart Chrome, then press Enable Extension.")
             add("capability", "screen", "not_verified" if ready else "failed",
                 "The session is ready, but Fleet cannot check the macOS screen recording and accessibility "
                 "permissions that screen control needs." if ready else
@@ -1416,6 +1421,21 @@ class Lifecycle:
             return ("model", ref, "failed", f"{effort} is not an effort of {model or 'the default model'} here.")
         return ("model", ref, "ok", ("Offered" if model else "The default model") +
                 (" with the efforts " + ", ".join(efforts) + "." if efforts else "."))
+
+    def chrome_extension(self):
+        """Claude's extension, from each Chrome profile's own record: True when a profile has it on, False when it is
+        there and off, None when no profile has it. A newer Chrome keeps only the reasons it is off."""
+        chrome, found = os.path.join(self.home, "Library", "Application Support", "Google", "Chrome"), None
+        for profile in os.listdir(chrome) if os.path.isdir(chrome) else ():
+            try:
+                with open(os.path.join(chrome, profile, "Secure Preferences"), encoding="utf-8") as f:
+                    entry = json.load(f)["extensions"]["settings"][CLAUDE_EXTENSION]
+                if entry.get("state") != 0 and not entry.get("disable_reasons"):
+                    return True
+                found = False
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                continue
+        return found
 
     def session_item(self, user):
         """macOS: who is at the console, and whether its screen is locked. A heartbeat cannot show this."""
