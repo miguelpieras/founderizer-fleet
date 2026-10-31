@@ -388,7 +388,8 @@ class Verify:
         if not self.tailscale():
             return self.answer(FAIL, "Tailscale is not installed, so this server is on no private network.",
                                "Install Tailscale on this server.", "curl -fsSL https://tailscale.com/install.sh | sh")
-        if self.backend_state() != "Running":
+        state = self.backend_state()
+        if state != "Running" and (state is not None or not self.address):
             return self.answer(FAIL, "Tailscale is not up, so this server is on no private network.",
                                "Start Tailscale on this server.", "tailscale up --accept-dns=false")
         if not self.address:
@@ -400,6 +401,9 @@ class Verify:
                                      f"calls.", ADDRESS_FIX)
         if not self.machine:
             return self.answer(FAIL, f"The hub has no server at {self.address}, this server's address.", ADDRESS_FIX)
+        if state is None:       # a status that failed while Tailscale still gives its address says nothing of the network
+            return self.answer(WARN, "Tailscale could not be read.", "Read Tailscale's state by hand on this server.",
+                               "tailscale status")
         return self.answer(OK, f"{self.address} is up, and it is {self.machine}'s address.")
 
     def firewall(self):

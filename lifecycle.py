@@ -31,6 +31,9 @@ import onboard      # the vendors' installers, which the runtime updates run (up
 
 REPORT_EVERY = 300          # seconds between status reports when nothing changes
 RETRY_MAX = 30              # seconds at most between the tries of a status report that did not reach the hub
+# What `tailscale status --json` can say of itself. `Starting` is up, as for Tailscale's own command: it lasts until the
+# first live peer or relay. Any other state says neither.
+TAILSCALE_UP, TAILSCALE_DOWN = ("Running", "Starting"), ("Stopped", "NeedsLogin", "NeedsMachineAuth")
 OWNER_ONLY = re.compile(r"(?:^|/)(?:test_[^/]*|ui_fixture|selftest|verify|pilot|vault|place)\.py$")  # never loaded here
 TICK = 15                   # seconds between idle checks
 RESTART_GRACE = 120         # seconds this process may live on after it asked for its own restart
@@ -1101,7 +1104,7 @@ class Lifecycle:
 
     def security(self):
         s = {"unattended_upgrades": None, "pending_security": None, "reboot_required": None,
-             "firewall": None, "tailscale": None}
+             "firewall": None, "tailscale": None}       # tailscale: read as a report leaves (report)
         if self.platform == "darwin":
             code, out, _ = self.run(["/usr/libexec/ApplicationFirewall/socketfilterfw", "--getglobalstate"])
             if code == 0 and out.strip():
@@ -1121,19 +1124,24 @@ class Lifecycle:
                     s["firewall"] = "active" if m.group(1) == "yes" else "inactive"
             except OSError:
                 pass
-        app = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
-        ts = shutil.which("tailscale") or (app if os.path.exists(app) else None)
-        if ts:
-            code, out, _ = self.run([ts, "status", "--json"])
-            try:
-                s["tailscale"] = code == 0 and json.loads(out or "{}").get("BackendState") == "Running"
-            except ValueError:
-                s["tailscale"] = False
         try:
             s["vault"] = self.vault() if self.vault else None
         except Exception:
             s["vault"] = None
         return s
+
+    def private_network(self):
+        """Whether Tailscale says that it is up, or None when nothing says: no command, one that failed or hung, or a
+        state that says neither. Only a report reads this, as it leaves (report). It waits 5 seconds and not 20,
+        because a report that must be immediate reads it too."""
+        app = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+        ts = shutil.which("tailscale") or (app if os.path.exists(app) else None)
+        code, out, _ = self.run([ts, "status", "--json"], timeout=5) if ts else (1, "", "")
+        try:
+            state = json.loads(out).get("BackendState") if code == 0 else None
+        except (ValueError, AttributeError):
+            state = None
+        return True if state in TAILSCALE_UP else False if state in TAILSCALE_DOWN else None
 
     def boot(self):
         """This boot of the machine: a reading saved before a reboot says nothing about the machine now."""
@@ -1208,7 +1216,7 @@ class Lifecycle:
                 ssh = ssh or out.strip() == "active"
         ts = shutil.which("tailscale")
         if ts and not ssh:
-            code, out, _ = self.run([ts, "debug", "prefs"])
+            code, out, _ = self.run([ts, "debug", "prefs"], timeout=5)
             try:
                 ssh = bool(json.loads(out).get("RunSSH")) if code == 0 else ssh
             except ValueError:
@@ -1527,6 +1535,9 @@ class Lifecycle:
                 if check:
                     status["check"] = check         # this report answers the owner's "check this machine"
                     status["verify"] = self.verify(status, probe_job)
+                # Tailscale, as the report leaves, and never saved: a report goes over the private network, so a reading
+                # from before it says "off" when the network is back, and a retry after a break would repeat that.
+                status["security"]["tailscale"] = self.private_network()
                 status["reading_age"] = round(max(0.0, self.monotonic() - self.read_mono), 3)
                 code, data = self.post(status)
             except Exception:

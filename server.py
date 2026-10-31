@@ -432,7 +432,9 @@ class Service:
             return []
 
     def report(self):
-        status, answer = self.hub.call("POST", f"/server/{self.name}/status", self.reading())
+        reading = self.reading()
+        reading["security"]["tailscale"] = self.life.private_network()      # as it leaves (Lifecycle.report)
+        status, answer = self.hub.call("POST", f"/server/{self.name}/status", reading)
         self.last_report = self.clock()
         if status == 200 and re.fullmatch(r"[0-9a-f]{40}", str(answer.get("desired_revision"))):
             self.desired = answer["desired_revision"]
